@@ -266,7 +266,7 @@ impl Database {
             .get(name)
             .ok_or_else(|| EngineError::TableNotFound(name.to_string()))?;
         let mut out = Vec::new();
-        for (key, bytes) in engine.scan() {
+        for (key, bytes) in engine.scan()? {
             match Value::decode(&bytes) {
                 Ok(Value::Document(doc)) => out.push((key, doc)),
                 Ok(_) => {

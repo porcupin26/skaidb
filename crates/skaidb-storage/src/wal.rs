@@ -136,6 +136,15 @@ impl Wal {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Truncate the log to empty. Called after a flush makes the logged
+    /// mutations durable in an SSTable, so they no longer need replay.
+    pub fn truncate(&mut self) -> Result<()> {
+        self.file.set_len(0)?;
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.sync_all()?;
+        Ok(())
+    }
 }
 
 fn read_u32(bytes: &[u8]) -> u32 {

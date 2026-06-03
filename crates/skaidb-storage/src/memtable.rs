@@ -59,6 +59,28 @@ impl Memtable {
         })
     }
 
+    /// The latest stored version for `key` including tombstones, or `None` if
+    /// the key has never been written here. Distinguishes "deleted" (returns
+    /// `Some(Delete)`) from "absent" (returns `None`) — unlike [`Memtable::get`].
+    pub fn get_entry(&self, key: &[u8]) -> Option<&VersionValue> {
+        self.latest_version(key, Hlc::MAX)
+    }
+
+    /// Latest version per distinct key (including tombstones), with its stamp,
+    /// in key order. Used to flush the memtable into an SSTable.
+    pub fn iter_latest_entries(&self) -> Vec<(Vec<u8>, Hlc, VersionValue)> {
+        let mut out = Vec::new();
+        let mut current: Option<&[u8]> = None;
+        for ((k, std::cmp::Reverse(stamp)), value) in &self.map {
+            if current == Some(k.as_slice()) {
+                continue;
+            }
+            current = Some(k.as_slice());
+            out.push((k.clone(), *stamp, value.clone()));
+        }
+        out
+    }
+
     /// The newest version of `key` whose stamp is `<= as_of`, if any.
     fn latest_version(&self, key: &[u8], as_of: Hlc) -> Option<&VersionValue> {
         let start = (key.to_vec(), Reverse(Hlc::MAX));
