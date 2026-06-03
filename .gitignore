@@ -1,0 +1,19 @@
+# Private / local-only files — never commit
+.priv/
+
+# LLM / agent artifacts — never commit
+.claude/
+.claude*
+*.llm
+CLAUDE.md
+
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
