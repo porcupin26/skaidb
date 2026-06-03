@@ -5,6 +5,7 @@
 //! [`Value`]. A field that is absent from a document reads as `NULL` under the
 //! three-valued logic in [`ternary`].
 
+mod codec;
 mod json;
 pub mod ternary;
 mod value;

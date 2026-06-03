@@ -170,6 +170,30 @@ pub enum Value {
     Document(Document),
 }
 
+impl fmt::Display for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Value::Null => write!(f, "NULL"),
+            Value::Bool(b) => write!(f, "{b}"),
+            Value::Int(i) => write!(f, "{i}"),
+            Value::Float(x) => write!(f, "{x}"),
+            Value::Decimal(d) => write!(f, "{d}"),
+            Value::String(s) => write!(f, "{s}"),
+            Value::Bytes(b) => {
+                write!(f, "0x")?;
+                for byte in b {
+                    write!(f, "{byte:02x}")?;
+                }
+                Ok(())
+            }
+            Value::Uuid(u) => write!(f, "{u}"),
+            Value::Timestamp(t) => write!(f, "{t}"),
+            // Composite values render as their JSON form for readability.
+            Value::Array(_) | Value::Document(_) => write!(f, "{}", self.to_json()),
+        }
+    }
+}
+
 /// Type-tag byte prefixes for order-preserving key encoding. Distinct constants
 /// keep the encoding stable even if [`ValueType`] variants are reordered.
 mod tag {

@@ -1,4 +1,13 @@
-//! skaidb SQL frontend: parser, AST, and logical planning.
+//! skaidb SQL frontend: lexer, AST, and parser.
 //!
-//! Targets a named subset of SQL:2016 core (see SPEC §3). Implementation lands
-//! in a later phase; this crate currently reserves the module boundary.
+//! Targets a named subset of SQL:2016 core (SPEC §3). [`parse`] turns a SQL
+//! string into a [`Statement`]; the query engine consumes the AST and executes
+//! it against the storage layer.
+
+pub mod ast;
+mod parser;
+mod token;
+
+pub use ast::*;
+pub use parser::{parse, ParseError};
+pub use token::{tokenize, Keyword, LexError, Token};

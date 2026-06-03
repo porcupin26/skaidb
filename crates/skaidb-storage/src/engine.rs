@@ -102,6 +102,17 @@ impl Engine {
         self.mem.get_as_of(key, as_of).map(|b| b.to_vec())
     }
 
+    /// Full scan of the latest live (non-tombstone) key/value pairs, in key
+    /// order. Until SSTables land, this reads the memtable, which the WAL fully
+    /// reconstructs on open.
+    pub fn scan(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.mem
+            .iter_latest()
+            .into_iter()
+            .map(|(k, v)| (k, v.to_vec()))
+            .collect()
+    }
+
     /// Take a read snapshot: any write already applied is visible at or before
     /// the returned stamp, and writes made afterward are not.
     pub fn snapshot(&self) -> Hlc {

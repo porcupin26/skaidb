@@ -14,3 +14,5 @@ skaidb-types.workspace = true
 skaidb-storage.workspace = true
 skaidb-sql.workspace = true
 thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true

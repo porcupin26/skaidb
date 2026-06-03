@@ -225,7 +225,8 @@ name = "skaidb-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
- "skaidb-driver",
+ "skaidb-engine",
+ "skaidb-types",
 ]
 
 [[package]]
@@ -259,6 +260,8 @@ dependencies = [
 name = "skaidb-engine"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "skaidb-sql",
  "skaidb-storage",
  "skaidb-types",

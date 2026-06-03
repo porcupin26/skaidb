@@ -14,5 +14,6 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-skaidb-driver.workspace = true
+skaidb-engine.workspace = true
+skaidb-types.workspace = true
 clap.workspace = true
