@@ -11,4 +11,5 @@ workspace = true
 
 [dependencies]
 skaidb-types.workspace = true
+skaidb-storage.workspace = true
 thiserror.workspace = true

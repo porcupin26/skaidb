@@ -1,5 +1,11 @@
-//! skaidb clustering: consistent-hash partitioning, leaderless replication,
-//! tunable quorum consistency, and the push-based topology channel (SPEC §4–6).
+//! skaidb clustering (SPEC §4–6): consistent-hash partitioning, tunable quorum
+//! consistency, and HLC last-writer-wins conflict resolution.
 //!
-//! Implementation lands in a later phase; this crate currently reserves the
-//! module boundary.
+//! This crate is the placement/coordination logic; the network transport that
+//! ships requests between nodes lives in `skaidb-proto`/`skaidb-server`.
+
+mod quorum;
+mod ring;
+
+pub use quorum::{is_strong, merge_documents, resolve_value, Consistency, Versioned};
+pub use ring::{NodeId, Ring};

@@ -233,6 +233,7 @@ dependencies = [
 name = "skaidb-cluster"
 version = "0.1.0"
 dependencies = [
+ "skaidb-storage",
  "skaidb-types",
  "thiserror",
 ]
