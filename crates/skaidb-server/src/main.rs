@@ -37,13 +37,10 @@ fn run(args: cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!(
-        "skaidb {} starting as {:?} on {}:{} (data_dir={})",
+        "skaidb {} starting as {:?} (data_dir={})",
         env!("CARGO_PKG_VERSION"),
         config.server.node_role,
-        config.server.bind_addr,
-        config.server.quic_port,
         config.server.data_dir,
     );
-    println!("skaidb: subsystem startup not yet implemented");
-    Ok(())
+    skaidb_server::run(config)
 }

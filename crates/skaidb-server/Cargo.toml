@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[lib]
+name = "skaidb_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "skaidb"
 path = "src/main.rs"
@@ -15,8 +19,12 @@ workspace = true
 
 [dependencies]
 skaidb-config.workspace = true
-skaidb-storage.workspace = true
 skaidb-engine.workspace = true
 skaidb-cluster.workspace = true
 skaidb-proto.workspace = true
+skaidb-types.workspace = true
 clap.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+skaidb-driver.workspace = true
