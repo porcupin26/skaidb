@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/skaidb-types",
+    "crates/skaidb-storage",
+    "crates/skaidb-config",
+    "crates/skaidb-sql",
+    "crates/skaidb-engine",
+    "crates/skaidb-cluster",
+    "crates/skaidb-proto",
+    "crates/skaidb-server",
+    "crates/skaidb-driver",
+    "crates/skaidb-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/porcupin26/skaidb"
+rust-version = "1.93"
+
+[workspace.dependencies]
+skaidb-types = { path = "crates/skaidb-types" }
+skaidb-storage = { path = "crates/skaidb-storage" }
+skaidb-config = { path = "crates/skaidb-config" }
+skaidb-sql = { path = "crates/skaidb-sql" }
+skaidb-engine = { path = "crates/skaidb-engine" }
+skaidb-cluster = { path = "crates/skaidb-cluster" }
+skaidb-proto = { path = "crates/skaidb-proto" }
+skaidb-driver = { path = "crates/skaidb-driver" }
+
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"

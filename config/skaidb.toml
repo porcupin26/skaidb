@@ -1,0 +1,45 @@
+[server]
+bind_addr = "127.0.0.1"
+quic_port = 7000
+rest_port = 7080
+node_role = "member"
+data_dir = "/var/lib/skaidb"
+
+[cluster]
+seeds = []
+replication_factor = 3
+vnodes_per_node = 256
+default_read_consistency = "QUORUM"
+default_write_consistency = "QUORUM"
+
+[agent]
+subset_tables = []
+max_staleness_ms = 5000
+
+[auth]
+scram_enabled = true
+x509_enabled = false
+x509_ca_file = ""
+internode_auth = "keyfile"
+internode_keyfile = ""
+superuser = "admin"
+
+[encryption]
+tls_cert_file = ""
+tls_key_file = ""
+at_rest_enabled = false
+at_rest_kek_source = "keyfile"
+at_rest_keyfile = ""
+
+[storage]
+memtable_size_mb = 256
+compaction_strategy = "lazy_leveled"
+use_io_uring = true
+
+[observability]
+prometheus_port = 9090
+slow_query_ms = 200
+query_log_enabled = true
+query_log_masked = true
+login_log_enabled = true
+error_log_level = "warn"

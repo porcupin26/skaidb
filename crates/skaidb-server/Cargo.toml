@@ -1,0 +1,22 @@
+[package]
+name = "skaidb-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "skaidb"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+skaidb-config.workspace = true
+skaidb-storage.workspace = true
+skaidb-engine.workspace = true
+skaidb-cluster.workspace = true
+skaidb-proto.workspace = true
+clap.workspace = true

@@ -10,7 +10,7 @@ CLAUDE.md
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock IS committed: skaidb ships binaries, so lockfile reproducibility matters.
 
 # OS / editor
 .DS_Store
