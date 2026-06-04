@@ -7,6 +7,7 @@ data_dir = "/var/lib/skaidb"
 
 [cluster]
 seeds = []
+internode_port = 7100
 replication_factor = 3
 vnodes_per_node = 256
 default_read_consistency = "QUORUM"

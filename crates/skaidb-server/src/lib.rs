@@ -15,13 +15,52 @@ pub mod shared;
 use std::sync::{Arc, Mutex};
 
 use skaidb_auth::RoleStore;
-use skaidb_config::Config;
+use skaidb_cluster::{Consistency as ClusterConsistency, Node, NodeConfig, NodeId};
+use skaidb_config::{Config, Consistency};
 use skaidb_engine::Database;
 
 use crate::audit::AuditSettings;
 use crate::authn::AuthState;
 use crate::metrics::Metrics;
-use crate::shared::{Context, Shared};
+use crate::shared::{Backend, Context, Shared};
+
+/// Build the execution backend: a cluster coordinator when seeds are
+/// configured, otherwise a standalone local engine.
+fn build_backend(db: Database, config: &Config) -> Result<Backend, Box<dyn std::error::Error>> {
+    if config.cluster.seeds.is_empty() {
+        return Ok(Backend::Local(Mutex::new(db)));
+    }
+    let internode_addr = format!(
+        "{}:{}",
+        config.server.bind_addr, config.cluster.internode_port
+    );
+    let members: Vec<(NodeId, String)> = config
+        .cluster
+        .seeds
+        .iter()
+        .map(|addr| (NodeId::new(addr.clone()), addr.clone()))
+        .collect();
+    let node_cfg = NodeConfig {
+        id: NodeId::new(internode_addr.clone()),
+        internode_addr,
+        members,
+        replication_factor: config.cluster.replication_factor as usize,
+        vnodes_per_node: config.cluster.vnodes_per_node,
+        read_consistency: map_consistency(config.cluster.default_read_consistency),
+        write_consistency: map_consistency(config.cluster.default_write_consistency),
+    };
+    let node = Node::new(db, node_cfg);
+    node.serve_internode()?;
+    Ok(Backend::Cluster(node))
+}
+
+fn map_consistency(c: Consistency) -> ClusterConsistency {
+    match c {
+        Consistency::One => ClusterConsistency::One,
+        Consistency::Quorum => ClusterConsistency::Quorum,
+        Consistency::All => ClusterConsistency::All,
+    }
+}
 
 /// Open the database from `config` and serve the binary + REST endpoints,
 /// blocking until the binary accept loop ends.
@@ -50,8 +89,11 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Metrics::new();
     metrics.set("skaidb_up", 1);
 
+    let clustered = !config.cluster.seeds.is_empty();
+    let backend = build_backend(db, &config)?;
+
     let ctx: Shared = Arc::new(Context {
-        db: Mutex::new(db),
+        backend,
         metrics,
         audit: AuditSettings::from(&config.observability),
         roles,
@@ -59,6 +101,18 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         superuser_role: config.auth.superuser.clone(),
     });
 
+    println!(
+        "skaidb mode: {}",
+        if clustered {
+            format!(
+                "cluster ({} members, internode :{})",
+                config.cluster.seeds.len(),
+                config.cluster.internode_port
+            )
+        } else {
+            "standalone".to_string()
+        }
+    );
     println!(
         "skaidb authentication: {}",
         if auth_required {
@@ -118,7 +172,7 @@ mod tests {
         let mut roles = RoleStore::new();
         roles.create_superuser("superuser");
         Arc::new(Context {
-            db: Mutex::new(Database::open(temp_dir()).unwrap()),
+            backend: Backend::Local(Mutex::new(Database::open(temp_dir()).unwrap())),
             metrics: Metrics::new(),
             audit: quiet_audit(),
             roles,
@@ -213,7 +267,7 @@ mod tests {
         let mut authn = AuthState::required();
         authn.add_user("ada", "pencil", "admin");
         Arc::new(Context {
-            db: Mutex::new(Database::open(temp_dir()).unwrap()),
+            backend: Backend::Local(Mutex::new(Database::open(temp_dir()).unwrap())),
             metrics: Metrics::new(),
             audit: quiet_audit(),
             roles,
@@ -249,7 +303,7 @@ mod tests {
             .grant("reader", Privilege::Select, Object::Table("t".into()))
             .unwrap();
         let ctx: Shared = Arc::new(Context {
-            db: Mutex::new(Database::open(temp_dir()).unwrap()),
+            backend: Backend::Local(Mutex::new(Database::open(temp_dir()).unwrap())),
             metrics: Metrics::new(),
             audit: quiet_audit(),
             roles,
@@ -272,6 +326,54 @@ mod tests {
             Response::Error(m) => assert!(m.contains("permission denied"), "got: {m}"),
             other => panic!("expected denial, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rest_basic_auth_enforced() {
+        let (addr, _h) = rest::spawn("127.0.0.1:0", auth_ctx()).unwrap();
+
+        // Correct credentials (ada:pencil → base64) authenticate.
+        let (status, _) = http_post_auth(
+            addr,
+            "CREATE TABLE t (PRIMARY KEY (id))",
+            Some("YWRhOnBlbmNpbA=="),
+        );
+        assert_eq!(status, 200, "valid basic auth should succeed");
+
+        // No credentials → 401.
+        let (status, _) = http_post_auth(addr, "SELECT 1 FROM t", None);
+        assert_eq!(status, 401);
+
+        // Wrong password (ada:wrong → base64) → 401.
+        let (status, _) = http_post_auth(addr, "SELECT 1 FROM t", Some("YWRhOndyb25n"));
+        assert_eq!(status, 401);
+    }
+
+    /// POST /query with an optional `Authorization: Basic` value; returns
+    /// (status code, body).
+    fn http_post_auth(addr: std::net::SocketAddr, sql: &str, basic: Option<&str>) -> (u16, String) {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        let auth = basic
+            .map(|b| format!("Authorization: Basic {b}\r\n"))
+            .unwrap_or_default();
+        let req = format!(
+            "POST /query HTTP/1.1\r\nHost: localhost\r\n{auth}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            sql.len(),
+            sql
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        let status = resp
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let body = resp
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_string())
+            .unwrap_or_default();
+        (status, body)
     }
 
     fn http_get(addr: std::net::SocketAddr, path: &str) -> String {

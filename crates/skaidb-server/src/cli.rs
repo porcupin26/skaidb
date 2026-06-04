@@ -34,6 +34,8 @@ pub struct Cli {
     // ---- [cluster] ----
     #[arg(long, env = "SKAIDB_SEEDS", value_delimiter = ',')]
     pub seeds: Option<Vec<String>>,
+    #[arg(long, env = "SKAIDB_INTERNODE_PORT")]
+    pub internode_port: Option<u16>,
     #[arg(long, env = "SKAIDB_REPLICATION_FACTOR")]
     pub replication_factor: Option<u32>,
     #[arg(long, env = "SKAIDB_VNODES_PER_NODE")]
@@ -123,6 +125,7 @@ impl Cli {
             data_dir => config.server.data_dir,
 
             seeds => config.cluster.seeds,
+            internode_port => config.cluster.internode_port,
             replication_factor => config.cluster.replication_factor,
             vnodes_per_node => config.cluster.vnodes_per_node,
             default_read_consistency => config.cluster.default_read_consistency,

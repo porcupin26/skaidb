@@ -84,7 +84,11 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClusterConfig {
+    /// Internode addresses of all cluster members, `host:port` (including this
+    /// node). Empty means single-node / standalone mode.
     pub seeds: Vec<String>,
+    /// Port this node serves internode replication RPC on.
+    pub internode_port: u16,
     pub replication_factor: u32,
     pub vnodes_per_node: u32,
     pub default_read_consistency: Consistency,
@@ -181,6 +185,7 @@ impl Default for ClusterConfig {
     fn default() -> Self {
         ClusterConfig {
             seeds: Vec::new(),
+            internode_port: 7100,
             replication_factor: 3,
             vnodes_per_node: 256,
             default_read_consistency: Consistency::Quorum,

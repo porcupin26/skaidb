@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use skaidb_auth::{Object, Privilege, RoleStore};
-use skaidb_engine::{Database, QueryOutput};
+use skaidb_cluster::Node;
+use skaidb_engine::{Database, EngineError, QueryOutput};
 use skaidb_proto::Response;
 use skaidb_sql::ast::Statement;
 
@@ -13,10 +14,30 @@ use crate::audit::AuditSettings;
 use crate::authn::AuthState;
 use crate::metrics::Metrics;
 
+/// Where statements actually execute: a local single-node engine, or the
+/// cluster coordinator that replicates across nodes.
+#[derive(Debug)]
+pub enum Backend {
+    Local(Mutex<Database>),
+    Cluster(Arc<Node>),
+}
+
+impl Backend {
+    fn execute(&self, sql: &str) -> Result<QueryOutput, EngineError> {
+        match self {
+            Backend::Local(db) => db
+                .lock()
+                .map_err(|_| EngineError::Cluster("server lock poisoned".into()))?
+                .execute(sql),
+            Backend::Cluster(node) => node.execute(sql),
+        }
+    }
+}
+
 /// State shared across connection-handling threads.
 #[derive(Debug)]
 pub struct Context {
-    pub db: Mutex<Database>,
+    pub backend: Backend,
     pub metrics: Metrics,
     pub audit: AuditSettings,
     /// Roles/grants (SPEC §8.2).
@@ -49,19 +70,16 @@ pub fn execute_as(ctx: &Shared, role: &str, sql: &str) -> Response {
 
     let start = Instant::now();
 
-    let response = match ctx.db.lock() {
-        Ok(mut db) => match db.execute(sql) {
-            Ok(QueryOutput::Rows(rs)) => Response::Rows {
-                columns: rs.columns,
-                rows: rs.rows,
-            },
-            Ok(QueryOutput::Mutation { affected }) => Response::Mutation {
-                affected: affected as u64,
-            },
-            Ok(QueryOutput::Ddl) => Response::Ddl,
-            Err(e) => Response::Error(e.to_string()),
+    let response = match ctx.backend.execute(sql) {
+        Ok(QueryOutput::Rows(rs)) => Response::Rows {
+            columns: rs.columns,
+            rows: rs.rows,
         },
-        Err(_) => Response::Error("server lock poisoned".into()),
+        Ok(QueryOutput::Mutation { affected }) => Response::Mutation {
+            affected: affected as u64,
+        },
+        Ok(QueryOutput::Ddl) => Response::Ddl,
+        Err(e) => Response::Error(e.to_string()),
     };
 
     let elapsed_ms = start.elapsed().as_millis() as u64;

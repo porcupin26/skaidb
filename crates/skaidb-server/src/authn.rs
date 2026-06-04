@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use skaidb_auth::crypto::sha256;
+use skaidb_auth::crypto::{ct_eq, sha256};
 use skaidb_auth::{ScramCredential, DEFAULT_ITERATIONS};
 
 /// A user account: how to verify the password, and which role it acts as.
@@ -76,6 +76,20 @@ impl AuthState {
         match self.users.get(username) {
             Some(acct) => (acct.credential.salt.clone(), acct.credential.iterations),
             None => (self.default_salt.clone(), DEFAULT_ITERATIONS),
+        }
+    }
+
+    /// Verify a plaintext `password` for `username` (used by HTTP Basic auth on
+    /// the REST endpoint). Returns the role on success. Recomputes the SCRAM
+    /// verifier from the stored salt/iterations and compares stored keys.
+    pub fn verify_password(&self, username: &str, password: &str) -> Option<String> {
+        let acct = self.users.get(username)?;
+        let candidate =
+            ScramCredential::new(password, &acct.credential.salt, acct.credential.iterations);
+        if ct_eq(&candidate.stored_key, &acct.credential.stored_key) {
+            Some(acct.role.clone())
+        } else {
+            None
         }
     }
 
