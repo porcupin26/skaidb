@@ -1,0 +1,507 @@
+//! A cluster member node: local storage plus the coordinator that replicates
+//! writes and gathers distributed reads (SPEC §4–6).
+//!
+//! Writes go to a key's replica set (the ring) and wait for a write quorum;
+//! reads scatter to members and merge by HLC last-writer-wins. DDL is broadcast
+//! to a member quorum. The same `run()` executor the embedded engine uses drives
+//! everything — only the [`Cluster`] impl changes. (Active read-repair and
+//! hinted handoff are noted for a later phase; convergence currently relies on
+//! every write reaching its replica quorum.)
+//!
+//! Consistency note: per-key write quorums are enforced exactly; a table read
+//! gathers from all reachable members (strongest read), and requires at least a
+//! cluster quorum of members to respond.
+
+use std::collections::{BTreeMap, HashMap};
+use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+use skaidb_engine::{filter_rows, run, Cluster, Database, EngineError, QueryOutput};
+use skaidb_proto::{read_frame, write_frame};
+use skaidb_sql::ast::Statement;
+use skaidb_sql::parse;
+use skaidb_storage::{Hlc, HlcClock};
+use skaidb_types::{Document, Value};
+
+use crate::internode::{self, Request, Response};
+use crate::quorum::Consistency;
+use crate::ring::{NodeId, Ring};
+
+type EngineResult<T> = std::result::Result<T, EngineError>;
+
+/// Configuration for a node's place in the cluster.
+#[derive(Debug, Clone)]
+pub struct NodeConfig {
+    pub id: NodeId,
+    /// Address this node serves internode RPC on.
+    pub internode_addr: String,
+    /// All members: id → internode address (including this node).
+    pub members: Vec<(NodeId, String)>,
+    pub replication_factor: usize,
+    pub vnodes_per_node: u32,
+    pub read_consistency: Consistency,
+    pub write_consistency: Consistency,
+}
+
+/// A cluster member: owns local storage and coordinates cluster operations.
+#[derive(Debug)]
+pub struct Node {
+    id: NodeId,
+    local: Mutex<Database>,
+    ring: Ring,
+    /// Peer id → internode address (excludes self).
+    peers: HashMap<NodeId, String>,
+    clock: HlcClock,
+    cfg: NodeConfig,
+}
+
+impl Node {
+    /// Create a node with the given local database and cluster config.
+    pub fn new(local: Database, cfg: NodeConfig) -> Arc<Node> {
+        let mut ring = Ring::new(cfg.vnodes_per_node);
+        for (id, _) in &cfg.members {
+            ring.add_node(id.clone());
+        }
+        let peers = cfg
+            .members
+            .iter()
+            .filter(|(id, _)| *id != cfg.id)
+            .map(|(id, addr)| (id.clone(), addr.clone()))
+            .collect();
+
+        Arc::new(Node {
+            id: cfg.id.clone(),
+            local: Mutex::new(local),
+            ring,
+            peers,
+            clock: HlcClock::new(),
+            cfg,
+        })
+    }
+
+    /// Total member count (peers + self).
+    fn member_count(&self) -> usize {
+        self.peers.len() + 1
+    }
+
+    /// Start serving internode RPC on this node's address (background thread).
+    pub fn serve_internode(self: &Arc<Self>) -> std::io::Result<()> {
+        let listener = TcpListener::bind(&self.cfg.internode_addr)?;
+        let node = Arc::clone(self);
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let node = Arc::clone(&node);
+                thread::spawn(move || node.handle_internode(stream));
+            }
+        });
+        Ok(())
+    }
+
+    fn handle_internode(&self, mut stream: TcpStream) {
+        while let Ok(payload) = read_frame(&mut stream) {
+            let response = match Request::decode(&payload) {
+                Ok(req) => self.apply_local(req),
+                Err(e) => Response::Err(e.to_string()),
+            };
+            if write_frame(&mut stream, &response.encode()).is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Apply an internode request to local storage.
+    fn apply_local(&self, req: Request) -> Response {
+        let mut db = match self.local.lock() {
+            Ok(db) => db,
+            Err(_) => return Response::Err("local lock poisoned".into()),
+        };
+        match req {
+            Request::Ping => Response::Pong,
+            Request::ApplyPut {
+                table,
+                key,
+                value,
+                hlc,
+            } => match db.apply_put(&table, &key, value, hlc) {
+                Ok(()) => Response::Ack,
+                Err(e) => Response::Err(e.to_string()),
+            },
+            Request::ApplyDelete { table, key, hlc } => match db.apply_delete(&table, &key, hlc) {
+                Ok(()) => Response::Ack,
+                Err(e) => Response::Err(e.to_string()),
+            },
+            Request::ApplyDdl { sql } => match db.execute(&sql) {
+                Ok(_) => Response::Ack,
+                Err(e) => Response::Err(e.to_string()),
+            },
+            Request::LocalScan { table } => match db.local_scan_versioned(&table) {
+                Ok(rows) => Response::Scan { rows },
+                Err(e) => Response::Err(e.to_string()),
+            },
+        }
+    }
+
+    /// Execute a SQL statement as the cluster coordinator.
+    pub fn execute(self: &Arc<Self>, sql: &str) -> EngineResult<QueryOutput> {
+        let stmt = parse(sql)?;
+        if is_ddl(&stmt) {
+            self.broadcast_ddl(sql)?;
+            return Ok(QueryOutput::Ddl);
+        }
+        let mut coord = Coordinator { node: self };
+        run(stmt, &mut coord)
+    }
+
+    /// Broadcast DDL to all members; require a member quorum to apply it (so a
+    /// single node being down does not block schema changes). A node that missed
+    /// the broadcast would need to catch up via a schema log — not yet built, so
+    /// phase 1 relies on the broadcast reaching each node.
+    fn broadcast_ddl(&self, sql: &str) -> EngineResult<()> {
+        let mut acks = 0usize;
+        // Local first.
+        match self.local.lock() {
+            Ok(mut db) => {
+                db.execute(sql)?;
+                acks += 1;
+            }
+            Err(_) => return Err(EngineError::Cluster("local lock poisoned".into())),
+        }
+        for addr in self.peers.values() {
+            if let Ok(Response::Ack) = internode::call(
+                addr,
+                &Request::ApplyDdl {
+                    sql: sql.to_string(),
+                },
+            ) {
+                acks += 1;
+            }
+        }
+        let needed = Consistency::Quorum.required(self.member_count());
+        if acks >= needed {
+            Ok(())
+        } else {
+            Err(EngineError::Cluster(format!(
+                "DDL quorum not met: {acks}/{needed} members applied"
+            )))
+        }
+    }
+
+    /// Replicate a single write to the key's replica set; wait for write quorum.
+    fn replicate(&self, table: &str, key: &[u8], op: WriteOp, hlc: Hlc) -> EngineResult<()> {
+        let replicas = self.ring.replicas_for(key, self.cfg.replication_factor);
+        let needed = self.cfg.write_consistency.required(replicas.len().max(1));
+        let mut acks = 0usize;
+
+        for replica in &replicas {
+            let ok = if *replica == self.id {
+                self.apply_write_local(table, key, &op, hlc).is_ok()
+            } else if let Some(addr) = self.peers.get(replica) {
+                matches!(self.send_write(addr, table, key, &op, hlc), Ok(true))
+            } else {
+                false
+            };
+            if ok {
+                acks += 1;
+            }
+        }
+
+        if acks >= needed {
+            Ok(())
+        } else {
+            Err(EngineError::Cluster(format!(
+                "write quorum not met: {acks}/{needed} acks"
+            )))
+        }
+    }
+
+    fn apply_write_local(
+        &self,
+        table: &str,
+        key: &[u8],
+        op: &WriteOp,
+        hlc: Hlc,
+    ) -> EngineResult<()> {
+        let mut db = self
+            .local
+            .lock()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
+        match op {
+            WriteOp::Put(bytes) => db.apply_put(table, key, bytes.clone(), hlc),
+            WriteOp::Delete => db.apply_delete(table, key, hlc),
+        }
+    }
+
+    fn send_write(
+        &self,
+        addr: &str,
+        table: &str,
+        key: &[u8],
+        op: &WriteOp,
+        hlc: Hlc,
+    ) -> std::io::Result<bool> {
+        let req = match op {
+            WriteOp::Put(bytes) => Request::ApplyPut {
+                table: table.to_string(),
+                key: key.to_vec(),
+                value: bytes.clone(),
+                hlc,
+            },
+            WriteOp::Delete => Request::ApplyDelete {
+                table: table.to_string(),
+                key: key.to_vec(),
+                hlc,
+            },
+        };
+        Ok(matches!(internode::call(addr, &req)?, Response::Ack))
+    }
+
+    /// Gather a table from all reachable members, merged by last-writer-wins.
+    fn cluster_scan(&self, table: &str) -> EngineResult<Vec<(Vec<u8>, Document)>> {
+        // key -> (hlc, encoded value)
+        let mut merged: BTreeMap<Vec<u8>, (Hlc, Vec<u8>)> = BTreeMap::new();
+        let mut responders = 0usize;
+
+        // Local shard.
+        {
+            let db = self
+                .local
+                .lock()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
+            for (key, value, hlc) in db.local_scan_versioned(table)? {
+                merge_row(&mut merged, key, value, hlc);
+            }
+            responders += 1;
+        }
+
+        // Peers.
+        for addr in self.peers.values() {
+            if let Ok(Response::Scan { rows }) = internode::call(
+                addr,
+                &Request::LocalScan {
+                    table: table.to_string(),
+                },
+            ) {
+                for (key, value, hlc) in rows {
+                    merge_row(&mut merged, key, value, hlc);
+                }
+                responders += 1;
+            }
+        }
+
+        let needed = self.cfg.read_consistency.required(self.member_count());
+        if responders < needed {
+            return Err(EngineError::Cluster(format!(
+                "read quorum not met: {responders}/{needed} members responded"
+            )));
+        }
+
+        // Decode surviving rows into documents.
+        let mut out = Vec::with_capacity(merged.len());
+        for (key, (_hlc, value)) in merged {
+            if let Value::Document(doc) = Value::decode(&value)
+                .map_err(|e| EngineError::Cluster(format!("corrupt row: {e}")))?
+            {
+                out.push((key, doc));
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// A pending replicated mutation.
+enum WriteOp {
+    Put(Vec<u8>),
+    Delete,
+}
+
+fn merge_row(
+    merged: &mut BTreeMap<Vec<u8>, (Hlc, Vec<u8>)>,
+    key: Vec<u8>,
+    value: Vec<u8>,
+    hlc: Hlc,
+) {
+    merged
+        .entry(key)
+        .and_modify(|cur| {
+            if hlc > cur.0 {
+                *cur = (hlc, value.clone());
+            }
+        })
+        .or_insert((hlc, value));
+}
+
+fn is_ddl(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::CreateTable(_)
+            | Statement::DropTable { .. }
+            | Statement::CreateIndex(_)
+            | Statement::DropIndex { .. }
+    )
+}
+
+/// The networked [`Cluster`] implementation driving `run()` on a coordinator.
+struct Coordinator<'a> {
+    node: &'a Node,
+}
+
+impl Cluster for Coordinator<'_> {
+    fn primary_key(&self, table: &str) -> EngineResult<Vec<String>> {
+        self.node
+            .local
+            .lock()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .table_primary_key(table)
+    }
+
+    fn matching_rows(
+        &mut self,
+        table: &str,
+        filter: &Option<skaidb_sql::ast::Expr>,
+    ) -> EngineResult<Vec<(Vec<u8>, Document)>> {
+        let rows = self.node.cluster_scan(table)?;
+        filter_rows(filter, rows)
+    }
+
+    fn put(&mut self, table: &str, key: &[u8], doc: &Document) -> EngineResult<()> {
+        let hlc = self.node.clock.now();
+        let bytes = Value::Document(doc.clone()).encode();
+        self.node.replicate(table, key, WriteOp::Put(bytes), hlc)
+    }
+
+    fn delete(&mut self, table: &str, key: &[u8], _doc: &Document) -> EngineResult<()> {
+        let hlc = self.node.clock.now();
+        self.node.replicate(table, key, WriteOp::Delete, hlc)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use skaidb_engine::{QueryOutput, ResultSet};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        static C: AtomicU64 = AtomicU64::new(0);
+        let n = C.fetch_add(1, Ordering::Relaxed);
+        let mut p = std::env::temp_dir();
+        p.push(format!("skaidb-node-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    /// Grab a free localhost address (small TOCTOU window, fine for tests).
+    fn free_addr() -> String {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        format!("127.0.0.1:{}", addr.port())
+    }
+
+    fn member(id: &str, addr: &str) -> (NodeId, String) {
+        (NodeId::new(id), addr.to_string())
+    }
+
+    fn rows(out: QueryOutput) -> ResultSet {
+        match out {
+            QueryOutput::Rows(rs) => rs,
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    fn cfg(
+        id: &str,
+        addr: &str,
+        members: &[(NodeId, String)],
+        r: Consistency,
+        w: Consistency,
+    ) -> NodeConfig {
+        NodeConfig {
+            id: NodeId::new(id),
+            internode_addr: addr.to_string(),
+            members: members.to_vec(),
+            replication_factor: 3,
+            vnodes_per_node: 64,
+            read_consistency: r,
+            write_consistency: w,
+        }
+    }
+
+    #[test]
+    fn three_node_replication_and_distributed_reads() {
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b), member("c", &c)];
+
+        let na = Node::new(
+            Database::open(temp_dir("a")).unwrap(),
+            cfg("a", &a, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("b")).unwrap(),
+            cfg("b", &b, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nc = Node::new(
+            Database::open(temp_dir("c")).unwrap(),
+            cfg("c", &c, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        nc.serve_internode().unwrap();
+
+        // DDL via A propagates to all.
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        // Writes via A replicate to the ring.
+        na.execute("INSERT INTO t (id, name) VALUES (1, 'ada'), (2, 'bob'), (3, 'cleo')")
+            .unwrap();
+
+        // Reads via B and C see all rows (gathered from replicas, LWW-merged).
+        for coord in [&nb, &nc] {
+            let rs = rows(coord.execute("SELECT id, name FROM t ORDER BY id").unwrap());
+            assert_eq!(rs.rows.len(), 3, "every coordinator sees all rows");
+            assert_eq!(rs.rows[0], vec![Value::Int(1), Value::String("ada".into())]);
+            assert_eq!(
+                rs.rows[2],
+                vec![Value::Int(3), Value::String("cleo".into())]
+            );
+        }
+
+        // Update via B, read via C reflects it (last-writer-wins by HLC).
+        nb.execute("UPDATE t SET name = 'ADA' WHERE id = 1")
+            .unwrap();
+        let rs = rows(nc.execute("SELECT name FROM t WHERE id = 1").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::String("ADA".into())]]);
+
+        // Delete via C, read via A reflects it.
+        nc.execute("DELETE FROM t WHERE id = 2").unwrap();
+        let rs = rows(na.execute("SELECT id FROM t ORDER BY id").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::Int(1)], vec![Value::Int(3)]]);
+    }
+
+    #[test]
+    fn cluster_tolerates_one_node_down_at_quorum() {
+        let (a, b, dead) = (free_addr(), free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b), member("dead", &dead)];
+
+        // Only A and B are served; "dead" is never started.
+        let na = Node::new(
+            Database::open(temp_dir("qa")).unwrap(),
+            cfg("a", &a, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("qb")).unwrap(),
+            cfg("b", &b, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+
+        // DDL reaches a quorum (a + b = 2 of 3).
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        // Writes meet write quorum (2 of 3 replicas ack) despite the dead node.
+        na.execute("INSERT INTO t (id, v) VALUES (1, 'x'), (2, 'y')")
+            .unwrap();
+        // Reads meet read quorum (a + b respond).
+        let rs = rows(nb.execute("SELECT id FROM t ORDER BY id").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+    }
+}

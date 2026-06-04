@@ -4,8 +4,11 @@
 //! This crate is the placement/coordination logic; the network transport that
 //! ships requests between nodes lives in `skaidb-proto`/`skaidb-server`.
 
+pub mod internode;
+mod node;
 mod quorum;
 mod ring;
 
+pub use node::{Node, NodeConfig};
 pub use quorum::{is_strong, merge_documents, resolve_value, Consistency, Versioned};
 pub use ring::{NodeId, Ring};

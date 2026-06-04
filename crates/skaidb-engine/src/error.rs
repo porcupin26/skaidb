@@ -35,6 +35,9 @@ pub enum EngineError {
 
     #[error("unsupported: {0}")]
     Unsupported(String),
+
+    #[error("cluster error: {0}")]
+    Cluster(String),
 }
 
 /// Convenience result alias for engine operations.

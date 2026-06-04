@@ -240,6 +240,9 @@ dependencies = [
 name = "skaidb-cluster"
 version = "0.1.0"
 dependencies = [
+ "skaidb-engine",
+ "skaidb-proto",
+ "skaidb-sql",
  "skaidb-storage",
  "skaidb-types",
  "thiserror",
