@@ -97,3 +97,18 @@ the distributed read path** (PK point reads are routed, but non-PK and range
 reads still gather from replicas and filter).
 
 See `.priv/SPEC.md` for the full design.
+
+## License
+
+skaidb is licensed under the **Server Side Public License, version 1 (SSPL-1.0)** —
+see [LICENSE](LICENSE).
+
+In plain terms: you may use, copy, modify, and self-host skaidb freely, including
+inside your own company. The one restriction is the SSPL's Section 13 — if you
+**offer skaidb (or a modified version) to third parties as a service**, you must
+release the complete source of the service-management software you use to do so
+under the SSPL. Internal use and ordinary distribution are unaffected. This is the
+same license MongoDB uses, for the same reason.
+
+> Not a substitute for legal advice — read the [LICENSE](LICENSE) for the binding
+> terms.
