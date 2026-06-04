@@ -4,14 +4,18 @@ The tooling used to produce [`../docs/BENCHMARKS.md`](../docs/BENCHMARKS.md) —
 the comparison of skaidb against MongoDB 7/8, PostgreSQL 15, and MariaDB 11.4 on
 identical small nodes (1 vCPU / 512 MB / 4 GB), with matched write durability.
 
-skaidb's own load generator lives in-tree as a driver example
-(`cargo run --release --example bench -p skaidb-driver -- ...`); this directory
-holds the equivalents for the other databases plus the cluster setup scripts, so
-the comparison is reproducible.
+skaidb has two interchangeable load generators: the canonical in-tree Rust
+driver example (`cargo run --release --example bench -p skaidb-driver -- ...`)
+and `clients/skaidb_bench.py` here, which speaks the same binary protocol from
+Python so skaidb runs in the identical Python harness as the other DBs. Use the
+Rust one for headline numbers (lower client overhead); the Python one is handy
+for parity checks and quick runs. The published `docs/BENCHMARKS.md` figures use
+the Rust client.
 
 ```
 bench/
   clients/         load generators (one persistent conn per thread)
+    skaidb_bench.py    # skaidb binary protocol (SCRAM handshake), pure stdlib
     mongo_bench.py     # pymongo
     pg_bench.py        # psycopg2
     maria_bench.py     # pymysql
@@ -60,11 +64,15 @@ MongoDB's is the client write concern (`MONGO_W`); PostgreSQL's is
 ## Running
 
 ```sh
-# skaidb (in-tree example as the client prefix)
+# skaidb — canonical Rust client as the prefix
 CSV=results.csv ./run_suite.sh skaidb C4 \
   ../target/release/examples/bench NODE1:7000 skaidb "$PASS"
 
-# skaidb fanned across all nodes (leaderless: any node coordinates)
+# skaidb — Python client (same protocol; same positional args)
+CSV=results.csv ./run_suite.sh skaidb C4 \
+  python3 clients/skaidb_bench.py NODE1:7000 skaidb "$PASS"
+
+# skaidb fanned across all nodes (leaderless: any node coordinates) — either client
 CSV=results.csv ./run_suite.sh skaidb C4-fanout \
   ../target/release/examples/bench NODE1:7000,NODE2:7000,NODE3:7000 skaidb "$PASS"
 
