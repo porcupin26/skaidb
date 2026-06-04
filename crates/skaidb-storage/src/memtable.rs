@@ -66,6 +66,19 @@ impl Memtable {
         self.latest_version(key, Hlc::MAX)
     }
 
+    /// Like [`Memtable::get_entry`] but also returns the version stamp, so a
+    /// coordinator can resolve replicas by last-writer-wins on a point read.
+    pub fn get_entry_versioned(&self, key: &[u8]) -> Option<(Hlc, VersionValue)> {
+        // The first entry at or after `(key, Reverse(MAX))` is the newest
+        // version of `key`, if the key is present at all.
+        let start = (key.to_vec(), std::cmp::Reverse(Hlc::MAX));
+        self.map
+            .range(start..)
+            .next()
+            .filter(|((k, _), _)| k.as_slice() == key)
+            .map(|((_, std::cmp::Reverse(stamp)), value)| (*stamp, value.clone()))
+    }
+
     /// Latest version per distinct key (including tombstones), with its stamp,
     /// in key order. Used to flush the memtable into an SSTable.
     pub fn iter_latest_entries(&self) -> Vec<(Vec<u8>, Hlc, VersionValue)> {

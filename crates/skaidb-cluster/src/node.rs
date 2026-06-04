@@ -14,12 +14,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::thread;
 
 use skaidb_engine::{filter_rows, run, Cluster, Database, EngineError, QueryOutput};
 use skaidb_proto::{read_frame, write_frame};
-use skaidb_sql::ast::Statement;
+use skaidb_sql::ast::{BinaryOp, Expr, Statement};
 use skaidb_sql::parse;
 use skaidb_storage::{Hlc, HlcClock};
 use skaidb_types::{Document, Value};
@@ -48,11 +48,15 @@ pub struct NodeConfig {
 #[derive(Debug)]
 pub struct Node {
     id: NodeId,
-    local: Mutex<Database>,
+    /// Local storage behind an `RwLock` so concurrent reads share a read lock
+    /// while writes are exclusive.
+    local: RwLock<Database>,
     ring: Ring,
     /// Peer id → internode address (excludes self).
     peers: HashMap<NodeId, String>,
     clock: HlcClock,
+    /// Pooled persistent connections to peers.
+    pool: internode::Pool,
     cfg: NodeConfig,
 }
 
@@ -72,10 +76,11 @@ impl Node {
 
         Arc::new(Node {
             id: cfg.id.clone(),
-            local: Mutex::new(local),
+            local: RwLock::new(local),
             ring,
             peers,
             clock: HlcClock::new(),
+            pool: internode::Pool::new(),
             cfg,
         })
     }
@@ -110,35 +115,47 @@ impl Node {
         }
     }
 
-    /// Apply an internode request to local storage.
+    /// Apply an internode request to local storage. Reads take a shared lock;
+    /// writes take an exclusive lock.
     fn apply_local(&self, req: Request) -> Response {
-        let mut db = match self.local.lock() {
-            Ok(db) => db,
-            Err(_) => return Response::Err("local lock poisoned".into()),
-        };
         match req {
             Request::Ping => Response::Pong,
+            Request::LocalScan { table } => match self.local.read() {
+                Ok(db) => match db.local_scan_versioned(&table) {
+                    Ok(rows) => Response::Scan { rows },
+                    Err(e) => Response::Err(e.to_string()),
+                },
+                Err(_) => Response::Err("local lock poisoned".into()),
+            },
+            Request::LocalGet { table, key } => match self.local.read() {
+                Ok(db) => match db.local_get_versioned(&table, &key) {
+                    Ok(entry) => Response::Get { entry },
+                    Err(e) => Response::Err(e.to_string()),
+                },
+                Err(_) => Response::Err("local lock poisoned".into()),
+            },
             Request::ApplyPut {
                 table,
                 key,
                 value,
                 hlc,
-            } => match db.apply_put(&table, &key, value, hlc) {
+            } => self.with_write(|db| db.apply_put(&table, &key, value, hlc)),
+            Request::ApplyDelete { table, key, hlc } => {
+                self.with_write(|db| db.apply_delete(&table, &key, hlc))
+            }
+            Request::ApplyDdl { sql } => self.with_write(|db| db.execute(&sql).map(|_| ())),
+        }
+    }
+
+    /// Run a write closure under the exclusive lock, mapping the result to an
+    /// `Ack`/`Err` response.
+    fn with_write(&self, f: impl FnOnce(&mut Database) -> EngineResult<()>) -> Response {
+        match self.local.write() {
+            Ok(mut db) => match f(&mut db) {
                 Ok(()) => Response::Ack,
                 Err(e) => Response::Err(e.to_string()),
             },
-            Request::ApplyDelete { table, key, hlc } => match db.apply_delete(&table, &key, hlc) {
-                Ok(()) => Response::Ack,
-                Err(e) => Response::Err(e.to_string()),
-            },
-            Request::ApplyDdl { sql } => match db.execute(&sql) {
-                Ok(_) => Response::Ack,
-                Err(e) => Response::Err(e.to_string()),
-            },
-            Request::LocalScan { table } => match db.local_scan_versioned(&table) {
-                Ok(rows) => Response::Scan { rows },
-                Err(e) => Response::Err(e.to_string()),
-            },
+            Err(_) => Response::Err("local lock poisoned".into()),
         }
     }
 
@@ -160,7 +177,7 @@ impl Node {
     fn broadcast_ddl(&self, sql: &str) -> EngineResult<()> {
         let mut acks = 0usize;
         // Local first.
-        match self.local.lock() {
+        match self.local.write() {
             Ok(mut db) => {
                 db.execute(sql)?;
                 acks += 1;
@@ -168,7 +185,7 @@ impl Node {
             Err(_) => return Err(EngineError::Cluster("local lock poisoned".into())),
         }
         for addr in self.peers.values() {
-            if let Ok(Response::Ack) = internode::call(
+            if let Ok(Response::Ack) = self.pool.call(
                 addr,
                 &Request::ApplyDdl {
                     sql: sql.to_string(),
@@ -224,11 +241,69 @@ impl Node {
     ) -> EngineResult<()> {
         let mut db = self
             .local
-            .lock()
+            .write()
             .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
         match op {
             WriteOp::Put(bytes) => db.apply_put(table, key, bytes.clone(), hlc),
             WriteOp::Delete => db.apply_delete(table, key, hlc),
+        }
+    }
+
+    /// Point-read `key` from its replica set, resolving by last-writer-wins,
+    /// requiring a read quorum of replicas to respond.
+    fn point_get(&self, table: &str, key: &[u8]) -> EngineResult<Vec<(Vec<u8>, Document)>> {
+        let replicas = self.ring.replicas_for(key, self.cfg.replication_factor);
+        let needed = self.cfg.read_consistency.required(replicas.len().max(1));
+        let mut responders = 0usize;
+        // Best (highest-stamped) version seen: (hlc, Some(value) | None tombstone).
+        let mut best: Option<(Hlc, Option<Vec<u8>>)> = None;
+
+        for replica in &replicas {
+            let entry = if *replica == self.id {
+                match self.local.read() {
+                    Ok(db) => db.local_get_versioned(table, key)?,
+                    Err(_) => return Err(EngineError::Cluster("local lock poisoned".into())),
+                }
+            } else if let Some(addr) = self.peers.get(replica) {
+                match self.pool.call(
+                    addr,
+                    &Request::LocalGet {
+                        table: table.to_string(),
+                        key: key.to_vec(),
+                    },
+                ) {
+                    Ok(Response::Get { entry }) => entry,
+                    _ => continue, // unreachable peer: not a responder
+                }
+            } else {
+                continue;
+            };
+            responders += 1;
+            if let Some((value, hlc, is_put)) = entry {
+                if best.as_ref().is_none_or(|(h, _)| hlc > *h) {
+                    best = Some((hlc, is_put.then_some(value)));
+                }
+            }
+        }
+
+        if responders < needed {
+            return Err(EngineError::Cluster(format!(
+                "read quorum not met: {responders}/{needed} replicas responded"
+            )));
+        }
+
+        match best {
+            Some((_, Some(value))) => {
+                let doc = match Value::decode(&value)
+                    .map_err(|e| EngineError::Cluster(format!("corrupt row: {e}")))?
+                {
+                    Value::Document(d) => d,
+                    _ => return Ok(Vec::new()),
+                };
+                Ok(vec![(key.to_vec(), doc)])
+            }
+            // Absent everywhere, or newest version is a tombstone.
+            _ => Ok(Vec::new()),
         }
     }
 
@@ -253,7 +328,7 @@ impl Node {
                 hlc,
             },
         };
-        Ok(matches!(internode::call(addr, &req)?, Response::Ack))
+        Ok(matches!(self.pool.call(addr, &req)?, Response::Ack))
     }
 
     /// Gather a table from all reachable members, merged by last-writer-wins.
@@ -266,7 +341,7 @@ impl Node {
         {
             let db = self
                 .local
-                .lock()
+                .read()
                 .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
             for (key, value, hlc) in db.local_scan_versioned(table)? {
                 merge_row(&mut merged, key, value, hlc);
@@ -276,7 +351,7 @@ impl Node {
 
         // Peers.
         for addr in self.peers.values() {
-            if let Ok(Response::Scan { rows }) = internode::call(
+            if let Ok(Response::Scan { rows }) = self.pool.call(
                 addr,
                 &Request::LocalScan {
                     table: table.to_string(),
@@ -331,6 +406,33 @@ fn merge_row(
         .or_insert((hlc, value));
 }
 
+/// If `filter` is a single-column primary-key equality (`pk = literal`), return
+/// the storage key for that row so the read can be a point get. The key must be
+/// built exactly as the engine builds it for inserts: the order-preserving
+/// encoding of a one-element array holding the value.
+fn pk_point_key(pk: &[String], filter: &Option<Expr>) -> Option<Vec<u8>> {
+    if pk.len() != 1 {
+        return None;
+    }
+    let Some(Expr::Binary {
+        op: BinaryOp::Eq,
+        left,
+        right,
+    }) = filter
+    else {
+        return None;
+    };
+    let col = &pk[0];
+    let value = match (left.as_ref(), right.as_ref()) {
+        (Expr::Column(c), Expr::Literal(v)) | (Expr::Literal(v), Expr::Column(c)) if c == col => v,
+        _ => return None,
+    };
+    if value.is_null() {
+        return None;
+    }
+    Some(Value::Array(vec![value.clone()]).encode_key())
+}
+
 fn is_ddl(stmt: &Statement) -> bool {
     matches!(
         stmt,
@@ -350,7 +452,7 @@ impl Cluster for Coordinator<'_> {
     fn primary_key(&self, table: &str) -> EngineResult<Vec<String>> {
         self.node
             .local
-            .lock()
+            .read()
             .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
             .table_primary_key(table)
     }
@@ -358,8 +460,15 @@ impl Cluster for Coordinator<'_> {
     fn matching_rows(
         &mut self,
         table: &str,
-        filter: &Option<skaidb_sql::ast::Expr>,
+        filter: &Option<Expr>,
     ) -> EngineResult<Vec<(Vec<u8>, Document)>> {
+        // Fast path: a primary-key equality is a point read to the key's
+        // replica set, not a full cluster scan.
+        let pk = self.primary_key(table)?;
+        if let Some(key) = pk_point_key(&pk, filter) {
+            let rows = self.node.point_get(table, &key)?;
+            return filter_rows(filter, rows);
+        }
         let rows = self.node.cluster_scan(table)?;
         filter_rows(filter, rows)
     }

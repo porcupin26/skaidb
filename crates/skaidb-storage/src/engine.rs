@@ -184,6 +184,20 @@ impl Engine {
         Ok(None)
     }
 
+    /// Latest stored version for `key` (including tombstones) with its stamp,
+    /// across memtable and SSTables. Used for last-writer-wins point reads.
+    pub fn get_versioned(&self, key: &[u8]) -> Result<Option<(Hlc, VersionValue)>> {
+        if let Some((hlc, entry)) = self.mem.get_entry_versioned(key) {
+            return Ok(Some((hlc, entry)));
+        }
+        for sst in self.sstables_newest_first() {
+            if let Some((hlc, value)) = sst.get(key)? {
+                return Ok(Some((hlc, value)));
+            }
+        }
+        Ok(None)
+    }
+
     /// Value for `key` as visible at snapshot `as_of` (MVCC read).
     ///
     /// Full historical versions live only in the memtable; once flushed, only

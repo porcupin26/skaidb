@@ -28,6 +28,10 @@ pub enum Request {
     LocalScan {
         table: String,
     },
+    LocalGet {
+        table: String,
+        key: Vec<u8>,
+    },
     ApplyDdl {
         sql: String,
     },
@@ -38,7 +42,13 @@ pub enum Request {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Response {
     Ack,
-    Scan { rows: Vec<(Vec<u8>, Vec<u8>, Hlc)> },
+    Scan {
+        rows: Vec<(Vec<u8>, Vec<u8>, Hlc)>,
+    },
+    /// Point-read result: `(value, stamp, is_put)`, or `None` if absent here.
+    Get {
+        entry: Option<(Vec<u8>, Hlc, bool)>,
+    },
     Err(String),
     Pong,
 }
@@ -55,11 +65,13 @@ const REQ_DEL: u8 = 2;
 const REQ_SCAN: u8 = 3;
 const REQ_DDL: u8 = 4;
 const REQ_PING: u8 = 5;
+const REQ_GET: u8 = 6;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
 const RES_ERR: u8 = 2;
 const RES_PONG: u8 = 3;
+const RES_GET: u8 = 4;
 
 impl Request {
     pub fn encode(&self) -> Vec<u8> {
@@ -87,6 +99,11 @@ impl Request {
                 o.push(REQ_SCAN);
                 put_str(&mut o, table);
             }
+            Request::LocalGet { table, key } => {
+                o.push(REQ_GET);
+                put_str(&mut o, table);
+                put_bytes(&mut o, key);
+            }
             Request::ApplyDdl { sql } => {
                 o.push(REQ_DDL);
                 put_str(&mut o, sql);
@@ -111,6 +128,10 @@ impl Request {
                 hlc: c.hlc()?,
             },
             REQ_SCAN => Request::LocalScan { table: c.string()? },
+            REQ_GET => Request::LocalGet {
+                table: c.string()?,
+                key: c.bytes()?,
+            },
             REQ_DDL => Request::ApplyDdl { sql: c.string()? },
             REQ_PING => Request::Ping,
             _ => return Err(WireError::Malformed("unknown request op")),
@@ -130,6 +151,18 @@ impl Response {
                     put_bytes(&mut o, k);
                     put_bytes(&mut o, v);
                     o.extend_from_slice(&hlc.to_bytes());
+                }
+            }
+            Response::Get { entry } => {
+                o.push(RES_GET);
+                match entry {
+                    Some((value, hlc, is_put)) => {
+                        o.push(1);
+                        put_bytes(&mut o, value);
+                        o.extend_from_slice(&hlc.to_bytes());
+                        o.push(u8::from(*is_put));
+                    }
+                    None => o.push(0),
                 }
             }
             Response::Err(msg) => {
@@ -153,6 +186,17 @@ impl Response {
                 }
                 Response::Scan { rows }
             }
+            RES_GET => {
+                let entry = if c.u8()? == 1 {
+                    let value = c.bytes()?;
+                    let hlc = c.hlc()?;
+                    let is_put = c.u8()? == 1;
+                    Some((value, hlc, is_put))
+                } else {
+                    None
+                };
+                Response::Get { entry }
+            }
             RES_ERR => Response::Err(c.string()?),
             RES_PONG => Response::Pong,
             _ => return Err(WireError::Malformed("unknown response op")),
@@ -164,10 +208,63 @@ impl Response {
 pub fn call(addr: &str, req: &Request) -> io::Result<Response> {
     let mut stream = TcpStream::connect(addr)?;
     stream.set_nodelay(true).ok();
-    write_frame(&mut stream, &req.encode())?;
-    let payload = read_frame(&mut stream)?;
+    roundtrip(&mut stream, req)
+}
+
+fn roundtrip(stream: &mut TcpStream, req: &Request) -> io::Result<Response> {
+    write_frame(stream, &req.encode())?;
+    let payload = read_frame(stream)?;
     Response::decode(&payload)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+}
+
+/// Max idle connections kept per peer.
+const MAX_IDLE_PER_PEER: usize = 32;
+
+/// A pool of persistent internode connections, keyed by peer address. Reuses an
+/// idle connection when available (the server keeps connections alive across
+/// requests), avoiding a TCP handshake per replicated write.
+#[derive(Debug, Default)]
+pub struct Pool {
+    idle: std::sync::Mutex<std::collections::HashMap<String, Vec<TcpStream>>>,
+}
+
+impl Pool {
+    pub fn new() -> Self {
+        Pool::default()
+    }
+
+    /// Send `req` to `addr`, reusing a pooled connection if possible. On any I/O
+    /// error the connection is dropped (not returned to the pool).
+    pub fn call(&self, addr: &str, req: &Request) -> io::Result<Response> {
+        let mut stream = self.take(addr)?;
+        let resp = roundtrip(&mut stream, req)?;
+        self.put(addr, stream);
+        Ok(resp)
+    }
+
+    fn take(&self, addr: &str) -> io::Result<TcpStream> {
+        if let Some(stream) = self
+            .idle
+            .lock()
+            .expect("pool lock")
+            .get_mut(addr)
+            .and_then(|v| v.pop())
+        {
+            return Ok(stream);
+        }
+        let stream = TcpStream::connect(addr)?;
+        stream.set_nodelay(true).ok();
+        Ok(stream)
+    }
+
+    fn put(&self, addr: &str, stream: TcpStream) {
+        let mut idle = self.idle.lock().expect("pool lock");
+        let bucket = idle.entry(addr.to_string()).or_default();
+        if bucket.len() < MAX_IDLE_PER_PEER {
+            bucket.push(stream);
+        }
+    }
 }
 
 fn put_str(o: &mut Vec<u8>, s: &str) {
@@ -236,6 +333,10 @@ mod tests {
                 hlc: Hlc::new(11, 0),
             },
             Request::LocalScan { table: "t".into() },
+            Request::LocalGet {
+                table: "t".into(),
+                key: vec![7, 8, 9],
+            },
             Request::ApplyDdl {
                 sql: "CREATE TABLE t (PRIMARY KEY (id))".into(),
             },
@@ -256,6 +357,13 @@ mod tests {
         for res in [
             Response::Ack,
             scan,
+            Response::Get {
+                entry: Some((vec![1, 2, 3], Hlc::new(9, 1), true)),
+            },
+            Response::Get {
+                entry: Some((vec![], Hlc::new(9, 2), false)),
+            },
+            Response::Get { entry: None },
             Response::Err("x".into()),
             Response::Pong,
         ] {

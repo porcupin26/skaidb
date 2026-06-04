@@ -12,7 +12,7 @@ use skaidb_sql::ast::{
     Update,
 };
 use skaidb_sql::parse;
-use skaidb_storage::{Engine as StorageEngine, Hlc};
+use skaidb_storage::{Engine as StorageEngine, Hlc, VersionValue};
 use skaidb_types::{Document, Value};
 
 use crate::catalog::{Catalog, IndexDef, TableDef};
@@ -304,6 +304,26 @@ impl Database {
             .get(table)
             .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
         Ok(engine.scan_versioned()?)
+    }
+
+    /// Point-read the latest stored version of `key` in `table`: returns
+    /// `(value, stamp, is_put)` where `is_put == false` marks a tombstone, or
+    /// `None` if the key was never written here. The coordinator merges these
+    /// across replicas by last-writer-wins.
+    pub fn local_get_versioned(
+        &self,
+        table: &str,
+        key: &[u8],
+    ) -> Result<Option<(Vec<u8>, Hlc, bool)>> {
+        let engine = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+        Ok(match engine.get_versioned(key)? {
+            Some((hlc, VersionValue::Put(bytes))) => Some((bytes, hlc, true)),
+            Some((hlc, VersionValue::Delete)) => Some((Vec::new(), hlc, false)),
+            None => None,
+        })
     }
 
     /// Apply a replicated row write at an explicit stamp, maintaining indexes.
