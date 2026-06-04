@@ -169,7 +169,9 @@ impl Node {
             self.broadcast_ddl(sql)?;
             return Ok(QueryOutput::Ddl);
         }
-        let mut coord = Coordinator { node: self };
+        let mut coord = Coordinator {
+            node: Arc::clone(self),
+        };
         run(stmt, &mut coord)
     }
 
@@ -207,23 +209,54 @@ impl Node {
         }
     }
 
-    /// Replicate a single write to the key's replica set; wait for write quorum.
-    fn replicate(&self, table: &str, key: &[u8], op: WriteOp, hlc: Hlc) -> EngineResult<()> {
+    /// Replicate a single write to the key's replica set, blocking only until
+    /// the configured write consistency is satisfied. The local replica is
+    /// always written synchronously (so the coordinator can read its own
+    /// writes); peers are written synchronously up to the quorum, and any
+    /// remaining peers are replicated in the background (so e.g. CL=ONE returns
+    /// after the local fsync without waiting for the peer round-trip).
+    fn replicate(
+        self: &Arc<Self>,
+        table: &str,
+        key: &[u8],
+        op: WriteOp,
+        hlc: Hlc,
+    ) -> EngineResult<()> {
         let replicas = self.ring.replicas_for(key, self.cfg.replication_factor);
         let needed = self.cfg.write_consistency.required(replicas.len().max(1));
         let mut acks = 0usize;
 
+        // The local replica (if this node owns the key) is always synchronous.
+        if replicas.contains(&self.id) {
+            self.apply_write_local(table, key, &op, hlc)?;
+            acks += 1;
+        }
+
+        // Peers: synchronous until the quorum is met, then background.
+        let mut async_peers: Vec<String> = Vec::new();
         for replica in &replicas {
-            let ok = if *replica == self.id {
-                self.apply_write_local(table, key, &op, hlc).is_ok()
-            } else if let Some(addr) = self.peers.get(replica) {
-                matches!(self.send_write(addr, table, key, &op, hlc), Ok(true))
-            } else {
-                false
+            if *replica == self.id {
+                continue;
+            }
+            let Some(addr) = self.peers.get(replica) else {
+                continue;
             };
-            if ok {
+            if acks >= needed {
+                async_peers.push(addr.clone());
+            } else if matches!(self.send_write(addr, table, key, &op, hlc), Ok(true)) {
                 acks += 1;
             }
+        }
+
+        // Fire-and-forget the remaining replicas (eventual consistency).
+        if !async_peers.is_empty() {
+            let node = Arc::clone(self);
+            let (table, key, op) = (table.to_string(), key.to_vec(), op.clone());
+            thread::spawn(move || {
+                for addr in async_peers {
+                    let _ = node.send_write(&addr, &table, &key, &op, hlc);
+                }
+            });
         }
 
         if acks >= needed {
@@ -394,6 +427,7 @@ impl Node {
 }
 
 /// A pending replicated mutation.
+#[derive(Clone)]
 enum WriteOp {
     Put(Vec<u8>),
     Delete,
@@ -461,11 +495,11 @@ fn is_ddl(stmt: &Statement) -> bool {
 }
 
 /// The networked [`Cluster`] implementation driving `run()` on a coordinator.
-struct Coordinator<'a> {
-    node: &'a Node,
+struct Coordinator {
+    node: Arc<Node>,
 }
 
-impl Cluster for Coordinator<'_> {
+impl Cluster for Coordinator {
     fn primary_key(&self, table: &str) -> EngineResult<Vec<String>> {
         self.node
             .local
