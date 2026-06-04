@@ -71,22 +71,29 @@ Types: `null, bool, int64, float64, decimal, string, bytes, uuid, timestamp`
 
 ## Status & deferred work
 
-Implemented end-to-end and tested (138 tests):
+Implemented end-to-end and tested (141 tests):
 
 - soft-schema document model, SQL subset, 3-valued logic
-- LSM storage: WAL recovery, SSTables + Bloom filters, lazy-leveled compaction
-- **secondary indexes** that accelerate `WHERE path = value`
-- **auth**: SCRAM-SHA-256 handshake (mutual auth) + per-statement **RBAC**
-- **cross-node replication**: consistent-hash placement, quorum writes,
-  scatter-gather reads merged by HLC last-writer-wins, quorum-broadcast DDL,
-  one-node-down tolerance
+- LSM storage: WAL recovery, SSTables + Bloom filters, lazy-leveled compaction,
+  **group-commit WAL** (batched fsync across concurrent writers)
+- **secondary indexes** that accelerate local `WHERE path = value`
+- **leaderless replication**: consistent-hash placement; every node serves reads
+  and writes; **tunable write consistency** (`ONE`/`QUORUM`/`ALL`) where weaker
+  levels ack early and replicate the rest in the background; **PK point reads**
+  routed to the key's replica set; scatter-gather reads merged by HLC
+  last-writer-wins; quorum-broadcast DDL; one-node-down tolerance
+- **auth**: SCRAM-SHA-256 handshake (mutual auth) on the binary endpoint and
+  HTTP Basic on REST, + per-statement **RBAC**
 - binary + REST endpoints, Prometheus metrics, masked audit logs
+- **benchmarked** against MongoDB 7/8, PostgreSQL, MariaDB — see
+  [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
 
 Designed for but deliberately not yet built: **QUIC** transport + push-based
 control plane (the raw-TCP fast path is in; QUIC needs an async runtime),
 **distributed/multi-key transactions** (needs a coordinator/2PC), active
-**read-repair & hinted handoff** (convergence currently relies on write
-quorums), and **secondary-index use in the distributed read path** (cluster
-reads full-scan).
+**anti-entropy** (read-repair & hinted handoff — convergence currently relies on
+writes reaching their replicas), and **secondary-index / range acceleration on
+the distributed read path** (PK point reads are routed, but non-PK and range
+reads still gather from replicas and filter).
 
 See `.priv/SPEC.md` for the full design.
