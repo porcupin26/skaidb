@@ -10,7 +10,7 @@ mod exec;
 mod result;
 
 pub use error::EngineError;
-pub use exec::Database;
+pub use exec::{filter_rows, run, Cluster, Database};
 pub use result::{QueryOutput, ResultSet};
 
 #[cfg(test)]

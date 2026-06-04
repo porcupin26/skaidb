@@ -12,13 +12,16 @@ use skaidb_sql::ast::{
     Update,
 };
 use skaidb_sql::parse;
-use skaidb_storage::Engine as StorageEngine;
+use skaidb_storage::{Engine as StorageEngine, Hlc};
 use skaidb_types::{Document, Value};
 
 use crate::catalog::{Catalog, IndexDef, TableDef};
 use crate::error::{EngineError, Result};
 use crate::eval::{compare, eval, eval_predicate};
 use crate::result::{QueryOutput, ResultSet};
+
+/// A live row with its encoded document and version stamp.
+pub type VersionedRow = (Vec<u8>, Vec<u8>, Hlc);
 
 /// An embedded skaidb database: catalog plus one storage engine per table and
 /// per secondary index.
@@ -70,10 +73,13 @@ impl Database {
                 self.create_index(&ci.name, &ci.table, &ci.path, ci.if_not_exists)
             }
             Statement::DropIndex { name, if_exists } => self.drop_index(&name, if_exists),
-            Statement::Insert(ins) => self.insert(ins),
-            Statement::Select(sel) => self.select(sel).map(QueryOutput::Rows),
-            Statement::Update(upd) => self.update(upd),
-            Statement::Delete(del) => self.delete(del),
+            // DML and SELECT run through the storage-agnostic executor so the
+            // exact same logic serves the local engine and the cluster
+            // coordinator (which replaces LocalCluster with a networked one).
+            dml => {
+                let mut local = LocalCluster { db: self };
+                run(dml, &mut local)
+            }
         }
     }
 
@@ -185,149 +191,31 @@ impl Database {
         Ok(QueryOutput::Ddl)
     }
 
-    // ---- DML ----
-
-    fn insert(&mut self, ins: Insert) -> Result<QueryOutput> {
-        let pk = self.table_def(&ins.table)?.primary_key.clone();
-        let indexes = self.indexes_on(&ins.table);
-        let empty = Document::new();
-
-        let mut rows: Vec<(Vec<u8>, Document)> = Vec::with_capacity(ins.rows.len());
-        for row in &ins.rows {
-            let mut doc = Document::new();
-            for (col, expr) in ins.columns.iter().zip(row) {
-                doc.insert(col.clone(), eval(expr, &empty)?);
-            }
-            let key = primary_key_bytes(&pk, &doc)?;
-            rows.push((key, doc));
-        }
-        let affected = rows.len();
-
-        {
-            let engine = self.table_engine_mut(&ins.table)?;
-            for (key, doc) in &rows {
-                engine.put(key, Value::Document(doc.clone()).encode())?;
-            }
-        }
-        for (key, doc) in &rows {
-            for (name, path) in &indexes {
-                self.index_put(name, path, doc, key)?;
-            }
-        }
-        Ok(QueryOutput::Mutation { affected })
-    }
-
-    fn update(&mut self, upd: Update) -> Result<QueryOutput> {
-        let pk = self.table_def(&upd.table)?.primary_key.clone();
-        let indexes = self.indexes_on(&upd.table);
-        let rows = self.scan_docs(&upd.table)?;
-
-        let mut changes: Vec<RowChange> = Vec::new();
-        for (old_key, doc) in rows {
-            if !matches_filter(&upd.filter, &doc)? {
-                continue;
-            }
-            let mut new_doc = doc.clone();
-            for (path, expr) in &upd.assignments {
-                let val = eval(expr, &doc)?;
-                set_path(&mut new_doc, path, val);
-            }
-            let new_key = primary_key_bytes(&pk, &new_doc)?;
-            changes.push(RowChange {
-                old_key,
-                old_doc: doc,
-                new_key,
-                new_doc,
-            });
-        }
-
-        let affected = changes.len();
-        {
-            let engine = self.table_engine_mut(&upd.table)?;
-            for change in &changes {
-                if change.new_key != change.old_key {
-                    engine.delete(&change.old_key)?;
-                }
-                engine.put(
-                    &change.new_key,
-                    Value::Document(change.new_doc.clone()).encode(),
-                )?;
-            }
-        }
-        for change in &changes {
-            for (name, path) in &indexes {
-                self.index_del(name, path, &change.old_doc, &change.old_key)?;
-                self.index_put(name, path, &change.new_doc, &change.new_key)?;
-            }
-        }
-        Ok(QueryOutput::Mutation { affected })
-    }
-
-    fn delete(&mut self, del: Delete) -> Result<QueryOutput> {
-        let indexes = self.indexes_on(&del.table);
-        let rows = self.scan_docs(&del.table)?;
-        let mut victims: Vec<(Vec<u8>, Document)> = Vec::new();
-        for (key, doc) in rows {
-            if matches_filter(&del.filter, &doc)? {
-                victims.push((key, doc));
-            }
-        }
-        let affected = victims.len();
-        {
-            let engine = self.table_engine_mut(&del.table)?;
-            for (key, _) in &victims {
-                engine.delete(key)?;
-            }
-        }
-        for (key, doc) in &victims {
-            for (name, path) in &indexes {
-                self.index_del(name, path, doc, key)?;
-            }
-        }
-        Ok(QueryOutput::Mutation { affected })
-    }
-
-    // ---- SELECT ----
-
-    fn select(&self, sel: Select) -> Result<ResultSet> {
-        let docs = self.gather_rows(&sel.from, &sel.filter)?;
-
-        let has_aggregate = sel.items.iter().any(|it| match it {
-            SelectItem::Expr { expr, .. } => contains_aggregate(expr),
-            SelectItem::Wildcard => false,
-        });
-
-        if has_aggregate || !sel.group_by.is_empty() {
-            select_aggregate(&sel, docs)
-        } else {
-            select_rows(&sel, docs)
-        }
-    }
-
     // ---- row gathering (with optional index acceleration) ----
 
-    /// Collect the rows of `table` matching `filter`. When `filter` is a simple
-    /// equality on an indexed path, the matching primary keys are read from the
-    /// secondary index and point-fetched, avoiding a full table scan.
-    fn gather_rows(&self, table: &str, filter: &Option<Expr>) -> Result<Vec<Document>> {
-        if let Some((path, value)) = index_equality(filter) {
-            if let Some(name) = self.find_index(table, &path) {
-                let mut out = Vec::new();
-                for doc in self.lookup_by_index(table, &name, &value)? {
-                    if matches_filter(filter, &doc)? {
-                        out.push(doc);
-                    }
-                }
-                return Ok(out);
+    /// Collect `(key, doc)` for the rows of `table` matching `filter`. When
+    /// `filter` is a simple equality on an indexed path, matching primary keys
+    /// are read from the secondary index and point-fetched, avoiding a scan.
+    fn gather_rows_keyed(
+        &self,
+        table: &str,
+        filter: &Option<Expr>,
+    ) -> Result<Vec<(Vec<u8>, Document)>> {
+        let candidates = if let Some((path, value)) = index_equality(filter) {
+            match self.find_index(table, &path) {
+                Some(name) => self.lookup_by_index_keyed(table, &name, &value)?,
+                None => self.scan_docs(table)?,
             }
-        }
-        let mut docs = Vec::new();
-        for (_key, doc) in self.scan_docs(table)? {
+        } else {
+            self.scan_docs(table)?
+        };
+        let mut out = Vec::new();
+        for (key, doc) in candidates {
             if matches_filter(filter, &doc)? {
-                docs.push(doc);
+                out.push((key, doc));
             }
         }
-        Ok(docs)
+        Ok(out)
     }
 
     /// The (name, path) of every index defined on `table`.
@@ -367,8 +255,13 @@ impl Database {
         Ok(())
     }
 
-    /// Fetch rows whose indexed value equals `value` via the named index.
-    fn lookup_by_index(&self, table: &str, name: &str, value: &Value) -> Result<Vec<Document>> {
+    /// Fetch `(key, doc)` for rows whose indexed value equals `value`.
+    fn lookup_by_index_keyed(
+        &self,
+        table: &str,
+        name: &str,
+        value: &Value,
+    ) -> Result<Vec<(Vec<u8>, Document)>> {
         let index_engine = self
             .indexes
             .get(name)
@@ -378,17 +271,77 @@ impl Database {
             .get(table)
             .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
 
-        let mut docs = Vec::new();
+        let mut rows = Vec::new();
         for (_entry_key, row_key) in index_engine.scan_prefix(&index_prefix(value))? {
             if let Some(bytes) = table_engine.get(&row_key)? {
                 if let Value::Document(doc) = Value::decode(&bytes)
                     .map_err(|e| EngineError::Constraint(format!("corrupt row: {e}")))?
                 {
-                    docs.push(doc);
+                    rows.push((row_key, doc));
                 }
             }
         }
-        Ok(docs)
+        Ok(rows)
+    }
+
+    // ---- distribution support (used by the cluster coordinator) ----
+
+    /// Primary-key columns of `table` (public for the coordinator).
+    pub fn table_primary_key(&self, table: &str) -> Result<Vec<String>> {
+        Ok(self.table_def(table)?.primary_key.clone())
+    }
+
+    /// Whether `table` exists locally.
+    pub fn has_table(&self, table: &str) -> bool {
+        self.catalog.tables.contains_key(table)
+    }
+
+    /// Scan a local table returning `(key, encoded_doc, stamp)` for each live
+    /// row — the coordinator merges these across replicas by last-writer-wins.
+    pub fn local_scan_versioned(&self, table: &str) -> Result<Vec<VersionedRow>> {
+        let engine = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+        Ok(engine.scan_versioned()?)
+    }
+
+    /// Apply a replicated row write at an explicit stamp, maintaining indexes.
+    pub fn apply_put(&mut self, table: &str, key: &[u8], bytes: Vec<u8>, hlc: Hlc) -> Result<()> {
+        let doc = match Value::decode(&bytes)
+            .map_err(|e| EngineError::Constraint(format!("corrupt replicated row: {e}")))?
+        {
+            Value::Document(d) => d,
+            _ => {
+                return Err(EngineError::Constraint(
+                    "replicated row is not a document".into(),
+                ))
+            }
+        };
+        self.table_engine_mut(table)?
+            .put_with_hlc(key, bytes, hlc)?;
+        for (name, path) in self.indexes_on(table) {
+            self.index_put(&name, &path, &doc, key)?;
+        }
+        Ok(())
+    }
+
+    /// Apply a replicated delete at an explicit stamp, maintaining indexes.
+    pub fn apply_delete(&mut self, table: &str, key: &[u8], hlc: Hlc) -> Result<()> {
+        // Read the local row first so its index entries can be removed.
+        let existing = self
+            .tables
+            .get(table)
+            .and_then(|e| e.get(key).ok().flatten());
+        self.table_engine_mut(table)?.delete_with_hlc(key, hlc)?;
+        if let Some(bytes) = existing {
+            if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
+                for (name, path) in self.indexes_on(table) {
+                    self.index_del(&name, &path, &doc, key)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     // ---- helpers ----
@@ -431,14 +384,139 @@ impl Database {
     }
 }
 
-/// A pending row rewrite for `UPDATE`: delete `old_key` if the primary key
-/// changed, then write the new document under `new_key`. The documents are kept
-/// so secondary indexes can be updated.
-struct RowChange {
-    old_key: Vec<u8>,
-    old_doc: Document,
-    new_key: Vec<u8>,
-    new_doc: Document,
+/// Storage seam for the SQL executor (SPEC §4–6). Implemented by [`LocalCluster`]
+/// for the embedded engine and by the cluster coordinator for replicated,
+/// quorum-based reads and writes — so [`run`] is identical in both worlds.
+pub trait Cluster {
+    /// Primary-key columns of `table`.
+    fn primary_key(&self, table: &str) -> Result<Vec<String>>;
+    /// `(key, doc)` for rows of `table` matching `filter`.
+    fn matching_rows(
+        &mut self,
+        table: &str,
+        filter: &Option<Expr>,
+    ) -> Result<Vec<(Vec<u8>, Document)>>;
+    /// Write `doc` under `key` in `table` (and maintain indexes/replicas).
+    fn put(&mut self, table: &str, key: &[u8], doc: &Document) -> Result<()>;
+    /// Delete `key` from `table`; `doc` is the row being removed (for indexes).
+    fn delete(&mut self, table: &str, key: &[u8], doc: &Document) -> Result<()>;
+}
+
+/// Execute one DML/SELECT statement against any [`Cluster`].
+///
+/// DDL is handled by each executor directly (locally, or broadcast in a
+/// cluster), so only the data-plane statements arrive here.
+pub fn run(stmt: Statement, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
+    match stmt {
+        Statement::Insert(ins) => run_insert(ins, cluster),
+        Statement::Select(sel) => run_select(sel, cluster).map(QueryOutput::Rows),
+        Statement::Update(upd) => run_update(upd, cluster),
+        Statement::Delete(del) => run_delete(del, cluster),
+        _ => Err(EngineError::Unsupported(
+            "non-data statement reached the data-plane executor".into(),
+        )),
+    }
+}
+
+fn run_insert(ins: Insert, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
+    let pk = cluster.primary_key(&ins.table)?;
+    let empty = Document::new();
+    let mut rows: Vec<(Vec<u8>, Document)> = Vec::with_capacity(ins.rows.len());
+    for row in &ins.rows {
+        let mut doc = Document::new();
+        for (col, expr) in ins.columns.iter().zip(row) {
+            doc.insert(col.clone(), eval(expr, &empty)?);
+        }
+        let key = primary_key_bytes(&pk, &doc)?;
+        rows.push((key, doc));
+    }
+    let affected = rows.len();
+    for (key, doc) in &rows {
+        cluster.put(&ins.table, key, doc)?;
+    }
+    Ok(QueryOutput::Mutation { affected })
+}
+
+fn run_select(sel: Select, cluster: &mut dyn Cluster) -> Result<ResultSet> {
+    let docs: Vec<Document> = cluster
+        .matching_rows(&sel.from, &sel.filter)?
+        .into_iter()
+        .map(|(_k, doc)| doc)
+        .collect();
+    let has_aggregate = sel.items.iter().any(|it| match it {
+        SelectItem::Expr { expr, .. } => contains_aggregate(expr),
+        SelectItem::Wildcard => false,
+    });
+    if has_aggregate || !sel.group_by.is_empty() {
+        select_aggregate(&sel, docs)
+    } else {
+        select_rows(&sel, docs)
+    }
+}
+
+fn run_update(upd: Update, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
+    let pk = cluster.primary_key(&upd.table)?;
+    let matches = cluster.matching_rows(&upd.table, &upd.filter)?;
+    let affected = matches.len();
+    for (old_key, old_doc) in matches {
+        let mut new_doc = old_doc.clone();
+        for (path, expr) in &upd.assignments {
+            let val = eval(expr, &old_doc)?;
+            set_path(&mut new_doc, path, val);
+        }
+        let new_key = primary_key_bytes(&pk, &new_doc)?;
+        // Model the rewrite as delete-old then put-new (covers PK changes and
+        // keeps index/replica maintenance uniform).
+        cluster.delete(&upd.table, &old_key, &old_doc)?;
+        cluster.put(&upd.table, &new_key, &new_doc)?;
+    }
+    Ok(QueryOutput::Mutation { affected })
+}
+
+fn run_delete(del: Delete, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
+    let matches = cluster.matching_rows(&del.table, &del.filter)?;
+    let affected = matches.len();
+    for (key, doc) in matches {
+        cluster.delete(&del.table, &key, &doc)?;
+    }
+    Ok(QueryOutput::Mutation { affected })
+}
+
+/// The embedded, single-node implementation of [`Cluster`].
+struct LocalCluster<'a> {
+    db: &'a mut Database,
+}
+
+impl Cluster for LocalCluster<'_> {
+    fn primary_key(&self, table: &str) -> Result<Vec<String>> {
+        Ok(self.db.table_def(table)?.primary_key.clone())
+    }
+
+    fn matching_rows(
+        &mut self,
+        table: &str,
+        filter: &Option<Expr>,
+    ) -> Result<Vec<(Vec<u8>, Document)>> {
+        self.db.gather_rows_keyed(table, filter)
+    }
+
+    fn put(&mut self, table: &str, key: &[u8], doc: &Document) -> Result<()> {
+        self.db
+            .table_engine_mut(table)?
+            .put(key, Value::Document(doc.clone()).encode())?;
+        for (name, path) in self.db.indexes_on(table) {
+            self.db.index_put(&name, &path, doc, key)?;
+        }
+        Ok(())
+    }
+
+    fn delete(&mut self, table: &str, key: &[u8], doc: &Document) -> Result<()> {
+        self.db.table_engine_mut(table)?.delete(key)?;
+        for (name, path) in self.db.indexes_on(table) {
+            self.db.index_del(&name, &path, doc, key)?;
+        }
+        Ok(())
+    }
 }
 
 fn table_dir(root: &Path, name: &str) -> PathBuf {
@@ -493,6 +571,21 @@ fn matches_filter(filter: &Option<Expr>, doc: &Document) -> Result<bool> {
         Some(expr) => eval_predicate(expr, doc),
         None => Ok(true),
     }
+}
+
+/// Keep the `(key, doc)` rows whose document satisfies `filter`. Public so the
+/// cluster coordinator can filter cluster-merged rows with engine semantics.
+pub fn filter_rows(
+    filter: &Option<Expr>,
+    rows: Vec<(Vec<u8>, Document)>,
+) -> Result<Vec<(Vec<u8>, Document)>> {
+    let mut out = Vec::new();
+    for (key, doc) in rows {
+        if matches_filter(filter, &doc)? {
+            out.push((key, doc));
+        }
+    }
+    Ok(out)
 }
 
 /// Extract primary-key values and encode them into an order-preserving key.
