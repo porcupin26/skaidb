@@ -6,34 +6,29 @@ use std::thread::{self, JoinHandle};
 
 use skaidb_proto::{read_frame, write_frame, Request, Response};
 
-use crate::shared::{execute, SharedDb};
+use crate::shared::{execute, Shared};
 
 /// Bind the binary endpoint and serve it on a background thread.
 ///
 /// Returns the bound address (useful when binding to port 0 in tests) and the
 /// accept-loop join handle.
-pub fn spawn(addr: &str, db: SharedDb) -> io::Result<(std::net::SocketAddr, JoinHandle<()>)> {
+pub fn spawn(addr: &str, ctx: Shared) -> io::Result<(std::net::SocketAddr, JoinHandle<()>)> {
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
-    let handle = thread::spawn(move || serve(listener, db));
+    let handle = thread::spawn(move || serve(listener, ctx));
     Ok((local, handle))
 }
 
 /// Accept connections forever, handling each on its own thread.
-pub fn serve(listener: TcpListener, db: SharedDb) {
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let db = db.clone();
-                thread::spawn(move || handle_connection(stream, db));
-            }
-            Err(_) => continue,
-        }
+pub fn serve(listener: TcpListener, ctx: Shared) {
+    for stream in listener.incoming().flatten() {
+        let ctx = ctx.clone();
+        thread::spawn(move || handle_connection(stream, ctx));
     }
 }
 
 /// Serve requests on one connection until the peer disconnects.
-fn handle_connection(mut stream: TcpStream, db: SharedDb) {
+fn handle_connection(mut stream: TcpStream, ctx: Shared) {
     stream.set_nodelay(true).ok();
     loop {
         let payload = match read_frame(&mut stream) {
@@ -41,7 +36,7 @@ fn handle_connection(mut stream: TcpStream, db: SharedDb) {
             Err(_) => return, // disconnect or framing error
         };
         let response = match Request::decode(&payload) {
-            Ok(req) => execute(&db, &req.sql),
+            Ok(req) => execute(&ctx, &req.sql),
             Err(e) => Response::Error(format!("protocol error: {e}")),
         };
         if write_frame(&mut stream, &response.encode()).is_err() {

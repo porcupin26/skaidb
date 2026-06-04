@@ -12,27 +12,27 @@ use std::thread::{self, JoinHandle};
 use serde_json::{json, Value as Json};
 use skaidb_proto::Response;
 
-use crate::shared::{execute, SharedDb};
+use crate::shared::{execute, Shared};
 
 /// Bind the REST endpoint and serve it on a background thread.
-pub fn spawn(addr: &str, db: SharedDb) -> io::Result<(std::net::SocketAddr, JoinHandle<()>)> {
+pub fn spawn(addr: &str, ctx: Shared) -> io::Result<(std::net::SocketAddr, JoinHandle<()>)> {
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
-    let handle = thread::spawn(move || serve(listener, db));
+    let handle = thread::spawn(move || serve(listener, ctx));
     Ok((local, handle))
 }
 
 /// Accept connections forever, handling each on its own thread.
-pub fn serve(listener: TcpListener, db: SharedDb) {
+pub fn serve(listener: TcpListener, ctx: Shared) {
     for stream in listener.incoming().flatten() {
-        let db = db.clone();
+        let ctx = ctx.clone();
         thread::spawn(move || {
-            let _ = handle_connection(stream, db);
+            let _ = handle_connection(stream, ctx);
         });
     }
 }
 
-fn handle_connection(mut stream: TcpStream, db: SharedDb) -> io::Result<()> {
+fn handle_connection(mut stream: TcpStream, ctx: Shared) -> io::Result<()> {
     let (method, path, body) = match read_request(&mut stream) {
         Ok(Some(req)) => req,
         Ok(None) => return Ok(()),
@@ -41,16 +41,21 @@ fn handle_connection(mut stream: TcpStream, db: SharedDb) -> io::Result<()> {
         }
     };
 
+    // Prometheus scrape endpoint (SPEC §10).
+    if method == "GET" && path.starts_with("/metrics") {
+        return write_text(&mut stream, 200, &ctx.metrics.render());
+    }
+
     if method != "POST" || !path.starts_with("/query") {
         return write_response(
             &mut stream,
             404,
-            &json!({"error": "use POST /query with a SQL body"}),
+            &json!({"error": "use POST /query with a SQL body, or GET /metrics"}),
         );
     }
 
     let sql = extract_sql(&body);
-    let response = execute(&db, &sql);
+    let response = execute(&ctx, &sql);
     let (status, payload) = response_to_json(response);
     write_response(&mut stream, status, &payload)
 }
@@ -130,6 +135,17 @@ fn write_response(stream: &mut TcpStream, status: u16, body: &Json) -> io::Resul
     let body = body.to_string();
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body.as_bytes())?;
+    stream.flush()
+}
+
+/// Write a plain-text response (used by `/metrics`).
+fn write_text(stream: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 {status} OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes())?;

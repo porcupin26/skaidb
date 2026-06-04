@@ -5,28 +5,47 @@
 //! eventual WAN default. Both endpoints execute SQL against one [`Database`]
 //! guarded by a mutex (thread-per-connection model).
 
+pub mod audit;
 pub mod binary;
+pub mod metrics;
 pub mod rest;
 pub mod shared;
 
 use std::sync::{Arc, Mutex};
 
+use skaidb_auth::RoleStore;
 use skaidb_config::Config;
 use skaidb_engine::Database;
 
-use crate::shared::SharedDb;
+use crate::audit::AuditSettings;
+use crate::metrics::Metrics;
+use crate::shared::{Context, Shared};
 
 /// Open the database from `config` and serve the binary + REST endpoints,
 /// blocking until the binary accept loop ends.
 pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    let db: SharedDb = Arc::new(Mutex::new(Database::open(&config.server.data_dir)?));
+    let db = Database::open(&config.server.data_dir)?;
+
+    // Bootstrap the configured superuser (SPEC §8.2).
+    let mut roles = RoleStore::new();
+    roles.create_superuser(&config.auth.superuser);
+
+    let metrics = Metrics::new();
+    metrics.set("skaidb_up", 1);
+
+    let ctx: Shared = Arc::new(Context {
+        db: Mutex::new(db),
+        metrics,
+        audit: AuditSettings::from(&config.observability),
+        roles,
+    });
 
     let bind = &config.server.bind_addr;
     let binary_addr = format!("{}:{}", bind, config.server.quic_port);
     let rest_addr = format!("{}:{}", bind, config.server.rest_port);
 
-    let (binary_local, binary_handle) = binary::spawn(&binary_addr, db.clone())?;
-    let (rest_local, _rest_handle) = rest::spawn(&rest_addr, db.clone())?;
+    let (binary_local, binary_handle) = binary::spawn(&binary_addr, ctx.clone())?;
+    let (rest_local, _rest_handle) = rest::spawn(&rest_addr, ctx.clone())?;
 
     println!("skaidb binary endpoint listening on {binary_local}");
     println!("skaidb REST endpoint listening on http://{rest_local}/query");
@@ -46,19 +65,32 @@ mod tests {
     use skaidb_proto::Response;
     use skaidb_types::Value;
 
-    fn temp_db() -> SharedDb {
+    fn temp_ctx() -> Shared {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut dir = std::env::temp_dir();
         dir.push(format!("skaidb-server-it-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        Arc::new(Mutex::new(Database::open(dir).unwrap()))
+        // Quiet audit settings for tests; metrics still record.
+        let audit = AuditSettings {
+            query_log: false,
+            query_masked: true,
+            slow_query_ms: 0,
+            login_log: false,
+            error_log: false,
+        };
+        Arc::new(Context {
+            db: Mutex::new(Database::open(dir).unwrap()),
+            metrics: Metrics::new(),
+            audit,
+            roles: RoleStore::new(),
+        })
     }
 
     #[test]
     fn binary_endpoint_end_to_end() {
-        let db = temp_db();
-        let (addr, _h) = binary::spawn("127.0.0.1:0", db).unwrap();
+        let ctx = temp_ctx();
+        let (addr, _h) = binary::spawn("127.0.0.1:0", ctx).unwrap();
 
         let mut client = Client::connect(addr).unwrap();
         assert_eq!(
@@ -87,8 +119,8 @@ mod tests {
 
     #[test]
     fn binary_endpoint_reports_errors() {
-        let db = temp_db();
-        let (addr, _h) = binary::spawn("127.0.0.1:0", db).unwrap();
+        let ctx = temp_ctx();
+        let (addr, _h) = binary::spawn("127.0.0.1:0", ctx).unwrap();
         let mut client = Client::connect(addr).unwrap();
         // Selecting a missing table is a server-side error.
         let err = client.execute("SELECT * FROM missing").unwrap_err();
@@ -97,8 +129,8 @@ mod tests {
 
     #[test]
     fn rest_endpoint_end_to_end() {
-        let db = temp_db();
-        let (addr, _h) = rest::spawn("127.0.0.1:0", db).unwrap();
+        let ctx = temp_ctx();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
 
         // DDL + insert, then a query — each over its own connection.
         assert!(http_post(addr, "CREATE TABLE t (PRIMARY KEY (id))").contains("\"ok\":true"));
@@ -109,6 +141,41 @@ mod tests {
         let body = http_post(addr, "{\"sql\": \"SELECT v FROM t\"}");
         assert!(body.contains("\"columns\":[\"v\"]"), "got: {body}");
         assert!(body.contains("hello"), "got: {body}");
+    }
+
+    #[test]
+    fn metrics_endpoint_reports_query_counts() {
+        let ctx = temp_ctx();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
+        http_post(addr, "CREATE TABLE t (PRIMARY KEY (id))");
+        http_post(addr, "INSERT INTO t (id) VALUES (1)");
+        http_post(addr, "SELECT * FROM t");
+
+        let metrics = http_get(addr, "/metrics");
+        assert!(
+            metrics.contains("# TYPE skaidb_queries_total counter"),
+            "got: {metrics}"
+        );
+        assert!(
+            metrics.contains("skaidb_queries_total{type=\"select\"} 1"),
+            "got: {metrics}"
+        );
+        assert!(
+            metrics.contains("skaidb_queries_total{type=\"ddl\"} 1"),
+            "got: {metrics}"
+        );
+    }
+
+    fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        stream.write_all(req.as_bytes()).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body.to_string())
+            .unwrap_or(response)
     }
 
     /// Send a `POST /query` with `sql` as the body and return the response body.
