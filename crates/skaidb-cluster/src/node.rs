@@ -142,9 +142,9 @@ impl Node {
                 key,
                 value,
                 hlc,
-            } => self.with_write(|db| db.apply_put(&table, &key, value, hlc)),
+            } => write_response(self.apply_write_local(&table, &key, &WriteOp::Put(value), hlc)),
             Request::ApplyDelete { table, key, hlc } => {
-                self.with_write(|db| db.apply_delete(&table, &key, hlc))
+                write_response(self.apply_write_local(&table, &key, &WriteOp::Delete, hlc))
             }
             Request::ApplyDdl { sql } => self.with_write(|db| db.execute(&sql).map(|_| ())),
         }
@@ -242,14 +242,20 @@ impl Node {
         op: &WriteOp,
         hlc: Hlc,
     ) -> EngineResult<()> {
-        let mut db = self
-            .local
-            .write()
-            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
-        match op {
-            WriteOp::Put(bytes) => db.apply_put(table, key, bytes.clone(), hlc),
-            WriteOp::Delete => db.apply_delete(table, key, hlc),
-        }
+        // Append + apply under the write lock (fast), then fsync outside the lock
+        // so concurrent writers' fsyncs coalesce (group commit).
+        let (commit, handle) = {
+            let mut db = self
+                .local
+                .write()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
+            match op {
+                WriteOp::Put(bytes) => db.apply_put_buffered(table, key, bytes.clone(), hlc)?,
+                WriteOp::Delete => db.apply_delete_buffered(table, key, hlc)?,
+            }
+        };
+        handle.sync_through(commit)?;
+        Ok(())
     }
 
     /// Point-read `key` from its replica set, resolving by last-writer-wins,
@@ -434,6 +440,14 @@ fn pk_point_key(pk: &[String], filter: &Option<Expr>) -> Option<Vec<u8>> {
         return None;
     }
     Some(Value::Array(vec![value.clone()]).encode_key())
+}
+
+/// Map a local write result to an internode `Ack`/`Err` response.
+fn write_response(result: EngineResult<()>) -> Response {
+    match result {
+        Ok(()) => Response::Ack,
+        Err(e) => Response::Err(e.to_string()),
+    }
 }
 
 fn is_ddl(stmt: &Statement) -> bool {

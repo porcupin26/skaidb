@@ -22,4 +22,4 @@ pub use error::{Result, StorageError};
 pub use hlc::{Hlc, HlcClock};
 pub use memtable::{Memtable, VersionValue};
 pub use sstable::{SsTable, SstEntry};
-pub use wal::{Wal, WalOp, WalRecord};
+pub use wal::{Wal, WalCommit, WalOp, WalRecord, WalSync};

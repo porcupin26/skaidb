@@ -12,7 +12,9 @@ use skaidb_sql::ast::{
     Update,
 };
 use skaidb_sql::parse;
-use skaidb_storage::{Engine as StorageEngine, Hlc, VersionValue};
+use std::sync::Arc;
+
+use skaidb_storage::{Engine as StorageEngine, Hlc, VersionValue, WalCommit, WalSync};
 use skaidb_types::{Document, Value};
 
 use crate::catalog::{Catalog, IndexDef, TableDef};
@@ -362,6 +364,63 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    /// Buffered replicated write (no fsync): append + apply + maintain indexes,
+    /// returning the commit point and the WAL sync handle so the coordinator can
+    /// fsync after releasing its write lock (group commit).
+    pub fn apply_put_buffered(
+        &mut self,
+        table: &str,
+        key: &[u8],
+        bytes: Vec<u8>,
+        hlc: Hlc,
+    ) -> Result<(WalCommit, Arc<WalSync>)> {
+        let doc = match Value::decode(&bytes)
+            .map_err(|e| EngineError::Constraint(format!("corrupt replicated row: {e}")))?
+        {
+            Value::Document(d) => d,
+            _ => {
+                return Err(EngineError::Constraint(
+                    "replicated row is not a document".into(),
+                ))
+            }
+        };
+        let (commit, handle) = {
+            let engine = self.table_engine_mut(table)?;
+            let commit = engine.append_put_buffered(key, bytes, hlc)?;
+            (commit, engine.wal_sync_handle())
+        };
+        for (name, path) in self.indexes_on(table) {
+            self.index_put(&name, &path, &doc, key)?;
+        }
+        Ok((commit, handle))
+    }
+
+    /// Buffered replicated delete (no fsync); see [`Database::apply_put_buffered`].
+    pub fn apply_delete_buffered(
+        &mut self,
+        table: &str,
+        key: &[u8],
+        hlc: Hlc,
+    ) -> Result<(WalCommit, Arc<WalSync>)> {
+        let existing = self
+            .tables
+            .get(table)
+            .and_then(|e| e.get(key).ok().flatten());
+        let (commit, handle) = {
+            let engine = self.table_engine_mut(table)?;
+            let commit = engine.append_delete_buffered(key, hlc)?;
+            (commit, engine.wal_sync_handle())
+        };
+        if let Some(bytes) = existing {
+            if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
+                for (name, path) in self.indexes_on(table) {
+                    self.index_del(&name, &path, &doc, key)?;
+                }
+            }
+        }
+        Ok((commit, handle))
     }
 
     // ---- helpers ----

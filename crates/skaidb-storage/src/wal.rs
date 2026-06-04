@@ -1,9 +1,18 @@
-//! Write-ahead log (SPEC §12).
+//! Write-ahead log with group commit (SPEC §12).
 //!
-//! Every mutation is appended to the WAL before it is applied to the in-memory
-//! memtable, so a crash can be recovered by replaying the log. Records are
-//! length-prefixed and CRC-checked; a torn trailing record (from a crash
-//! mid-append) is detected and truncated on open rather than treated as fatal.
+//! Every mutation is appended before it is applied to the memtable, so a crash
+//! recovers by replaying the log. Records are length-prefixed and CRC-checked; a
+//! torn trailing record (from a crash mid-append) is detected and truncated on
+//! open rather than treated as fatal.
+//!
+//! **Group commit.** Appending and fsyncing are separated. [`Wal::append`]
+//! writes the record (positionally, no fsync) and returns a [`WalCommit`]; the
+//! caller later calls [`WalSync::sync_through`] to make it durable. Many
+//! concurrent writers therefore share a single fsync: the first into the sync
+//! critical section flushes everything appended so far, and the rest observe
+//! their commit point is already durable and skip their own fsync. Appends must
+//! be serialized by the caller (the engine holds its write lock for the append),
+//! but the slow fsync happens outside that lock.
 //!
 //! On-disk record layout (all integers little-endian):
 //! ```text
@@ -12,8 +21,11 @@
 //! ```
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Read};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::crc::crc32;
 use crate::error::{Result, StorageError};
@@ -35,6 +47,14 @@ pub struct WalRecord {
     pub hlc: Hlc,
     pub key: Vec<u8>,
     pub op: WalOp,
+}
+
+/// A commit point: the WAL generation and the byte offset just past a record.
+/// Pass it to [`WalSync::sync_through`] to make that record durable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalCommit {
+    generation: u64,
+    offset: u64,
 }
 
 impl WalRecord {
@@ -88,22 +108,60 @@ impl WalRecord {
     }
 }
 
+/// The shared durability coordinator for one WAL file: the backing file plus the
+/// append/synced offsets and a generation that bumps on truncation.
+#[derive(Debug)]
+pub struct WalSync {
+    file: File,
+    /// Next free append offset (advanced by serialized appends).
+    write_offset: AtomicU64,
+    /// Bytes known durable on disk.
+    synced: AtomicU64,
+    /// Bumped on truncate; commits from an older generation are already durable
+    /// (their data was flushed to an SSTable), so their fsync is a no-op.
+    generation: AtomicU64,
+    /// Serializes the fsync critical section.
+    sync_lock: Mutex<()>,
+}
+
+impl WalSync {
+    /// Ensure everything up to `commit` is durable, coalescing with concurrent
+    /// callers (group commit). A commit from a superseded generation is already
+    /// durable elsewhere and returns immediately.
+    pub fn sync_through(&self, commit: WalCommit) -> Result<()> {
+        if self.generation.load(Ordering::SeqCst) != commit.generation
+            || self.synced.load(Ordering::SeqCst) >= commit.offset
+        {
+            return Ok(());
+        }
+        let _guard = self.sync_lock.lock().expect("wal sync lock");
+        // Re-check under the lock: another writer may have synced past us.
+        if self.generation.load(Ordering::SeqCst) != commit.generation
+            || self.synced.load(Ordering::SeqCst) >= commit.offset
+        {
+            return Ok(());
+        }
+        let durable = self.write_offset.load(Ordering::SeqCst);
+        self.file.sync_data()?;
+        self.synced.store(durable, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
 /// An append-only write-ahead log file.
 #[derive(Debug)]
 pub struct Wal {
-    file: File,
+    sync: Arc<WalSync>,
     path: PathBuf,
 }
 
 impl Wal {
-    /// Open (creating if needed) the WAL at `path`, replay it, and position the
-    /// file at the end for subsequent appends.
-    ///
-    /// Returns the recovered records in append order. A torn trailing record is
-    /// truncated so future appends start from a clean boundary.
+    /// Open (creating if needed) the WAL at `path` and replay it. A torn
+    /// trailing record is truncated so future appends start from a clean
+    /// boundary.
     pub fn open(path: impl AsRef<Path>) -> Result<(Wal, Vec<WalRecord>)> {
         let path = path.as_ref().to_path_buf();
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -111,39 +169,64 @@ impl Wal {
             .open(&path)?;
 
         let (records, good_len) = replay(&file)?;
+        file.set_len(good_len)?; // drop any torn trailing bytes
 
-        // Drop any torn trailing bytes, then seek to the end.
-        file.set_len(good_len)?;
-        file.seek(SeekFrom::End(0))?;
-
-        Ok((Wal { file, path }, records))
+        let sync = Arc::new(WalSync {
+            file,
+            write_offset: AtomicU64::new(good_len),
+            synced: AtomicU64::new(good_len),
+            generation: AtomicU64::new(0),
+            sync_lock: Mutex::new(()),
+        });
+        Ok((Wal { sync, path }, records))
     }
 
-    /// Append a record and flush it durably to disk.
-    pub fn append(&mut self, record: &WalRecord) -> Result<()> {
+    /// Append a record (positional write, no fsync) and return its commit point.
+    ///
+    /// Appends must be serialized by the caller (the engine's write lock); the
+    /// returned [`WalCommit`] is made durable later via [`WalSync::sync_through`].
+    pub fn append(&self, record: &WalRecord) -> Result<WalCommit> {
         let payload = record.encode_payload();
         let mut frame = Vec::with_capacity(payload.len() + 8);
         frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         frame.extend_from_slice(&payload);
         frame.extend_from_slice(&crc32(&payload).to_le_bytes());
-        self.file.write_all(&frame)?;
-        self.file.flush()?;
-        self.file.sync_data()?;
+
+        let offset = self.sync.write_offset.load(Ordering::SeqCst);
+        self.sync.file.write_all_at(&frame, offset)?;
+        let end = offset + frame.len() as u64;
+        self.sync.write_offset.store(end, Ordering::SeqCst);
+        Ok(WalCommit {
+            generation: self.sync.generation.load(Ordering::SeqCst),
+            offset: end,
+        })
+    }
+
+    /// A handle to the durability coordinator, for syncing outside the lock.
+    pub fn sync_handle(&self) -> Arc<WalSync> {
+        Arc::clone(&self.sync)
+    }
+
+    /// Convenience: make `commit` durable immediately (append-then-sync callers).
+    pub fn commit_sync(&self, commit: WalCommit) -> Result<()> {
+        self.sync.sync_through(commit)
+    }
+
+    /// Truncate the log to empty and bump the generation. Called after a flush
+    /// makes the logged mutations durable in an SSTable.
+    pub fn truncate(&self) -> Result<()> {
+        let _guard = self.sync.sync_lock.lock().expect("wal sync lock");
+        self.sync.file.set_len(0)?;
+        self.sync.file.sync_data()?;
+        self.sync.write_offset.store(0, Ordering::SeqCst);
+        self.sync.synced.store(0, Ordering::SeqCst);
+        self.sync.generation.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
     /// Path backing this WAL.
     pub fn path(&self) -> &Path {
         &self.path
-    }
-
-    /// Truncate the log to empty. Called after a flush makes the logged
-    /// mutations durable in an SSTable, so they no longer need replay.
-    pub fn truncate(&mut self) -> Result<()> {
-        self.file.set_len(0)?;
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.sync_all()?;
-        Ok(())
     }
 }
 
@@ -193,6 +276,7 @@ fn replay(file: &File) -> Result<(Vec<WalRecord>, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn rec(hlc: u64, key: &str, op: WalOp) -> WalRecord {
         WalRecord {
@@ -202,16 +286,22 @@ mod tests {
         }
     }
 
+    /// Append and immediately make durable (test convenience).
+    fn append_synced(wal: &Wal, record: &WalRecord) {
+        let commit = wal.append(record).unwrap();
+        wal.commit_sync(commit).unwrap();
+    }
+
     #[test]
     fn append_and_replay_roundtrip() {
         let dir = tempdir();
         let path = dir.join("wal.log");
 
-        let (mut wal, recovered) = Wal::open(&path).unwrap();
+        let (wal, recovered) = Wal::open(&path).unwrap();
         assert!(recovered.is_empty());
-        wal.append(&rec(1, "a", WalOp::Put(b"1".to_vec()))).unwrap();
-        wal.append(&rec(2, "b", WalOp::Put(b"2".to_vec()))).unwrap();
-        wal.append(&rec(3, "a", WalOp::Delete)).unwrap();
+        append_synced(&wal, &rec(1, "a", WalOp::Put(b"1".to_vec())));
+        append_synced(&wal, &rec(2, "b", WalOp::Put(b"2".to_vec())));
+        append_synced(&wal, &rec(3, "a", WalOp::Delete));
         drop(wal);
 
         let (_wal, recovered) = Wal::open(&path).unwrap();
@@ -221,12 +311,44 @@ mod tests {
     }
 
     #[test]
+    fn group_commit_coalesces_syncs() {
+        // Two appends, then one sync_through of the first commit makes both
+        // durable (the second commit is already <= synced).
+        let dir = tempdir();
+        let path = dir.join("wal.log");
+        let (wal, _) = Wal::open(&path).unwrap();
+        let c1 = wal.append(&rec(1, "a", WalOp::Put(b"1".to_vec()))).unwrap();
+        let c2 = wal.append(&rec(2, "b", WalOp::Put(b"2".to_vec()))).unwrap();
+        wal.commit_sync(c2).unwrap();
+        // c1 is already durable: its offset is below the synced point.
+        wal.commit_sync(c1).unwrap();
+        drop(wal);
+        let (_wal, recovered) = Wal::open(&path).unwrap();
+        assert_eq!(recovered.len(), 2);
+    }
+
+    #[test]
+    fn truncate_supersedes_old_commits() {
+        let dir = tempdir();
+        let path = dir.join("wal.log");
+        let (wal, _) = Wal::open(&path).unwrap();
+        let old = wal.append(&rec(1, "a", WalOp::Put(b"1".to_vec()))).unwrap();
+        wal.truncate().unwrap();
+        // Syncing a pre-truncation commit is a no-op (data is durable elsewhere).
+        wal.commit_sync(old).unwrap();
+        append_synced(&wal, &rec(2, "b", WalOp::Put(b"2".to_vec())));
+        drop(wal);
+        let (_wal, recovered) = Wal::open(&path).unwrap();
+        assert_eq!(recovered, vec![rec(2, "b", WalOp::Put(b"2".to_vec()))]);
+    }
+
+    #[test]
     fn torn_trailing_record_is_truncated() {
         let dir = tempdir();
         let path = dir.join("wal.log");
 
-        let (mut wal, _) = Wal::open(&path).unwrap();
-        wal.append(&rec(1, "a", WalOp::Put(b"1".to_vec()))).unwrap();
+        let (wal, _) = Wal::open(&path).unwrap();
+        append_synced(&wal, &rec(1, "a", WalOp::Put(b"1".to_vec())));
         drop(wal);
 
         // Simulate a crash mid-append by writing a bogus partial frame.
@@ -238,14 +360,12 @@ mod tests {
 
         let (wal, recovered) = Wal::open(&path).unwrap();
         assert_eq!(recovered.len(), 1, "torn tail should be ignored");
-        // The torn bytes were truncated, so the file is back to one clean record.
         let clean_len = std::fs::metadata(wal.path()).unwrap().len();
         let (_again, recovered2) = Wal::open(wal.path()).unwrap();
         assert_eq!(recovered2.len(), 1);
         assert_eq!(std::fs::metadata(&path).unwrap().len(), clean_len);
     }
 
-    /// Minimal unique temp dir helper (avoids a dev-dependency).
     fn tempdir() -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);

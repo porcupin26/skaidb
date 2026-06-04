@@ -17,7 +17,7 @@ use crate::error::{Result, StorageError};
 use crate::hlc::{Hlc, HlcClock};
 use crate::memtable::{Memtable, VersionValue};
 use crate::sstable::{SsTable, SstEntry};
-use crate::wal::{Wal, WalOp, WalRecord};
+use crate::wal::{Wal, WalCommit, WalOp, WalRecord, WalSync};
 
 /// The latest version of each key, keyed by storage key (used by merged reads).
 type MergedRows = std::collections::BTreeMap<Vec<u8>, (Hlc, VersionValue)>;
@@ -119,55 +119,88 @@ impl Engine {
         })
     }
 
+    /// Append a record to the WAL and apply it to the memtable, returning the
+    /// commit point — **without** fsync. Callers make it durable separately
+    /// (immediately, or batched outside a lock for group commit).
+    fn append_buffered(
+        &mut self,
+        key: &[u8],
+        hlc: Hlc,
+        op: WalOp,
+        value: VersionValue,
+    ) -> Result<WalCommit> {
+        let commit = self.wal.append(&WalRecord {
+            hlc,
+            key: key.to_vec(),
+            op,
+        })?;
+        self.mem.insert(key.to_vec(), hlc, value);
+        self.maybe_flush()?;
+        Ok(commit)
+    }
+
     /// Write `value` under `key`, returning the version stamp assigned.
     pub fn put(&mut self, key: &[u8], value: Vec<u8>) -> Result<Hlc> {
         let hlc = self.clock.now();
-        self.wal.append(&WalRecord {
+        let commit = self.append_buffered(
+            key,
             hlc,
-            key: key.to_vec(),
-            op: WalOp::Put(value.clone()),
-        })?;
-        self.mem.insert(key.to_vec(), hlc, VersionValue::Put(value));
-        self.maybe_flush()?;
+            WalOp::Put(value.clone()),
+            VersionValue::Put(value),
+        )?;
+        self.wal.commit_sync(commit)?;
         Ok(hlc)
     }
 
     /// Delete `key` (writes a tombstone), returning the version stamp assigned.
     pub fn delete(&mut self, key: &[u8]) -> Result<Hlc> {
         let hlc = self.clock.now();
-        self.wal.append(&WalRecord {
-            hlc,
-            key: key.to_vec(),
-            op: WalOp::Delete,
-        })?;
-        self.mem.insert(key.to_vec(), hlc, VersionValue::Delete);
-        self.maybe_flush()?;
+        let commit = self.append_buffered(key, hlc, WalOp::Delete, VersionValue::Delete)?;
+        self.wal.commit_sync(commit)?;
         Ok(hlc)
     }
 
     /// Apply a write at a caller-supplied stamp (replication: a replica stores
     /// the coordinator's stamp). The local clock is advanced past `hlc`.
     pub fn put_with_hlc(&mut self, key: &[u8], value: Vec<u8>, hlc: Hlc) -> Result<()> {
-        self.clock.observe(hlc);
-        self.wal.append(&WalRecord {
-            hlc,
-            key: key.to_vec(),
-            op: WalOp::Put(value.clone()),
-        })?;
-        self.mem.insert(key.to_vec(), hlc, VersionValue::Put(value));
-        self.maybe_flush()
+        let commit = self.append_put_buffered(key, value, hlc)?;
+        self.wal.commit_sync(commit)
     }
 
     /// Apply a delete at a caller-supplied stamp (replication).
     pub fn delete_with_hlc(&mut self, key: &[u8], hlc: Hlc) -> Result<()> {
+        let commit = self.append_delete_buffered(key, hlc)?;
+        self.wal.commit_sync(commit)
+    }
+
+    /// Buffered replicated write (no fsync): append + apply, returning the
+    /// commit point so the caller can fsync outside its write lock (group
+    /// commit). Pair with [`Engine::wal_sync_handle`].
+    pub fn append_put_buffered(
+        &mut self,
+        key: &[u8],
+        value: Vec<u8>,
+        hlc: Hlc,
+    ) -> Result<WalCommit> {
         self.clock.observe(hlc);
-        self.wal.append(&WalRecord {
+        self.append_buffered(
+            key,
             hlc,
-            key: key.to_vec(),
-            op: WalOp::Delete,
-        })?;
-        self.mem.insert(key.to_vec(), hlc, VersionValue::Delete);
-        self.maybe_flush()
+            WalOp::Put(value.clone()),
+            VersionValue::Put(value),
+        )
+    }
+
+    /// Buffered replicated delete (no fsync); see [`Engine::append_put_buffered`].
+    pub fn append_delete_buffered(&mut self, key: &[u8], hlc: Hlc) -> Result<WalCommit> {
+        self.clock.observe(hlc);
+        self.append_buffered(key, hlc, WalOp::Delete, VersionValue::Delete)
+    }
+
+    /// Durability coordinator handle, to `sync_through` a buffered commit after
+    /// releasing the write lock.
+    pub fn wal_sync_handle(&self) -> std::sync::Arc<WalSync> {
+        self.wal.sync_handle()
     }
 
     /// Latest committed value for `key`, or `None` if absent or deleted.
