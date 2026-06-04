@@ -109,6 +109,35 @@ client locality** (connect to any node, tolerate losing one), not extra write
 throughput on tiny nodes. On multi-core nodes, fan-out would spread coordinator
 CPU and help; here, the single core per node is the ceiling.
 
+## Higher concurrency — 64 connections (C4, 3-node quorum)
+
+Pushing from 16 to 64 client connections on the same 1-core nodes:
+
+| Workload | skaidb (1 coord) | skaidb (all nodes) | MongoDB 7 | MongoDB 8 | PostgreSQL | MariaDB |
+|----------|-----------------:|-------------------:|----------:|----------:|-----------:|--------:|
+| write 64c | 3,158 | 3,285 | 3,524 | 3,567 | **5,183** | 2,853 |
+| read 64c  | 2,042 | **3,360** | 4,862 | 4,447 | 4,692 | 5,646 |
+| mixed 64c | 3,292 | 3,259 | 4,289 | 4,067 | **5,269** | 4,532 |
+
+- **skaidb writes scale ~2× from 16→64** (1,584 → 3,158) — group commit keeps
+  coalescing more fsyncs as concurrency rises.
+- **Single-coordinator reads stop scaling and dip** (2,324 at 16c → 2,042 at 64c):
+  one node's single core saturates coordinating every read. **Fanning reads
+  across all 3 nodes recovers it (→ 3,360, +65%)** — the opposite of the 16-conn
+  case, where fan-out was flat. The more concurrent the read load, the more it
+  pays to spread coordinators.
+- skaidb's reads are **quorum reads** (the coordinator contacts a peer to satisfy
+  `default_read_consistency = QUORUM`), so each read costs a cross-node hop; the
+  other systems read locally from the primary. Setting skaidb's read consistency
+  to `ONE` would make reads node-local and faster, at the cost of read-your-writes
+  guarantees across coordinators.
+- The mature engines keep scaling on their fast local-read / pipelined-commit
+  paths; PostgreSQL again leads writes/mixed, MariaDB leads reads.
+
+> Connections are pinned to nodes round-robin at connect time (thread *i* → node
+> *i mod N*), so the 64-connection fan-out spreads ~21 connections per node; the
+> *key* each op touches is random, the target node is fixed per connection.
+
 ## Memory footprint (idle, of 512 MB per node)
 
 | | skaidb | MongoDB 7 | MongoDB 8 | PostgreSQL | MariaDB |
