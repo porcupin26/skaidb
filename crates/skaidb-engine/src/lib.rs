@@ -197,6 +197,85 @@ mod tests {
     }
 
     #[test]
+    fn secondary_index_equality_lookup_stays_correct() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        db.execute("INSERT INTO t (id, name) VALUES (1, 'ada'), (2, 'bob'), (3, 'ada')")
+            .unwrap();
+        db.execute("CREATE INDEX t_name ON t(name)").unwrap();
+
+        // Index lookup returns the matching rows.
+        let rs = rows(
+            db.execute("SELECT id FROM t WHERE name = 'ada' ORDER BY id")
+                .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(1)], vec![Value::Int(3)]]);
+
+        // Update keeps the index in sync.
+        db.execute("UPDATE t SET name = 'cleo' WHERE id = 1")
+            .unwrap();
+        let rs = rows(
+            db.execute("SELECT id FROM t WHERE name = 'ada' ORDER BY id")
+                .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(3)]]);
+        let rs = rows(db.execute("SELECT id FROM t WHERE name = 'cleo'").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::Int(1)]]);
+
+        // Delete keeps the index in sync.
+        db.execute("DELETE FROM t WHERE id = 3").unwrap();
+        let rs = rows(db.execute("SELECT id FROM t WHERE name = 'ada'").unwrap());
+        assert!(rs.rows.is_empty());
+    }
+
+    #[test]
+    fn secondary_index_backfills_existing_rows_and_persists() {
+        let dir = tempdir();
+        {
+            let mut db = Database::open(&dir).unwrap();
+            db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+            db.execute("INSERT INTO t (id, city) VALUES (1, 'oslo'), (2, 'oslo'), (3, 'rome')")
+                .unwrap();
+            // Index created after data exists → must backfill.
+            db.execute("CREATE INDEX t_city ON t(city)").unwrap();
+            let rs = rows(
+                db.execute("SELECT id FROM t WHERE city = 'oslo' ORDER BY id")
+                    .unwrap(),
+            );
+            assert_eq!(rs.rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+        }
+        // Index survives reopen.
+        let mut db = Database::open(&dir).unwrap();
+        db.execute("INSERT INTO t (id, city) VALUES (4, 'oslo')")
+            .unwrap();
+        let rs = rows(
+            db.execute("SELECT id FROM t WHERE city = 'oslo' ORDER BY id")
+                .unwrap(),
+        );
+        assert_eq!(
+            rs.rows,
+            vec![
+                vec![Value::Int(1)],
+                vec![Value::Int(2)],
+                vec![Value::Int(4)]
+            ]
+        );
+    }
+
+    #[test]
+    fn dropping_index_falls_back_to_scan() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        db.execute("CREATE INDEX t_k ON t(k)").unwrap();
+        db.execute("INSERT INTO t (id, k) VALUES (1, 7), (2, 8)")
+            .unwrap();
+        db.execute("DROP INDEX t_k").unwrap();
+        // Still correct via full scan.
+        let rs = rows(db.execute("SELECT id FROM t WHERE k = 7").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::Int(1)]]);
+    }
+
+    #[test]
     fn limit_and_offset() {
         let mut db = Database::open(tempdir()).unwrap();
         db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();

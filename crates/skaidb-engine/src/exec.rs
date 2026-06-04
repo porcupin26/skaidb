@@ -8,7 +8,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use skaidb_sql::ast::{
-    AggArg, AggFunc, Delete, Expr, Insert, OrderKey, Select, SelectItem, Statement, Update,
+    AggArg, AggFunc, BinaryOp, Delete, Expr, Insert, OrderKey, Select, SelectItem, Statement,
+    Update,
 };
 use skaidb_sql::parse;
 use skaidb_storage::Engine as StorageEngine;
@@ -19,12 +20,16 @@ use crate::error::{EngineError, Result};
 use crate::eval::{compare, eval, eval_predicate};
 use crate::result::{QueryOutput, ResultSet};
 
-/// An embedded skaidb database: catalog plus one storage engine per table.
+/// An embedded skaidb database: catalog plus one storage engine per table and
+/// per secondary index.
 #[derive(Debug)]
 pub struct Database {
     dir: PathBuf,
     catalog: Catalog,
     tables: HashMap<String, StorageEngine>,
+    /// Secondary index storage by index name; entries map an indexed value to a
+    /// table primary-key (so a `WHERE path = v` lookup avoids a full scan).
+    indexes: HashMap<String, StorageEngine>,
 }
 
 impl Database {
@@ -40,10 +45,17 @@ impl Database {
             tables.insert(name.clone(), engine);
         }
 
+        let mut indexes = HashMap::new();
+        for name in catalog.indexes.keys() {
+            let engine = StorageEngine::open(index_dir(&dir, name))?;
+            indexes.insert(name.clone(), engine);
+        }
+
         Ok(Database {
             dir,
             catalog,
             tables,
+            indexes,
         })
     }
 
@@ -102,7 +114,22 @@ impl Database {
         }
         self.tables.remove(name);
         self.catalog.tables.remove(name);
-        self.catalog.indexes.retain(|_, idx| idx.table != name);
+        // Drop the table's indexes too.
+        let dropped: Vec<String> = self
+            .catalog
+            .indexes
+            .iter()
+            .filter(|(_, idx)| idx.table == name)
+            .map(|(n, _)| n.clone())
+            .collect();
+        for index_name in dropped {
+            self.catalog.indexes.remove(&index_name);
+            self.indexes.remove(&index_name);
+            let idir = index_dir(&self.dir, &index_name);
+            if idir.exists() {
+                std::fs::remove_dir_all(idir)?;
+            }
+        }
         self.save_catalog()?;
         let dir = table_dir(&self.dir, name);
         if dir.exists() {
@@ -127,8 +154,13 @@ impl Database {
             }
             return Err(EngineError::IndexExists(name.to_string()));
         }
-        // Recorded for the planner; secondary-index-accelerated scans are a
-        // later phase, so reads currently full-scan regardless.
+        // Create the index store and backfill it from the existing rows.
+        let mut index_engine = StorageEngine::open(index_dir(&self.dir, name))?;
+        for (row_key, doc) in self.scan_docs(table)? {
+            let value = index_value(&doc, path);
+            index_engine.put(&index_entry_key(&value, &row_key), row_key.clone())?;
+        }
+        self.indexes.insert(name.to_string(), index_engine);
         self.catalog.indexes.insert(
             name.to_string(),
             IndexDef {
@@ -144,6 +176,11 @@ impl Database {
         if self.catalog.indexes.remove(name).is_none() && !if_exists {
             return Err(EngineError::IndexNotFound(name.to_string()));
         }
+        self.indexes.remove(name);
+        let idir = index_dir(&self.dir, name);
+        if idir.exists() {
+            std::fs::remove_dir_all(idir)?;
+        }
         self.save_catalog()?;
         Ok(QueryOutput::Ddl)
     }
@@ -152,27 +189,37 @@ impl Database {
 
     fn insert(&mut self, ins: Insert) -> Result<QueryOutput> {
         let pk = self.table_def(&ins.table)?.primary_key.clone();
+        let indexes = self.indexes_on(&ins.table);
         let empty = Document::new();
-        let mut encoded_rows = Vec::with_capacity(ins.rows.len());
+
+        let mut rows: Vec<(Vec<u8>, Document)> = Vec::with_capacity(ins.rows.len());
         for row in &ins.rows {
             let mut doc = Document::new();
             for (col, expr) in ins.columns.iter().zip(row) {
                 doc.insert(col.clone(), eval(expr, &empty)?);
             }
             let key = primary_key_bytes(&pk, &doc)?;
-            encoded_rows.push((key, Value::Document(doc).encode()));
+            rows.push((key, doc));
         }
+        let affected = rows.len();
 
-        let engine = self.table_engine_mut(&ins.table)?;
-        let affected = encoded_rows.len();
-        for (key, bytes) in encoded_rows {
-            engine.put(&key, bytes)?;
+        {
+            let engine = self.table_engine_mut(&ins.table)?;
+            for (key, doc) in &rows {
+                engine.put(key, Value::Document(doc.clone()).encode())?;
+            }
+        }
+        for (key, doc) in &rows {
+            for (name, path) in &indexes {
+                self.index_put(name, path, doc, key)?;
+            }
         }
         Ok(QueryOutput::Mutation { affected })
     }
 
     fn update(&mut self, upd: Update) -> Result<QueryOutput> {
         let pk = self.table_def(&upd.table)?.primary_key.clone();
+        let indexes = self.indexes_on(&upd.table);
         let rows = self.scan_docs(&upd.table)?;
 
         let mut changes: Vec<RowChange> = Vec::new();
@@ -188,50 +235,62 @@ impl Database {
             let new_key = primary_key_bytes(&pk, &new_doc)?;
             changes.push(RowChange {
                 old_key,
+                old_doc: doc,
                 new_key,
-                bytes: Value::Document(new_doc).encode(),
+                new_doc,
             });
         }
 
         let affected = changes.len();
-        let engine = self.table_engine_mut(&upd.table)?;
-        for change in changes {
-            if change.new_key != change.old_key {
-                engine.delete(&change.old_key)?;
+        {
+            let engine = self.table_engine_mut(&upd.table)?;
+            for change in &changes {
+                if change.new_key != change.old_key {
+                    engine.delete(&change.old_key)?;
+                }
+                engine.put(
+                    &change.new_key,
+                    Value::Document(change.new_doc.clone()).encode(),
+                )?;
             }
-            engine.put(&change.new_key, change.bytes)?;
+        }
+        for change in &changes {
+            for (name, path) in &indexes {
+                self.index_del(name, path, &change.old_doc, &change.old_key)?;
+                self.index_put(name, path, &change.new_doc, &change.new_key)?;
+            }
         }
         Ok(QueryOutput::Mutation { affected })
     }
 
     fn delete(&mut self, del: Delete) -> Result<QueryOutput> {
+        let indexes = self.indexes_on(&del.table);
         let rows = self.scan_docs(&del.table)?;
-        let mut keys = Vec::new();
+        let mut victims: Vec<(Vec<u8>, Document)> = Vec::new();
         for (key, doc) in rows {
             if matches_filter(&del.filter, &doc)? {
-                keys.push(key);
+                victims.push((key, doc));
             }
         }
-        let affected = keys.len();
-        let engine = self.table_engine_mut(&del.table)?;
-        for key in keys {
-            engine.delete(&key)?;
+        let affected = victims.len();
+        {
+            let engine = self.table_engine_mut(&del.table)?;
+            for (key, _) in &victims {
+                engine.delete(key)?;
+            }
+        }
+        for (key, doc) in &victims {
+            for (name, path) in &indexes {
+                self.index_del(name, path, doc, key)?;
+            }
         }
         Ok(QueryOutput::Mutation { affected })
     }
 
     // ---- SELECT ----
 
-    fn select(&mut self, sel: Select) -> Result<ResultSet> {
-        let rows = self.scan_docs(&sel.from)?;
-
-        // Filter.
-        let mut docs: Vec<Document> = Vec::new();
-        for (_key, doc) in rows {
-            if matches_filter(&sel.filter, &doc)? {
-                docs.push(doc);
-            }
-        }
+    fn select(&self, sel: Select) -> Result<ResultSet> {
+        let docs = self.gather_rows(&sel.from, &sel.filter)?;
 
         let has_aggregate = sel.items.iter().any(|it| match it {
             SelectItem::Expr { expr, .. } => contains_aggregate(expr),
@@ -243,6 +302,93 @@ impl Database {
         } else {
             select_rows(&sel, docs)
         }
+    }
+
+    // ---- row gathering (with optional index acceleration) ----
+
+    /// Collect the rows of `table` matching `filter`. When `filter` is a simple
+    /// equality on an indexed path, the matching primary keys are read from the
+    /// secondary index and point-fetched, avoiding a full table scan.
+    fn gather_rows(&self, table: &str, filter: &Option<Expr>) -> Result<Vec<Document>> {
+        if let Some((path, value)) = index_equality(filter) {
+            if let Some(name) = self.find_index(table, &path) {
+                let mut out = Vec::new();
+                for doc in self.lookup_by_index(table, &name, &value)? {
+                    if matches_filter(filter, &doc)? {
+                        out.push(doc);
+                    }
+                }
+                return Ok(out);
+            }
+        }
+        let mut docs = Vec::new();
+        for (_key, doc) in self.scan_docs(table)? {
+            if matches_filter(filter, &doc)? {
+                docs.push(doc);
+            }
+        }
+        Ok(docs)
+    }
+
+    /// The (name, path) of every index defined on `table`.
+    fn indexes_on(&self, table: &str) -> Vec<(String, String)> {
+        self.catalog
+            .indexes
+            .iter()
+            .filter(|(_, idx)| idx.table == table)
+            .map(|(name, idx)| (name.clone(), idx.path.clone()))
+            .collect()
+    }
+
+    /// Find an index on `table` over exactly `path`, if one exists.
+    fn find_index(&self, table: &str, path: &str) -> Option<String> {
+        self.catalog
+            .indexes
+            .iter()
+            .find(|(_, idx)| idx.table == table && idx.path == path)
+            .map(|(name, _)| name.clone())
+    }
+
+    /// Add an index entry for `doc`'s value at `path` pointing to `row_key`.
+    fn index_put(&mut self, name: &str, path: &str, doc: &Document, row_key: &[u8]) -> Result<()> {
+        let value = index_value(doc, path);
+        if let Some(engine) = self.indexes.get_mut(name) {
+            engine.put(&index_entry_key(&value, row_key), row_key.to_vec())?;
+        }
+        Ok(())
+    }
+
+    /// Remove the index entry for `doc`'s value at `path` pointing to `row_key`.
+    fn index_del(&mut self, name: &str, path: &str, doc: &Document, row_key: &[u8]) -> Result<()> {
+        let value = index_value(doc, path);
+        if let Some(engine) = self.indexes.get_mut(name) {
+            engine.delete(&index_entry_key(&value, row_key))?;
+        }
+        Ok(())
+    }
+
+    /// Fetch rows whose indexed value equals `value` via the named index.
+    fn lookup_by_index(&self, table: &str, name: &str, value: &Value) -> Result<Vec<Document>> {
+        let index_engine = self
+            .indexes
+            .get(name)
+            .ok_or_else(|| EngineError::IndexNotFound(name.to_string()))?;
+        let table_engine = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+
+        let mut docs = Vec::new();
+        for (_entry_key, row_key) in index_engine.scan_prefix(&index_prefix(value))? {
+            if let Some(bytes) = table_engine.get(&row_key)? {
+                if let Value::Document(doc) = Value::decode(&bytes)
+                    .map_err(|e| EngineError::Constraint(format!("corrupt row: {e}")))?
+                {
+                    docs.push(doc);
+                }
+            }
+        }
+        Ok(docs)
     }
 
     // ---- helpers ----
@@ -286,15 +432,60 @@ impl Database {
 }
 
 /// A pending row rewrite for `UPDATE`: delete `old_key` if the primary key
-/// changed, then write `bytes` under `new_key`.
+/// changed, then write the new document under `new_key`. The documents are kept
+/// so secondary indexes can be updated.
 struct RowChange {
     old_key: Vec<u8>,
+    old_doc: Document,
     new_key: Vec<u8>,
-    bytes: Vec<u8>,
+    new_doc: Document,
 }
 
 fn table_dir(root: &Path, name: &str) -> PathBuf {
     root.join("tables").join(name)
+}
+
+fn index_dir(root: &Path, name: &str) -> PathBuf {
+    root.join("indexes").join(name)
+}
+
+/// The indexed value of `doc` at `path` (a missing field indexes as `NULL`).
+fn index_value(doc: &Document, path: &str) -> Value {
+    doc.get_path(path).cloned().unwrap_or(Value::Null)
+}
+
+/// Index entry key: `[indexed_value, row_key]` encoded order-preservingly, so
+/// all entries for one value share a common byte prefix.
+fn index_entry_key(value: &Value, row_key: &[u8]) -> Vec<u8> {
+    Value::Array(vec![value.clone(), Value::Bytes(row_key.to_vec())]).encode_key()
+}
+
+/// The shared byte prefix of every index entry for `value` (the encoding of the
+/// single-element array `[value]` without its trailing array terminator).
+fn index_prefix(value: &Value) -> Vec<u8> {
+    let mut key = Value::Array(vec![value.clone()]).encode_key();
+    key.pop(); // drop the array-terminator byte
+    key
+}
+
+/// Recognize a `path = literal` (or `literal = path`) predicate for index use.
+fn index_equality(filter: &Option<Expr>) -> Option<(String, Value)> {
+    let Some(Expr::Binary {
+        op: BinaryOp::Eq,
+        left,
+        right,
+    }) = filter
+    else {
+        return None;
+    };
+    match (left.as_ref(), right.as_ref()) {
+        (Expr::Column(p), Expr::Literal(v)) | (Expr::Literal(v), Expr::Column(p))
+            if !v.is_null() =>
+        {
+            Some((p.clone(), v.clone()))
+        }
+        _ => None,
+    }
 }
 
 fn matches_filter(filter: &Option<Expr>, doc: &Document) -> Result<bool> {

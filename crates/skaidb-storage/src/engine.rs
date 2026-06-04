@@ -19,6 +19,12 @@ use crate::memtable::{Memtable, VersionValue};
 use crate::sstable::{SsTable, SstEntry};
 use crate::wal::{Wal, WalOp, WalRecord};
 
+/// The latest version of each key, keyed by storage key (used by merged reads).
+type MergedRows = std::collections::BTreeMap<Vec<u8>, (Hlc, VersionValue)>;
+
+/// A live key/value pair together with its version stamp.
+pub type VersionedRow = (Vec<u8>, Vec<u8>, Hlc);
+
 /// Default memtable size that triggers a flush (SPEC §9.1: 256 MiB).
 pub const DEFAULT_FLUSH_THRESHOLD_BYTES: usize = 256 * 1024 * 1024;
 /// Number of level-0 tables that triggers compaction.
@@ -139,6 +145,31 @@ impl Engine {
         Ok(hlc)
     }
 
+    /// Apply a write at a caller-supplied stamp (replication: a replica stores
+    /// the coordinator's stamp). The local clock is advanced past `hlc`.
+    pub fn put_with_hlc(&mut self, key: &[u8], value: Vec<u8>, hlc: Hlc) -> Result<()> {
+        self.clock.observe(hlc);
+        self.wal.append(&WalRecord {
+            hlc,
+            key: key.to_vec(),
+            op: WalOp::Put(value.clone()),
+        })?;
+        self.mem.insert(key.to_vec(), hlc, VersionValue::Put(value));
+        self.maybe_flush()
+    }
+
+    /// Apply a delete at a caller-supplied stamp (replication).
+    pub fn delete_with_hlc(&mut self, key: &[u8], hlc: Hlc) -> Result<()> {
+        self.clock.observe(hlc);
+        self.wal.append(&WalRecord {
+            hlc,
+            key: key.to_vec(),
+            op: WalOp::Delete,
+        })?;
+        self.mem.insert(key.to_vec(), hlc, VersionValue::Delete);
+        self.maybe_flush()
+    }
+
     /// Latest committed value for `key`, or `None` if absent or deleted.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         // Memtable is authoritative if it holds any version of the key.
@@ -181,9 +212,47 @@ impl Engine {
     /// Full scan of the latest live key/value pairs across all sources, in key
     /// order.
     pub fn scan(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        Ok(self
+            .merged()?
+            .into_iter()
+            .filter_map(|(k, (_, v))| match v {
+                VersionValue::Put(bytes) => Some((k, bytes)),
+                VersionValue::Delete => None,
+            })
+            .collect())
+    }
+
+    /// Like [`Engine::scan`] but also returns each row's version stamp, so a
+    /// coordinator can resolve replicas by last-writer-wins (SPEC §5).
+    pub fn scan_versioned(&self) -> Result<Vec<VersionedRow>> {
+        Ok(self
+            .merged()?
+            .into_iter()
+            .filter_map(|(k, (hlc, v))| match v {
+                VersionValue::Put(bytes) => Some((k, bytes, hlc)),
+                VersionValue::Delete => None,
+            })
+            .collect())
+    }
+
+    /// Scan only the live keys that start with `prefix`, in key order. Used by
+    /// secondary indexes, whose entries are prefixed by the indexed value.
+    pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        Ok(self
+            .merged()?
+            .into_iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .filter_map(|(k, (_, v))| match v {
+                VersionValue::Put(bytes) => Some((k, bytes)),
+                VersionValue::Delete => None,
+            })
+            .collect())
+    }
+
+    /// Merge all sources into the latest version per key (newest stamp wins).
+    fn merged(&self) -> Result<MergedRows> {
         use std::collections::BTreeMap;
-        // For each key keep the version with the highest stamp.
-        let mut merged: BTreeMap<Vec<u8>, (Hlc, VersionValue)> = BTreeMap::new();
+        let mut merged: MergedRows = BTreeMap::new();
         let mut consider = |key: Vec<u8>, hlc: Hlc, value: VersionValue| {
             merged
                 .entry(key)
@@ -194,7 +263,6 @@ impl Engine {
                 })
                 .or_insert((hlc, value));
         };
-
         for (key, hlc, value) in self.mem.iter_latest_entries() {
             consider(key, hlc, value);
         }
@@ -203,14 +271,7 @@ impl Engine {
                 consider(e.key, e.hlc, e.value);
             }
         }
-
-        Ok(merged
-            .into_iter()
-            .filter_map(|(k, (_, v))| match v {
-                VersionValue::Put(bytes) => Some((k, bytes)),
-                VersionValue::Delete => None,
-            })
-            .collect())
+        Ok(merged)
     }
 
     /// Force the active memtable to flush to an SSTable (no-op if empty).
