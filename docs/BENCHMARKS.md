@@ -214,10 +214,6 @@ within noise, by design:
 
 ## Caveats
 
-- **skaidb columns were re-measured in isolation** (2026-06-04), with the other
-  four databases idle, whereas the original matrix ran all five back-to-back.
-  The quieter host most plausibly explains skaidb's stronger high-concurrency
-  read scaling this time; treat cross-system gaps at 64c as generous to skaidb.
 - **MongoDB 8 requires a Linux kernel < 6.19.** On a ≥6.19 kernel, 8.0.15+ refuse
   to start (a guard for [SERVER-121912](https://jira.mongodb.org/browse/SERVER-121912))
   and 8.0.0 segfaults. The host was pinned to kernel `6.17` so MongoDB 8 could run;
