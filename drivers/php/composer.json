@@ -1,0 +1,24 @@
+{
+    "name": "skaidb/skaidb",
+    "description": "Official pure-PHP client driver for skaidb, with a PDO-shaped API.",
+    "type": "library",
+    "license": "SSPL-1.0",
+    "keywords": ["skaidb", "database", "sql", "driver", "pdo"],
+    "require": {
+        "php": ">=8.0",
+        "ext-hash": "*"
+    },
+    "suggest": {
+        "ext-sockets": "Optional; the driver uses stream sockets and works without it.",
+        "ext-bcmath": "Exact 128-bit Decimal mantissa handling (or ext-gmp).",
+        "ext-gmp": "Exact 128-bit Decimal mantissa handling (or ext-bcmath)."
+    },
+    "autoload": {
+        "psr-4": {
+            "Skaidb\\": "src/"
+        },
+        "files": [
+            "src/Skaidb.php"
+        ]
+    }
+}

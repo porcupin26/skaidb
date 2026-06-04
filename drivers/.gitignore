@@ -1,0 +1,21 @@
+# Driver build artifacts
+java/out/
+*.class
+*.jar
+
+# .NET
+dotnet/**/bin/
+dotnet/**/obj/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# Node
+node_modules/
+
+# Go
+go.sum

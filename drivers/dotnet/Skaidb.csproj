@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+
+    <PackageId>Skaidb</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>skaidb</Authors>
+    <Description>Official C# / .NET driver for skaidb (binary wire protocol). Pure BCL, no dependencies. ADO.NET-shaped API.</Description>
+    <PackageLicenseExpression>SSPL-1.0</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/skaidb/skaidb</RepositoryUrl>
+  </PropertyGroup>
+
+</Project>

@@ -98,6 +98,15 @@ reads still gather from replicas and filter).
 
 See `.priv/SPEC.md` for the full design.
 
+## Client drivers
+
+Official, dependency-free drivers for **Python, Node.js/TypeScript, Go, Java,
+Ruby, PHP, and C#/.NET** live in [`drivers/`](drivers/). Each mirrors the
+idiomatic database API of its language (DB-API 2.0, `pg`, `database/sql`, JDBC,
+the `pg` gem, PDO, ADO.NET) so there's almost nothing new to learn, and each
+speaks the binary protocol directly with SCRAM auth and safe parameter binding.
+The wire protocol is specified in [`drivers/PROTOCOL.md`](drivers/PROTOCOL.md).
+
 ## License
 
 skaidb is licensed under the **Server Side Public License, version 1 (SSPL-1.0)** —

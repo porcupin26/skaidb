@@ -1,0 +1,11 @@
+{
+  "name": "skaidb",
+  "version": "0.1.0",
+  "description": "Official skaidb driver for Node.js. node-postgres-style API, zero dependencies.",
+  "main": "skaidb.js",
+  "types": "skaidb.d.ts",
+  "license": "SSPL-1.0",
+  "keywords": ["skaidb", "database", "sql", "driver"],
+  "engines": { "node": ">=16" },
+  "files": ["skaidb.js", "skaidb.d.ts"]
+}

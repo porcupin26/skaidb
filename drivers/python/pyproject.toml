@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skaidb"
+version = "0.1.0"
+description = "Official skaidb driver (DB-API 2.0). Pure standard library, no dependencies."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "SSPL-1.0" }
+keywords = ["skaidb", "database", "sql", "dbapi", "pep249"]
+
+[tool.setuptools]
+packages = ["skaidb"]
