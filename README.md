@@ -66,12 +66,22 @@ Types: `null, bool, int64, float64, decimal, string, bytes, uuid, timestamp`
 
 ## Status & deferred work
 
-Implemented end-to-end and tested. The transport is the raw-TCP fast path; the
-following are designed for but not yet built: **QUIC** transport and the
-push-based control plane, **secondary-index-accelerated** reads (indexes are
-recorded but reads full-scan), cross-node **replication wiring** (the ring and
-quorum logic exist as a library), **distributed/multi-key transactions**, and
-per-connection **auth handshake + RBAC enforcement** (the crypto, credentials,
-and role model exist; the protocol does not yet carry an identity).
+Implemented end-to-end and tested (138 tests):
+
+- soft-schema document model, SQL subset, 3-valued logic
+- LSM storage: WAL recovery, SSTables + Bloom filters, lazy-leveled compaction
+- **secondary indexes** that accelerate `WHERE path = value`
+- **auth**: SCRAM-SHA-256 handshake (mutual auth) + per-statement **RBAC**
+- **cross-node replication**: consistent-hash placement, quorum writes,
+  scatter-gather reads merged by HLC last-writer-wins, quorum-broadcast DDL,
+  one-node-down tolerance
+- binary + REST endpoints, Prometheus metrics, masked audit logs
+
+Designed for but deliberately not yet built: **QUIC** transport + push-based
+control plane (the raw-TCP fast path is in; QUIC needs an async runtime),
+**distributed/multi-key transactions** (needs a coordinator/2PC), active
+**read-repair & hinted handoff** (convergence currently relies on write
+quorums), and **secondary-index use in the distributed read path** (cluster
+reads full-scan).
 
 See `.priv/SPEC.md` for the full design.
