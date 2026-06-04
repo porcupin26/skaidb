@@ -80,6 +80,35 @@ op is its own committed/acked operation.
 | read 16c  | 2,324 | 2,442 | **2,639** | 2,229 | 2,430 |
 | mixed 16c | 2,007 | 1,678 | 2,065 | **2,691** | 1,023 |
 
+## skaidb: reads and writes on **all nodes** (leaderless)
+
+skaidb is leaderless — every node accepts both reads and writes and coordinates
+the quorum itself. Verified directly: inserting a row through each of the three
+nodes and then reading each row back from a *different* node returns consistent
+results, and a full scan from any node sees all three writes.
+
+The table below compares driving all client load at a **single coordinator**
+node vs **fanning the 16 connections across all 3 nodes** (round-robin), both in
+the C4 (3-node, quorum 2-of-3) config:
+
+| Workload | single coordinator | all 3 nodes (fan-out) |
+|----------|-------------------:|----------------------:|
+| write 16c | **1,584** | 1,157 |
+| read 16c  | 2,324 | 2,269 |
+| mixed 16c | 2,007 | 2,096 |
+
+**Reads and mixed are flat; concurrent writes are *lower* when fanned out.**
+That's expected on **1-core** nodes: with one coordinator, only that node runs
+the coordination/replication logic while the other two just apply replicas. When
+every node is also a coordinator, each one simultaneously coordinates its own
+writes *and* receives replication from the other two — so all three single cores
+saturate, and group-commit batching is split three ways instead of concentrated.
+
+The takeaway: serving reads/writes from all nodes is about **availability and
+client locality** (connect to any node, tolerate losing one), not extra write
+throughput on tiny nodes. On multi-core nodes, fan-out would spread coordinator
+CPU and help; here, the single core per node is the ceiling.
+
 ## Memory footprint (idle, of 512 MB per node)
 
 | | skaidb | MongoDB 7 | MongoDB 8 | PostgreSQL | MariaDB |

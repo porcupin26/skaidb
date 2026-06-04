@@ -19,7 +19,9 @@ fn main() {
         eprintln!("usage: bench <addr> <user> <pass> <write|read|mixed> <ops> <threads> [preload]");
         std::process::exit(2);
     }
-    let addr = args[1].clone();
+    // First arg may be a comma-separated list of node addresses; threads are
+    // spread across them round-robin (leaderless: any node coordinates).
+    let addrs: Vec<String> = args[1].split(',').map(|s| s.trim().to_string()).collect();
     let user = args[2].clone();
     let pass = args[3].clone();
     let mode = args[4].clone();
@@ -27,11 +29,11 @@ fn main() {
     let threads: usize = args[6].parse().expect("threads");
     let preload: usize = args.get(7).map(|s| s.parse().unwrap()).unwrap_or(1000);
 
-    let cfg = Arc::new((addr, user, pass));
+    let cfg = Arc::new((addrs, user, pass));
 
     // Fresh table; preload rows for read/mixed.
     {
-        let mut c = connect(&cfg);
+        let mut c = connect(&cfg, 0);
         let _ = c.execute("DROP TABLE IF EXISTS bench");
         run_ok(&mut c, "CREATE TABLE bench (PRIMARY KEY (id))");
         if mode != "write" {
@@ -52,7 +54,7 @@ fn main() {
         let cfg = Arc::clone(&cfg);
         let mode = mode.clone();
         handles.push(std::thread::spawn(move || {
-            let mut client = connect(&cfg);
+            let mut client = connect(&cfg, t);
             let mut lat = Vec::with_capacity(per_thread);
             let mut errors = 0u64;
             let mut rng = 0x9e37_79b9_7f4a_7c15u64 ^ (t as u64).wrapping_mul(0x2545_f491_4f6c_dd1d);
@@ -111,8 +113,10 @@ fn build_op(mode: &str, thread: usize, i: usize, preload: usize, rng: &mut u64) 
     }
 }
 
-fn connect(cfg: &(String, String, String)) -> Client {
-    Client::connect_with(&cfg.0, &cfg.1, &cfg.2).expect("connect")
+/// Connect thread `idx` to one of the configured node addresses (round-robin).
+fn connect(cfg: &(Vec<String>, String, String), idx: usize) -> Client {
+    let addr = &cfg.0[idx % cfg.0.len()];
+    Client::connect_with(addr, &cfg.1, &cfg.2).expect("connect")
 }
 
 fn run_ok(c: &mut Client, sql: &str) {
