@@ -13,6 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::compress::Codec;
 use crate::error::{Result, StorageError};
 use crate::hlc::{Hlc, HlcClock};
 use crate::memtable::{Memtable, VersionValue};
@@ -38,6 +39,10 @@ pub struct EngineOptions {
     pub flush_threshold_bytes: usize,
     pub l0_compaction_trigger: usize,
     pub level1_capacity: u64,
+    /// Codec for freshly flushed and upper-level SSTables (fast path).
+    pub compression: Codec,
+    /// Codec for the deepest (cold, write-once) level (high ratio).
+    pub bottom_compression: Codec,
 }
 
 impl Default for EngineOptions {
@@ -46,6 +51,8 @@ impl Default for EngineOptions {
             flush_threshold_bytes: DEFAULT_FLUSH_THRESHOLD_BYTES,
             l0_compaction_trigger: DEFAULT_L0_COMPACTION_TRIGGER,
             level1_capacity: DEFAULT_LEVEL1_CAPACITY,
+            compression: Codec::Lz4,
+            bottom_compression: Codec::Brotli,
         }
     }
 }
@@ -333,7 +340,8 @@ impl Engine {
             .map(|(key, hlc, value)| SstEntry { key, hlc, value })
             .collect();
 
-        let (sst, _path) = self.write_table(&entries)?;
+        let codec = self.opts.compression;
+        let (sst, _path) = self.write_table(&entries, codec)?;
         self.l0.insert(0, sst);
 
         self.mem = Memtable::new();
@@ -376,11 +384,21 @@ impl Engine {
         self.l0.iter().chain(self.levels.iter())
     }
 
-    fn write_table(&mut self, entries: &[SstEntry]) -> Result<(SsTable, PathBuf)> {
+    /// Pick the codec for a compaction output: the high-ratio bottom codec for
+    /// the deepest (cold) level, the fast codec otherwise.
+    fn codec_for(&self, deepest: bool) -> Codec {
+        if deepest {
+            self.opts.bottom_compression
+        } else {
+            self.opts.compression
+        }
+    }
+
+    fn write_table(&mut self, entries: &[SstEntry], codec: Codec) -> Result<(SsTable, PathBuf)> {
         let seq = self.next_seq;
         self.next_seq += 1;
         let path = self.dir.join("sst").join(format!("{seq:020}.sst"));
-        let sst = SsTable::write(&path, entries)?;
+        let sst = SsTable::write(&path, entries, codec)?;
         Ok((sst, path))
     }
 
@@ -399,7 +417,8 @@ impl Engine {
         let merged = merge_tables(&sources, deepest)?;
         let old_paths = collect_paths(&self.l0, self.levels.first());
 
-        let (new_l1, _) = self.write_table(&merged)?;
+        let codec = self.codec_for(deepest);
+        let (new_l1, _) = self.write_table(&merged, codec)?;
         self.l0.clear();
         if self.levels.is_empty() {
             self.levels.push(new_l1);
@@ -427,7 +446,8 @@ impl Engine {
                 old_paths.push(self.levels[level + 1].path().to_path_buf());
             }
 
-            let (new_run, _) = self.write_table(&merged)?;
+            let codec = self.codec_for(deepest);
+            let (new_run, _) = self.write_table(&merged, codec)?;
             if has_next {
                 self.levels[level + 1] = new_run;
                 self.levels.remove(level);
@@ -575,6 +595,7 @@ mod tests {
             flush_threshold_bytes: 256,
             l0_compaction_trigger: 3,
             level1_capacity: 8,
+            ..Default::default()
         }
     }
 

@@ -9,6 +9,7 @@ use std::io;
 use std::net::TcpStream;
 
 use skaidb_proto::{read_frame, write_frame};
+use skaidb_storage::compress::{compress, decompress, Codec};
 use skaidb_storage::Hlc;
 
 /// A request from a coordinator to a peer member.
@@ -204,6 +205,50 @@ impl Response {
     }
 }
 
+/// Payloads at or above this size are LZ4-compressed on the wire. Small frames
+/// (acks, point writes/reads) stay raw — compression would only add overhead.
+const COMPRESS_THRESHOLD: usize = 256;
+
+/// Wrap a raw message payload in a compression envelope so the peer can tell
+/// whether to decompress: `[codec u8] [u32 uncompressed_len if codec!=None] [body]`.
+///
+/// LZ4 is used (fast, cheap on the small cores nodes run on); a payload that
+/// doesn't shrink, or is below [`COMPRESS_THRESHOLD`], is sent uncompressed.
+pub(crate) fn frame_encode(payload: &[u8]) -> Vec<u8> {
+    if payload.len() >= COMPRESS_THRESHOLD {
+        let comp = compress(Codec::Lz4, payload);
+        if comp.len() + 5 < payload.len() {
+            let mut out = Vec::with_capacity(comp.len() + 5);
+            out.push(Codec::Lz4.to_u8());
+            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            out.extend_from_slice(&comp);
+            return out;
+        }
+    }
+    let mut out = Vec::with_capacity(payload.len() + 1);
+    out.push(Codec::None.to_u8());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Reverse of [`frame_encode`]: recover the raw message payload.
+pub(crate) fn frame_decode(framed: &[u8]) -> Result<Vec<u8>, WireError> {
+    let (&tag, rest) = framed
+        .split_first()
+        .ok_or(WireError::Malformed("empty frame"))?;
+    match Codec::from_u8(tag) {
+        Some(Codec::None) => Ok(rest.to_vec()),
+        Some(codec) => {
+            let len_bytes = rest
+                .get(..4)
+                .ok_or(WireError::Malformed("short compressed frame"))?;
+            let ulen = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+            decompress(codec, &rest[4..], ulen).map_err(|_| WireError::Malformed("decompress"))
+        }
+        None => Err(WireError::Malformed("unknown wire codec")),
+    }
+}
+
 /// Send one request to `addr` and read the response (a fresh connection).
 pub fn call(addr: &str, req: &Request) -> io::Result<Response> {
     let mut stream = TcpStream::connect(addr)?;
@@ -212,8 +257,10 @@ pub fn call(addr: &str, req: &Request) -> io::Result<Response> {
 }
 
 fn roundtrip(stream: &mut TcpStream, req: &Request) -> io::Result<Response> {
-    write_frame(stream, &req.encode())?;
-    let payload = read_frame(stream)?;
+    write_frame(stream, &frame_encode(&req.encode()))?;
+    let framed = read_frame(stream)?;
+    let payload =
+        frame_decode(&framed).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     Response::decode(&payload)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
 }
@@ -369,5 +416,44 @@ mod tests {
         ] {
             assert_eq!(Response::decode(&res.encode()).unwrap(), res);
         }
+    }
+
+    #[test]
+    fn frame_envelope_roundtrips_small_and_large() {
+        // Small payload stays raw; large compressible payload is LZ4'd.
+        let small = vec![1u8, 2, 3];
+        let large = b"row-row-row-your-boat ".repeat(64);
+
+        let small_framed = frame_encode(&small);
+        assert_eq!(small_framed[0], Codec::None.to_u8());
+        assert_eq!(frame_decode(&small_framed).unwrap(), small);
+
+        let large_framed = frame_encode(&large);
+        assert_eq!(large_framed[0], Codec::Lz4.to_u8());
+        assert!(large_framed.len() < large.len(), "large frame should shrink");
+        assert_eq!(frame_decode(&large_framed).unwrap(), large);
+    }
+
+    #[test]
+    fn frame_decode_rejects_garbage() {
+        assert!(frame_decode(&[]).is_err());
+        assert!(frame_decode(&[99]).is_err()); // unknown codec tag
+    }
+
+    #[test]
+    fn large_scan_response_survives_frame_envelope() {
+        let rows: Vec<(Vec<u8>, Vec<u8>, Hlc)> = (0..200)
+            .map(|i| {
+                (
+                    format!("key{i:04}").into_bytes(),
+                    format!("a fairly repetitive value number {i}").into_bytes(),
+                    Hlc::new(i as u64, 0),
+                )
+            })
+            .collect();
+        let res = Response::Scan { rows };
+        let framed = frame_encode(&res.encode());
+        let payload = frame_decode(&framed).unwrap();
+        assert_eq!(Response::decode(&payload).unwrap(), res);
     }
 }

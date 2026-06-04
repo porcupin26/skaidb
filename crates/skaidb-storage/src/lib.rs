@@ -8,6 +8,7 @@
 //!   and crash recovery.
 
 mod bloom;
+pub mod compress;
 mod crc;
 pub mod engine;
 pub mod hlc;
@@ -17,6 +18,7 @@ pub mod wal;
 
 mod error;
 
+pub use compress::Codec;
 pub use engine::{Engine, EngineOptions, DEFAULT_FLUSH_THRESHOLD_BYTES};
 pub use error::{Result, StorageError};
 pub use hlc::{Hlc, HlcClock};

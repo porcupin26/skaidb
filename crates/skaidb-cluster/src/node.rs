@@ -107,12 +107,12 @@ impl Node {
         // Disable Nagle: connections are pooled and reused for many small
         // request/response frames, so Nagle + delayed-ACK would add ~40 ms.
         stream.set_nodelay(true).ok();
-        while let Ok(payload) = read_frame(&mut stream) {
-            let response = match Request::decode(&payload) {
+        while let Ok(framed) = read_frame(&mut stream) {
+            let response = match internode::frame_decode(&framed).and_then(|p| Request::decode(&p)) {
                 Ok(req) => self.apply_local(req),
                 Err(e) => Response::Err(e.to_string()),
             };
-            if write_frame(&mut stream, &response.encode()).is_err() {
+            if write_frame(&mut stream, &internode::frame_encode(&response.encode())).is_err() {
                 return;
             }
         }

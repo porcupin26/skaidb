@@ -1,15 +1,17 @@
-//! Immutable sorted-string tables (SPEC §12).
+//! Immutable sorted-string tables with block compression (SPEC §12).
 //!
-//! A memtable flush writes its latest version per key to an SSTable: an
-//! append-only file of key-sorted entries, followed by a full key→offset index
-//! and a Bloom filter, then a fixed footer. Files are never mutated; compaction
-//! produces new files and removes old ones.
+//! A memtable flush writes its latest version per key to an SSTable: key-sorted
+//! entries grouped into fixed-ish **blocks**, each compressed independently with
+//! the table's [`Codec`]. A block index (first key → file offset + sizes) plus a
+//! Bloom filter make a point read decompress just one block; a scan decompresses
+//! all of them. Files are never mutated; compaction writes new files.
 //!
-//! Layout: `[data][index][bloom][footer(32)]`, all integers little-endian.
-//! - data entry: `u32 keylen | key | hlc[12] | u8 op | (op==Put) u32 vlen | val`
-//! - index:      `u64 count | (u32 keylen | key | u64 offset)*`
-//! - bloom:      the bytes of [`Bloom::encode`]
-//! - footer:     `u64 index_off | u64 bloom_off | u64 count | u64 magic`
+//! Layout: `[block0][block1]...[index][bloom][footer(40)]`, integers little-endian.
+//! - block:  the codec-compressed bytes of a run of entries
+//! - entry (uncompressed): `u32 keylen | key | hlc[12] | u8 op | (Put) u32 vlen | val`
+//! - index:  `u64 nblocks | (u32 keylen | first_key | u64 offset | u32 comp | u32 uncomp)*`
+//! - bloom:  the bytes of [`Bloom::encode`]
+//! - footer: `u64 index_off | u64 bloom_off | u64 entry_count | u64 codec | u64 magic`
 
 use std::fs::File;
 use std::io::Write;
@@ -17,15 +19,18 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use crate::bloom::Bloom;
+use crate::compress::{compress, decompress, Codec};
 use crate::error::{Result, StorageError};
 use crate::hlc::Hlc;
 use crate::memtable::VersionValue;
 
 const MAGIC: u64 = 0x736b_6169_6462_5354; // "skaidbST"
-const FOOTER_LEN: u64 = 32;
+const FOOTER_LEN: u64 = 40;
 const OP_PUT: u8 = 0;
 const OP_DELETE: u8 = 1;
 const BLOOM_FP_RATE: f64 = 0.01;
+/// Target uncompressed size of a data block before it is sealed.
+const BLOCK_TARGET: usize = 4096;
 
 /// One entry as stored in (or read from) an SSTable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,72 +40,105 @@ pub struct SstEntry {
     pub value: VersionValue,
 }
 
+/// In-memory description of one on-disk compressed block.
+#[derive(Debug, Clone)]
+struct BlockMeta {
+    first_key: Vec<u8>,
+    offset: u64,
+    comp_len: u32,
+    uncomp_len: u32,
+}
+
 /// A handle to an immutable on-disk SSTable.
 #[derive(Debug)]
 pub struct SsTable {
     file: File,
     path: PathBuf,
-    /// Full, in-memory key→offset index (sorted by key).
-    index: Vec<(Vec<u8>, u64)>,
+    codec: Codec,
+    blocks: Vec<BlockMeta>,
     bloom: Bloom,
-    data_end: u64,
     entry_count: u64,
 }
 
 impl SsTable {
-    /// Write `entries` (which must be sorted by key, unique) to a new SSTable.
-    pub fn write(path: impl AsRef<Path>, entries: &[SstEntry]) -> Result<SsTable> {
+    /// Write `entries` (sorted by key, unique) to a new SSTable using `codec`.
+    pub fn write(path: impl AsRef<Path>, entries: &[SstEntry], codec: Codec) -> Result<SsTable> {
         let path = path.as_ref().to_path_buf();
-        let mut buf = Vec::new();
-        let mut index: Vec<(Vec<u8>, u64)> = Vec::with_capacity(entries.len());
         let keys: Vec<Vec<u8>> = entries.iter().map(|e| e.key.clone()).collect();
 
+        // Group entries into uncompressed blocks of ~BLOCK_TARGET bytes.
+        let mut raw_blocks: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut buf = Vec::new();
+        let mut first: Option<Vec<u8>> = None;
         for e in entries {
-            let offset = buf.len() as u64;
+            if first.is_none() {
+                first = Some(e.key.clone());
+            }
             encode_entry(&mut buf, e);
-            index.push((e.key.clone(), offset));
+            if buf.len() >= BLOCK_TARGET {
+                raw_blocks.push((first.take().unwrap(), std::mem::take(&mut buf)));
+            }
         }
-        let data_end = buf.len() as u64;
+        if !buf.is_empty() {
+            raw_blocks.push((first.take().unwrap(), buf));
+        }
+
+        // Compress each block; build the data region and the block index.
+        let mut data = Vec::new();
+        let mut blocks: Vec<BlockMeta> = Vec::with_capacity(raw_blocks.len());
+        for (fk, raw) in &raw_blocks {
+            let comp = compress(codec, raw);
+            let offset = data.len() as u64;
+            data.extend_from_slice(&comp);
+            blocks.push(BlockMeta {
+                first_key: fk.clone(),
+                offset,
+                comp_len: comp.len() as u32,
+                uncomp_len: raw.len() as u32,
+            });
+        }
 
         // Index block.
-        let index_off = buf.len() as u64;
-        buf.extend_from_slice(&(entries.len() as u64).to_le_bytes());
-        for (key, offset) in &index {
-            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-            buf.extend_from_slice(key);
-            buf.extend_from_slice(&offset.to_le_bytes());
+        let index_off = data.len() as u64;
+        data.extend_from_slice(&(blocks.len() as u64).to_le_bytes());
+        for b in &blocks {
+            data.extend_from_slice(&(b.first_key.len() as u32).to_le_bytes());
+            data.extend_from_slice(&b.first_key);
+            data.extend_from_slice(&b.offset.to_le_bytes());
+            data.extend_from_slice(&b.comp_len.to_le_bytes());
+            data.extend_from_slice(&b.uncomp_len.to_le_bytes());
         }
 
         // Bloom block.
         let bloom = Bloom::build(&keys, BLOOM_FP_RATE);
-        let bloom_off = buf.len() as u64;
-        buf.extend_from_slice(&bloom.encode());
+        let bloom_off = data.len() as u64;
+        data.extend_from_slice(&bloom.encode());
 
         // Footer.
-        buf.extend_from_slice(&index_off.to_le_bytes());
-        buf.extend_from_slice(&bloom_off.to_le_bytes());
-        buf.extend_from_slice(&(entries.len() as u64).to_le_bytes());
-        buf.extend_from_slice(&MAGIC.to_le_bytes());
+        data.extend_from_slice(&index_off.to_le_bytes());
+        data.extend_from_slice(&bloom_off.to_le_bytes());
+        data.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        data.extend_from_slice(&(codec.to_u8() as u64).to_le_bytes());
+        data.extend_from_slice(&MAGIC.to_le_bytes());
 
         {
             let mut file = File::create(&path)?;
-            file.write_all(&buf)?;
+            file.write_all(&data)?;
             file.sync_all()?;
         }
-        // Reopen read-only: the write handle above cannot serve `read_at`.
         let file = File::open(&path)?;
 
         Ok(SsTable {
             file,
             path,
-            index,
+            codec,
+            blocks,
             bloom,
-            data_end,
             entry_count: entries.len() as u64,
         })
     }
 
-    /// Open an existing SSTable, loading its index and Bloom filter into memory.
+    /// Open an existing SSTable, loading its block index and Bloom filter.
     pub fn open(path: impl AsRef<Path>) -> Result<SsTable> {
         let path = path.as_ref().to_path_buf();
         let file = File::open(&path)?;
@@ -114,7 +152,8 @@ impl SsTable {
         let index_off = u64::from_le_bytes(footer[0..8].try_into().unwrap());
         let bloom_off = u64::from_le_bytes(footer[8..16].try_into().unwrap());
         let entry_count = u64::from_le_bytes(footer[16..24].try_into().unwrap());
-        let magic = u64::from_le_bytes(footer[24..32].try_into().unwrap());
+        let codec = Codec::from_u8(footer[24]).ok_or_else(|| corrupt("unknown codec"))?;
+        let magic = u64::from_le_bytes(footer[32..40].try_into().unwrap());
         if magic != MAGIC {
             return Err(corrupt("bad magic"));
         }
@@ -122,13 +161,11 @@ impl SsTable {
             return Err(corrupt("inconsistent footer offsets"));
         }
 
-        // Read and parse the index block.
         let index_len = (bloom_off - index_off) as usize;
         let mut index_buf = vec![0u8; index_len];
         file.read_exact_at(&mut index_buf, index_off)?;
-        let index = parse_index(&index_buf)?;
+        let blocks = parse_block_index(&index_buf)?;
 
-        // Read and decode the Bloom block.
         let bloom_len = (file_len - FOOTER_LEN - bloom_off) as usize;
         let mut bloom_buf = vec![0u8; bloom_len];
         file.read_exact_at(&mut bloom_buf, bloom_off)?;
@@ -137,9 +174,9 @@ impl SsTable {
         Ok(SsTable {
             file,
             path,
-            index,
+            codec,
+            blocks,
             bloom,
-            data_end: index_off,
             entry_count,
         })
     }
@@ -163,36 +200,46 @@ impl SsTable {
         if !self.bloom.contains(key) {
             return Ok(None);
         }
-        let idx = match self.index.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
-            Ok(i) => i,
-            Err(_) => return Ok(None),
-        };
-        let (_, offset) = &self.index[idx];
-        let (entry, _) = self.read_entry_at(*offset)?;
-        Ok(Some((entry.hlc, entry.value)))
+        // The block that may contain `key` is the last one whose first key <= key.
+        let i = self.blocks.partition_point(|b| b.first_key.as_slice() <= key);
+        if i == 0 {
+            return Ok(None);
+        }
+        let block = self.read_block(&self.blocks[i - 1])?;
+        let mut pos = 0;
+        while pos < block.len() {
+            let (entry, next) = decode_entry(&block, pos)?;
+            if entry.key.as_slice() == key {
+                return Ok(Some((entry.hlc, entry.value)));
+            }
+            if entry.key.as_slice() > key {
+                break; // entries are sorted; past the key
+            }
+            pos = next;
+        }
+        Ok(None)
     }
 
     /// Read every entry in key order (used by scans and compaction).
     pub fn entries(&self) -> Result<Vec<SstEntry>> {
-        let mut buf = vec![0u8; self.data_end as usize];
-        self.file.read_exact_at(&mut buf, 0)?;
         let mut out = Vec::with_capacity(self.entry_count as usize);
-        let mut pos = 0usize;
-        while pos < buf.len() {
-            let (entry, next) = decode_entry(&buf, pos)?;
-            out.push(entry);
-            pos = next;
+        for meta in &self.blocks {
+            let block = self.read_block(meta)?;
+            let mut pos = 0;
+            while pos < block.len() {
+                let (entry, next) = decode_entry(&block, pos)?;
+                out.push(entry);
+                pos = next;
+            }
         }
         Ok(out)
     }
 
-    fn read_entry_at(&self, offset: u64) -> Result<(SstEntry, u64)> {
-        // Read a generous window covering the entry; entries are small.
-        let remaining = self.data_end - offset;
-        let mut buf = vec![0u8; remaining as usize];
-        self.file.read_exact_at(&mut buf, offset)?;
-        let (entry, next) = decode_entry(&buf, 0)?;
-        Ok((entry, offset + next as u64))
+    /// Read and decompress one block from disk.
+    fn read_block(&self, meta: &BlockMeta) -> Result<Vec<u8>> {
+        let mut comp = vec![0u8; meta.comp_len as usize];
+        self.file.read_exact_at(&mut comp, meta.offset)?;
+        decompress(self.codec, &comp, meta.uncomp_len as usize)
     }
 }
 
@@ -232,15 +279,22 @@ fn decode_entry(buf: &[u8], start: usize) -> Result<(SstEntry, usize)> {
     Ok((SstEntry { key, hlc, value }, pos))
 }
 
-fn parse_index(buf: &[u8]) -> Result<Vec<(Vec<u8>, u64)>> {
+fn parse_block_index(buf: &[u8]) -> Result<Vec<BlockMeta>> {
     let mut pos = 0;
-    let count = read_u64(buf, &mut pos)? as usize;
-    let mut out = Vec::with_capacity(count);
-    for _ in 0..count {
+    let n = read_u64(buf, &mut pos)? as usize;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
         let key_len = read_u32(buf, &mut pos)? as usize;
-        let key = take(buf, &mut pos, key_len)?.to_vec();
+        let first_key = take(buf, &mut pos, key_len)?.to_vec();
         let offset = read_u64(buf, &mut pos)?;
-        out.push((key, offset));
+        let comp_len = read_u32(buf, &mut pos)?;
+        let uncomp_len = read_u32(buf, &mut pos)?;
+        out.push(BlockMeta {
+            first_key,
+            offset,
+            comp_len,
+            uncomp_len,
+        });
     }
     Ok(out)
 }
@@ -291,14 +345,35 @@ mod tests {
 
     #[test]
     fn write_get_roundtrip() {
+        for codec in [Codec::None, Codec::Lz4, Codec::Brotli] {
+            let path = tmp();
+            let entries = vec![put("a", 1, "1"), put("b", 2, "2"), put("c", 3, "3")];
+            let sst = SsTable::write(&path, &entries, codec).unwrap();
+            assert_eq!(
+                sst.get(b"b").unwrap(),
+                Some((Hlc::new(2, 0), VersionValue::Put(b"2".to_vec()))),
+                "codec {codec:?}"
+            );
+            assert_eq!(sst.get(b"z").unwrap(), None);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn many_entries_span_blocks_and_roundtrip() {
+        // Enough entries to span multiple 4 KiB blocks.
         let path = tmp();
-        let entries = vec![put("a", 1, "1"), put("b", 2, "2"), put("c", 3, "3")];
-        let sst = SsTable::write(&path, &entries).unwrap();
+        let entries: Vec<SstEntry> = (0..2000)
+            .map(|i| put(&format!("key{i:05}"), i as u64 + 1, &format!("value-{i}")))
+            .collect();
+        let sst = SsTable::write(&path, &entries, Codec::Lz4).unwrap();
+        assert!(sst.blocks.len() > 1, "should span multiple blocks");
+        // Spot-check point reads and a full scan.
         assert_eq!(
-            sst.get(b"b").unwrap(),
-            Some((Hlc::new(2, 0), VersionValue::Put(b"2".to_vec())))
+            sst.get(b"key01234").unwrap(),
+            Some((Hlc::new(1235, 0), VersionValue::Put(b"value-1234".to_vec())))
         );
-        assert_eq!(sst.get(b"z").unwrap(), None);
+        assert_eq!(sst.entries().unwrap(), entries);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -314,9 +389,10 @@ mod tests {
             },
             put("gamma", 2, "y"),
         ];
-        SsTable::write(&path, &entries).unwrap();
+        SsTable::write(&path, &entries, Codec::Brotli).unwrap();
         let sst = SsTable::open(&path).unwrap();
         assert_eq!(sst.len(), 3);
+        assert_eq!(sst.codec, Codec::Brotli);
         assert_eq!(
             sst.get(b"beta").unwrap(),
             Some((Hlc::new(5, 0), VersionValue::Delete))
@@ -328,8 +404,7 @@ mod tests {
     #[test]
     fn detects_bad_magic() {
         let path = tmp();
-        SsTable::write(&path, &[put("a", 1, "1")]).unwrap();
-        // Corrupt the magic in the footer.
+        SsTable::write(&path, &[put("a", 1, "1")], Codec::Lz4).unwrap();
         let mut bytes = std::fs::read(&path).unwrap();
         let len = bytes.len();
         bytes[len - 1] ^= 0xFF;
