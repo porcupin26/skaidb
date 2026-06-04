@@ -104,6 +104,9 @@ impl Node {
     }
 
     fn handle_internode(&self, mut stream: TcpStream) {
+        // Disable Nagle: connections are pooled and reused for many small
+        // request/response frames, so Nagle + delayed-ACK would add ~40 ms.
+        stream.set_nodelay(true).ok();
         while let Ok(payload) = read_frame(&mut stream) {
             let response = match Request::decode(&payload) {
                 Ok(req) => self.apply_local(req),
