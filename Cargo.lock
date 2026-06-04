@@ -259,6 +259,7 @@ dependencies = [
 name = "skaidb-driver"
 version = "0.1.0"
 dependencies = [
+ "skaidb-auth",
  "skaidb-proto",
  "skaidb-types",
  "thiserror",
@@ -296,6 +297,7 @@ dependencies = [
  "skaidb-driver",
  "skaidb-engine",
  "skaidb-proto",
+ "skaidb-sql",
  "skaidb-types",
 ]
 

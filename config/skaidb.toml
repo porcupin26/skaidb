@@ -23,6 +23,7 @@ x509_ca_file = ""
 internode_auth = "keyfile"
 internode_keyfile = ""
 superuser = "admin"
+superuser_password = ""
 
 [encryption]
 tls_cert_file = ""

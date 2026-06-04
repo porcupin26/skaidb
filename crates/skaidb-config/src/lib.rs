@@ -107,6 +107,10 @@ pub struct AuthConfig {
     pub internode_auth: InternodeAuth,
     pub internode_keyfile: String,
     pub superuser: String,
+    /// Password for the bootstrapped superuser. When `scram_enabled` is true and
+    /// this is non-empty, the server requires authentication; otherwise
+    /// connections are accepted anonymously (development default).
+    pub superuser_password: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -203,6 +207,7 @@ impl Default for AuthConfig {
             internode_auth: InternodeAuth::Keyfile,
             internode_keyfile: String::new(),
             superuser: "admin".to_string(),
+            superuser_password: String::new(),
         }
     }
 }

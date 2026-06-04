@@ -6,6 +6,7 @@
 //! guarded by a mutex (thread-per-connection model).
 
 pub mod audit;
+pub mod authn;
 pub mod binary;
 pub mod metrics;
 pub mod rest;
@@ -18,6 +19,7 @@ use skaidb_config::Config;
 use skaidb_engine::Database;
 
 use crate::audit::AuditSettings;
+use crate::authn::AuthState;
 use crate::metrics::Metrics;
 use crate::shared::{Context, Shared};
 
@@ -26,9 +28,24 @@ use crate::shared::{Context, Shared};
 pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let db = Database::open(&config.server.data_dir)?;
 
-    // Bootstrap the configured superuser (SPEC §8.2).
+    // Bootstrap the configured superuser role (SPEC §8.2).
     let mut roles = RoleStore::new();
     roles.create_superuser(&config.auth.superuser);
+
+    // Require auth only when SCRAM is enabled and a superuser password is set.
+    let auth_required = config.auth.scram_enabled && !config.auth.superuser_password.is_empty();
+    let mut authn = if auth_required {
+        AuthState::required()
+    } else {
+        AuthState::disabled()
+    };
+    if auth_required {
+        authn.add_user(
+            &config.auth.superuser,
+            &config.auth.superuser_password,
+            &config.auth.superuser,
+        );
+    }
 
     let metrics = Metrics::new();
     metrics.set("skaidb_up", 1);
@@ -38,7 +55,18 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         metrics,
         audit: AuditSettings::from(&config.observability),
         roles,
+        authn,
+        superuser_role: config.auth.superuser.clone(),
     });
+
+    println!(
+        "skaidb authentication: {}",
+        if auth_required {
+            "required (SCRAM)"
+        } else {
+            "disabled (anonymous)"
+        }
+    );
 
     let bind = &config.server.bind_addr;
     let binary_addr = format!("{}:{}", bind, config.server.quic_port);
@@ -61,29 +89,41 @@ mod tests {
     use std::net::TcpStream;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use skaidb_auth::{Object, Privilege};
     use skaidb_driver::Client;
     use skaidb_proto::Response;
     use skaidb_types::Value;
 
-    fn temp_ctx() -> Shared {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut dir = std::env::temp_dir();
-        dir.push(format!("skaidb-server-it-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        // Quiet audit settings for tests; metrics still record.
-        let audit = AuditSettings {
+    fn quiet_audit() -> AuditSettings {
+        AuditSettings {
             query_log: false,
             query_masked: true,
             slow_query_ms: 0,
             login_log: false,
             error_log: false,
-        };
+        }
+    }
+
+    fn temp_dir() -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("skaidb-server-it-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Context with auth disabled; anonymous connections act as the superuser.
+    fn temp_ctx() -> Shared {
+        let mut roles = RoleStore::new();
+        roles.create_superuser("superuser");
         Arc::new(Context {
-            db: Mutex::new(Database::open(dir).unwrap()),
+            db: Mutex::new(Database::open(temp_dir()).unwrap()),
             metrics: Metrics::new(),
-            audit,
-            roles: RoleStore::new(),
+            audit: quiet_audit(),
+            roles,
+            authn: AuthState::disabled(),
+            superuser_role: "superuser".into(),
         })
     }
 
@@ -164,6 +204,74 @@ mod tests {
             metrics.contains("skaidb_queries_total{type=\"ddl\"} 1"),
             "got: {metrics}"
         );
+    }
+
+    /// Context requiring SCRAM auth: user `ada`/`pencil` acting as `admin`.
+    fn auth_ctx() -> Shared {
+        let mut roles = RoleStore::new();
+        roles.create_superuser("admin");
+        let mut authn = AuthState::required();
+        authn.add_user("ada", "pencil", "admin");
+        Arc::new(Context {
+            db: Mutex::new(Database::open(temp_dir()).unwrap()),
+            metrics: Metrics::new(),
+            audit: quiet_audit(),
+            roles,
+            authn,
+            superuser_role: "admin".into(),
+        })
+    }
+
+    #[test]
+    fn scram_handshake_accepts_correct_and_rejects_otherwise() {
+        let (addr, _h) = binary::spawn("127.0.0.1:0", auth_ctx()).unwrap();
+
+        // Correct password authenticates and can run statements.
+        let mut client = Client::connect_with(addr, "ada", "pencil").unwrap();
+        assert_eq!(
+            client.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap(),
+            Response::Ddl
+        );
+
+        // Wrong password, unknown user, and anonymous are all rejected.
+        assert!(Client::connect_with(addr, "ada", "WRONG").is_err());
+        assert!(Client::connect_with(addr, "ghost", "x").is_err());
+        assert!(Client::connect(addr).is_err());
+    }
+
+    #[test]
+    fn rbac_enforced_per_statement() {
+        use crate::shared::{execute, execute_as};
+        let mut roles = RoleStore::new();
+        roles.create_superuser("superuser");
+        roles.create_role("reader").unwrap();
+        roles
+            .grant("reader", Privilege::Select, Object::Table("t".into()))
+            .unwrap();
+        let ctx: Shared = Arc::new(Context {
+            db: Mutex::new(Database::open(temp_dir()).unwrap()),
+            metrics: Metrics::new(),
+            audit: quiet_audit(),
+            roles,
+            authn: AuthState::disabled(),
+            superuser_role: "superuser".into(),
+        });
+
+        // Superuser sets up the table.
+        assert_eq!(
+            execute(&ctx, "CREATE TABLE t (PRIMARY KEY (id))"),
+            Response::Ddl
+        );
+        // Reader may SELECT.
+        assert!(matches!(
+            execute_as(&ctx, "reader", "SELECT id FROM t"),
+            Response::Rows { .. }
+        ));
+        // Reader may not INSERT.
+        match execute_as(&ctx, "reader", "INSERT INTO t (id) VALUES (1)") {
+            Response::Error(m) => assert!(m.contains("permission denied"), "got: {m}"),
+            other => panic!("expected denial, got {other:?}"),
+        }
     }
 
     fn http_get(addr: std::net::SocketAddr, path: &str) -> String {

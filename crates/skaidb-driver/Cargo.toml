@@ -12,4 +12,5 @@ workspace = true
 [dependencies]
 skaidb-types.workspace = true
 skaidb-proto.workspace = true
+skaidb-auth.workspace = true
 thiserror.workspace = true

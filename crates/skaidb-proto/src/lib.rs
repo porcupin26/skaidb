@@ -6,7 +6,9 @@
 //! plane) builds on these message types in a later phase.
 
 pub mod frame;
+pub mod handshake;
 pub mod message;
 
 pub use frame::{read_frame, write_frame, MAX_FRAME_LEN};
+pub use handshake::{auth_message, AuthChallenge, AuthFinish, AuthOutcome, AuthStart};
 pub use message::{Consistency, ProtoError, Request, Response};

@@ -4,11 +4,13 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use skaidb_auth::RoleStore;
+use skaidb_auth::{Object, Privilege, RoleStore};
 use skaidb_engine::{Database, QueryOutput};
 use skaidb_proto::Response;
+use skaidb_sql::ast::Statement;
 
 use crate::audit::AuditSettings;
+use crate::authn::AuthState;
 use crate::metrics::Metrics;
 
 /// State shared across connection-handling threads.
@@ -17,18 +19,34 @@ pub struct Context {
     pub db: Mutex<Database>,
     pub metrics: Metrics,
     pub audit: AuditSettings,
-    /// Roles/grants (SPEC §8.2). The configured superuser is bootstrapped here;
-    /// per-connection privilege enforcement is wired in once the protocol
-    /// carries an authenticated identity.
+    /// Roles/grants (SPEC §8.2).
     pub roles: RoleStore,
+    /// Connection authentication (SPEC §8.1).
+    pub authn: AuthState,
+    /// Role used for the REST gateway and anonymous connections.
+    pub superuser_role: String,
 }
 
 /// A reference-counted [`Context`] shared by all handlers.
 pub type Shared = Arc<Context>;
 
-/// Execute one SQL statement, recording metrics and audit logs, and map the
-/// engine outcome to a protocol response. All errors become [`Response::Error`].
+/// Execute as the superuser role (used by the REST gateway).
 pub fn execute(ctx: &Shared, sql: &str) -> Response {
+    let role = ctx.superuser_role.clone();
+    execute_as(ctx, &role, sql)
+}
+
+/// Execute one SQL statement on behalf of `role`: enforce RBAC, then run it,
+/// recording metrics and audit logs. All errors become [`Response::Error`].
+pub fn execute_as(ctx: &Shared, role: &str, sql: &str) -> Response {
+    // Authorization: check the role may perform the statement before executing.
+    if let Some((privilege, object)) = required_privilege(sql) {
+        if !ctx.roles.has_privilege(role, privilege, &object) {
+            ctx.metrics.incr("skaidb_authz_denied_total");
+            return Response::Error(format!("permission denied: {privilege:?} on {object:?}"));
+        }
+    }
+
     let start = Instant::now();
 
     let response = match ctx.db.lock() {
@@ -69,6 +87,21 @@ fn record_metrics(ctx: &Shared, sql: &str, elapsed_ms: u64, response: &Response)
     if ctx.audit.slow_query_ms > 0 && elapsed_ms >= ctx.audit.slow_query_ms {
         ctx.metrics.incr("skaidb_slow_queries_total");
     }
+}
+
+/// The privilege and object a statement requires (SPEC §8.2). Returns `None`
+/// when the SQL does not parse — the engine then reports the parse error.
+fn required_privilege(sql: &str) -> Option<(Privilege, Object)> {
+    Some(match skaidb_sql::parse(sql).ok()? {
+        Statement::Select(s) => (Privilege::Select, Object::Table(s.from)),
+        Statement::Insert(i) => (Privilege::Insert, Object::Table(i.table)),
+        Statement::Update(u) => (Privilege::Update, Object::Table(u.table)),
+        Statement::Delete(d) => (Privilege::Delete, Object::Table(d.table)),
+        Statement::CreateTable(_) => (Privilege::Create, Object::Global),
+        Statement::CreateIndex(ci) => (Privilege::Create, Object::Table(ci.table)),
+        Statement::DropTable { name, .. } => (Privilege::Drop, Object::Table(name)),
+        Statement::DropIndex { .. } => (Privilege::Drop, Object::Global),
+    })
 }
 
 /// Classify a statement by its leading keyword (for the `type` metric label).

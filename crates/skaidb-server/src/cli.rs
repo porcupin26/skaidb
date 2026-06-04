@@ -62,6 +62,8 @@ pub struct Cli {
     pub internode_keyfile: Option<String>,
     #[arg(long, env = "SKAIDB_SUPERUSER")]
     pub superuser: Option<String>,
+    #[arg(long, env = "SKAIDB_SUPERUSER_PASSWORD")]
+    pub superuser_password: Option<String>,
 
     // ---- [encryption] ----
     #[arg(long, env = "SKAIDB_TLS_CERT_FILE")]
@@ -135,6 +137,7 @@ impl Cli {
             internode_auth => config.auth.internode_auth,
             internode_keyfile => config.auth.internode_keyfile,
             superuser => config.auth.superuser,
+            superuser_password => config.auth.superuser_password,
 
             tls_cert_file => config.encryption.tls_cert_file,
             tls_key_file => config.encryption.tls_key_file,
