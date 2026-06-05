@@ -17,7 +17,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, RwLock};
 use std::thread;
 
-use skaidb_engine::{filter_rows, run, Cluster, Database, EngineError, QueryOutput};
+use skaidb_engine::{filter_rows, run, Cluster, Database, EngineError, IndexScanRange, QueryOutput};
 use skaidb_proto::{read_frame, write_frame};
 use skaidb_sql::ast::{BinaryOp, Expr, Statement};
 use skaidb_sql::parse;
@@ -133,6 +133,13 @@ impl Node {
             Request::LocalGet { table, key } => match self.local.read() {
                 Ok(db) => match db.local_get_versioned(&table, &key) {
                     Ok(entry) => Response::Get { entry },
+                    Err(e) => Response::Err(e.to_string()),
+                },
+                Err(_) => Response::Err("local lock poisoned".into()),
+            },
+            Request::IndexScan { index, start, end } => match self.local.read() {
+                Ok(db) => match db.index_scan_keys(&index, start.as_deref(), end.as_deref()) {
+                    Ok(keys) => Response::Keys { keys },
                     Err(e) => Response::Err(e.to_string()),
                 },
                 Err(_) => Response::Err("local lock poisoned".into()),
@@ -481,6 +488,55 @@ impl Node {
         }
         Ok(out)
     }
+
+    /// Distributed secondary-index lookup: gather candidate row keys from every
+    /// member's local index over `[start, end)`, then re-read each key at the
+    /// configured read quorum so the authoritative last-writer-wins version is
+    /// returned. Candidate keys are a superset (a node's local index may reflect
+    /// a stale value); the quorum re-read + the coordinator's post-filter make
+    /// the result exact. Unreachable members are skipped — their rows are still
+    /// found via other replicas' indexes (for `replication_factor > 1`).
+    fn index_lookup(
+        &self,
+        table: &str,
+        index: &str,
+        start: Option<Vec<u8>>,
+        end: Option<Vec<u8>>,
+    ) -> EngineResult<Vec<(Vec<u8>, Document)>> {
+        let mut keys: BTreeMap<Vec<u8>, ()> = BTreeMap::new();
+
+        // Local index shard.
+        {
+            let db = self
+                .local
+                .read()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
+            for k in db.index_scan_keys(index, start.as_deref(), end.as_deref())? {
+                keys.insert(k, ());
+            }
+        }
+
+        // Peer index shards.
+        let req = Request::IndexScan {
+            index: index.to_string(),
+            start,
+            end,
+        };
+        for addr in self.peers.values() {
+            if let Ok(Response::Keys { keys: ks }) = self.pool.call(addr, &req) {
+                for k in ks {
+                    keys.insert(k, ());
+                }
+            }
+        }
+
+        // Re-read each candidate key at quorum for its authoritative version.
+        let mut out = Vec::new();
+        for key in keys.into_keys() {
+            out.extend(self.point_get(table, &key)?);
+        }
+        Ok(out)
+    }
 }
 
 /// A pending replicated mutation.
@@ -556,6 +612,24 @@ struct Coordinator {
     node: Arc<Node>,
 }
 
+impl Coordinator {
+    /// Ask the local catalog whether a secondary index can serve `filter`, and
+    /// the byte range to scan. The encoding is catalog-deterministic, so the
+    /// same range applies to every member's local index.
+    fn plan_index_scan(
+        &self,
+        table: &str,
+        filter: &Option<Expr>,
+    ) -> EngineResult<Option<IndexScanRange>> {
+        Ok(self
+            .node
+            .local
+            .read()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .plan_index_scan(table, filter))
+    }
+}
+
 impl Cluster for Coordinator {
     fn primary_key(&self, table: &str) -> EngineResult<Vec<String>> {
         self.node
@@ -575,6 +649,13 @@ impl Cluster for Coordinator {
         let pk = self.primary_key(table)?;
         if let Some(key) = pk_point_key(&pk, filter) {
             let rows = self.node.point_get(table, &key)?;
+            return filter_rows(filter, rows);
+        }
+        // Indexed non-PK predicate: push the index scan to every node to gather
+        // candidate keys, then re-read each at quorum — far less data than
+        // shipping every node's whole shard.
+        if let Some((index, start, end)) = self.plan_index_scan(table, filter)? {
+            let rows = self.node.index_lookup(table, &index, start, end)?;
             return filter_rows(filter, rows);
         }
         let rows = self.node.cluster_scan(table)?;
@@ -693,6 +774,62 @@ mod tests {
         nc.execute("DELETE FROM t WHERE id = 2").unwrap();
         let rs = rows(na.execute("SELECT id FROM t ORDER BY id").unwrap());
         assert_eq!(rs.rows, vec![vec![Value::Int(1)], vec![Value::Int(3)]]);
+    }
+
+    #[test]
+    fn distributed_secondary_index_query() {
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let na = Node::new(
+            Database::open(temp_dir("ixa")).unwrap(),
+            cfg("a", &a, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("ixb")).unwrap(),
+            cfg("b", &b, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nc = Node::new(
+            Database::open(temp_dir("ixc")).unwrap(),
+            cfg("c", &c, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        nc.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        na.execute("CREATE INDEX t_region ON t(region)").unwrap();
+        na.execute("CREATE INDEX t_age ON t(age)").unwrap();
+        na.execute(
+            "INSERT INTO t (id, region, age) VALUES \
+             (1,'eu',30),(2,'us',20),(3,'eu',40),(4,'us',50),(5,'eu',25)",
+        )
+        .unwrap();
+
+        // Equality on a non-PK indexed column, coordinated by a *different* node:
+        // each member uses its local index; the coordinator re-reads at quorum.
+        let rs = rows(
+            nb.execute("SELECT id FROM t WHERE region = 'eu' ORDER BY id")
+                .unwrap(),
+        );
+        assert_eq!(
+            rs.rows,
+            vec![vec![Value::Int(1)], vec![Value::Int(3)], vec![Value::Int(5)]]
+        );
+
+        // Range on a non-PK indexed column, coordinated by a third node.
+        let rs = rows(
+            nc.execute("SELECT id FROM t WHERE age > 30 ORDER BY id").unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(3)], vec![Value::Int(4)]]);
+
+        // Update the indexed value (PK update); the index query reflects it
+        // cluster-wide because candidates are re-read at quorum (LWW).
+        nb.execute("UPDATE t SET region = 'us' WHERE id = 1").unwrap();
+        let rs = rows(
+            na.execute("SELECT id FROM t WHERE region = 'eu' ORDER BY id")
+                .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(3)], vec![Value::Int(5)]]);
     }
 
     #[test]

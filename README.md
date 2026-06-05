@@ -88,8 +88,12 @@ Implemented end-to-end and tested (141 tests):
   levels ack early and replicate the rest in the background, and a coordinated
   write **overlaps its local fsync with peer replication** rather than running
   them serially; **PK point reads** routed to the key's replica set;
-  scatter-gather reads merged by HLC last-writer-wins (tombstones included, so
-  deletes win cluster-wide); quorum-broadcast DDL; one-node-down tolerance
+  **non-PK indexed reads pushed down** — the coordinator scatters the index scan
+  to each member's local index, unions the candidate keys, then re-reads each at
+  quorum (last-writer-wins authoritative version) — instead of shipping whole
+  shards; non-indexed reads scatter-gather and merge by HLC LWW (tombstones
+  included, so deletes win cluster-wide); quorum-broadcast DDL; one-node-down
+  tolerance
 - **auth**: SCRAM-SHA-256 handshake (mutual auth) on the binary endpoint and
   HTTP Basic on REST, + per-statement **RBAC**
 - binary + REST endpoints, Prometheus metrics, masked audit logs
@@ -100,10 +104,11 @@ Designed for but deliberately not yet built: **QUIC** transport + push-based
 control plane (the raw-TCP fast path is in; QUIC needs an async runtime),
 **distributed/multi-key transactions** (needs a coordinator/2PC), active
 **anti-entropy** (read-repair & hinted handoff — convergence currently relies on
-writes reaching their replicas), and **secondary-index acceleration on the
-distributed read path** (locally, indexes serve equality/range/`ORDER BY`; in a
-cluster the coordinator still routes only by primary key, so a non-PK query
-gathers from replicas and filters).
+writes reaching their replicas), **global (value-sharded) secondary indexes** —
+today's indexes are local per node, so a distributed indexed read still scatters
+to every member (their local indexes return only candidate keys) rather than
+routing to a single owner — and specialized index types (text, geospatial,
+array/multi-value).
 
 See `.priv/SPEC.md` for the full design.
 

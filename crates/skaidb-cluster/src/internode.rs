@@ -33,6 +33,13 @@ pub enum Request {
         table: String,
         key: Vec<u8>,
     },
+    /// Scan the named local secondary index over a byte range and return the
+    /// candidate row keys (a superset; the coordinator re-reads each).
+    IndexScan {
+        index: String,
+        start: Option<Vec<u8>>,
+        end: Option<Vec<u8>>,
+    },
     ApplyDdl {
         sql: String,
     },
@@ -53,6 +60,10 @@ pub enum Response {
     Get {
         entry: Option<(Vec<u8>, Hlc, bool)>,
     },
+    /// Candidate row keys from an [`Request::IndexScan`].
+    Keys {
+        keys: Vec<Vec<u8>>,
+    },
     Err(String),
     Pong,
 }
@@ -70,12 +81,14 @@ const REQ_SCAN: u8 = 3;
 const REQ_DDL: u8 = 4;
 const REQ_PING: u8 = 5;
 const REQ_GET: u8 = 6;
+const REQ_INDEX: u8 = 7;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
 const RES_ERR: u8 = 2;
 const RES_PONG: u8 = 3;
 const RES_GET: u8 = 4;
+const RES_KEYS: u8 = 5;
 
 impl Request {
     pub fn encode(&self) -> Vec<u8> {
@@ -108,6 +121,12 @@ impl Request {
                 put_str(&mut o, table);
                 put_bytes(&mut o, key);
             }
+            Request::IndexScan { index, start, end } => {
+                o.push(REQ_INDEX);
+                put_str(&mut o, index);
+                put_opt_bytes(&mut o, start.as_deref());
+                put_opt_bytes(&mut o, end.as_deref());
+            }
             Request::ApplyDdl { sql } => {
                 o.push(REQ_DDL);
                 put_str(&mut o, sql);
@@ -135,6 +154,11 @@ impl Request {
             REQ_GET => Request::LocalGet {
                 table: c.string()?,
                 key: c.bytes()?,
+            },
+            REQ_INDEX => Request::IndexScan {
+                index: c.string()?,
+                start: c.opt_bytes()?,
+                end: c.opt_bytes()?,
             },
             REQ_DDL => Request::ApplyDdl { sql: c.string()? },
             REQ_PING => Request::Ping,
@@ -168,6 +192,13 @@ impl Response {
                         o.push(u8::from(*is_put));
                     }
                     None => o.push(0),
+                }
+            }
+            Response::Keys { keys } => {
+                o.push(RES_KEYS);
+                o.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+                for k in keys {
+                    put_bytes(&mut o, k);
                 }
             }
             Response::Err(msg) => {
@@ -205,6 +236,14 @@ impl Response {
                     None
                 };
                 Response::Get { entry }
+            }
+            RES_KEYS => {
+                let n = c.u32()? as usize;
+                let mut keys = Vec::with_capacity(n);
+                for _ in 0..n {
+                    keys.push(c.bytes()?);
+                }
+                Response::Keys { keys }
             }
             RES_ERR => Response::Err(c.string()?),
             RES_PONG => Response::Pong,
@@ -329,6 +368,16 @@ fn put_bytes(o: &mut Vec<u8>, b: &[u8]) {
     o.extend_from_slice(&(b.len() as u32).to_le_bytes());
     o.extend_from_slice(b);
 }
+/// An optional byte string: a presence flag followed by the bytes when present.
+fn put_opt_bytes(o: &mut Vec<u8>, b: Option<&[u8]>) {
+    match b {
+        Some(bytes) => {
+            o.push(1);
+            put_bytes(o, bytes);
+        }
+        None => o.push(0),
+    }
+}
 
 struct Cur<'a> {
     buf: &'a [u8],
@@ -359,6 +408,13 @@ impl<'a> Cur<'a> {
     fn bytes(&mut self) -> Result<Vec<u8>, WireError> {
         let n = self.u32()? as usize;
         Ok(self.take(n)?.to_vec())
+    }
+    fn opt_bytes(&mut self) -> Result<Option<Vec<u8>>, WireError> {
+        Ok(if self.u8()? == 1 {
+            Some(self.bytes()?)
+        } else {
+            None
+        })
     }
     fn string(&mut self) -> Result<String, WireError> {
         String::from_utf8(self.bytes()?).map_err(|_| WireError::Malformed("bad utf-8"))
@@ -395,6 +451,16 @@ mod tests {
             Request::ApplyDdl {
                 sql: "CREATE TABLE t (PRIMARY KEY (id))".into(),
             },
+            Request::IndexScan {
+                index: "t_age".into(),
+                start: Some(vec![1, 2, 3]),
+                end: None,
+            },
+            Request::IndexScan {
+                index: "t_age".into(),
+                start: None,
+                end: Some(vec![9]),
+            },
             Request::Ping,
         ] {
             assert_eq!(Request::decode(&req.encode()).unwrap(), req);
@@ -412,6 +478,9 @@ mod tests {
         for res in [
             Response::Ack,
             scan,
+            Response::Keys {
+                keys: vec![vec![1], vec![2, 3], vec![]],
+            },
             Response::Get {
                 entry: Some((vec![1, 2, 3], Hlc::new(9, 1), true)),
             },

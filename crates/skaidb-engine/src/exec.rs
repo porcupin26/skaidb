@@ -29,6 +29,10 @@ pub type VersionedRow = (Vec<u8>, Vec<u8>, Hlc);
 /// `is_put` is false the row is a delete and `value` is empty.
 pub type VersionedTombstoneRow = (Vec<u8>, Vec<u8>, Hlc, bool);
 
+/// A secondary-index scan request for a coordinator: `(index_name, start_key,
+/// end_key)` (byte bounds, `None` = unbounded).
+pub type IndexScanRange = (String, Option<Vec<u8>>, Option<Vec<u8>>);
+
 /// `(key, document)` rows — the engine's standard row-gather result.
 type KeyedRows = Vec<(Vec<u8>, Document)>;
 /// Gathered rows plus whether they are already in the requested `ORDER BY` order.
@@ -339,6 +343,35 @@ impl Database {
     /// Primary-key columns of `table` (public for the coordinator).
     pub fn table_primary_key(&self, table: &str) -> Result<Vec<String>> {
         Ok(self.table_def(table)?.primary_key.clone())
+    }
+
+    /// Plan a secondary-index scan for a coordinator pushdown: the index name
+    /// and byte range that covers `filter`, or `None` if no index serves it.
+    /// The byte bounds are catalog-deterministic, so every node's local index
+    /// scans the same range.
+    pub fn plan_index_scan(&self, table: &str, filter: &Option<Expr>) -> Option<IndexScanRange> {
+        self.plan_index(table, filter, None)
+            .map(|(name, start, end, _sorted)| (name, start, end))
+    }
+
+    /// Row keys whose entries fall in `[start, end)` of the named index — the
+    /// candidate keys for a distributed index lookup (a superset; the
+    /// coordinator re-reads and re-filters each against the authoritative row).
+    pub fn index_scan_keys(
+        &self,
+        index: &str,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<Vec<Vec<u8>>> {
+        let engine = self
+            .indexes
+            .get(index)
+            .ok_or_else(|| EngineError::IndexNotFound(index.to_string()))?;
+        Ok(engine
+            .scan_range(start, end)?
+            .into_iter()
+            .map(|(_entry_key, row_key)| row_key)
+            .collect())
     }
 
     /// Whether `table` exists locally.
