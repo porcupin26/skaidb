@@ -9,6 +9,8 @@ pub enum Statement {
     DropTable { name: String, if_exists: bool },
     CreateIndex(CreateIndex),
     DropIndex { name: String, if_exists: bool },
+    CreateVectorIndex(CreateVectorIndex),
+    DropVectorIndex { name: String, if_exists: bool },
     Insert(Insert),
     Select(Select),
     Update(Update),
@@ -33,6 +35,20 @@ pub struct CreateIndex {
     pub if_not_exists: bool,
     pub table: String,
     pub paths: Vec<String>,
+}
+
+/// `CREATE VECTOR INDEX [IF NOT EXISTS] name ON table (path) DIM n [USING metric]`.
+/// An HNSW index for approximate nearest-neighbor search over the float array
+/// at `path`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateVectorIndex {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub table: String,
+    pub path: String,
+    pub dim: usize,
+    /// `cosine` (default), `l2`, or `dot`.
+    pub metric: String,
 }
 
 /// `INSERT INTO table (cols...) VALUES (..), (..)`.

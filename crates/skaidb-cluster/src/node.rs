@@ -144,6 +144,13 @@ impl Node {
                 },
                 Err(_) => Response::Err("local lock poisoned".into()),
             },
+            Request::VectorSearch { index, query, k } => match self.local.read() {
+                Ok(db) => match db.vector_search_local(&index, &query, k as usize) {
+                    Ok(hits) => Response::VectorHits { hits },
+                    Err(e) => Response::Err(e.to_string()),
+                },
+                Err(_) => Response::Err("local lock poisoned".into()),
+            },
             Request::ApplyPut {
                 table,
                 key,
@@ -537,6 +544,83 @@ impl Node {
         }
         Ok(out)
     }
+
+    /// Distributed approximate nearest-neighbor search: scatter the query to
+    /// every member's local vector index, merge their per-shard top-k by
+    /// distance, then re-read the survivors at quorum and apply `filter`.
+    /// Returns up to `k` rows as `(key, doc, distance)`, nearest first. Distances
+    /// are from the (per-shard) HNSW; `filter` is applied after the authoritative
+    /// re-read, so very selective filters want more over-fetch.
+    pub fn vector_search(
+        self: &Arc<Self>,
+        index: &str,
+        query: &[f32],
+        k: usize,
+        filter: &Option<Expr>,
+    ) -> EngineResult<Vec<(Vec<u8>, Document, f32)>> {
+        let table = {
+            let db = self
+                .local
+                .read()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
+            db.vector_index_table(index)
+                .ok_or_else(|| EngineError::IndexNotFound(index.to_string()))?
+        };
+        // Over-fetch per shard so the merge (and any filtering) still yields k.
+        let fetch = if filter.is_some() {
+            k.saturating_mul(4).max(k + 16)
+        } else {
+            k.max(1)
+        };
+
+        // Best (smallest) distance seen per key across all shards.
+        let mut best: HashMap<Vec<u8>, f32> = HashMap::new();
+        let consider = |key: Vec<u8>, dist: f32, best: &mut HashMap<Vec<u8>, f32>| {
+            best.entry(key)
+                .and_modify(|d| {
+                    if dist < *d {
+                        *d = dist;
+                    }
+                })
+                .or_insert(dist);
+        };
+        {
+            let db = self
+                .local
+                .read()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
+            for (key, dist) in db.vector_search_local(index, query, fetch)? {
+                consider(key, dist, &mut best);
+            }
+        }
+        let req = Request::VectorSearch {
+            index: index.to_string(),
+            query: query.to_vec(),
+            k: fetch as u32,
+        };
+        for addr in self.peers.values() {
+            if let Ok(Response::VectorHits { hits }) = self.pool.call(addr, &req) {
+                for (key, dist) in hits {
+                    consider(key, dist, &mut best);
+                }
+            }
+        }
+
+        // Rank globally by distance, then re-read + filter until we have k.
+        let mut ranked: Vec<(Vec<u8>, f32)> = best.into_iter().collect();
+        ranked.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let mut out = Vec::new();
+        for (key, dist) in ranked {
+            let rows = filter_rows(filter, self.point_get(table.as_str(), &key)?)?;
+            if let Some((_, doc)) = rows.into_iter().next() {
+                out.push((key, doc, dist));
+                if out.len() >= k {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// A pending replicated mutation.
@@ -604,6 +688,8 @@ fn is_ddl(stmt: &Statement) -> bool {
             | Statement::DropTable { .. }
             | Statement::CreateIndex(_)
             | Statement::DropIndex { .. }
+            | Statement::CreateVectorIndex(_)
+            | Statement::DropVectorIndex { .. }
     )
 }
 
@@ -830,6 +916,62 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(rs.rows, vec![vec![Value::Int(3)], vec![Value::Int(5)]]);
+    }
+
+    #[test]
+    fn distributed_vector_search() {
+        use skaidb_sql::ast::{BinaryOp, Expr};
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let na = Node::new(
+            Database::open(temp_dir("vva")).unwrap(),
+            cfg("a", &a, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("vvb")).unwrap(),
+            cfg("b", &b, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nc = Node::new(
+            Database::open(temp_dir("vvc")).unwrap(),
+            cfg("c", &c, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        nc.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE docs (PRIMARY KEY (id))").unwrap();
+        // Broadcast DDL: every node builds its own (initially empty) HNSW.
+        na.execute("CREATE VECTOR INDEX docs_emb ON docs (embedding) DIM 3 USING cosine")
+            .unwrap();
+        na.execute(
+            "INSERT INTO docs (id, cat, embedding) VALUES \
+             (1,'a',[1.0,0.0,0.0]),(2,'b',[0.0,1.0,0.0]),(3,'a',[0.0,0.0,1.0]),(4,'b',[0.9,0.1,0.0])",
+        )
+        .unwrap();
+
+        let ids = |hits: Vec<(Vec<u8>, Document, f32)>| -> Vec<i64> {
+            hits.iter()
+                .map(|(_, doc, _)| match doc.get("id") {
+                    Some(Value::Int(i)) => *i,
+                    other => panic!("expected int id, got {other:?}"),
+                })
+                .collect()
+        };
+
+        // Distributed kNN coordinated by a different node: scatter to all
+        // members' local HNSW, merge, re-read at quorum.
+        assert_eq!(ids(nb.vector_search("docs_emb", &[1.0, 0.0, 0.0], 2, &None).unwrap()), vec![1, 4]);
+
+        // Filtered distributed kNN: WHERE cat = 'a' excludes id 4.
+        let filter = Some(Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Column("cat".into())),
+            right: Box::new(Expr::Literal(Value::String("a".into()))),
+        });
+        assert_eq!(
+            ids(nc.vector_search("docs_emb", &[1.0, 0.0, 0.0], 2, &filter).unwrap()),
+            vec![1, 3]
+        );
     }
 
     #[test]

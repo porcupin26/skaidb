@@ -101,14 +101,17 @@ impl Database {
     }
 
     /// Create an HNSW vector index over the float array at `path` of `table`.
-    /// The dimension is inferred from the first vector found (the table must
-    /// have at least one row with a vector). `metric` is `cosine`/`l2`/`dot`.
+    /// `dim` fixes the vector dimension; pass `None` to infer it from existing
+    /// rows (convenient for a single node, but in a cluster a shard may be empty,
+    /// so the broadcast DDL always supplies an explicit dimension).
+    /// `metric` is `cosine`/`l2`/`dot`.
     pub fn create_vector_index(
         &mut self,
         name: &str,
         table: &str,
         path: &str,
         metric: &str,
+        dim: Option<usize>,
     ) -> Result<QueryOutput> {
         if !self.catalog.tables.contains_key(table) {
             return Err(EngineError::TableNotFound(table.to_string()));
@@ -119,16 +122,18 @@ impl Database {
         if Metric::parse(metric).is_none() {
             return Err(EngineError::Constraint(format!("unknown vector metric '{metric}'")));
         }
-        // Infer the dimension from existing data.
         let rows = self.scan_docs(table)?;
-        let dim = rows
-            .iter()
-            .find_map(|(_, doc)| doc_vector_raw(doc, path).map(|v| v.len()))
-            .ok_or_else(|| {
-                EngineError::Constraint(format!(
-                    "cannot infer vector dimension: no row of '{table}' has a numeric array at '{path}'"
-                ))
-            })?;
+        let dim = match dim {
+            Some(d) => d,
+            None => rows
+                .iter()
+                .find_map(|(_, doc)| doc_vector_raw(doc, path).map(|v| v.len()))
+                .ok_or_else(|| {
+                    EngineError::Constraint(format!(
+                        "cannot infer vector dimension: no row of '{table}' has a numeric array at '{path}'"
+                    ))
+                })?,
+        };
 
         let def = VectorIndexDef {
             table: table.to_string(),
@@ -206,6 +211,30 @@ impl Database {
         Ok(out)
     }
 
+    /// Local-shard ANN: the `k` nearest `(key, distance)` to `query` from this
+    /// node's HNSW, unfiltered. Used by the cluster coordinator, which gathers
+    /// these from every node, merges, then re-reads + filters the survivors.
+    pub fn vector_search_local(
+        &self,
+        index: &str,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<(Vec<u8>, f32)>> {
+        let hnsw = self
+            .vector_indexes
+            .get(index)
+            .ok_or_else(|| EngineError::IndexNotFound(index.to_string()))?;
+        Ok(hnsw.search(query, k, |_| true))
+    }
+
+    /// The table a vector index is defined on, if it exists locally.
+    pub fn vector_index_table(&self, index: &str) -> Option<String> {
+        self.catalog
+            .vector_indexes
+            .get(index)
+            .map(|d| d.table.clone())
+    }
+
     /// The `(name, path)` of every vector index on `table`.
     fn vector_indexes_on(&self, table: &str) -> Vec<(String, String)> {
         self.catalog
@@ -259,6 +288,12 @@ impl Database {
                 self.create_index(&ci.name, &ci.table, &ci.paths, ci.if_not_exists)
             }
             Statement::DropIndex { name, if_exists } => self.drop_index(&name, if_exists),
+            Statement::CreateVectorIndex(ci) => {
+                self.create_vector_index(&ci.name, &ci.table, &ci.path, &ci.metric, Some(ci.dim))
+            }
+            Statement::DropVectorIndex { name, if_exists } => {
+                self.drop_vector_index(&name, if_exists)
+            }
             // DML and SELECT run through the storage-agnostic executor so the
             // exact same logic serves the local engine and the cluster
             // coordinator (which replaces LocalCluster with a networked one).

@@ -85,10 +85,11 @@ Implemented end-to-end and tested (141 tests):
   `BETWEEN`-style; composite uses a leftmost-prefix of equalities plus a trailing
   range) and `ORDER BY` along the index (sorted scan with early-stop `LIMIT` for
   top-N), since index entries are stored order-preserved
-- **vector search** (prototype): an in-memory **HNSW** index for approximate
-  nearest-neighbor search over embeddings, with **filtered** kNN
-  ("nearest neighbors `WHERE …`"); cosine/L2/dot — see
-  [docs/VECTOR.md](docs/VECTOR.md)
+- **vector search**: `CREATE VECTOR INDEX … DIM n` builds an **HNSW** index for
+  approximate nearest-neighbor search over embeddings, with **filtered** kNN
+  ("nearest neighbors `WHERE …`"); cosine/L2/dot. **Distributed** — the index is
+  broadcast so each node indexes its shard and queries scatter-gather + merge.
+  In-memory/rebuilt-on-open for now — see [docs/VECTOR.md](docs/VECTOR.md)
 - **leaderless replication**: consistent-hash placement; every node serves reads
   and writes; **tunable write consistency** (`ONE`/`QUORUM`/`ALL`) where weaker
   levels ack early and replicate the rest in the background, and a coordinated

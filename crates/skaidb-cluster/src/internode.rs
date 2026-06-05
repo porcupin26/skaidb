@@ -13,7 +13,7 @@ use skaidb_storage::compress::{compress, decompress, Codec};
 use skaidb_storage::Hlc;
 
 /// A request from a coordinator to a peer member.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Request {
     ApplyPut {
         table: String,
@@ -40,6 +40,13 @@ pub enum Request {
         start: Option<Vec<u8>>,
         end: Option<Vec<u8>>,
     },
+    /// Approximate `k` nearest keys to `query` from the node's local vector
+    /// index (one shard). The coordinator merges these across nodes.
+    VectorSearch {
+        index: String,
+        query: Vec<f32>,
+        k: u32,
+    },
     ApplyDdl {
         sql: String,
     },
@@ -47,7 +54,7 @@ pub enum Request {
 }
 
 /// A response from a peer member.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Response {
     Ack,
     /// A versioned table shard: `(key, value, hlc, is_put)`. `is_put == false`
@@ -63,6 +70,10 @@ pub enum Response {
     /// Candidate row keys from an [`Request::IndexScan`].
     Keys {
         keys: Vec<Vec<u8>>,
+    },
+    /// `(key, distance)` hits from a [`Request::VectorSearch`], nearest-first.
+    VectorHits {
+        hits: Vec<(Vec<u8>, f32)>,
     },
     Err(String),
     Pong,
@@ -82,6 +93,7 @@ const REQ_DDL: u8 = 4;
 const REQ_PING: u8 = 5;
 const REQ_GET: u8 = 6;
 const REQ_INDEX: u8 = 7;
+const REQ_VECTOR: u8 = 8;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
@@ -89,6 +101,7 @@ const RES_ERR: u8 = 2;
 const RES_PONG: u8 = 3;
 const RES_GET: u8 = 4;
 const RES_KEYS: u8 = 5;
+const RES_VHITS: u8 = 6;
 
 impl Request {
     pub fn encode(&self) -> Vec<u8> {
@@ -127,6 +140,15 @@ impl Request {
                 put_opt_bytes(&mut o, start.as_deref());
                 put_opt_bytes(&mut o, end.as_deref());
             }
+            Request::VectorSearch { index, query, k } => {
+                o.push(REQ_VECTOR);
+                put_str(&mut o, index);
+                o.extend_from_slice(&(query.len() as u32).to_le_bytes());
+                for x in query {
+                    o.extend_from_slice(&x.to_le_bytes());
+                }
+                o.extend_from_slice(&k.to_le_bytes());
+            }
             Request::ApplyDdl { sql } => {
                 o.push(REQ_DDL);
                 put_str(&mut o, sql);
@@ -160,6 +182,16 @@ impl Request {
                 start: c.opt_bytes()?,
                 end: c.opt_bytes()?,
             },
+            REQ_VECTOR => {
+                let index = c.string()?;
+                let n = c.u32()? as usize;
+                let mut query = Vec::with_capacity(n);
+                for _ in 0..n {
+                    query.push(c.f32()?);
+                }
+                let k = c.u32()?;
+                Request::VectorSearch { index, query, k }
+            }
             REQ_DDL => Request::ApplyDdl { sql: c.string()? },
             REQ_PING => Request::Ping,
             _ => return Err(WireError::Malformed("unknown request op")),
@@ -199,6 +231,14 @@ impl Response {
                 o.extend_from_slice(&(keys.len() as u32).to_le_bytes());
                 for k in keys {
                     put_bytes(&mut o, k);
+                }
+            }
+            Response::VectorHits { hits } => {
+                o.push(RES_VHITS);
+                o.extend_from_slice(&(hits.len() as u32).to_le_bytes());
+                for (key, dist) in hits {
+                    put_bytes(&mut o, key);
+                    o.extend_from_slice(&dist.to_le_bytes());
                 }
             }
             Response::Err(msg) => {
@@ -244,6 +284,15 @@ impl Response {
                     keys.push(c.bytes()?);
                 }
                 Response::Keys { keys }
+            }
+            RES_VHITS => {
+                let n = c.u32()? as usize;
+                let mut hits = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let key = c.bytes()?;
+                    hits.push((key, c.f32()?));
+                }
+                Response::VectorHits { hits }
             }
             RES_ERR => Response::Err(c.string()?),
             RES_PONG => Response::Pong,
@@ -405,6 +454,9 @@ impl<'a> Cur<'a> {
     fn u32(&mut self) -> Result<u32, WireError> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
+    fn f32(&mut self) -> Result<f32, WireError> {
+        Ok(f32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
     fn bytes(&mut self) -> Result<Vec<u8>, WireError> {
         let n = self.u32()? as usize;
         Ok(self.take(n)?.to_vec())
@@ -461,6 +513,11 @@ mod tests {
                 start: None,
                 end: Some(vec![9]),
             },
+            Request::VectorSearch {
+                index: "t_emb".into(),
+                query: vec![0.1, -0.2, 0.3, 0.0],
+                k: 10,
+            },
             Request::Ping,
         ] {
             assert_eq!(Request::decode(&req.encode()).unwrap(), req);
@@ -480,6 +537,9 @@ mod tests {
             scan,
             Response::Keys {
                 keys: vec![vec![1], vec![2, 3], vec![]],
+            },
+            Response::VectorHits {
+                hits: vec![(vec![1], 0.0), (vec![2, 3], 1.5)],
             },
             Response::Get {
                 entry: Some((vec![1, 2, 3], Hlc::new(9, 1), true)),

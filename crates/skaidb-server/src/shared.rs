@@ -118,8 +118,10 @@ fn required_privilege(sql: &str) -> Option<(Privilege, Object)> {
         Statement::Delete(d) => (Privilege::Delete, Object::Table(d.table)),
         Statement::CreateTable(_) => (Privilege::Create, Object::Global),
         Statement::CreateIndex(ci) => (Privilege::Create, Object::Table(ci.table)),
+        Statement::CreateVectorIndex(ci) => (Privilege::Create, Object::Table(ci.table)),
         Statement::DropTable { name, .. } => (Privilege::Drop, Object::Table(name)),
         Statement::DropIndex { .. } => (Privilege::Drop, Object::Global),
+        Statement::DropVectorIndex { .. } => (Privilege::Drop, Object::Global),
     })
 }
 

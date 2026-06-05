@@ -16,6 +16,8 @@ CREATE TABLE [IF NOT EXISTS] <table> (PRIMARY KEY (<col> [, <col> ...]))
 DROP   TABLE [IF EXISTS] <table>
 CREATE INDEX [IF NOT EXISTS] <name> ON <table> (<path> [, <path> ...])
 DROP   INDEX [IF EXISTS] <name>
+CREATE VECTOR INDEX [IF NOT EXISTS] <name> ON <table> (<path>) DIM <n> [USING <metric>]
+DROP   VECTOR INDEX [IF EXISTS] <name>
 
 -- DML
 INSERT INTO <table> (<col> [, <col> ...]) VALUES (<expr>, ...) [, (<expr>, ...) ...]
@@ -35,6 +37,11 @@ FROM <table>
   documents are schema-less. A composite PK lists several columns.
 - `CREATE INDEX` with one path is a single-column index; with several it is a
   **composite** index (ordered left-to-right). See indexing notes below.
+- `CREATE VECTOR INDEX` builds an HNSW index for nearest-neighbor search over the
+  float array at `<path>`. `DIM <n>` (the vector dimension) is **required**;
+  `USING <metric>` is `cosine` (default), `l2`, or `dot`. It broadcasts across
+  the cluster so every node indexes its shard. **Querying** it is via the
+  `vector_search` API, not SQL yet (see below and [VECTOR.md](VECTOR.md)).
 - `<select-item>` is `*` (all fields seen in the result rows) or
   `<expr> [[AS] <alias>]`.
 
@@ -95,6 +102,7 @@ values arrive via stored data or the value codec, not as SQL literals.
 - **No** `JOIN`, subqueries, `DISTINCT`, `HAVING`, `UNION`, CTEs, window
   functions, or multi-statement transactions (`BEGIN`/`COMMIT`/`ROLLBACK`).
 - **No** `ALTER`. Schema changes are limited to create/drop of tables/indexes.
-- **Vector / nearest-neighbor search has no SQL syntax yet** — it is driven
-  through the `Database::vector_search` API (see [VECTOR.md](VECTOR.md)), not an
-  `ORDER BY embedding <-> [...]` operator.
+- **Vector index *creation* is SQL** (`CREATE VECTOR INDEX …`), but the
+  **nearest-neighbor *query* has no SQL syntax yet** — searches go through the
+  `Database::vector_search` / `Node::vector_search` API (see
+  [VECTOR.md](VECTOR.md)), not an `ORDER BY embedding <-> [...]` operator.

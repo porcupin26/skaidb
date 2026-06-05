@@ -5,9 +5,9 @@ search over them with an in-memory **HNSW** index, including **filtered** search
 ("nearest neighbors *where* …"). This is the index family behind semantic
 search / RAG / recommendations.
 
-> Status: an embedded-engine prototype. There is no SQL syntax for kNN yet (use
-> the `Database` API below) and the index is single-node, in-memory, rebuilt
-> from the table on open. See limitations at the end.
+> Status: **distributed** (sharded scatter-gather) but still in-memory and
+> rebuilt from the table on open; the kNN *query* has no SQL syntax yet (index
+> creation does). See limitations at the end.
 
 ## Storing vectors
 
@@ -19,28 +19,45 @@ CREATE TABLE docs (PRIMARY KEY (id));
 INSERT INTO docs (id, cat, embedding) VALUES (1, 'news', [0.12, -0.04, 0.91, ...]);
 ```
 
-## Building an index and searching (embedded API)
+## Creating an index (SQL — works cluster-wide)
 
-```rust
-use skaidb_engine::Database;
-
-let mut db = Database::open("data")?;
-// metric: "cosine" | "l2" | "dot"; dimension is inferred from existing rows.
-db.create_vector_index("docs_emb", "docs", "embedding", "cosine")?;
-
-// k nearest to a query embedding:
-let hits = db.vector_search("docs_emb", &query_vec, 10, &None)?;
-for (key, doc, distance) in hits { /* ... */ }
-
-// filtered ANN — only rows matching the predicate are returned, while the
-// graph is still traversed for connectivity:
-let filter = Some(/* Expr: cat = 'news' */);
-let hits = db.vector_search("docs_emb", &query_vec, 10, &filter)?;
+```sql
+CREATE VECTOR INDEX docs_emb ON docs (embedding) DIM 768 USING cosine
+DROP   VECTOR INDEX docs_emb
 ```
 
-The index is maintained automatically on `INSERT`/`UPDATE`/`DELETE` (a replace
-soft-deletes the old vector and inserts the new one), and is persisted as a
-catalog definition — on reopen it is rebuilt from the table's rows.
+`DIM` (the vector dimension) is required; `USING` is `cosine` (default), `l2`, or
+`dot`. This is **broadcast DDL**: every node builds and maintains an HNSW over
+its own shard. The index is maintained automatically on `INSERT`/`UPDATE`/
+`DELETE` (a replace soft-deletes the old vector and inserts the new one).
+
+## Searching (API)
+
+```rust
+// Embedded single-node:
+let hits = db.vector_search("docs_emb", &query_vec, 10, &None)?;        // (key, doc, distance)
+let hits = db.vector_search("docs_emb", &query_vec, 10, &filter)?;      // filtered ANN
+
+// Cluster coordinator (distributed): scatters to every node's local HNSW,
+// merges the per-shard top-k by distance, then re-reads survivors at quorum.
+let hits = node.vector_search("docs_emb", &query_vec, 10, &filter)?;
+```
+
+The embedded `create_vector_index(name, table, path, metric, dim)` also exists
+(pass `dim = None` to infer from existing rows — single-node only). On reopen the
+in-memory graph is rebuilt from the table's rows.
+
+## Distributed search
+
+Similarity can't be routed to one shard, so distributed ANN **broadcasts** to all
+nodes and merges — the same scatter-gather skaidb uses for secondary-index
+pushdown. Each node runs its local HNSW top-k; the coordinator merges by
+distance, then re-reads the survivors at the read quorum (authoritative
+last-writer-wins vector) and applies the filter. The index is implicitly
+replicated/fault-tolerant because each replica derives its graph from the rows
+it already holds. Note: per-shard top-k merge means global recall depends on each
+shard's recall, so the coordinator over-fetches per shard (more so when a filter
+is present, since filtering happens after the re-read).
 
 ## How it works
 
@@ -75,13 +92,14 @@ search as a *feature* (pgvector, Mongo Atlas, ES `dense_vector`). skaidb now sit
 in that second group: a durable, tunably-consistent store that can also do
 filtered ANN — for moderate, single-node vector sets.
 
-## Limitations (prototype)
+## Limitations
 
-- **No SQL kNN syntax** yet — searches go through the `Database::vector_search`
-  API, not `ORDER BY embedding <-> [..] LIMIT k`.
-- **Single-node, in-memory** — the HNSW lives in RAM and is rebuilt from the
-  table on open (slow startup for very large sets); it is not sharded across the
-  cluster, so there is no distributed vector search.
+- **No SQL kNN syntax** yet — index *creation* is SQL, but searches go through
+  the `vector_search` API, not `ORDER BY embedding <-> [..] LIMIT k`.
+- **In-memory, rebuilt on open** — the HNSW lives in RAM and is reconstructed by
+  scanning the table at startup (slow for very large sets). The performant fix is
+  to persist per-segment graphs that ride the LSM (snapshot + mmap), with
+  quantized vectors in RAM and exact vectors re-read from the table.
 - **Simple neighbor selection** and a fixed `ef` — recall/latency aren't tuned to
   production ANN libraries; large/high-dimensional workloads want a specialist.
 - Vectors must be arrays of `int`/`float` of a single, consistent dimension.

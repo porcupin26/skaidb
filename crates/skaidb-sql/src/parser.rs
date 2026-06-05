@@ -150,6 +150,37 @@ impl Parser {
                 if_not_exists,
                 primary_key,
             }))
+        } else if self.eat_keyword(Keyword::Vector) {
+            self.expect_keyword(Keyword::Index)?;
+            let if_not_exists = self.parse_if_not_exists()?;
+            let name = self.expect_ident()?;
+            self.expect_keyword(Keyword::On)?;
+            let table = self.expect_ident()?;
+            self.expect(&Token::LParen)?;
+            let path = self.parse_path()?;
+            self.expect(&Token::RParen)?;
+            // `DIM <n>` (required) and `USING <metric>` (optional), either order.
+            let mut dim = None;
+            let mut metric = None;
+            loop {
+                if self.eat_keyword(Keyword::Dim) {
+                    dim = Some(self.expect_u64()? as usize);
+                } else if self.eat_keyword(Keyword::Using) {
+                    metric = Some(self.expect_ident()?);
+                } else {
+                    break;
+                }
+            }
+            let dim = dim
+                .ok_or_else(|| ParseError::Other("CREATE VECTOR INDEX requires DIM <n>".into()))?;
+            Ok(Statement::CreateVectorIndex(CreateVectorIndex {
+                name,
+                if_not_exists,
+                table,
+                path,
+                dim,
+                metric: metric.unwrap_or_else(|| "cosine".into()),
+            }))
         } else if self.eat_keyword(Keyword::Index) {
             let if_not_exists = self.parse_if_not_exists()?;
             let name = self.expect_ident()?;
@@ -178,12 +209,17 @@ impl Parser {
             let if_exists = self.parse_if_exists()?;
             let name = self.expect_ident()?;
             Ok(Statement::DropTable { name, if_exists })
+        } else if self.eat_keyword(Keyword::Vector) {
+            self.expect_keyword(Keyword::Index)?;
+            let if_exists = self.parse_if_exists()?;
+            let name = self.expect_ident()?;
+            Ok(Statement::DropVectorIndex { name, if_exists })
         } else if self.eat_keyword(Keyword::Index) {
             let if_exists = self.parse_if_exists()?;
             let name = self.expect_ident()?;
             Ok(Statement::DropIndex { name, if_exists })
         } else {
-            Err(self.unexpected("TABLE or INDEX".into()))
+            Err(self.unexpected("TABLE, INDEX, or VECTOR INDEX".into()))
         }
     }
 

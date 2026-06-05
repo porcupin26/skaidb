@@ -81,6 +81,9 @@ pub enum Keyword {
     Avg,
     Min,
     Max,
+    Vector,
+    Using,
+    Dim,
 }
 
 impl Keyword {
@@ -125,6 +128,9 @@ impl Keyword {
             "AVG" => Avg,
             "MIN" => Min,
             "MAX" => Max,
+            "VECTOR" => Vector,
+            "USING" => Using,
+            "DIM" => Dim,
             _ => return None,
         };
         Some(kw)

@@ -472,7 +472,7 @@ mod tests {
                 .unwrap();
             db.execute("INSERT INTO docs (id, cat, embedding) VALUES (4, 'b', [0.9, 0.1, 0.0])")
                 .unwrap();
-            db.create_vector_index("docs_emb", "docs", "embedding", "cosine")
+            db.create_vector_index("docs_emb", "docs", "embedding", "cosine", None)
                 .unwrap();
 
             // Nearest to [1,0,0]: id 1 (exact), then id 4 (close direction).
