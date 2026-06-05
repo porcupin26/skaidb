@@ -1,0 +1,253 @@
+# Release automation: every push to `main` cuts a versioned GitHub Release with
+# binaries and packages for every supported platform.
+#
+# Flow:  gate (clippy + tests)  ->  version (semver bump + tag)
+#        ->  build matrix (cross-compile + package)  ->  release (publish)
+#
+# Versioning is SemVer, derived from Conventional Commits since the last tag:
+#   feat: ...              -> minor bump
+#   <type>!: / BREAKING    -> major bump
+#   anything else          -> patch bump
+# The bump commit is marked `[skip ci]`, so publishing a release does not loop.
+# Put `[skip ci]` in a commit message to push to main without cutting a release.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  version:
+    name: compute version + tag
+    needs: gate
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.compute.outputs.version }}
+      tag: ${{ steps.compute.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Compute next semantic version
+        id: compute
+        run: |
+          set -euo pipefail
+          latest=$(git tag --list 'v*' --sort=-v:refname | head -n1 || true)
+          current=$(grep -m1 -E '^version = "' Cargo.toml | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/')
+          if [ -z "$latest" ]; then
+            # First release: ship the version already declared in Cargo.toml.
+            new="$current"
+            bump="false"
+            echo "No prior tag; first release v$new"
+          else
+            base="${latest#v}"
+            log=$(git log --format='%s%n%b' "$latest"..HEAD)
+            level="patch"
+            if printf '%s' "$log" | grep -qiE 'BREAKING[ -]CHANGE|^[a-z]+(\([^)]+\))?!:'; then
+              level="major"
+            elif printf '%s' "$log" | grep -qiE '^feat(\([^)]+\))?:'; then
+              level="minor"
+            fi
+            IFS=. read -r MA MI PA <<<"$base"
+            case "$level" in
+              major) MA=$((MA + 1)); MI=0; PA=0 ;;
+              minor) MI=$((MI + 1)); PA=0 ;;
+              patch) PA=$((PA + 1)) ;;
+            esac
+            new="$MA.$MI.$PA"
+            bump="true"
+            echo "Last tag $latest; $level bump -> v$new"
+          fi
+          echo "version=$new" >>"$GITHUB_OUTPUT"
+          echo "tag=v$new" >>"$GITHUB_OUTPUT"
+          echo "bump=$bump" >>"$GITHUB_OUTPUT"
+      - name: Bump Cargo version, commit and tag
+        env:
+          NEW: ${{ steps.compute.outputs.version }}
+          TAG: ${{ steps.compute.outputs.tag }}
+          BUMP: ${{ steps.compute.outputs.bump }}
+        run: |
+          set -euo pipefail
+          git config user.name "skaidb-release[bot]"
+          git config user.email "release@users.noreply.github.com"
+          if [ "$BUMP" = "true" ]; then
+            sed -i -E '0,/^version = "[0-9]+\.[0-9]+\.[0-9]+"/s//version = "'"$NEW"'"/' Cargo.toml
+            cargo update --workspace --quiet || true
+            git add Cargo.toml Cargo.lock 2>/dev/null || git add Cargo.toml
+            git commit -m "chore(release): v$NEW [skip ci]"
+            git push origin HEAD:main
+          fi
+          git tag -a "$TAG" -m "skaidb $TAG"
+          git push origin "$TAG"
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            packaging: linux
+            nfpm_arch: amd64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            packaging: linux
+            nfpm_arch: arm64
+            linker: aarch64-linux-gnu-gcc
+            apt: gcc-aarch64-linux-gnu
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            packaging: musl
+            apt: musl-tools
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            packaging: macos
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            packaging: macos
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            packaging: windows
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install Linux cross/packaging deps
+        if: runner.os == 'Linux' && matrix.apt != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
+
+      - name: Configure cross linker
+        if: matrix.linker != ''
+        shell: bash
+        run: |
+          echo "CARGO_TARGET_$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')_LINKER=${{ matrix.linker }}" >>"$GITHUB_ENV"
+
+      - name: Build release binaries
+        run: cargo build --release --target ${{ matrix.target }} -p skaidb-server -p skaidb-cli
+
+      # ---- packaging: Linux (tarball + .deb + .rpm) ----
+      - name: Install nfpm
+        if: matrix.packaging == 'linux'
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.41.3
+      - name: Package Linux
+        if: matrix.packaging == 'linux'
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          NFPM_ARCH: ${{ matrix.nfpm_arch }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist staging
+          cp "target/$TARGET/release/skaidb" "target/$TARGET/release/skaidb-cli" staging/
+          cp LICENSE README.md staging/
+          tar -C staging -czf "dist/skaidb-$VERSION-$TARGET.tar.gz" .
+          "$(go env GOPATH)/bin/nfpm" package -f .github/nfpm.yaml -p deb -t dist/
+          "$(go env GOPATH)/bin/nfpm" package -f .github/nfpm.yaml -p rpm -t dist/
+
+      # ---- packaging: musl (static tarball) ----
+      - name: Package musl
+        if: matrix.packaging == 'musl'
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist staging
+          cp "target/$TARGET/release/skaidb" "target/$TARGET/release/skaidb-cli" staging/
+          cp LICENSE README.md staging/
+          tar -C staging -czf "dist/skaidb-$VERSION-$TARGET.tar.gz" .
+
+      # ---- packaging: macOS (tarball + .dmg) ----
+      - name: Package macOS
+        if: matrix.packaging == 'macos'
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist dmgroot
+          cp "target/$TARGET/release/skaidb" "target/$TARGET/release/skaidb-cli" dmgroot/
+          cp LICENSE README.md dmgroot/
+          tar -C dmgroot -czf "dist/skaidb-$VERSION-$TARGET.tar.gz" .
+          hdiutil create -volname "skaidb $VERSION" -srcfolder dmgroot \
+            -ov -format UDZO "dist/skaidb-$VERSION-$TARGET.dmg"
+
+      # ---- packaging: Windows (.zip + raw .exe) ----
+      - name: Package Windows
+        if: matrix.packaging == 'windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          New-Item -ItemType Directory -Force -Path dist,staging | Out-Null
+          Copy-Item "target/$env:TARGET/release/skaidb.exe" staging/
+          Copy-Item "target/$env:TARGET/release/skaidb-cli.exe" staging/
+          Copy-Item LICENSE,README.md staging/
+          Compress-Archive -Path staging/* -DestinationPath "dist/skaidb-$env:VERSION-$env:TARGET.zip" -Force
+          Copy-Item "target/$env:TARGET/release/skaidb.exe" "dist/skaidb-$env:VERSION-$env:TARGET.exe"
+          Copy-Item "target/$env:TARGET/release/skaidb-cli.exe" "dist/skaidb-cli-$env:VERSION-$env:TARGET.exe"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum * > SHA256SUMS
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: skaidb ${{ needs.version.outputs.tag }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: artifacts/*

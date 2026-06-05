@@ -1,0 +1,25 @@
+# nfpm config for building the skaidb .deb / .rpm packages (https://nfpm.goreleaser.com).
+# `VERSION` and `NFPM_ARCH` are supplied by the release workflow; the binaries are
+# staged into ./staging/ for the target arch before nfpm runs.
+name: skaidb
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${VERSION}
+section: database
+priority: optional
+maintainer: skaidb maintainers <release@users.noreply.github.com>
+description: |
+  skaidb — a schema-less, SQL-speaking, leaderless distributed database.
+  Bundles the server (skaidb) and the embedded SQL shell (skaidb-cli).
+vendor: skaidb
+homepage: https://github.com/porcupin26/skaidb
+license: SSPL-1.0
+contents:
+  - src: ./staging/skaidb
+    dst: /usr/bin/skaidb
+  - src: ./staging/skaidb-cli
+    dst: /usr/bin/skaidb-cli
+  - src: ./LICENSE
+    dst: /usr/share/doc/skaidb/LICENSE
+  - src: ./README.md
+    dst: /usr/share/doc/skaidb/README.md

@@ -38,6 +38,26 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+## Install
+
+Prebuilt binaries and packages for Linux, macOS, and Windows are attached to
+every [GitHub Release](https://github.com/porcupin26/skaidb/releases) — `.deb`
+and `.rpm` (x86_64 + aarch64), `.dmg` (Intel + Apple Silicon), a Windows `.zip`/
+`.exe`, and `.tar.gz` tarballs (incl. a static musl build), with `SHA256SUMS`.
+Each bundle ships both the `skaidb` server and the `skaidb-cli` shell.
+
+```sh
+# Debian/Ubuntu
+sudo dpkg -i skaidb_*_amd64.deb
+# Fedora/RHEL
+sudo rpm -i skaidb-*.x86_64.rpm
+# or just grab a tarball
+tar xzf skaidb-*-x86_64-unknown-linux-gnu.tar.gz
+```
+
+Releases are cut automatically on every push to `main` with SemVer version
+bumps — see [docs/RELEASING.md](docs/RELEASING.md). Or build from source:
+
 ## Run the server
 
 ```sh
