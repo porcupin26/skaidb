@@ -344,6 +344,28 @@ impl Engine {
             .collect())
     }
 
+    /// Scan live keys in the half-open byte range `[start, end)`, in key order.
+    /// `None` bounds are unbounded. Because the index encodes values
+    /// order-preservingly, this is what powers range predicates and
+    /// `ORDER BY`-via-index in the query engine.
+    pub fn scan_range(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        Ok(self
+            .merged()?
+            .into_iter()
+            .filter(|(k, _)| {
+                start.is_none_or(|s| k.as_slice() >= s) && end.is_none_or(|e| k.as_slice() < e)
+            })
+            .filter_map(|(k, (_, v))| match v {
+                VersionValue::Put(bytes) => Some((k, bytes)),
+                VersionValue::Delete => None,
+            })
+            .collect())
+    }
+
     /// Merge all sources into the latest version per key (newest stamp wins).
     fn merged(&self) -> Result<MergedRows> {
         use std::collections::BTreeMap;

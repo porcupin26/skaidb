@@ -78,7 +78,9 @@ Implemented end-to-end and tested (141 tests):
 - LSM storage: WAL recovery, SSTables + Bloom filters, lazy-leveled compaction,
   **group-commit WAL** (batched fsync across concurrent writers), and a bounded
   **RAM read cache** for point reads that fall through to SSTables
-- **secondary indexes** that accelerate local `WHERE path = value`
+- **secondary indexes** that accelerate local **equality and range** predicates
+  (`= < <= > >=`, `BETWEEN`-style) and `ORDER BY <indexed col>` (sorted scan with
+  early-stop `LIMIT` for top-N), since index entries are stored order-preserved
 - **leaderless replication**: consistent-hash placement; every node serves reads
   and writes; **tunable write consistency** (`ONE`/`QUORUM`/`ALL`) where weaker
   levels ack early and replicate the rest in the background, and a coordinated
@@ -96,9 +98,10 @@ Designed for but deliberately not yet built: **QUIC** transport + push-based
 control plane (the raw-TCP fast path is in; QUIC needs an async runtime),
 **distributed/multi-key transactions** (needs a coordinator/2PC), active
 **anti-entropy** (read-repair & hinted handoff — convergence currently relies on
-writes reaching their replicas), and **secondary-index / range acceleration on
-the distributed read path** (PK point reads are routed, but non-PK and range
-reads still gather from replicas and filter).
+writes reaching their replicas), and **secondary-index acceleration on the
+distributed read path** (locally, indexes serve equality/range/`ORDER BY`; in a
+cluster the coordinator still routes only by primary key, so a non-PK query
+gathers from replicas and filters).
 
 See `.priv/SPEC.md` for the full design.
 

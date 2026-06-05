@@ -29,6 +29,13 @@ pub type VersionedRow = (Vec<u8>, Vec<u8>, Hlc);
 /// `is_put` is false the row is a delete and `value` is empty.
 pub type VersionedTombstoneRow = (Vec<u8>, Vec<u8>, Hlc, bool);
 
+/// `(key, document)` rows — the engine's standard row-gather result.
+type KeyedRows = Vec<(Vec<u8>, Document)>;
+/// Gathered rows plus whether they are already in the requested `ORDER BY` order.
+type OrderedRows = (KeyedRows, bool);
+/// A chosen index access path: `(index_name, column, start_key, end_key)`.
+type IndexPlan = (String, String, Option<Vec<u8>>, Option<Vec<u8>>);
+
 /// An embedded skaidb database: catalog plus one storage engine per table and
 /// per secondary index.
 #[derive(Debug)]
@@ -199,29 +206,91 @@ impl Database {
 
     // ---- row gathering (with optional index acceleration) ----
 
-    /// Collect `(key, doc)` for the rows of `table` matching `filter`. When
-    /// `filter` is a simple equality on an indexed path, matching primary keys
-    /// are read from the secondary index and point-fetched, avoiding a scan.
+    /// Collect `(key, doc)` for the rows of `table` matching `filter`, using a
+    /// secondary index when the filter permits (equality or range on an indexed
+    /// path). Unordered convenience wrapper over [`Database::gather_rows_planned`].
     fn gather_rows_keyed(
         &self,
         table: &str,
         filter: &Option<Expr>,
     ) -> Result<Vec<(Vec<u8>, Document)>> {
-        let candidates = if let Some((path, value)) = index_equality(filter) {
-            match self.find_index(table, &path) {
-                Some(name) => self.lookup_by_index_keyed(table, &name, &value)?,
-                None => self.scan_docs(table)?,
+        Ok(self.gather_rows_planned(table, filter, None, None)?.0)
+    }
+
+    /// Plan and execute a row gather, optionally using a secondary index to (a)
+    /// bound the scan to a value range (equality/`<`/`>`/`BETWEEN` on an indexed
+    /// path) and/or (b) return rows already sorted ascending by `order`. When the
+    /// result is in `order` and `fetch_limit` is set, scanning stops early
+    /// (top-N). Returns the rows and whether they are sorted by `order`.
+    fn gather_rows_planned(
+        &self,
+        table: &str,
+        filter: &Option<Expr>,
+        order: Option<&str>,
+        fetch_limit: Option<usize>,
+    ) -> Result<OrderedRows> {
+        let Some((index_name, path, start, end)) = self.plan_index(table, filter, order) else {
+            // No usable index: full table scan + filter, unordered.
+            let mut out = Vec::new();
+            for (key, doc) in self.scan_docs(table)? {
+                if matches_filter(filter, &doc)? {
+                    out.push((key, doc));
+                }
             }
-        } else {
-            self.scan_docs(table)?
+            return Ok((out, false));
         };
+
+        let index_engine = self
+            .indexes
+            .get(&index_name)
+            .ok_or_else(|| EngineError::IndexNotFound(index_name.clone()))?;
+        let table_engine = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+        let sorted = order == Some(path.as_str());
+
         let mut out = Vec::new();
-        for (key, doc) in candidates {
-            if matches_filter(filter, &doc)? {
-                out.push((key, doc));
+        for (_entry_key, row_key) in index_engine.scan_range(start.as_deref(), end.as_deref())? {
+            let Some(bytes) = table_engine.get(&row_key)? else {
+                continue; // index entry for a since-deleted row
+            };
+            if let Value::Document(doc) =
+                Value::decode(&bytes).map_err(|e| EngineError::Constraint(format!("corrupt row: {e}")))?
+            {
+                if matches_filter(filter, &doc)? {
+                    out.push((row_key, doc));
+                    // Rows already arrive in `order`, so a fetch limit lets us stop.
+                    if sorted && fetch_limit.is_some_and(|lim| out.len() >= lim) {
+                        break;
+                    }
+                }
             }
         }
-        Ok(out)
+        Ok((out, sorted))
+    }
+
+    /// Choose an index access path for `(filter, order)`: a column with
+    /// equality/range bounds that is indexed (bounded scan), else an indexed
+    /// `ORDER BY` column (full ordered scan). Returns
+    /// `(index_name, path, start_key, end_key)`.
+    fn plan_index(
+        &self,
+        table: &str,
+        filter: &Option<Expr>,
+        order: Option<&str>,
+    ) -> Option<IndexPlan> {
+        for (col, start, end) in range_bounds_by_column(filter) {
+            if let Some(name) = self.find_index(table, &col) {
+                return Some((name, col, start, end));
+            }
+        }
+        if let Some(col) = order {
+            if let Some(name) = self.find_index(table, col) {
+                return Some((name, col.to_string(), None, None));
+            }
+        }
+        None
     }
 
     /// The (name, path) of every index defined on `table`.
@@ -259,35 +328,6 @@ impl Database {
             engine.delete(&index_entry_key(&value, row_key))?;
         }
         Ok(())
-    }
-
-    /// Fetch `(key, doc)` for rows whose indexed value equals `value`.
-    fn lookup_by_index_keyed(
-        &self,
-        table: &str,
-        name: &str,
-        value: &Value,
-    ) -> Result<Vec<(Vec<u8>, Document)>> {
-        let index_engine = self
-            .indexes
-            .get(name)
-            .ok_or_else(|| EngineError::IndexNotFound(name.to_string()))?;
-        let table_engine = self
-            .tables
-            .get(table)
-            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
-
-        let mut rows = Vec::new();
-        for (_entry_key, row_key) in index_engine.scan_prefix(&index_prefix(value))? {
-            if let Some(bytes) = table_engine.get(&row_key)? {
-                if let Value::Document(doc) = Value::decode(&bytes)
-                    .map_err(|e| EngineError::Constraint(format!("corrupt row: {e}")))?
-                {
-                    rows.push((row_key, doc));
-                }
-            }
-        }
-        Ok(rows)
     }
 
     // ---- distribution support (used by the cluster coordinator) ----
@@ -501,6 +541,20 @@ pub trait Cluster {
         table: &str,
         filter: &Option<Expr>,
     ) -> Result<Vec<(Vec<u8>, Document)>>;
+
+    /// Like [`Cluster::matching_rows`] but may use an index to return rows
+    /// already sorted ascending by `order` (a single plain column) and to stop
+    /// after `fetch_limit` matching rows. Returns the rows and whether they are
+    /// actually sorted by `order`. The default ignores the hints.
+    fn matching_rows_ordered(
+        &mut self,
+        table: &str,
+        filter: &Option<Expr>,
+        _order: Option<&str>,
+        _fetch_limit: Option<usize>,
+    ) -> Result<OrderedRows> {
+        Ok((self.matching_rows(table, filter)?, false))
+    }
     /// Write `doc` under `key` in `table` (and maintain indexes/replicas).
     fn put(&mut self, table: &str, key: &[u8], doc: &Document) -> Result<()>;
     /// Delete `key` from `table`; `doc` is the row being removed (for indexes).
@@ -543,19 +597,44 @@ fn run_insert(ins: Insert, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
 }
 
 fn run_select(sel: Select, cluster: &mut dyn Cluster) -> Result<ResultSet> {
-    let docs: Vec<Document> = cluster
-        .matching_rows(&sel.from, &sel.filter)?
-        .into_iter()
-        .map(|(_k, doc)| doc)
-        .collect();
     let has_aggregate = sel.items.iter().any(|it| match it {
         SelectItem::Expr { expr, .. } => contains_aggregate(expr),
         SelectItem::Wildcard => false,
     });
-    if has_aggregate || !sel.group_by.is_empty() {
+    let grouped = has_aggregate || !sel.group_by.is_empty();
+
+    // An index can satisfy a single ascending `ORDER BY <column>` directly.
+    let order_col = if grouped {
+        None
+    } else {
+        index_order_column(&sel.order_by)
+    };
+    // Push a fetch limit only when the rows will come back in the requested order
+    // (so truncating the prefix is correct).
+    let fetch_limit = match (&order_col, sel.limit) {
+        (Some(_), Some(limit)) => Some(sel.offset.unwrap_or(0).saturating_add(limit) as usize),
+        _ => None,
+    };
+
+    let (keyed, presorted) =
+        cluster.matching_rows_ordered(&sel.from, &sel.filter, order_col.as_deref(), fetch_limit)?;
+    let docs: Vec<Document> = keyed.into_iter().map(|(_k, doc)| doc).collect();
+
+    if grouped {
         select_aggregate(&sel, docs)
     } else {
-        select_rows(&sel, docs)
+        select_rows(&sel, docs, presorted)
+    }
+}
+
+/// The column an index could order by: a lone ascending `ORDER BY <column>`.
+fn index_order_column(order_by: &[OrderKey]) -> Option<String> {
+    match order_by {
+        [key] if !key.descending => match &key.expr {
+            Expr::Column(col) => Some(col.clone()),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -605,6 +684,16 @@ impl Cluster for LocalCluster<'_> {
         self.db.gather_rows_keyed(table, filter)
     }
 
+    fn matching_rows_ordered(
+        &mut self,
+        table: &str,
+        filter: &Option<Expr>,
+        order: Option<&str>,
+        fetch_limit: Option<usize>,
+    ) -> Result<OrderedRows> {
+        self.db.gather_rows_planned(table, filter, order, fetch_limit)
+    }
+
     fn put(&mut self, table: &str, key: &[u8], doc: &Document) -> Result<()> {
         self.db
             .table_engine_mut(table)?
@@ -644,30 +733,134 @@ fn index_entry_key(value: &Value, row_key: &[u8]) -> Vec<u8> {
 }
 
 /// The shared byte prefix of every index entry for `value` (the encoding of the
-/// single-element array `[value]` without its trailing array terminator).
+/// single-element array `[value]` without its trailing array terminator). It is
+/// also the inclusive lower bound for a range scan starting at `value`.
 fn index_prefix(value: &Value) -> Vec<u8> {
     let mut key = Value::Array(vec![value.clone()]).encode_key();
     key.pop(); // drop the array-terminator byte
     key
 }
 
-/// Recognize a `path = literal` (or `literal = path`) predicate for index use.
-fn index_equality(filter: &Option<Expr>) -> Option<(String, Value)> {
-    let Some(Expr::Binary {
-        op: BinaryOp::Eq,
-        left,
-        right,
-    }) = filter
-    else {
-        return None;
-    };
-    match (left.as_ref(), right.as_ref()) {
-        (Expr::Column(p), Expr::Literal(v)) | (Expr::Literal(v), Expr::Column(p))
-            if !v.is_null() =>
-        {
-            Some((p.clone(), v.clone()))
+/// Exclusive upper bound just past every index entry for `value`, so a scan
+/// `[.., index_upper_bound(value))` includes all rows whose value equals it.
+/// `None` means "no upper bound" (the prefix is all `0xFF`).
+fn index_upper_bound(value: &Value) -> Option<Vec<u8>> {
+    prefix_upper_bound(&index_prefix(value))
+}
+
+/// The smallest byte string strictly greater than every string with `prefix`.
+fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut bound = prefix.to_vec();
+    while let Some(last) = bound.last_mut() {
+        if *last < 0xFF {
+            *last += 1;
+            return Some(bound);
         }
-        _ => None,
+        bound.pop();
+    }
+    None
+}
+
+/// Derive per-column index scan bounds from `filter`. Equality and the
+/// comparison operators (`<`, `<=`, `>`, `>=`) on a `column <op> literal` (in
+/// either order), combined with `AND`, contribute bounds; everything else is
+/// left to the post-scan filter. Bounds are a superset of the matching rows —
+/// `matches_filter` re-checks exact predicates — so inclusivity need not be
+/// byte-exact. Returns `(column, start_key, end_key)` per constrained column.
+type ColumnBounds = (String, Option<Vec<u8>>, Option<Vec<u8>>);
+fn range_bounds_by_column(filter: &Option<Expr>) -> Vec<ColumnBounds> {
+    let mut cmps: Vec<(String, BinaryOp, Value)> = Vec::new();
+    if let Some(expr) = filter {
+        collect_comparisons(expr, &mut cmps);
+    }
+
+    let mut by_col: Vec<ColumnBounds> = Vec::new();
+    for (col, op, val) in cmps {
+        let idx = match by_col.iter().position(|(c, _, _)| *c == col) {
+            Some(i) => i,
+            None => {
+                by_col.push((col.clone(), None, None));
+                by_col.len() - 1
+            }
+        };
+        let (_, start, end) = &mut by_col[idx];
+        match op {
+            BinaryOp::Eq => {
+                *start = tighten_start(start.take(), Some(index_prefix(&val)));
+                *end = tighten_end(end.take(), index_upper_bound(&val));
+            }
+            BinaryOp::Gt | BinaryOp::GtEq => {
+                *start = tighten_start(start.take(), Some(index_prefix(&val)));
+            }
+            BinaryOp::Lt | BinaryOp::LtEq => {
+                *end = tighten_end(end.take(), index_upper_bound(&val));
+            }
+            _ => {}
+        }
+    }
+    by_col
+        .into_iter()
+        .filter(|(_, s, e)| s.is_some() || e.is_some())
+        .collect()
+}
+
+/// Tightest (largest) inclusive lower bound.
+fn tighten_start(cur: Option<Vec<u8>>, new: Option<Vec<u8>>) -> Option<Vec<u8>> {
+    match (cur, new) {
+        (c, None) => c,
+        (None, Some(n)) => Some(n),
+        (Some(c), Some(n)) => Some(c.max(n)),
+    }
+}
+
+/// Tightest (smallest) exclusive upper bound.
+fn tighten_end(cur: Option<Vec<u8>>, new: Option<Vec<u8>>) -> Option<Vec<u8>> {
+    match (cur, new) {
+        (c, None) => c,
+        (None, Some(n)) => Some(n),
+        (Some(c), Some(n)) => Some(c.min(n)),
+    }
+}
+
+/// Collect `column <op> literal` comparisons reachable through `AND`.
+fn collect_comparisons(expr: &Expr, out: &mut Vec<(String, BinaryOp, Value)>) {
+    match expr {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            collect_comparisons(left, out);
+            collect_comparisons(right, out);
+        }
+        Expr::Binary { op, left, right }
+            if matches!(
+                op,
+                BinaryOp::Eq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
+            ) =>
+        {
+            match (left.as_ref(), right.as_ref()) {
+                (Expr::Column(c), Expr::Literal(v)) if !v.is_null() => {
+                    out.push((c.clone(), *op, v.clone()))
+                }
+                (Expr::Literal(v), Expr::Column(c)) if !v.is_null() => {
+                    out.push((c.clone(), flip_op(*op), v.clone()))
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Flip a comparison so the column sits on the left (`5 < x` → `x > 5`).
+fn flip_op(op: BinaryOp) -> BinaryOp {
+    match op {
+        BinaryOp::Lt => BinaryOp::Gt,
+        BinaryOp::LtEq => BinaryOp::GtEq,
+        BinaryOp::Gt => BinaryOp::Lt,
+        BinaryOp::GtEq => BinaryOp::LtEq,
+        other => other,
     }
 }
 
@@ -759,8 +952,12 @@ fn expr_name(expr: &Expr) -> String {
 }
 
 /// Row-per-document projection (no aggregates).
-fn select_rows(sel: &Select, mut docs: Vec<Document>) -> Result<ResultSet> {
-    sort_docs(&mut docs, &sel.order_by)?;
+fn select_rows(sel: &Select, mut docs: Vec<Document>, presorted: bool) -> Result<ResultSet> {
+    // `presorted` means the gather already returned rows in `ORDER BY` order
+    // (via an index), so the sort pass is skipped.
+    if !presorted {
+        sort_docs(&mut docs, &sel.order_by)?;
+    }
     apply_offset_limit(&mut docs, sel.offset, sel.limit);
 
     // Wildcard expands to the sorted union of all field names in the output set.

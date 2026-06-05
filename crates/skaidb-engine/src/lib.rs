@@ -228,6 +228,132 @@ mod tests {
         assert!(rs.rows.is_empty());
     }
 
+    /// Build a `people(id, age)` table with `age` indexed and rows 1..=n where
+    /// `age = id * 10`.
+    fn people_by_age(n: i64) -> Database {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE people (PRIMARY KEY (id))").unwrap();
+        db.execute("CREATE INDEX people_age ON people(age)").unwrap();
+        for id in 1..=n {
+            db.execute(&format!(
+                "INSERT INTO people (id, age) VALUES ({id}, {})",
+                id * 10
+            ))
+            .unwrap();
+        }
+        db
+    }
+
+    fn ids(rs: ResultSet) -> Vec<i64> {
+        rs.rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Int(i) => *i,
+                other => panic!("expected int id, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn index_range_scan_returns_correct_rows() {
+        let mut db = people_by_age(10); // ages 10,20,..,100
+        assert_eq!(
+            ids(rows(db.execute("SELECT id FROM people WHERE age > 70 ORDER BY id").unwrap())),
+            vec![8, 9, 10]
+        );
+        assert_eq!(
+            ids(rows(db.execute("SELECT id FROM people WHERE age >= 70 ORDER BY id").unwrap())),
+            vec![7, 8, 9, 10]
+        );
+        assert_eq!(
+            ids(rows(db.execute("SELECT id FROM people WHERE age < 30 ORDER BY id").unwrap())),
+            vec![1, 2]
+        );
+        assert_eq!(
+            ids(rows(db.execute("SELECT id FROM people WHERE age <= 30 ORDER BY id").unwrap())),
+            vec![1, 2, 3]
+        );
+        // BETWEEN-style range (two bounds AND-ed on the indexed column).
+        assert_eq!(
+            ids(rows(
+                db.execute("SELECT id FROM people WHERE age >= 30 AND age <= 60 ORDER BY id")
+                    .unwrap()
+            )),
+            vec![3, 4, 5, 6]
+        );
+        // Literal-on-the-left is normalized.
+        assert_eq!(
+            ids(rows(db.execute("SELECT id FROM people WHERE 80 < age ORDER BY id").unwrap())),
+            vec![9, 10]
+        );
+    }
+
+    #[test]
+    fn order_by_indexed_column_is_sorted_and_limited() {
+        let mut db = people_by_age(5); // ages 10..50
+        // Insert in non-sorted id order to prove ordering comes from the index.
+        db.execute("INSERT INTO people (id, age) VALUES (99, 5)").unwrap();
+        assert_eq!(
+            ids(rows(db.execute("SELECT id FROM people ORDER BY age").unwrap())),
+            vec![99, 1, 2, 3, 4, 5] // ages 5,10,20,30,40,50
+        );
+        // Top-N via the index (early stop).
+        assert_eq!(
+            ids(rows(db.execute("SELECT id FROM people ORDER BY age LIMIT 3").unwrap())),
+            vec![99, 1, 2]
+        );
+        // OFFSET + LIMIT windows correctly.
+        assert_eq!(
+            ids(rows(
+                db.execute("SELECT id FROM people ORDER BY age LIMIT 2 OFFSET 2").unwrap()
+            )),
+            vec![2, 3]
+        );
+        // Range + order combined.
+        assert_eq!(
+            ids(rows(
+                db.execute("SELECT id FROM people WHERE age >= 20 ORDER BY age LIMIT 2").unwrap()
+            )),
+            vec![2, 3]
+        );
+    }
+
+    #[test]
+    fn order_by_desc_falls_back_to_sort() {
+        let mut db = people_by_age(4);
+        assert_eq!(
+            ids(rows(db.execute("SELECT id FROM people ORDER BY age DESC").unwrap())),
+            vec![4, 3, 2, 1]
+        );
+    }
+
+    #[test]
+    fn range_on_unindexed_column_still_correct() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE people (PRIMARY KEY (id))").unwrap();
+        for id in 1..=6 {
+            db.execute(&format!("INSERT INTO people (id, age) VALUES ({id}, {})", id * 10))
+                .unwrap();
+        }
+        assert_eq!(
+            ids(rows(db.execute("SELECT id FROM people WHERE age > 30 ORDER BY id").unwrap())),
+            vec![4, 5, 6]
+        );
+    }
+
+    #[test]
+    fn index_range_survives_updates_and_deletes() {
+        let mut db = people_by_age(50);
+        db.execute("UPDATE people SET age = 5 WHERE id = 50").unwrap(); // moves out of range
+        db.execute("DELETE FROM people WHERE id = 1").unwrap();
+        assert_eq!(
+            ids(rows(
+                db.execute("SELECT id FROM people WHERE age >= 480 ORDER BY id").unwrap()
+            )),
+            vec![48, 49] // ages 480, 490; id 50 now 5, id 1 gone
+        );
+    }
+
     #[test]
     fn secondary_index_backfills_existing_rows_and_persists() {
         let dir = tempdir();
