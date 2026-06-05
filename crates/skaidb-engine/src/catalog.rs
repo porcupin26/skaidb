@@ -10,11 +10,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{EngineError, Result};
 
-/// A secondary index declaration (`CREATE INDEX ... ON t(path)`).
+/// A secondary index declaration (`CREATE INDEX ... ON t(path1, path2, ...)`).
+/// `paths` is ordered: a composite index sorts by the first path, then the
+/// second, and so on.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IndexDef {
     pub table: String,
-    pub path: String,
+    pub paths: Vec<String>,
 }
 
 /// A table definition: just its primary key columns.

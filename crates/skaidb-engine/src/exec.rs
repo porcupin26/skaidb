@@ -33,8 +33,9 @@ pub type VersionedTombstoneRow = (Vec<u8>, Vec<u8>, Hlc, bool);
 type KeyedRows = Vec<(Vec<u8>, Document)>;
 /// Gathered rows plus whether they are already in the requested `ORDER BY` order.
 type OrderedRows = (KeyedRows, bool);
-/// A chosen index access path: `(index_name, column, start_key, end_key)`.
-type IndexPlan = (String, String, Option<Vec<u8>>, Option<Vec<u8>>);
+/// A chosen index access path: `(index_name, start_key, end_key, sorted)` where
+/// `sorted` is whether the scan order already satisfies the query's `ORDER BY`.
+type IndexPlan = (String, Option<Vec<u8>>, Option<Vec<u8>>, bool);
 
 /// An embedded skaidb database: catalog plus one storage engine per table and
 /// per secondary index.
@@ -83,7 +84,7 @@ impl Database {
             }
             Statement::DropTable { name, if_exists } => self.drop_table(&name, if_exists),
             Statement::CreateIndex(ci) => {
-                self.create_index(&ci.name, &ci.table, &ci.path, ci.if_not_exists)
+                self.create_index(&ci.name, &ci.table, &ci.paths, ci.if_not_exists)
             }
             Statement::DropIndex { name, if_exists } => self.drop_index(&name, if_exists),
             // DML and SELECT run through the storage-agnostic executor so the
@@ -161,7 +162,7 @@ impl Database {
         &mut self,
         name: &str,
         table: &str,
-        path: &str,
+        paths: &[String],
         if_not_exists: bool,
     ) -> Result<QueryOutput> {
         if !self.catalog.tables.contains_key(table) {
@@ -176,15 +177,15 @@ impl Database {
         // Create the index store and backfill it from the existing rows.
         let mut index_engine = StorageEngine::open(index_dir(&self.dir, name))?;
         for (row_key, doc) in self.scan_docs(table)? {
-            let value = index_value(&doc, path);
-            index_engine.put(&index_entry_key(&value, &row_key), row_key.clone())?;
+            let values = index_values(&doc, paths);
+            index_engine.put(&index_entry_key(&values, &row_key), row_key.clone())?;
         }
         self.indexes.insert(name.to_string(), index_engine);
         self.catalog.indexes.insert(
             name.to_string(),
             IndexDef {
                 table: table.to_string(),
-                path: path.to_string(),
+                paths: paths.to_vec(),
             },
         );
         self.save_catalog()?;
@@ -229,7 +230,7 @@ impl Database {
         order: Option<&str>,
         fetch_limit: Option<usize>,
     ) -> Result<OrderedRows> {
-        let Some((index_name, path, start, end)) = self.plan_index(table, filter, order) else {
+        let Some((index_name, start, end, sorted)) = self.plan_index(table, filter, order) else {
             // No usable index: full table scan + filter, unordered.
             let mut out = Vec::new();
             for (key, doc) in self.scan_docs(table)? {
@@ -248,7 +249,6 @@ impl Database {
             .tables
             .get(table)
             .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
-        let sorted = order == Some(path.as_str());
 
         let mut out = Vec::new();
         for (_entry_key, row_key) in index_engine.scan_range(start.as_deref(), end.as_deref())? {
@@ -280,52 +280,56 @@ impl Database {
         filter: &Option<Expr>,
         order: Option<&str>,
     ) -> Option<IndexPlan> {
-        for (col, start, end) in range_bounds_by_column(filter) {
-            if let Some(name) = self.find_index(table, &col) {
-                return Some((name, col, start, end));
+        let constraints = column_constraints(filter);
+        let mut fallback: Option<IndexPlan> = None;
+        for (name, idx) in self.catalog.indexes.iter().filter(|(_, i)| i.table == table) {
+            if let Some((start, end, sorted)) = plan_for_index(&idx.paths, &constraints, order) {
+                let plan = (name.clone(), start, end, sorted);
+                if sorted {
+                    return Some(plan); // prefer a plan that also satisfies ORDER BY
+                }
+                fallback.get_or_insert(plan);
             }
         }
-        if let Some(col) = order {
-            if let Some(name) = self.find_index(table, col) {
-                return Some((name, col.to_string(), None, None));
-            }
-        }
-        None
+        fallback
     }
 
-    /// The (name, path) of every index defined on `table`.
-    fn indexes_on(&self, table: &str) -> Vec<(String, String)> {
+    /// The `(name, paths)` of every index defined on `table`.
+    fn indexes_on(&self, table: &str) -> Vec<(String, Vec<String>)> {
         self.catalog
             .indexes
             .iter()
             .filter(|(_, idx)| idx.table == table)
-            .map(|(name, idx)| (name.clone(), idx.path.clone()))
+            .map(|(name, idx)| (name.clone(), idx.paths.clone()))
             .collect()
     }
 
-    /// Find an index on `table` over exactly `path`, if one exists.
-    fn find_index(&self, table: &str, path: &str) -> Option<String> {
-        self.catalog
-            .indexes
-            .iter()
-            .find(|(_, idx)| idx.table == table && idx.path == path)
-            .map(|(name, _)| name.clone())
-    }
-
-    /// Add an index entry for `doc`'s value at `path` pointing to `row_key`.
-    fn index_put(&mut self, name: &str, path: &str, doc: &Document, row_key: &[u8]) -> Result<()> {
-        let value = index_value(doc, path);
+    /// Add an index entry for `doc`'s values at `paths` pointing to `row_key`.
+    fn index_put(
+        &mut self,
+        name: &str,
+        paths: &[String],
+        doc: &Document,
+        row_key: &[u8],
+    ) -> Result<()> {
+        let values = index_values(doc, paths);
         if let Some(engine) = self.indexes.get_mut(name) {
-            engine.put(&index_entry_key(&value, row_key), row_key.to_vec())?;
+            engine.put(&index_entry_key(&values, row_key), row_key.to_vec())?;
         }
         Ok(())
     }
 
-    /// Remove the index entry for `doc`'s value at `path` pointing to `row_key`.
-    fn index_del(&mut self, name: &str, path: &str, doc: &Document, row_key: &[u8]) -> Result<()> {
-        let value = index_value(doc, path);
+    /// Remove the index entry for `doc`'s values at `paths` pointing to `row_key`.
+    fn index_del(
+        &mut self,
+        name: &str,
+        paths: &[String],
+        doc: &Document,
+        row_key: &[u8],
+    ) -> Result<()> {
+        let values = index_values(doc, paths);
         if let Some(engine) = self.indexes.get_mut(name) {
-            engine.delete(&index_entry_key(&value, row_key))?;
+            engine.delete(&index_entry_key(&values, row_key))?;
         }
         Ok(())
     }
@@ -721,31 +725,34 @@ fn index_dir(root: &Path, name: &str) -> PathBuf {
     root.join("indexes").join(name)
 }
 
-/// The indexed value of `doc` at `path` (a missing field indexes as `NULL`).
-fn index_value(doc: &Document, path: &str) -> Value {
-    doc.get_path(path).cloned().unwrap_or(Value::Null)
+/// The indexed values of `doc` at `paths` (a missing field indexes as `NULL`).
+fn index_values(doc: &Document, paths: &[String]) -> Vec<Value> {
+    paths
+        .iter()
+        .map(|p| doc.get_path(p).cloned().unwrap_or(Value::Null))
+        .collect()
 }
 
-/// Index entry key: `[indexed_value, row_key]` encoded order-preservingly, so
-/// all entries for one value share a common byte prefix.
-fn index_entry_key(value: &Value, row_key: &[u8]) -> Vec<u8> {
-    Value::Array(vec![value.clone(), Value::Bytes(row_key.to_vec())]).encode_key()
+/// Index entry key: `[v1, .., vk, row_key]` encoded order-preservingly, so all
+/// entries sharing a leading value prefix share a byte prefix (composite-aware).
+fn index_entry_key(values: &[Value], row_key: &[u8]) -> Vec<u8> {
+    let mut elems = values.to_vec();
+    elems.push(Value::Bytes(row_key.to_vec()));
+    Value::Array(elems).encode_key()
 }
 
-/// The shared byte prefix of every index entry for `value` (the encoding of the
-/// single-element array `[value]` without its trailing array terminator). It is
-/// also the inclusive lower bound for a range scan starting at `value`.
-fn index_prefix(value: &Value) -> Vec<u8> {
-    let mut key = Value::Array(vec![value.clone()]).encode_key();
+/// The shared byte prefix of every index entry whose leading values are
+/// `values` (the encoding of the array `[values..]` without its trailing array
+/// terminator). Also the inclusive lower bound for a scan starting there.
+fn index_prefix_n(values: &[Value]) -> Vec<u8> {
+    let mut key = Value::Array(values.to_vec()).encode_key();
     key.pop(); // drop the array-terminator byte
     key
 }
 
-/// Exclusive upper bound just past every index entry for `value`, so a scan
-/// `[.., index_upper_bound(value))` includes all rows whose value equals it.
-/// `None` means "no upper bound" (the prefix is all `0xFF`).
-fn index_upper_bound(value: &Value) -> Option<Vec<u8>> {
-    prefix_upper_bound(&index_prefix(value))
+/// Exclusive upper bound just past every entry with leading values `values`.
+fn index_upper_bound_n(values: &[Value]) -> Option<Vec<u8>> {
+    prefix_upper_bound(&index_prefix_n(values))
 }
 
 /// The smallest byte string strictly greater than every string with `prefix`.
@@ -761,64 +768,134 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// Derive per-column index scan bounds from `filter`. Equality and the
-/// comparison operators (`<`, `<=`, `>`, `>=`) on a `column <op> literal` (in
-/// either order), combined with `AND`, contribute bounds; everything else is
-/// left to the post-scan filter. Bounds are a superset of the matching rows —
-/// `matches_filter` re-checks exact predicates — so inclusivity need not be
-/// byte-exact. Returns `(column, start_key, end_key)` per constrained column.
-type ColumnBounds = (String, Option<Vec<u8>>, Option<Vec<u8>>);
-fn range_bounds_by_column(filter: &Option<Expr>) -> Vec<ColumnBounds> {
+/// Equality / range constraints gathered for one column from a filter.
+#[derive(Default, Clone)]
+struct ColConstraint {
+    eq: Option<Value>,
+    lo: Option<Value>, // from `>` / `>=`
+    hi: Option<Value>, // from `<` / `<=`
+}
+
+/// Per-column constraints derived from `filter` (equality + comparisons reached
+/// through `AND`). Bounds are a *superset* of the matches — `matches_filter`
+/// re-checks exact predicates — so inclusivity need not be byte-exact.
+fn column_constraints(filter: &Option<Expr>) -> Vec<(String, ColConstraint)> {
     let mut cmps: Vec<(String, BinaryOp, Value)> = Vec::new();
     if let Some(expr) = filter {
         collect_comparisons(expr, &mut cmps);
     }
-
-    let mut by_col: Vec<ColumnBounds> = Vec::new();
+    let mut by_col: Vec<(String, ColConstraint)> = Vec::new();
     for (col, op, val) in cmps {
-        let idx = match by_col.iter().position(|(c, _, _)| *c == col) {
+        let idx = match by_col.iter().position(|(c, _)| *c == col) {
             Some(i) => i,
             None => {
-                by_col.push((col.clone(), None, None));
+                by_col.push((col.clone(), ColConstraint::default()));
                 by_col.len() - 1
             }
         };
-        let (_, start, end) = &mut by_col[idx];
+        let c = &mut by_col[idx].1;
         match op {
-            BinaryOp::Eq => {
-                *start = tighten_start(start.take(), Some(index_prefix(&val)));
-                *end = tighten_end(end.take(), index_upper_bound(&val));
-            }
+            BinaryOp::Eq => c.eq = Some(val),
             BinaryOp::Gt | BinaryOp::GtEq => {
-                *start = tighten_start(start.take(), Some(index_prefix(&val)));
+                c.lo = Some(match c.lo.take() {
+                    Some(cur) => value_max(cur, val),
+                    None => val,
+                });
             }
             BinaryOp::Lt | BinaryOp::LtEq => {
-                *end = tighten_end(end.take(), index_upper_bound(&val));
+                c.hi = Some(match c.hi.take() {
+                    Some(cur) => value_min(cur, val),
+                    None => val,
+                });
             }
             _ => {}
         }
     }
     by_col
-        .into_iter()
-        .filter(|(_, s, e)| s.is_some() || e.is_some())
-        .collect()
 }
 
-/// Tightest (largest) inclusive lower bound.
-fn tighten_start(cur: Option<Vec<u8>>, new: Option<Vec<u8>>) -> Option<Vec<u8>> {
-    match (cur, new) {
-        (c, None) => c,
-        (None, Some(n)) => Some(n),
-        (Some(c), Some(n)) => Some(c.max(n)),
+/// Build a scan plan for one (possibly composite) index given the filter's
+/// per-column constraints and the requested `ORDER BY` column. Consumes a
+/// leftmost run of equality-pinned columns, then an optional trailing range on
+/// the next column. Returns `(start, end, sorted)` where `sorted` is whether the
+/// scan order already satisfies `order`.
+type ScanBounds = (Option<Vec<u8>>, Option<Vec<u8>>, bool);
+fn plan_for_index(
+    paths: &[String],
+    constraints: &[(String, ColConstraint)],
+    order: Option<&str>,
+) -> Option<ScanBounds> {
+    let get = |col: &str| constraints.iter().find(|(c, _)| c == col).map(|(_, c)| c);
+
+    // Leftmost equality-pinned prefix.
+    let mut eq_prefix: Vec<Value> = Vec::new();
+    while eq_prefix.len() < paths.len() {
+        match get(&paths[eq_prefix.len()]).and_then(|c| c.eq.clone()) {
+            Some(v) => eq_prefix.push(v),
+            None => break,
+        }
+    }
+    let i = eq_prefix.len();
+    // Optional trailing range on the first unpinned column.
+    let trailing = if i < paths.len() {
+        get(&paths[i]).filter(|c| c.lo.is_some() || c.hi.is_some())
+    } else {
+        None
+    };
+
+    // The scan yields rows ordered by paths[i], paths[i+1], … (columns 0..i are
+    // pinned to a constant). A single `ORDER BY oc` is satisfied if `oc` is one
+    // of those pinned columns or is paths[i].
+    let sorted = order.is_some_and(|oc| {
+        paths[..i].iter().any(|p| p == oc) || paths.get(i).map(String::as_str) == Some(oc)
+    });
+
+    let usable = !eq_prefix.is_empty() || trailing.is_some() || sorted;
+    if !usable {
+        return None;
+    }
+
+    let (start, end) = match trailing {
+        Some(c) => {
+            let start = match &c.lo {
+                Some(v) => Some(index_prefix_n(&push(&eq_prefix, v))),
+                None if eq_prefix.is_empty() => None,
+                None => Some(index_prefix_n(&eq_prefix)),
+            };
+            let end = match &c.hi {
+                Some(v) => index_upper_bound_n(&push(&eq_prefix, v)),
+                None if eq_prefix.is_empty() => None,
+                None => index_upper_bound_n(&eq_prefix),
+            };
+            (start, end)
+        }
+        None if eq_prefix.is_empty() => (None, None), // ORDER BY-only full scan
+        None => (
+            Some(index_prefix_n(&eq_prefix)),
+            index_upper_bound_n(&eq_prefix),
+        ),
+    };
+    Some((start, end, sorted))
+}
+
+fn push(prefix: &[Value], v: &Value) -> Vec<Value> {
+    let mut out = prefix.to_vec();
+    out.push(v.clone());
+    out
+}
+
+fn value_max(a: Value, b: Value) -> Value {
+    if index_prefix_n(std::slice::from_ref(&b)) > index_prefix_n(std::slice::from_ref(&a)) {
+        b
+    } else {
+        a
     }
 }
-
-/// Tightest (smallest) exclusive upper bound.
-fn tighten_end(cur: Option<Vec<u8>>, new: Option<Vec<u8>>) -> Option<Vec<u8>> {
-    match (cur, new) {
-        (c, None) => c,
-        (None, Some(n)) => Some(n),
-        (Some(c), Some(n)) => Some(c.min(n)),
+fn value_min(a: Value, b: Value) -> Value {
+    if index_prefix_n(std::slice::from_ref(&b)) < index_prefix_n(std::slice::from_ref(&a)) {
+        b
+    } else {
+        a
     }
 }
 

@@ -354,6 +354,101 @@ mod tests {
         );
     }
 
+    /// `t(id, region, age)` with a composite index on `(region, age)`.
+    fn region_age_table() -> Database {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        db.execute("CREATE INDEX t_region_age ON t(region, age)").unwrap();
+        let rows = [
+            (1, "eu", 30),
+            (2, "eu", 20),
+            (3, "us", 40),
+            (4, "eu", 50),
+            (5, "us", 25),
+            (6, "eu", 20),
+        ];
+        for (id, region, age) in rows {
+            db.execute(&format!(
+                "INSERT INTO t (id, region, age) VALUES ({id}, '{region}', {age})"
+            ))
+            .unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn composite_index_equality_and_prefix() {
+        let mut db = region_age_table();
+        // Full composite equality.
+        assert_eq!(
+            ids(rows(
+                db.execute("SELECT id FROM t WHERE region = 'eu' AND age = 20 ORDER BY id")
+                    .unwrap()
+            )),
+            vec![2, 6]
+        );
+        // Leftmost-prefix equality (only the leading column).
+        assert_eq!(
+            ids(rows(
+                db.execute("SELECT id FROM t WHERE region = 'eu' ORDER BY id").unwrap()
+            )),
+            vec![1, 2, 4, 6]
+        );
+        // Equality on the prefix + range on the next column.
+        assert_eq!(
+            ids(rows(
+                db.execute("SELECT id FROM t WHERE region = 'eu' AND age > 25 ORDER BY id")
+                    .unwrap()
+            )),
+            vec![1, 4]
+        );
+    }
+
+    #[test]
+    fn composite_index_orders_by_trailing_column() {
+        let db_rows = rows(
+            region_age_table()
+                .execute("SELECT id FROM t WHERE region = 'eu' ORDER BY age")
+                .unwrap(),
+        );
+        // eu rows by age: 20(2), 20(6), 30(1), 50(4) — ties broken by row key (id).
+        assert_eq!(ids(db_rows), vec![2, 6, 1, 4]);
+    }
+
+    #[test]
+    fn composite_index_top_n_and_maintenance() {
+        let mut db = region_age_table();
+        // Top-N within the prefix via the index.
+        assert_eq!(
+            ids(rows(
+                db.execute("SELECT id FROM t WHERE region = 'eu' ORDER BY age LIMIT 2").unwrap()
+            )),
+            vec![2, 6]
+        );
+        // Update moves a row across the index; lookups stay correct.
+        db.execute("UPDATE t SET region = 'us' WHERE id = 1").unwrap();
+        assert_eq!(
+            ids(rows(
+                db.execute("SELECT id FROM t WHERE region = 'eu' ORDER BY id").unwrap()
+            )),
+            vec![2, 4, 6]
+        );
+        assert_eq!(
+            ids(rows(
+                db.execute("SELECT id FROM t WHERE region = 'us' AND age = 30").unwrap()
+            )),
+            vec![1]
+        );
+        // Delete keeps it in sync.
+        db.execute("DELETE FROM t WHERE id = 6").unwrap();
+        assert_eq!(
+            ids(rows(
+                db.execute("SELECT id FROM t WHERE region = 'eu' AND age = 20").unwrap()
+            )),
+            vec![2]
+        );
+    }
+
     #[test]
     fn secondary_index_backfills_existing_rows_and_persists() {
         let dir = tempdir();

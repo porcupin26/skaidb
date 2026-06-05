@@ -78,9 +78,11 @@ Implemented end-to-end and tested (141 tests):
 - LSM storage: WAL recovery, SSTables + Bloom filters, lazy-leveled compaction,
   **group-commit WAL** (batched fsync across concurrent writers), and a bounded
   **RAM read cache** for point reads that fall through to SSTables
-- **secondary indexes** that accelerate local **equality and range** predicates
-  (`= < <= > >=`, `BETWEEN`-style) and `ORDER BY <indexed col>` (sorted scan with
-  early-stop `LIMIT` for top-N), since index entries are stored order-preserved
+- **secondary indexes** — single or **composite** (`CREATE INDEX … ON t(a, b)`) —
+  that accelerate local **equality and range** predicates (`= < <= > >=`,
+  `BETWEEN`-style; composite uses a leftmost-prefix of equalities plus a trailing
+  range) and `ORDER BY` along the index (sorted scan with early-stop `LIMIT` for
+  top-N), since index entries are stored order-preserved
 - **leaderless replication**: consistent-hash placement; every node serves reads
   and writes; **tunable write consistency** (`ONE`/`QUORUM`/`ALL`) where weaker
   levels ack early and replicate the rest in the background, and a coordinated

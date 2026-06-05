@@ -156,13 +156,16 @@ impl Parser {
             self.expect_keyword(Keyword::On)?;
             let table = self.expect_ident()?;
             self.expect(&Token::LParen)?;
-            let path = self.parse_path()?;
+            let mut paths = vec![self.parse_path()?];
+            while self.eat(&Token::Comma) {
+                paths.push(self.parse_path()?);
+            }
             self.expect(&Token::RParen)?;
             Ok(Statement::CreateIndex(CreateIndex {
                 name,
                 if_not_exists,
                 table,
-                path,
+                paths,
             }))
         } else {
             Err(self.unexpected("TABLE or INDEX".into()))

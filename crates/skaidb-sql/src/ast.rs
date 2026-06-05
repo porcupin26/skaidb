@@ -25,13 +25,14 @@ pub struct CreateTable {
     pub primary_key: Vec<String>,
 }
 
-/// `CREATE INDEX [IF NOT EXISTS] name ON table (path)`.
+/// `CREATE INDEX [IF NOT EXISTS] name ON table (path1 [, path2, ...])`.
+/// Multiple paths form a composite index, ordered left-to-right.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateIndex {
     pub name: String,
     pub if_not_exists: bool,
     pub table: String,
-    pub path: String,
+    pub paths: Vec<String>,
 }
 
 /// `INSERT INTO table (cols...) VALUES (..), (..)`.
