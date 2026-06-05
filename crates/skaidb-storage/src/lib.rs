@@ -8,6 +8,7 @@
 //!   and crash recovery.
 
 mod bloom;
+mod cache;
 pub mod compress;
 mod crc;
 pub mod engine;

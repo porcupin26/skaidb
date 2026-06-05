@@ -21,7 +21,7 @@ use skaidb_engine::{filter_rows, run, Cluster, Database, EngineError, QueryOutpu
 use skaidb_proto::{read_frame, write_frame};
 use skaidb_sql::ast::{BinaryOp, Expr, Statement};
 use skaidb_sql::parse;
-use skaidb_storage::{Hlc, HlcClock};
+use skaidb_storage::{Hlc, HlcClock, WalCommit, WalSync};
 use skaidb_types::{Document, Value};
 
 use crate::internode::{self, Request, Response};
@@ -124,7 +124,7 @@ impl Node {
         match req {
             Request::Ping => Response::Pong,
             Request::LocalScan { table } => match self.local.read() {
-                Ok(db) => match db.local_scan_versioned(&table) {
+                Ok(db) => match db.local_scan_versioned_with_tombstones(&table) {
                     Ok(rows) => Response::Scan { rows },
                     Err(e) => Response::Err(e.to_string()),
                 },
@@ -224,15 +224,25 @@ impl Node {
     ) -> EngineResult<()> {
         let replicas = self.ring.replicas_for(key, self.cfg.replication_factor);
         let needed = self.cfg.write_consistency.required(replicas.len().max(1));
+
+        // 1) Apply locally to the memtable + WAL buffer under the write lock (fast),
+        //    then run the local fsync on a separate thread so it overlaps the peer
+        //    network round-trips below — instead of fsync-then-send serially. Read-
+        //    your-writes holds immediately (the memtable has the row before the
+        //    fsync lands); the local replica only *counts* toward the quorum once
+        //    its fsync completes, so durability is unchanged — just overlapped.
+        let local_owns = replicas.contains(&self.id);
+        let fsync = if local_owns {
+            let (commit, handle) = self.apply_write_buffered(table, key, &op, hlc)?;
+            Some(thread::spawn(move || handle.sync_through(commit).is_ok()))
+        } else {
+            None
+        };
+
+        // 2) Send to peers inline (concurrent with the local fsync), synchronously
+        //    up to the quorum; defer the rest to the background.
         let mut acks = 0usize;
-
-        // The local replica (if this node owns the key) is always synchronous.
-        if replicas.contains(&self.id) {
-            self.apply_write_local(table, key, &op, hlc)?;
-            acks += 1;
-        }
-
-        // Peers: synchronous until the quorum is met, then background.
+        let local_will_ack = fsync.is_some();
         let mut async_peers: Vec<String> = Vec::new();
         for replica in &replicas {
             if *replica == self.id {
@@ -241,14 +251,23 @@ impl Node {
             let Some(addr) = self.peers.get(replica) else {
                 continue;
             };
-            if acks >= needed {
+            // Acks we will have once the in-flight local fsync lands.
+            let projected = acks + usize::from(local_will_ack);
+            if projected >= needed {
                 async_peers.push(addr.clone());
             } else if matches!(self.send_write(addr, table, key, &op, hlc), Ok(true)) {
                 acks += 1;
             }
         }
 
-        // Fire-and-forget the remaining replicas (eventual consistency).
+        // 3) Fold in the local replica's durable ack (joins the overlapped fsync).
+        if let Some(handle) = fsync {
+            if handle.join().unwrap_or(false) {
+                acks += 1;
+            }
+        }
+
+        // 4) Fire-and-forget the remaining replicas (eventual consistency).
         if !async_peers.is_empty() {
             let node = Arc::clone(self);
             let (table, key, op) = (table.to_string(), key.to_vec(), op.clone());
@@ -265,6 +284,27 @@ impl Node {
             Err(EngineError::Cluster(format!(
                 "write quorum not met: {acks}/{needed} acks"
             )))
+        }
+    }
+
+    /// Apply a write to the local memtable + WAL buffer (no fsync) under the
+    /// write lock, returning the commit point and durability handle so the caller
+    /// can fsync after releasing the lock — and, in [`Node::replicate`],
+    /// concurrently with peer replication.
+    fn apply_write_buffered(
+        &self,
+        table: &str,
+        key: &[u8],
+        op: &WriteOp,
+        hlc: Hlc,
+    ) -> EngineResult<(WalCommit, Arc<WalSync>)> {
+        let mut db = self
+            .local
+            .write()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
+        match op {
+            WriteOp::Put(bytes) => db.apply_put_buffered(table, key, bytes.clone(), hlc),
+            WriteOp::Delete => db.apply_delete_buffered(table, key, hlc),
         }
     }
 
@@ -334,6 +374,13 @@ impl Node {
             )));
         }
 
+        // Advance our clock past what we read so a read-then-write on this
+        // coordinator (e.g. `DELETE WHERE pk = …`) mints a strictly newer stamp
+        // and wins last-writer-wins — independent of wall-clock resolution.
+        if let Some((hlc, _)) = best {
+            self.clock.observe(hlc);
+        }
+
         match best {
             Some((_, Some(value))) => {
                 let doc = match Value::decode(&value)
@@ -374,19 +421,21 @@ impl Node {
     }
 
     /// Gather a table from all reachable members, merged by last-writer-wins.
+    /// Tombstones participate in the merge so a delete on one replica correctly
+    /// masks a stale `Put` gathered from another (quorum read ∩ quorum write).
     fn cluster_scan(&self, table: &str) -> EngineResult<Vec<(Vec<u8>, Document)>> {
-        // key -> (hlc, encoded value)
-        let mut merged: BTreeMap<Vec<u8>, (Hlc, Vec<u8>)> = BTreeMap::new();
+        // key -> (hlc, Some(encoded value) | None tombstone)
+        let mut merged: BTreeMap<Vec<u8>, (Hlc, Option<Vec<u8>>)> = BTreeMap::new();
         let mut responders = 0usize;
 
-        // Local shard.
+        // Local shard (with tombstones).
         {
             let db = self
                 .local
                 .read()
                 .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
-            for (key, value, hlc) in db.local_scan_versioned(table)? {
-                merge_row(&mut merged, key, value, hlc);
+            for (key, value, hlc, is_put) in db.local_scan_versioned_with_tombstones(table)? {
+                merge_row(&mut merged, key, is_put.then_some(value), hlc);
             }
             responders += 1;
         }
@@ -399,8 +448,8 @@ impl Node {
                     table: table.to_string(),
                 },
             ) {
-                for (key, value, hlc) in rows {
-                    merge_row(&mut merged, key, value, hlc);
+                for (key, value, hlc, is_put) in rows {
+                    merge_row(&mut merged, key, is_put.then_some(value), hlc);
                 }
                 responders += 1;
             }
@@ -413,10 +462,18 @@ impl Node {
             )));
         }
 
-        // Decode surviving rows into documents.
+        // Advance our clock past the newest row seen, so a read-then-write on
+        // this coordinator (e.g. a non-PK `UPDATE`/`DELETE`) is causally ordered
+        // after it under last-writer-wins.
+        if let Some(max) = merged.values().map(|(hlc, _)| *hlc).max() {
+            self.clock.observe(max);
+        }
+
+        // Decode surviving rows into documents, dropping tombstoned keys.
         let mut out = Vec::with_capacity(merged.len());
         for (key, (_hlc, value)) in merged {
-            if let Value::Document(doc) = Value::decode(&value)
+            let Some(bytes) = value else { continue };
+            if let Value::Document(doc) = Value::decode(&bytes)
                 .map_err(|e| EngineError::Cluster(format!("corrupt row: {e}")))?
             {
                 out.push((key, doc));
@@ -434,9 +491,9 @@ enum WriteOp {
 }
 
 fn merge_row(
-    merged: &mut BTreeMap<Vec<u8>, (Hlc, Vec<u8>)>,
+    merged: &mut BTreeMap<Vec<u8>, (Hlc, Option<Vec<u8>>)>,
     key: Vec<u8>,
-    value: Vec<u8>,
+    value: Option<Vec<u8>>,
     hlc: Hlc,
 ) {
     merged

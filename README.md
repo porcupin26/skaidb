@@ -75,13 +75,16 @@ Implemented end-to-end and tested (141 tests):
 
 - soft-schema document model, SQL subset, 3-valued logic
 - LSM storage: WAL recovery, SSTables + Bloom filters, lazy-leveled compaction,
-  **group-commit WAL** (batched fsync across concurrent writers)
+  **group-commit WAL** (batched fsync across concurrent writers), and a bounded
+  **RAM read cache** for point reads that fall through to SSTables
 - **secondary indexes** that accelerate local `WHERE path = value`
 - **leaderless replication**: consistent-hash placement; every node serves reads
   and writes; **tunable write consistency** (`ONE`/`QUORUM`/`ALL`) where weaker
-  levels ack early and replicate the rest in the background; **PK point reads**
-  routed to the key's replica set; scatter-gather reads merged by HLC
-  last-writer-wins; quorum-broadcast DDL; one-node-down tolerance
+  levels ack early and replicate the rest in the background, and a coordinated
+  write **overlaps its local fsync with peer replication** rather than running
+  them serially; **PK point reads** routed to the key's replica set;
+  scatter-gather reads merged by HLC last-writer-wins (tombstones included, so
+  deletes win cluster-wide); quorum-broadcast DDL; one-node-down tolerance
 - **auth**: SCRAM-SHA-256 handshake (mutual auth) on the binary endpoint and
   HTTP Basic on REST, + per-statement **RBAC**
 - binary + REST endpoints, Prometheus metrics, masked audit logs
@@ -116,8 +119,7 @@ In plain terms: you may use, copy, modify, and self-host skaidb freely, includin
 inside your own company. The one restriction is the SSPL's Section 13 — if you
 **offer skaidb (or a modified version) to third parties as a service**, you must
 release the complete source of the service-management software you use to do so
-under the SSPL. Internal use and ordinary distribution are unaffected. This is the
-same license MongoDB uses, for the same reason.
+under the SSPL. Internal use and ordinary distribution are unaffected. 
 
 > Not a substitute for legal advice — read the [LICENSE](LICENSE) for the binding
 > terms.

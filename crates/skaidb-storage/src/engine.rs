@@ -13,6 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::cache::ReadCache;
 use crate::compress::Codec;
 use crate::error::{Result, StorageError};
 use crate::hlc::{Hlc, HlcClock};
@@ -25,6 +26,9 @@ type MergedRows = std::collections::BTreeMap<Vec<u8>, (Hlc, VersionValue)>;
 
 /// A live key/value pair together with its version stamp.
 pub type VersionedRow = (Vec<u8>, Vec<u8>, Hlc);
+
+/// A key with its stamp and value, where `None` marks a tombstone (delete).
+pub type VersionedTombstoneRow = (Vec<u8>, Hlc, Option<Vec<u8>>);
 
 /// Default memtable size that triggers a flush (SPEC §9.1: 256 MiB).
 pub const DEFAULT_FLUSH_THRESHOLD_BYTES: usize = 256 * 1024 * 1024;
@@ -43,7 +47,15 @@ pub struct EngineOptions {
     pub compression: Codec,
     /// Codec for the deepest (cold, write-once) level (high ratio).
     pub bottom_compression: Codec,
+    /// Capacity (entries) of the RAM read cache for memtable-miss point reads.
+    /// `0` disables it. Recent data is already served from the memtable, so this
+    /// only helps reads of keys that have been flushed to SSTables.
+    pub read_cache_capacity: usize,
 }
+
+/// Default read-cache size (entries). Modest so it can't dominate a small node's
+/// RAM; only populated by reads that fall through to SSTables.
+pub const DEFAULT_READ_CACHE_CAPACITY: usize = 16_384;
 
 impl Default for EngineOptions {
     fn default() -> Self {
@@ -53,6 +65,7 @@ impl Default for EngineOptions {
             level1_capacity: DEFAULT_LEVEL1_CAPACITY,
             compression: Codec::Lz4,
             bottom_compression: Codec::Brotli,
+            read_cache_capacity: DEFAULT_READ_CACHE_CAPACITY,
         }
     }
 }
@@ -70,6 +83,8 @@ pub struct Engine {
     /// Deeper levels: `levels[0]` is L1, `levels[1]` is L2, … each a single run.
     levels: Vec<SsTable>,
     next_seq: u64,
+    /// RAM cache for point reads that fall through to SSTables.
+    read_cache: ReadCache,
 }
 
 impl Engine {
@@ -114,6 +129,8 @@ impl Engine {
             clock.observe(max_hlc);
         }
 
+        let read_cache = ReadCache::new(opts.read_cache_capacity);
+
         Ok(Engine {
             dir,
             wal,
@@ -123,6 +140,7 @@ impl Engine {
             l0,
             levels,
             next_seq,
+            read_cache,
         })
     }
 
@@ -142,6 +160,9 @@ impl Engine {
             op,
         })?;
         self.mem.insert(key.to_vec(), hlc, value);
+        // Every write supersedes any cached SSTable result for this key. This is
+        // what keeps the read cache correct across flush/compaction.
+        self.read_cache.invalidate(key);
         self.maybe_flush()?;
         Ok(commit)
     }
@@ -212,30 +233,35 @@ impl Engine {
 
     /// Latest committed value for `key`, or `None` if absent or deleted.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        // Memtable is authoritative if it holds any version of the key.
-        if let Some(entry) = self.mem.get_entry(key) {
-            return Ok(version_to_value(entry.clone()));
+        match self.get_versioned(key)? {
+            Some((_, value)) => Ok(version_to_value(value)),
+            None => Ok(None),
         }
-        for sst in self.sstables_newest_first() {
-            if let Some((_, value)) = sst.get(key)? {
-                return Ok(version_to_value(value));
-            }
-        }
-        Ok(None)
     }
 
     /// Latest stored version for `key` (including tombstones) with its stamp,
     /// across memtable and SSTables. Used for last-writer-wins point reads.
+    ///
+    /// The memtable is authoritative for recently written keys. On a memtable
+    /// miss the result is served from (and recorded in) the RAM read cache,
+    /// avoiding repeated SSTable Bloom probes + block decompression for hot cold
+    /// keys. Writes invalidate the cache, so it never returns a stale version.
     pub fn get_versioned(&self, key: &[u8]) -> Result<Option<(Hlc, VersionValue)>> {
         if let Some((hlc, entry)) = self.mem.get_entry_versioned(key) {
             return Ok(Some((hlc, entry)));
         }
+        if let Some(cached) = self.read_cache.get(key) {
+            return Ok(cached);
+        }
+        let mut found = None;
         for sst in self.sstables_newest_first() {
             if let Some((hlc, value)) = sst.get(key)? {
-                return Ok(Some((hlc, value)));
+                found = Some((hlc, value));
+                break;
             }
         }
-        Ok(None)
+        self.read_cache.insert(key, found.clone());
+        Ok(found)
     }
 
     /// Value for `key` as visible at snapshot `as_of` (MVCC read).
@@ -285,6 +311,21 @@ impl Engine {
             .filter_map(|(k, (hlc, v))| match v {
                 VersionValue::Put(bytes) => Some((k, bytes, hlc)),
                 VersionValue::Delete => None,
+            })
+            .collect())
+    }
+
+    /// Like [`Engine::scan_versioned`] but **includes tombstones** (as
+    /// `(key, hlc, None)`). A coordinator gathering a table from several replicas
+    /// must see deletes to resolve them by last-writer-wins — otherwise a stale
+    /// `Put` on one replica could mask a newer delete on another.
+    pub fn scan_versioned_with_tombstones(&self) -> Result<Vec<VersionedTombstoneRow>> {
+        Ok(self
+            .merged()?
+            .into_iter()
+            .map(|(k, (hlc, v))| match v {
+                VersionValue::Put(bytes) => (k, hlc, Some(bytes)),
+                VersionValue::Delete => (k, hlc, None),
             })
             .collect())
     }
@@ -647,6 +688,37 @@ mod tests {
         // Reads merge memtable + SSTables.
         assert_eq!(e.get(b"key000").unwrap(), Some(vec![0u8; 32]));
         assert_eq!(e.get(b"key019").unwrap(), Some(vec![19u8; 32]));
+    }
+
+    #[test]
+    fn read_cache_stays_correct_across_flush_overwrite_delete() {
+        // Force flushes so reads fall through to SSTables (where the cache lives)
+        // and prove a write is never masked by a stale cached value.
+        let mut e = Engine::open_with_options(tempdir(), small_opts()).unwrap();
+        e.put(b"k", b"v1".to_vec()).unwrap();
+        // Fill enough to flush k out of the memtable into an SSTable.
+        for i in 0..20u32 {
+            e.put(format!("pad{i:03}").as_bytes(), vec![i as u8; 32]).unwrap();
+        }
+        e.flush().unwrap();
+        // First read populates the cache from the SSTable.
+        assert_eq!(e.get(b"k").unwrap(), Some(b"v1".to_vec()));
+
+        // Overwrite, flush again: the memtable no longer holds k, so a correct
+        // read must come from the new SSTable — never the cached "v1".
+        e.put(b"k", b"v2".to_vec()).unwrap();
+        e.flush().unwrap();
+        assert_eq!(e.get(b"k").unwrap(), Some(b"v2".to_vec()), "stale cache hit!");
+
+        // Delete + flush: read must report absence, not the cached value.
+        e.delete(b"k").unwrap();
+        e.flush().unwrap();
+        assert_eq!(e.get(b"k").unwrap(), None, "stale cache hid a delete!");
+
+        // Re-create the key and confirm it resurfaces.
+        e.put(b"k", b"v3".to_vec()).unwrap();
+        e.flush().unwrap();
+        assert_eq!(e.get(b"k").unwrap(), Some(b"v3".to_vec()));
     }
 
     #[test]

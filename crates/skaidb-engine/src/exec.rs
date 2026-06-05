@@ -25,6 +25,10 @@ use crate::result::{QueryOutput, ResultSet};
 /// A live row with its encoded document and version stamp.
 pub type VersionedRow = (Vec<u8>, Vec<u8>, Hlc);
 
+/// A versioned row including tombstones: `(key, value, hlc, is_put)`. When
+/// `is_put` is false the row is a delete and `value` is empty.
+pub type VersionedTombstoneRow = (Vec<u8>, Vec<u8>, Hlc, bool);
+
 /// An embedded skaidb database: catalog plus one storage engine per table and
 /// per secondary index.
 #[derive(Debug)]
@@ -306,6 +310,28 @@ impl Database {
             .get(table)
             .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
         Ok(engine.scan_versioned()?)
+    }
+
+    /// Like [`Database::local_scan_versioned`] but includes tombstones as
+    /// `(key, empty_value, hlc, is_put = false)`, so a coordinator can resolve a
+    /// table across replicas by last-writer-wins without a delete being masked by
+    /// a stale `Put` on another replica.
+    pub fn local_scan_versioned_with_tombstones(
+        &self,
+        table: &str,
+    ) -> Result<Vec<VersionedTombstoneRow>> {
+        let engine = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+        Ok(engine
+            .scan_versioned_with_tombstones()?
+            .into_iter()
+            .map(|(key, hlc, value)| match value {
+                Some(bytes) => (key, bytes, hlc, true),
+                None => (key, Vec::new(), hlc, false),
+            })
+            .collect())
     }
 
     /// Point-read the latest stored version of `key` in `table`: returns

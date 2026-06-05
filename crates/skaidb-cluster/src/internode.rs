@@ -43,8 +43,11 @@ pub enum Request {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Response {
     Ack,
+    /// A versioned table shard: `(key, value, hlc, is_put)`. `is_put == false`
+    /// marks a tombstone (empty value), so the coordinator can resolve deletes
+    /// across replicas by last-writer-wins.
     Scan {
-        rows: Vec<(Vec<u8>, Vec<u8>, Hlc)>,
+        rows: Vec<(Vec<u8>, Vec<u8>, Hlc, bool)>,
     },
     /// Point-read result: `(value, stamp, is_put)`, or `None` if absent here.
     Get {
@@ -148,10 +151,11 @@ impl Response {
             Response::Scan { rows } => {
                 o.push(RES_SCAN);
                 o.extend_from_slice(&(rows.len() as u32).to_le_bytes());
-                for (k, v, hlc) in rows {
+                for (k, v, hlc, is_put) in rows {
                     put_bytes(&mut o, k);
                     put_bytes(&mut o, v);
                     o.extend_from_slice(&hlc.to_bytes());
+                    o.push(u8::from(*is_put));
                 }
             }
             Response::Get { entry } => {
@@ -183,7 +187,11 @@ impl Response {
                 let n = c.u32()? as usize;
                 let mut rows = Vec::with_capacity(n);
                 for _ in 0..n {
-                    rows.push((c.bytes()?, c.bytes()?, c.hlc()?));
+                    let key = c.bytes()?;
+                    let value = c.bytes()?;
+                    let hlc = c.hlc()?;
+                    let is_put = c.u8()? != 0;
+                    rows.push((key, value, hlc, is_put));
                 }
                 Response::Scan { rows }
             }
@@ -397,8 +405,8 @@ mod tests {
     fn response_roundtrips() {
         let scan = Response::Scan {
             rows: vec![
-                (vec![1], vec![2, 3], Hlc::new(5, 0)),
-                (vec![4], vec![5], Hlc::new(6, 2)),
+                (vec![1], vec![2, 3], Hlc::new(5, 0), true),
+                (vec![4], vec![], Hlc::new(6, 2), false),
             ],
         };
         for res in [
@@ -442,12 +450,13 @@ mod tests {
 
     #[test]
     fn large_scan_response_survives_frame_envelope() {
-        let rows: Vec<(Vec<u8>, Vec<u8>, Hlc)> = (0..200)
+        let rows: Vec<(Vec<u8>, Vec<u8>, Hlc, bool)> = (0..200)
             .map(|i| {
                 (
                     format!("key{i:04}").into_bytes(),
                     format!("a fairly repetitive value number {i}").into_bytes(),
                     Hlc::new(i as u64, 0),
+                    i % 7 != 0, // sprinkle in some tombstones
                 )
             })
             .collect();

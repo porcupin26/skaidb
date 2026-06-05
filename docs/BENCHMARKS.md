@@ -193,6 +193,37 @@ board, ahead of MariaDB on several write/mixed cases, and **competitive on reads
 RAM**, 3–8× less than every other system, which is the main reason it stays
 stable on a 512 MB node.
 
+## Write-overlap + read-cache optimizations (2026-06-04)
+
+Two later changes target writes and cold reads:
+
+- **Overlapped durability + replication.** A coordinated write now applies to the
+  memtable + WAL buffer, then runs its **local fsync concurrently with the peer
+  replication round-trips** (on a separate thread) instead of fsync-then-send
+  serially, acking once the write quorum is durable. Durability is unchanged — the
+  local replica still only counts once its fsync lands — but the two latencies now
+  overlap. Because an fsync is mostly I/O-wait, the single core is free to drive
+  the peer send meanwhile, so it helps even on these 1-vCPU nodes.
+
+  Measured on the C4 config (3-node, QUORUM): **write 1c ≈ 166 → ~200 ops/s
+  (+~20%, p50 5.7 → 4.3 ms)** and **write 16c ≈ 1,419 → ~1,710 (+~20%)**. These
+  were taken while the host CPU was thermally throttling (88 °C, fans at 0 RPM),
+  so they understate the gain — treat ~20% as a lower bound.
+
+- **RAM read cache.** A bounded in-memory cache (default 16 K entries) serves
+  point reads that **miss the memtable** — i.e. keys already flushed to SSTables —
+  skipping the Bloom probe + block decompress on a repeat read. It's invalidated
+  on every write, so it never returns a stale version. It does **not** move the
+  numbers in this matrix: the working set (≤ a few thousand rows) lives entirely
+  in the memtable, which is already RAM, so the cache is never consulted here. The
+  win is on datasets large enough to spill to SSTables with hot cold-key reads.
+
+A latent correctness bug surfaced while tuning the above: scatter-gather table
+reads dropped tombstones, so a delete on one replica could be masked by a stale
+`Put` gathered from another (breaking the R+W>N quorum guarantee for deletes).
+Reads now merge tombstones by last-writer-wins and coordinators advance their HLC
+past what they read, so a `DELETE`/`UPDATE` is reliably visible cluster-wide.
+
 ## Why compression doesn't move these numbers
 
 The 2026-06-04 rerun is on the build that block-compresses SSTables (LZ4 hot /
