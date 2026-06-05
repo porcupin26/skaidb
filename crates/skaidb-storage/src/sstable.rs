@@ -220,6 +220,44 @@ impl SsTable {
         Ok(None)
     }
 
+    /// Entries whose key is in `[start, end)`, in key order. Seeks to the first
+    /// relevant block via the block index and stops once past `end`, so only the
+    /// covering blocks are read and decompressed — not the whole table.
+    pub fn range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<Vec<SstEntry>> {
+        // First block that may hold `start`: the last block whose first key <= start.
+        let first = match start {
+            Some(s) => self
+                .blocks
+                .partition_point(|b| b.first_key.as_slice() <= s)
+                .saturating_sub(1),
+            None => 0,
+        };
+        let mut out = Vec::new();
+        for meta in &self.blocks[first.min(self.blocks.len())..] {
+            // Every key in this block is >= its first key; if that already
+            // reaches `end`, no later block can contribute.
+            if let Some(e) = end {
+                if meta.first_key.as_slice() >= e {
+                    break;
+                }
+            }
+            let block = self.read_block(meta)?;
+            let mut pos = 0;
+            while pos < block.len() {
+                let (entry, next) = decode_entry(&block, pos)?;
+                pos = next;
+                if start.is_some_and(|s| entry.key.as_slice() < s) {
+                    continue;
+                }
+                if end.is_some_and(|e| entry.key.as_slice() >= e) {
+                    return Ok(out); // sorted: nothing further can be in range
+                }
+                out.push(entry);
+            }
+        }
+        Ok(out)
+    }
+
     /// Read every entry in key order (used by scans and compaction).
     pub fn entries(&self) -> Result<Vec<SstEntry>> {
         let mut out = Vec::with_capacity(self.entry_count as usize);

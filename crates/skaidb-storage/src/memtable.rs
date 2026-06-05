@@ -94,6 +94,39 @@ impl Memtable {
         out
     }
 
+    /// Latest version per distinct key (including tombstones), with its stamp,
+    /// for keys in the byte range `[start, end)`, in key order. `None` bounds are
+    /// unbounded. Uses the `BTreeMap`'s range, so cost is proportional to the
+    /// range, not the whole table — this is what makes index range scans fast.
+    pub fn range_latest(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Vec<(Vec<u8>, Hlc, VersionValue)> {
+        use std::ops::Bound;
+        // For a key, `(key, Reverse(Hlc::MAX))` is its smallest tuple, so an
+        // inclusive lower / excluded upper at that point gives a half-open key
+        // range that includes all versions of `start` and excludes `end`.
+        let lo = match start {
+            Some(s) => Bound::Included((s.to_vec(), Reverse(Hlc::MAX))),
+            None => Bound::Unbounded,
+        };
+        let hi = match end {
+            Some(e) => Bound::Excluded((e.to_vec(), Reverse(Hlc::MAX))),
+            None => Bound::Unbounded,
+        };
+        let mut out = Vec::new();
+        let mut current: Option<Vec<u8>> = None;
+        for ((k, Reverse(stamp)), value) in self.map.range((lo, hi)) {
+            if current.as_deref() == Some(k.as_slice()) {
+                continue; // already emitted the newest version of this key
+            }
+            current = Some(k.clone());
+            out.push((k.clone(), *stamp, value.clone()));
+        }
+        out
+    }
+
     /// The newest version of `key` whose stamp is `<= as_of`, if any.
     fn latest_version(&self, key: &[u8], as_of: Hlc) -> Option<&VersionValue> {
         let start = (key.to_vec(), Reverse(Hlc::MAX));

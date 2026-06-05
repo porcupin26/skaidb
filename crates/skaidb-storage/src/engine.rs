@@ -345,20 +345,36 @@ impl Engine {
     }
 
     /// Scan live keys in the half-open byte range `[start, end)`, in key order.
-    /// `None` bounds are unbounded. Because the index encodes values
-    /// order-preservingly, this is what powers range predicates and
-    /// `ORDER BY`-via-index in the query engine.
+    /// `None` bounds are unbounded. Seeks each source (memtable BTree range +
+    /// SSTable block index) so cost is proportional to the range, not the table
+    /// — this is what makes index range / `ORDER BY` scans fast on large data.
     pub fn scan_range(
         &self,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        Ok(self
-            .merged()?
+        use std::collections::BTreeMap;
+        let mut merged: BTreeMap<Vec<u8>, (Hlc, VersionValue)> = BTreeMap::new();
+        let mut consider = |key: Vec<u8>, hlc: Hlc, value: VersionValue| {
+            merged
+                .entry(key)
+                .and_modify(|cur| {
+                    if hlc > cur.0 {
+                        *cur = (hlc, value.clone());
+                    }
+                })
+                .or_insert((hlc, value));
+        };
+        for (key, hlc, value) in self.mem.range_latest(start, end) {
+            consider(key, hlc, value);
+        }
+        for sst in self.sstables_newest_first() {
+            for e in sst.range(start, end)? {
+                consider(e.key, e.hlc, e.value);
+            }
+        }
+        Ok(merged
             .into_iter()
-            .filter(|(k, _)| {
-                start.is_none_or(|s| k.as_slice() >= s) && end.is_none_or(|e| k.as_slice() < e)
-            })
             .filter_map(|(k, (_, v))| match v {
                 VersionValue::Put(bytes) => Some((k, bytes)),
                 VersionValue::Delete => None,
