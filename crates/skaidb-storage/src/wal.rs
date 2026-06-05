@@ -22,9 +22,10 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read};
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::posfile::write_all_at;
 use std::sync::{Arc, Mutex};
 
 use crate::crc::crc32;
@@ -193,7 +194,7 @@ impl Wal {
         frame.extend_from_slice(&crc32(&payload).to_le_bytes());
 
         let offset = self.sync.write_offset.load(Ordering::SeqCst);
-        self.sync.file.write_all_at(&frame, offset)?;
+        write_all_at(&self.sync.file, &frame, offset)?;
         let end = offset + frame.len() as u64;
         self.sync.write_offset.store(end, Ordering::SeqCst);
         Ok(WalCommit {

@@ -142,6 +142,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
 
       - name: Install Linux cross/packaging deps
         if: runner.os == 'Linux' && matrix.apt != ''

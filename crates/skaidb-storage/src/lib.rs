@@ -11,6 +11,7 @@ mod bloom;
 mod cache;
 pub mod compress;
 mod crc;
+mod posfile;
 pub mod engine;
 pub mod hlc;
 pub mod memtable;

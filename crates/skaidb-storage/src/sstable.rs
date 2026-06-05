@@ -15,8 +15,9 @@
 
 use std::fs::File;
 use std::io::Write;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+
+use crate::posfile::read_exact_at;
 
 use crate::bloom::Bloom;
 use crate::compress::{compress, decompress, Codec};
@@ -148,7 +149,7 @@ impl SsTable {
         }
 
         let mut footer = [0u8; FOOTER_LEN as usize];
-        file.read_exact_at(&mut footer, file_len - FOOTER_LEN)?;
+        read_exact_at(&file, &mut footer, file_len - FOOTER_LEN)?;
         let index_off = u64::from_le_bytes(footer[0..8].try_into().unwrap());
         let bloom_off = u64::from_le_bytes(footer[8..16].try_into().unwrap());
         let entry_count = u64::from_le_bytes(footer[16..24].try_into().unwrap());
@@ -163,12 +164,12 @@ impl SsTable {
 
         let index_len = (bloom_off - index_off) as usize;
         let mut index_buf = vec![0u8; index_len];
-        file.read_exact_at(&mut index_buf, index_off)?;
+        read_exact_at(&file, &mut index_buf, index_off)?;
         let blocks = parse_block_index(&index_buf)?;
 
         let bloom_len = (file_len - FOOTER_LEN - bloom_off) as usize;
         let mut bloom_buf = vec![0u8; bloom_len];
-        file.read_exact_at(&mut bloom_buf, bloom_off)?;
+        read_exact_at(&file, &mut bloom_buf, bloom_off)?;
         let bloom = Bloom::decode(&bloom_buf).ok_or_else(|| corrupt("bad bloom block"))?;
 
         Ok(SsTable {
@@ -276,7 +277,7 @@ impl SsTable {
     /// Read and decompress one block from disk.
     fn read_block(&self, meta: &BlockMeta) -> Result<Vec<u8>> {
         let mut comp = vec![0u8; meta.comp_len as usize];
-        self.file.read_exact_at(&mut comp, meta.offset)?;
+        read_exact_at(&self.file, &mut comp, meta.offset)?;
         decompress(self.codec, &comp, meta.uncomp_len as usize)
     }
 }
