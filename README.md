@@ -9,9 +9,10 @@ last-writer-wins; the client protocol is a length-prefixed binary fast path with
 a REST gateway alongside.
 
 On identical small nodes (1 vCPU / 512 MB) with matched durability, skaidb runs
-within ~10–25% of MongoDB and PostgreSQL across reads, writes, and mixed
-workloads — using **~19 MB of RAM**, 3–8× less than the others. Full
-multi-database, multi-consistency results are in **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**.
+close to MongoDB and PostgreSQL across reads, writes, and mixed workloads — and
+is strong on concurrent writes — using **16 MB of RAM per node**, 3–9× less than
+the others. Full multi-database, multi-consistency results are in
+**[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**.
 
 ## Workspace layout
 
