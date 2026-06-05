@@ -70,6 +70,8 @@ skaidb-cli --dir ./data -e "SELECT COUNT(*) FROM users"
 Types: `null, bool, int64, float64, decimal, string, bytes, uuid, timestamp`
 (unixtime ms), `array`, `document`, plus JSON-like values.
 
+Full grammar reference: **[docs/QUERY_SYNTAX.md](docs/QUERY_SYNTAX.md)**.
+
 ## Status & deferred work
 
 Implemented end-to-end and tested (141 tests):
