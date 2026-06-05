@@ -8,6 +8,7 @@ mod error;
 mod eval;
 mod exec;
 mod result;
+pub mod vector;
 
 pub use error::EngineError;
 pub use exec::{filter_rows, run, Cluster, Database, IndexScanRange};
@@ -447,6 +448,71 @@ mod tests {
             )),
             vec![2]
         );
+    }
+
+    fn doc_id(doc: &skaidb_types::Document) -> i64 {
+        match doc.get("id") {
+            Some(Value::Int(i)) => *i,
+            other => panic!("expected int id, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vector_index_search_filtered_and_persists() {
+        use skaidb_sql::ast::{BinaryOp, Expr};
+        let dir = tempdir();
+        {
+            let mut db = Database::open(&dir).unwrap();
+            db.execute("CREATE TABLE docs (PRIMARY KEY (id))").unwrap();
+            db.execute("INSERT INTO docs (id, cat, embedding) VALUES (1, 'a', [1.0, 0.0, 0.0])")
+                .unwrap();
+            db.execute("INSERT INTO docs (id, cat, embedding) VALUES (2, 'b', [0.0, 1.0, 0.0])")
+                .unwrap();
+            db.execute("INSERT INTO docs (id, cat, embedding) VALUES (3, 'a', [0.0, 0.0, 1.0])")
+                .unwrap();
+            db.execute("INSERT INTO docs (id, cat, embedding) VALUES (4, 'b', [0.9, 0.1, 0.0])")
+                .unwrap();
+            db.create_vector_index("docs_emb", "docs", "embedding", "cosine")
+                .unwrap();
+
+            // Nearest to [1,0,0]: id 1 (exact), then id 4 (close direction).
+            let ids: Vec<i64> = db
+                .vector_search("docs_emb", &[1.0, 0.0, 0.0], 2, &None)
+                .unwrap()
+                .iter()
+                .map(|(_, doc, _)| doc_id(doc))
+                .collect();
+            assert_eq!(ids, vec![1, 4]);
+
+            // Filtered nearest-neighbor: WHERE cat = 'a' excludes id 4 (cat 'b').
+            let filter = Some(Expr::Binary {
+                op: BinaryOp::Eq,
+                left: Box::new(Expr::Column("cat".into())),
+                right: Box::new(Expr::Literal(Value::String("a".into()))),
+            });
+            let ids: Vec<i64> = db
+                .vector_search("docs_emb", &[1.0, 0.0, 0.0], 2, &filter)
+                .unwrap()
+                .iter()
+                .map(|(_, doc, _)| doc_id(doc))
+                .collect();
+            assert_eq!(ids, vec![1, 3]);
+
+            // Maintenance: a new row is indexed; querying near its own vector
+            // returns it, and after deletion it's gone.
+            db.execute("INSERT INTO docs (id, cat, embedding) VALUES (5, 'a', [0.05, 0.95, 0.0])")
+                .unwrap();
+            let top = db.vector_search("docs_emb", &[0.05, 0.95, 0.0], 1, &None).unwrap();
+            assert_eq!(doc_id(&top[0].1), 5); // exact match to the just-inserted row
+            db.execute("DELETE FROM docs WHERE id = 5").unwrap();
+            let top = db.vector_search("docs_emb", &[0.05, 0.95, 0.0], 1, &None).unwrap();
+            assert_eq!(doc_id(&top[0].1), 2); // id 5 gone → id 2 ([0,1,0]) is nearest
+        }
+
+        // Reopen: the in-memory index is rebuilt from the table and still works.
+        let db = Database::open(&dir).unwrap();
+        let top = db.vector_search("docs_emb", &[0.0, 0.0, 1.0], 1, &None).unwrap();
+        assert_eq!(doc_id(&top[0].1), 3);
     }
 
     #[test]

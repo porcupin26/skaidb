@@ -524,6 +524,25 @@ impl Parser {
                 self.expect(&Token::RParen)?;
                 Ok(e)
             }
+            // Array literal `[a, b, c]` (e.g. an embedding vector). Elements must
+            // be constant: a literal, or a negated numeric literal.
+            Token::LBracket => {
+                self.advance();
+                let mut items = Vec::new();
+                if !self.eat(&Token::RBracket) {
+                    loop {
+                        let e = self.parse_expr()?;
+                        items.push(const_value(&e).ok_or_else(|| {
+                            ParseError::Other("array elements must be constant literals".into())
+                        })?);
+                        if !self.eat(&Token::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(&Token::RBracket)?;
+                }
+                Ok(Expr::Literal(Value::Array(items)))
+            }
             Token::Keyword(kw) if agg_func(kw).is_some() => {
                 self.advance();
                 let func = agg_func(kw).unwrap();
@@ -560,6 +579,23 @@ fn agg_func(kw: Keyword) -> Option<AggFunc> {
         Keyword::Avg => Some(AggFunc::Avg),
         Keyword::Min => Some(AggFunc::Min),
         Keyword::Max => Some(AggFunc::Max),
+        _ => None,
+    }
+}
+
+/// Fold a parse-time-constant expression — a literal, or a negated numeric
+/// literal — into a `Value`, for array-literal elements.
+fn const_value(e: &Expr) -> Option<Value> {
+    match e {
+        Expr::Literal(v) => Some(v.clone()),
+        Expr::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } => match expr.as_ref() {
+            Expr::Literal(Value::Int(i)) => Some(Value::Int(-i)),
+            Expr::Literal(Value::Float(f)) => Some(Value::Float(-f)),
+            _ => None,
+        },
         _ => None,
     }
 }

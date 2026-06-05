@@ -22,6 +22,8 @@ pub enum Token {
     Dot,
     LParen,
     RParen,
+    LBracket,
+    RBracket,
     Star,
     Plus,
     Minus,
@@ -170,6 +172,14 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             }
             ')' => {
                 tokens.push(Token::RParen);
+                i += 1;
+            }
+            '[' => {
+                tokens.push(Token::LBracket);
+                i += 1;
+            }
+            ']' => {
+                tokens.push(Token::RBracket);
                 i += 1;
             }
             '*' => {

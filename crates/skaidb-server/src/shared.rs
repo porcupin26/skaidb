@@ -18,7 +18,8 @@ use crate::metrics::Metrics;
 /// cluster coordinator that replicates across nodes.
 #[derive(Debug)]
 pub enum Backend {
-    Local(Mutex<Database>),
+    // Boxed so the enum isn't dominated by the large embedded `Database`.
+    Local(Box<Mutex<Database>>),
     Cluster(Arc<Node>),
 }
 

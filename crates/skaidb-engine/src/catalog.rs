@@ -19,6 +19,18 @@ pub struct IndexDef {
     pub paths: Vec<String>,
 }
 
+/// A vector (HNSW) index declaration for approximate nearest-neighbor search
+/// over the float array at `path`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VectorIndexDef {
+    pub table: String,
+    pub path: String,
+    /// `"cosine"`, `"l2"`, or `"dot"`.
+    pub metric: String,
+    /// Vector dimension (all indexed vectors must match).
+    pub dim: usize,
+}
+
 /// A table definition: just its primary key columns.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TableDef {
@@ -30,6 +42,9 @@ pub struct TableDef {
 pub struct Catalog {
     pub tables: BTreeMap<String, TableDef>,
     pub indexes: BTreeMap<String, IndexDef>,
+    /// Vector indexes (rebuilt in memory on open). `default` so older catalogs load.
+    #[serde(default)]
+    pub vector_indexes: BTreeMap<String, VectorIndexDef>,
 }
 
 impl Catalog {

@@ -17,10 +17,11 @@ use std::sync::Arc;
 use skaidb_storage::{Engine as StorageEngine, Hlc, VersionValue, WalCommit, WalSync};
 use skaidb_types::{Document, Value};
 
-use crate::catalog::{Catalog, IndexDef, TableDef};
+use crate::catalog::{Catalog, IndexDef, TableDef, VectorIndexDef};
 use crate::error::{EngineError, Result};
 use crate::eval::{compare, eval, eval_predicate};
 use crate::result::{QueryOutput, ResultSet};
+use crate::vector::{Hnsw, Metric};
 
 /// A live row with its encoded document and version stamp.
 pub type VersionedRow = (Vec<u8>, Vec<u8>, Hlc);
@@ -51,6 +52,8 @@ pub struct Database {
     /// Secondary index storage by index name; entries map an indexed value to a
     /// table primary-key (so a `WHERE path = v` lookup avoids a full scan).
     indexes: HashMap<String, StorageEngine>,
+    /// In-memory HNSW vector indexes by name (rebuilt from the table on open).
+    vector_indexes: HashMap<String, Hnsw>,
 }
 
 impl Database {
@@ -72,12 +75,177 @@ impl Database {
             indexes.insert(name.clone(), engine);
         }
 
+        // Vector indexes live in memory; rebuild each from its table's rows.
+        let mut vector_indexes = HashMap::new();
+        for (name, def) in &catalog.vector_indexes {
+            let mut hnsw = new_hnsw(def);
+            if let Some(engine) = tables.get(&def.table) {
+                for (key, bytes) in engine.scan()? {
+                    if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
+                        if let Some(v) = doc_vector(&doc, &def.path, def.dim) {
+                            hnsw.insert(key, v);
+                        }
+                    }
+                }
+            }
+            vector_indexes.insert(name.clone(), hnsw);
+        }
+
         Ok(Database {
             dir,
             catalog,
             tables,
             indexes,
+            vector_indexes,
         })
+    }
+
+    /// Create an HNSW vector index over the float array at `path` of `table`.
+    /// The dimension is inferred from the first vector found (the table must
+    /// have at least one row with a vector). `metric` is `cosine`/`l2`/`dot`.
+    pub fn create_vector_index(
+        &mut self,
+        name: &str,
+        table: &str,
+        path: &str,
+        metric: &str,
+    ) -> Result<QueryOutput> {
+        if !self.catalog.tables.contains_key(table) {
+            return Err(EngineError::TableNotFound(table.to_string()));
+        }
+        if self.catalog.vector_indexes.contains_key(name) {
+            return Err(EngineError::IndexExists(name.to_string()));
+        }
+        if Metric::parse(metric).is_none() {
+            return Err(EngineError::Constraint(format!("unknown vector metric '{metric}'")));
+        }
+        // Infer the dimension from existing data.
+        let rows = self.scan_docs(table)?;
+        let dim = rows
+            .iter()
+            .find_map(|(_, doc)| doc_vector_raw(doc, path).map(|v| v.len()))
+            .ok_or_else(|| {
+                EngineError::Constraint(format!(
+                    "cannot infer vector dimension: no row of '{table}' has a numeric array at '{path}'"
+                ))
+            })?;
+
+        let def = VectorIndexDef {
+            table: table.to_string(),
+            path: path.to_string(),
+            metric: metric.to_ascii_lowercase(),
+            dim,
+        };
+        let mut hnsw = new_hnsw(&def);
+        for (key, doc) in &rows {
+            if let Some(v) = doc_vector(doc, path, dim) {
+                hnsw.insert(key.clone(), v);
+            }
+        }
+        self.vector_indexes.insert(name.to_string(), hnsw);
+        self.catalog.vector_indexes.insert(name.to_string(), def);
+        self.save_catalog()?;
+        Ok(QueryOutput::Ddl)
+    }
+
+    /// Drop a vector index.
+    pub fn drop_vector_index(&mut self, name: &str, if_exists: bool) -> Result<QueryOutput> {
+        if self.catalog.vector_indexes.remove(name).is_none() && !if_exists {
+            return Err(EngineError::IndexNotFound(name.to_string()));
+        }
+        self.vector_indexes.remove(name);
+        self.save_catalog()?;
+        Ok(QueryOutput::Ddl)
+    }
+
+    /// Approximate `k` nearest rows to `query` under the named vector index,
+    /// optionally restricted to rows matching `filter` (filtered ANN). Returns
+    /// `(key, doc, distance)` nearest-first.
+    pub fn vector_search(
+        &self,
+        index: &str,
+        query: &[f32],
+        k: usize,
+        filter: &Option<Expr>,
+    ) -> Result<Vec<(Vec<u8>, Document, f32)>> {
+        let hnsw = self
+            .vector_indexes
+            .get(index)
+            .ok_or_else(|| EngineError::IndexNotFound(index.to_string()))?;
+        let def = self
+            .catalog
+            .vector_indexes
+            .get(index)
+            .ok_or_else(|| EngineError::IndexNotFound(index.to_string()))?;
+        let table_engine = self
+            .tables
+            .get(&def.table)
+            .ok_or_else(|| EngineError::TableNotFound(def.table.clone()))?;
+
+        // The HNSW only knows keys; resolve each candidate to its row to apply
+        // the filter (filtered nearest-neighbor search).
+        let hits = hnsw.search(query, k, |key| match table_engine.get(key) {
+            Ok(Some(bytes)) => match (filter, Value::decode(&bytes)) {
+                (Some(_), Ok(Value::Document(doc))) => matches_filter(filter, &doc).unwrap_or(false),
+                (None, Ok(Value::Document(_))) => true,
+                _ => false,
+            },
+            _ => false,
+        });
+
+        let mut out = Vec::with_capacity(hits.len());
+        for (key, dist) in hits {
+            if let Some(bytes) = table_engine.get(&key)? {
+                if let Value::Document(doc) = Value::decode(&bytes)
+                    .map_err(|e| EngineError::Constraint(format!("corrupt row: {e}")))?
+                {
+                    out.push((key, doc, dist));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The `(name, path)` of every vector index on `table`.
+    fn vector_indexes_on(&self, table: &str) -> Vec<(String, String)> {
+        self.catalog
+            .vector_indexes
+            .iter()
+            .filter(|(_, def)| def.table == table)
+            .map(|(name, def)| (name.clone(), def.path.clone()))
+            .collect()
+    }
+
+    /// Update the vector index `name` for `doc` at `key` (insert/replace), or
+    /// remove the entry when the doc has no vector at `path`.
+    fn vector_index_put(&mut self, name: &str, path: &str, doc: &Document, key: &[u8]) {
+        let dim = self.vector_indexes.get(name).map(|h| h.dim());
+        if let (Some(dim), Some(hnsw)) = (dim, self.vector_indexes.get_mut(name)) {
+            match doc_vector(doc, path, dim) {
+                Some(v) => hnsw.insert(key.to_vec(), v),
+                None => hnsw.remove(key),
+            }
+        }
+    }
+
+    fn vector_index_del(&mut self, name: &str, key: &[u8]) {
+        if let Some(hnsw) = self.vector_indexes.get_mut(name) {
+            hnsw.remove(key);
+        }
+    }
+
+    /// Maintain every vector index on `table` for a written row.
+    fn maintain_vectors_put(&mut self, table: &str, doc: &Document, key: &[u8]) {
+        for (name, path) in self.vector_indexes_on(table) {
+            self.vector_index_put(&name, &path, doc, key);
+        }
+    }
+
+    /// Maintain every vector index on `table` for a deleted row.
+    fn maintain_vectors_del(&mut self, table: &str, key: &[u8]) {
+        for (name, _) in self.vector_indexes_on(table) {
+            self.vector_index_del(&name, key);
+        }
     }
 
     /// Parse and execute a single SQL statement.
@@ -448,6 +616,7 @@ impl Database {
         for (name, path) in self.indexes_on(table) {
             self.index_put(&name, &path, &doc, key)?;
         }
+        self.maintain_vectors_put(table, &doc, key);
         Ok(())
     }
 
@@ -466,6 +635,7 @@ impl Database {
                 }
             }
         }
+        self.maintain_vectors_del(table, key);
         Ok(())
     }
 
@@ -497,6 +667,7 @@ impl Database {
         for (name, path) in self.indexes_on(table) {
             self.index_put(&name, &path, &doc, key)?;
         }
+        self.maintain_vectors_put(table, &doc, key);
         Ok((commit, handle))
     }
 
@@ -523,6 +694,7 @@ impl Database {
                 }
             }
         }
+        self.maintain_vectors_del(table, key);
         Ok((commit, handle))
     }
 
@@ -738,6 +910,7 @@ impl Cluster for LocalCluster<'_> {
         for (name, path) in self.db.indexes_on(table) {
             self.db.index_put(&name, &path, doc, key)?;
         }
+        self.db.maintain_vectors_put(table, doc, key);
         Ok(())
     }
 
@@ -746,6 +919,7 @@ impl Cluster for LocalCluster<'_> {
         for (name, path) in self.db.indexes_on(table) {
             self.db.index_del(&name, &path, doc, key)?;
         }
+        self.db.maintain_vectors_del(table, key);
         Ok(())
     }
 }
@@ -759,6 +933,32 @@ fn index_dir(root: &Path, name: &str) -> PathBuf {
 }
 
 /// The indexed values of `doc` at `paths` (a missing field indexes as `NULL`).
+/// Build an empty HNSW for a vector index definition.
+fn new_hnsw(def: &VectorIndexDef) -> Hnsw {
+    Hnsw::new(Metric::parse(&def.metric).unwrap_or(Metric::Cosine), def.dim)
+}
+
+/// Extract the float vector at `path` (an array of `int`/`float`), or `None`.
+fn doc_vector_raw(doc: &Document, path: &str) -> Option<Vec<f32>> {
+    let Some(Value::Array(items)) = doc.get_path(path) else {
+        return None;
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        match it {
+            Value::Int(i) => out.push(*i as f32),
+            Value::Float(f) => out.push(*f as f32),
+            _ => return None, // non-numeric element: not a vector
+        }
+    }
+    Some(out)
+}
+
+/// Like [`doc_vector_raw`] but only accepts vectors of the expected dimension.
+fn doc_vector(doc: &Document, path: &str, dim: usize) -> Option<Vec<f32>> {
+    doc_vector_raw(doc, path).filter(|v| v.len() == dim)
+}
+
 fn index_values(doc: &Document, paths: &[String]) -> Vec<Value> {
     paths
         .iter()

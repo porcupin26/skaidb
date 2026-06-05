@@ -28,7 +28,7 @@ use crate::shared::{Backend, Context, Shared};
 /// configured, otherwise a standalone local engine.
 fn build_backend(db: Database, config: &Config) -> Result<Backend, Box<dyn std::error::Error>> {
     if config.cluster.seeds.is_empty() {
-        return Ok(Backend::Local(Mutex::new(db)));
+        return Ok(Backend::Local(Box::new(Mutex::new(db))));
     }
     let internode_addr = format!(
         "{}:{}",
@@ -172,7 +172,7 @@ mod tests {
         let mut roles = RoleStore::new();
         roles.create_superuser("superuser");
         Arc::new(Context {
-            backend: Backend::Local(Mutex::new(Database::open(temp_dir()).unwrap())),
+            backend: Backend::Local(Box::new(Mutex::new(Database::open(temp_dir()).unwrap()))),
             metrics: Metrics::new(),
             audit: quiet_audit(),
             roles,
@@ -267,7 +267,7 @@ mod tests {
         let mut authn = AuthState::required();
         authn.add_user("ada", "pencil", "admin");
         Arc::new(Context {
-            backend: Backend::Local(Mutex::new(Database::open(temp_dir()).unwrap())),
+            backend: Backend::Local(Box::new(Mutex::new(Database::open(temp_dir()).unwrap()))),
             metrics: Metrics::new(),
             audit: quiet_audit(),
             roles,
@@ -303,7 +303,7 @@ mod tests {
             .grant("reader", Privilege::Select, Object::Table("t".into()))
             .unwrap();
         let ctx: Shared = Arc::new(Context {
-            backend: Backend::Local(Mutex::new(Database::open(temp_dir()).unwrap())),
+            backend: Backend::Local(Box::new(Mutex::new(Database::open(temp_dir()).unwrap()))),
             metrics: Metrics::new(),
             audit: quiet_audit(),
             roles,
