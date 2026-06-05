@@ -18,6 +18,8 @@ CREATE INDEX [IF NOT EXISTS] <name> ON <table> (<path> [, <path> ...])
 DROP   INDEX [IF EXISTS] <name>
 CREATE VECTOR INDEX [IF NOT EXISTS] <name> ON <table> (<path>) DIM <n> [USING <metric>]
 DROP   VECTOR INDEX [IF EXISTS] <name>
+ALTER  TABLE <table> RENAME TO <new_table>
+ALTER  TABLE <table> RENAME COLUMN <from> TO <to>
 
 -- DML
 INSERT INTO <table> (<col> [, <col> ...]) VALUES (<expr>, ...) [, (<expr>, ...) ...]
@@ -25,12 +27,22 @@ UPDATE <table> SET <path> = <expr> [, <path> = <expr> ...] [WHERE <expr>]
 DELETE FROM <table> [WHERE <expr>]
 
 -- Query
-SELECT <select-item> [, <select-item> ...]
-FROM <table>
+SELECT [DISTINCT] <select-item> [, <select-item> ...]
+FROM <table> [[AS] <alias>]
+[ <join> ... ]
 [WHERE <expr>]
 [GROUP BY <expr> [, <expr> ...]]
+[HAVING <expr>]
+[ { UNION | UNION ALL } <select> ... ]
 [ORDER BY <expr> [ASC|DESC] [, <expr> [ASC|DESC] ...]]
 [LIMIT <n>] [OFFSET <n>]
+
+<join> := [INNER | LEFT [OUTER] | RIGHT [OUTER] | CROSS] JOIN <table> [[AS] <alias>] [ON <expr>]
+
+-- Transactions (embedded engine only — see note)
+BEGIN [TRANSACTION]
+COMMIT [TRANSACTION]
+ROLLBACK [TRANSACTION]
 ```
 
 - `CREATE TABLE` declares **only the primary key** — there is no column list;
@@ -44,6 +56,27 @@ FROM <table>
   `vector_search` API, not SQL yet (see below and [VECTOR.md](VECTOR.md)).
 - `<select-item>` is `*` (all fields seen in the result rows) or
   `<expr> [[AS] <alias>]`.
+- `ALTER TABLE … RENAME TO` renames a table (moving its on-disk data and
+  repointing its indexes); `RENAME COLUMN from TO to` rewrites that field in
+  every row (recomputing the primary key if it is a key column) and rebuilds any
+  index that referenced it. The store is schema-less, so there is no
+  `ADD`/`DROP COLUMN` — a field simply exists in the rows that set it.
+- **`DISTINCT`** removes duplicate output rows. **`HAVING`** filters groups after
+  aggregation (it may reference aggregates and the `GROUP BY` columns).
+- **`JOIN`** combines tables by nested-loop. `INNER`/`LEFT`/`RIGHT`/`CROSS` are
+  supported (`JOIN` alone means `INNER`; `CROSS JOIN` takes no `ON`). Reference
+  columns **qualified** by table alias (`u.id`, `o.amt`); an unqualified field
+  resolves against whichever joined table defines it (first table wins on a name
+  clash). `SELECT *` over a join expands to the underlying fields.
+- **`UNION`** / **`UNION ALL`** concatenate the rows of several `SELECT`s that
+  share a column count (`UNION` removes duplicates, `UNION ALL` keeps them). A
+  trailing `ORDER BY`/`LIMIT`/`OFFSET` after the last branch applies to the whole
+  combined result and references the **output column** names.
+- **`BEGIN`/`COMMIT`/`ROLLBACK`** wrap several statements in a transaction with
+  read-your-writes: buffered writes are invisible to other readers until
+  `COMMIT`, and `ROLLBACK` discards them. **Embedded engine only** — in cluster
+  mode each statement autocommits and transaction control returns an error (a
+  distributed transaction coordinator is future work). DDL is not transactional.
 
 ## Expressions
 
@@ -99,9 +132,17 @@ values arrive via stored data or the value codec, not as SQL literals.
 
 ## Not part of the SQL surface
 
-- **No** `JOIN`, subqueries, `DISTINCT`, `HAVING`, `UNION`, CTEs, window
-  functions, or multi-statement transactions (`BEGIN`/`COMMIT`/`ROLLBACK`).
-- **No** `ALTER`. Schema changes are limited to create/drop of tables/indexes.
+- **No** subqueries, CTEs (`WITH`), `DISTINCT ON`, `FULL OUTER JOIN`,
+  `INTERSECT`/`EXCEPT`, window functions, or set operators other than `UNION` /
+  `UNION ALL`.
+- **No** `ALTER` beyond `RENAME TABLE` / `RENAME COLUMN` (the store is
+  schema-less, so there is nothing to `ADD`/`DROP COLUMN`).
+- **Transactions are embedded-only.** `BEGIN`/`COMMIT`/`ROLLBACK` work against an
+  embedded `Database`; the cluster coordinator autocommits each statement and
+  rejects transaction control (no distributed 2PC yet).
+- **Joins have no pushdown in a cluster:** a join pulls each table to the
+  coordinator and nested-loops there, so it suits modest tables / lookups, not
+  large fact-to-fact joins.
 - **Vector index *creation* is SQL** (`CREATE VECTOR INDEX …`), but the
   **nearest-neighbor *query* has no SQL syntax yet** — searches go through the
   `Database::vector_search` / `Node::vector_search` API (see

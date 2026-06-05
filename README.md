@@ -64,8 +64,10 @@ skaidb-cli --dir ./data -e "SELECT COUNT(*) FROM users"
 ## SQL surface (phase 1)
 
 `CREATE/DROP TABLE` (declares only the primary key — no column list),
-`CREATE/DROP INDEX`, `INSERT`, `SELECT` (projection incl. nested paths, `WHERE`,
-`ORDER BY`, `LIMIT/OFFSET`, aggregates, `GROUP BY`), `UPDATE`, `DELETE`.
+`CREATE/DROP INDEX`, `ALTER TABLE … RENAME`, `INSERT`, `SELECT` (projection incl.
+nested paths, `WHERE`, `ORDER BY`, `LIMIT/OFFSET`, aggregates, `GROUP BY`,
+`DISTINCT`, `HAVING`, `INNER/LEFT/RIGHT/CROSS JOIN`, `UNION [ALL]`), `UPDATE`,
+`DELETE`, and embedded `BEGIN/COMMIT/ROLLBACK` transactions.
 
 Types: `null, bool, int64, float64, decimal, string, bytes, uuid, timestamp`
 (unixtime ms), `array`, `document`, plus JSON-like values.
@@ -74,9 +76,14 @@ Full grammar reference: **[docs/QUERY_SYNTAX.md](docs/QUERY_SYNTAX.md)**.
 
 ## Status & deferred work
 
-Implemented end-to-end and tested (169 tests):
+Implemented end-to-end and tested (187 tests):
 
 - soft-schema document model, SQL subset, 3-valued logic
+- **SQL surface**: projection over nested paths, `WHERE`, `GROUP BY`/`HAVING`,
+  aggregates, `DISTINCT`, `ORDER BY`/`LIMIT`/`OFFSET`, `INNER`/`LEFT`/`RIGHT`/
+  `CROSS JOIN` (nested-loop, alias-qualified), `UNION`/`UNION ALL`,
+  `ALTER TABLE … RENAME`, and embedded `BEGIN`/`COMMIT`/`ROLLBACK` transactions
+  with read-your-writes — see [docs/QUERY_SYNTAX.md](docs/QUERY_SYNTAX.md)
 - LSM storage: WAL recovery, SSTables + Bloom filters, lazy-leveled compaction,
   **group-commit WAL** (batched fsync across concurrent writers), and a bounded
   **RAM read cache** for point reads that fall through to SSTables
@@ -115,7 +122,9 @@ Implemented end-to-end and tested (169 tests):
 
 Designed for but deliberately not yet built: **QUIC** transport + push-based
 control plane (the raw-TCP fast path is in; QUIC needs an async runtime),
-**distributed/multi-key transactions** (needs a coordinator/2PC), active
+**distributed/multi-key transactions** (single-node `BEGIN/COMMIT/ROLLBACK` is
+in; spanning nodes needs a coordinator/2PC), **join pushdown** (a clustered join
+gathers each table to the coordinator rather than executing shard-local), active
 **anti-entropy** (read-repair & hinted handoff — convergence currently relies on
 writes reaching their replicas; this is also what online resharding needs to
 reclaim space on a key's former owner and to give a node that missed a

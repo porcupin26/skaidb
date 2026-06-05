@@ -4,12 +4,12 @@
 //! Rows are documents keyed by their primary key, encoded with the
 //! order-preserving key codec so scans come back in key order.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use skaidb_sql::ast::{
-    AggArg, AggFunc, BinaryOp, Delete, Expr, Insert, OrderKey, Select, SelectItem, Statement,
-    Update,
+    AggArg, AggFunc, AlterAction, AlterTable, BinaryOp, Delete, Expr, Insert, JoinKind, OrderKey,
+    Select, SelectItem, Statement, Update,
 };
 use skaidb_sql::parse;
 use std::sync::Arc;
@@ -54,6 +54,17 @@ pub struct Database {
     indexes: HashMap<String, StorageEngine>,
     /// In-memory HNSW vector indexes by name (rebuilt from the table on open).
     vector_indexes: HashMap<String, Hnsw>,
+    /// The open transaction's buffered writes, if a `BEGIN` is in flight.
+    txn: Option<TxnBuffer>,
+}
+
+/// Buffered writes of an open transaction: `(table, key) -> Some(doc)` for a
+/// put, `None` for a delete. Reads during the transaction merge this over
+/// committed storage (read-your-writes); `COMMIT` flushes it to storage and
+/// `ROLLBACK` discards it. Embedded, single-connection only.
+#[derive(Debug, Default)]
+struct TxnBuffer {
+    writes: BTreeMap<(String, Vec<u8>), Option<Document>>,
 }
 
 impl Database {
@@ -97,6 +108,7 @@ impl Database {
             tables,
             indexes,
             vector_indexes,
+            txn: None,
         })
     }
 
@@ -294,6 +306,10 @@ impl Database {
             Statement::DropVectorIndex { name, if_exists } => {
                 self.drop_vector_index(&name, if_exists)
             }
+            Statement::AlterTable(alt) => self.alter_table(alt),
+            Statement::Begin => self.begin(),
+            Statement::Commit => self.commit(),
+            Statement::Rollback => self.rollback(),
             // DML and SELECT run through the storage-agnostic executor so the
             // exact same logic serves the local engine and the cluster
             // coordinator (which replaces LocalCluster with a networked one).
@@ -410,6 +426,252 @@ impl Database {
         }
         self.save_catalog()?;
         Ok(QueryOutput::Ddl)
+    }
+
+    // ---- ALTER ----
+
+    fn alter_table(&mut self, alt: AlterTable) -> Result<QueryOutput> {
+        if !self.catalog.tables.contains_key(&alt.name) {
+            return Err(EngineError::TableNotFound(alt.name.clone()));
+        }
+        match alt.action {
+            AlterAction::RenameTable { new_name } => self.rename_table(&alt.name, &new_name),
+            AlterAction::RenameColumn { from, to } => self.rename_column(&alt.name, &from, &to),
+        }
+    }
+
+    /// `ALTER TABLE old RENAME TO new`: move the on-disk table, repoint the
+    /// catalog entry, and update dependent index/vector-index definitions. The
+    /// open storage engine is dropped first (releasing its file handles) so the
+    /// directory rename is safe; it is reopened under the new path.
+    fn rename_table(&mut self, old: &str, new: &str) -> Result<QueryOutput> {
+        if self.catalog.tables.contains_key(new) {
+            return Err(EngineError::TableExists(new.to_string()));
+        }
+        self.tables.remove(old); // close handles before moving the directory
+        let old_dir = table_dir(&self.dir, old);
+        let new_dir = table_dir(&self.dir, new);
+        if old_dir.exists() {
+            std::fs::rename(&old_dir, &new_dir)?;
+        }
+        self.tables
+            .insert(new.to_string(), StorageEngine::open(new_dir)?);
+
+        let def = self.catalog.tables.remove(old).expect("table present");
+        self.catalog.tables.insert(new.to_string(), def);
+        for idx in self.catalog.indexes.values_mut() {
+            if idx.table == old {
+                idx.table = new.to_string();
+            }
+        }
+        for v in self.catalog.vector_indexes.values_mut() {
+            if v.table == old {
+                v.table = new.to_string();
+            }
+        }
+        self.save_catalog()?;
+        Ok(QueryOutput::Ddl)
+    }
+
+    /// `ALTER TABLE t RENAME COLUMN from TO to`: rewrite the field in every row
+    /// (recomputing the primary key if `from` is a key column), then rebuild any
+    /// index that referenced the renamed path. Rows are rewritten directly in
+    /// storage (index maintenance is deferred to the rebuild).
+    fn rename_column(&mut self, table: &str, from: &str, to: &str) -> Result<QueryOutput> {
+        // Update PK column names and index/vector path references first.
+        if let Some(def) = self.catalog.tables.get_mut(table) {
+            for c in def.primary_key.iter_mut() {
+                if c == from {
+                    *c = to.to_string();
+                }
+            }
+        }
+        for idx in self.catalog.indexes.values_mut() {
+            for p in idx.paths.iter_mut() {
+                if p == from {
+                    *p = to.to_string();
+                }
+            }
+        }
+        for v in self.catalog.vector_indexes.values_mut() {
+            if v.path == from {
+                v.path = to.to_string();
+            }
+        }
+
+        // Rewrite each row in raw storage: move the field, recompute the key.
+        let pk = self.table_def(table)?.primary_key.clone();
+        for (old_key, old_doc) in self.scan_docs(table)? {
+            let mut new_doc = old_doc.clone();
+            if let Some(val) = new_doc.0.remove(from) {
+                new_doc.0.insert(to.to_string(), val);
+            } else if old_key == primary_key_bytes(&pk, &new_doc)? {
+                continue; // field absent and key unaffected: nothing to do
+            }
+            let new_key = primary_key_bytes(&pk, &new_doc)?;
+            let engine = self.table_engine_mut(table)?;
+            if new_key != old_key {
+                engine.delete(&old_key)?;
+            }
+            engine.put(&new_key, Value::Document(new_doc).encode())?;
+        }
+
+        // Rebuild the table's secondary indexes (entries used the old path) and
+        // any vector indexes whose path changed.
+        let secondary: Vec<String> = self
+            .catalog
+            .indexes
+            .iter()
+            .filter(|(_, i)| i.table == table)
+            .map(|(n, _)| n.clone())
+            .collect();
+        for name in secondary {
+            self.rebuild_index(&name)?;
+        }
+        let vectors: Vec<String> = self
+            .catalog
+            .vector_indexes
+            .iter()
+            .filter(|(_, v)| v.table == table)
+            .map(|(n, _)| n.clone())
+            .collect();
+        for name in vectors {
+            self.rebuild_vector_index(&name)?;
+        }
+
+        self.save_catalog()?;
+        Ok(QueryOutput::Ddl)
+    }
+
+    /// Wipe and re-backfill a secondary index from its table's current rows.
+    fn rebuild_index(&mut self, name: &str) -> Result<()> {
+        let def = self
+            .catalog
+            .indexes
+            .get(name)
+            .ok_or_else(|| EngineError::IndexNotFound(name.to_string()))?;
+        let (idx_table, idx_paths) = (def.table.clone(), def.paths.clone());
+        self.indexes.remove(name);
+        let dir = index_dir(&self.dir, name);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        let mut engine = StorageEngine::open(dir)?;
+        for (row_key, doc) in self.scan_docs(&idx_table)? {
+            let values = index_values(&doc, &idx_paths);
+            engine.put(&index_entry_key(&values, &row_key), row_key.clone())?;
+        }
+        self.indexes.insert(name.to_string(), engine);
+        Ok(())
+    }
+
+    /// Rebuild an in-memory HNSW vector index from its table's current rows.
+    fn rebuild_vector_index(&mut self, name: &str) -> Result<()> {
+        let def = self
+            .catalog
+            .vector_indexes
+            .get(name)
+            .ok_or_else(|| EngineError::IndexNotFound(name.to_string()))?
+            .clone();
+        let mut hnsw = new_hnsw(&def);
+        for (row_key, doc) in self.scan_docs(&def.table)? {
+            if let Some(v) = doc_vector(&doc, &def.path, def.dim) {
+                hnsw.insert(row_key, v);
+            }
+        }
+        self.vector_indexes.insert(name.to_string(), hnsw);
+        Ok(())
+    }
+
+    // ---- transactions (embedded, single-connection) ----
+
+    /// Begin a transaction: subsequent writes buffer until `COMMIT`/`ROLLBACK`.
+    fn begin(&mut self) -> Result<QueryOutput> {
+        if self.txn.is_some() {
+            return Err(EngineError::Constraint(
+                "a transaction is already in progress".into(),
+            ));
+        }
+        self.txn = Some(TxnBuffer::default());
+        Ok(QueryOutput::Ddl)
+    }
+
+    /// Commit the open transaction: flush its buffered writes to storage
+    /// (maintaining indexes), then clear it.
+    fn commit(&mut self) -> Result<QueryOutput> {
+        let Some(txn) = self.txn.take() else {
+            return Err(EngineError::Constraint("no transaction in progress".into()));
+        };
+        let mut local = LocalCluster { db: self };
+        for ((table, key), op) in txn.writes {
+            match op {
+                Some(doc) => local.put(&table, &key, &doc)?,
+                None => {
+                    // Read the committed doc so index entries are removed correctly.
+                    let doc = local
+                        .db
+                        .committed_doc(&table, &key)?
+                        .unwrap_or_default();
+                    local.delete(&table, &key, &doc)?;
+                }
+            }
+        }
+        Ok(QueryOutput::Ddl)
+    }
+
+    /// Roll back (discard) the open transaction.
+    fn rollback(&mut self) -> Result<QueryOutput> {
+        if self.txn.take().is_none() {
+            return Err(EngineError::Constraint("no transaction in progress".into()));
+        }
+        Ok(QueryOutput::Ddl)
+    }
+
+    /// The committed document at `(table, key)`, ignoring any open transaction.
+    fn committed_doc(&self, table: &str, key: &[u8]) -> Result<Option<Document>> {
+        let Some(engine) = self.tables.get(table) else {
+            return Err(EngineError::TableNotFound(table.to_string()));
+        };
+        match engine.get(key)? {
+            Some(bytes) => match Value::decode(&bytes) {
+                Ok(Value::Document(doc)) => Ok(Some(doc)),
+                _ => Ok(None),
+            },
+            None => Ok(None),
+        }
+    }
+
+    /// Gather rows for `table` matching `filter` with the open transaction's
+    /// buffered writes merged over committed storage (read-your-writes). Used
+    /// only while a transaction is active, so it always full-scans (no index
+    /// acceleration) for simplicity.
+    fn gather_with_overlay(
+        &self,
+        table: &str,
+        filter: &Option<Expr>,
+    ) -> Result<Vec<(Vec<u8>, Document)>> {
+        let txn = self.txn.as_ref().expect("transaction active");
+        let mut map: BTreeMap<Vec<u8>, Document> = self.scan_docs(table)?.into_iter().collect();
+        for ((t, k), op) in &txn.writes {
+            if t != table {
+                continue;
+            }
+            match op {
+                Some(doc) => {
+                    map.insert(k.clone(), doc.clone());
+                }
+                None => {
+                    map.remove(k);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for (k, doc) in map {
+            if matches_filter(filter, &doc)? {
+                out.push((k, doc));
+            }
+        }
+        Ok(out)
     }
 
     // ---- row gathering (with optional index acceleration) ----
@@ -844,7 +1106,7 @@ pub trait Cluster {
 pub fn run(stmt: Statement, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
     match stmt {
         Statement::Insert(ins) => run_insert(ins, cluster),
-        Statement::Select(sel) => run_select(sel, cluster).map(QueryOutput::Rows),
+        Statement::Select(sel) => run_select(&sel, cluster).map(QueryOutput::Rows),
         Statement::Update(upd) => run_update(upd, cluster),
         Statement::Delete(del) => run_delete(del, cluster),
         _ => Err(EngineError::Unsupported(
@@ -872,13 +1134,46 @@ fn run_insert(ins: Insert, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
     Ok(QueryOutput::Mutation { affected })
 }
 
-fn run_select(sel: Select, cluster: &mut dyn Cluster) -> Result<ResultSet> {
-    let has_aggregate = sel.items.iter().any(|it| match it {
+fn run_select(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSet> {
+    // Compound query (`UNION [ALL]`): project each core without ordering/limiting,
+    // combine the row sets, then apply the whole-query DISTINCT / ORDER BY / LIMIT.
+    if !sel.set_ops.is_empty() {
+        let mut rs = project_core(sel, cluster)?;
+        for op in &sel.set_ops {
+            let leg = project_core(&op.select, cluster)?;
+            if leg.columns.len() != rs.columns.len() {
+                return Err(EngineError::Unsupported(
+                    "UNION branches must have the same number of columns".into(),
+                ));
+            }
+            rs.rows.extend(leg.rows);
+            if !op.all {
+                dedup_rows(&mut rs.rows);
+            }
+        }
+        return finalize_compound(sel, rs);
+    }
+    // Single query with joins: gather the joined rows, then project.
+    if !sel.joins.is_empty() {
+        let docs = gather_join_docs(sel, cluster)?;
+        let hide = join_hidden_keys(sel);
+        return project(sel, docs, &hide, true);
+    }
+    // Simple single-table query: keep the index-accelerated ORDER BY / top-N path.
+    run_simple_select(sel, cluster)
+}
+
+/// Whether the query is in aggregate/grouped mode.
+fn is_grouped(sel: &Select) -> bool {
+    sel.items.iter().any(|it| match it {
         SelectItem::Expr { expr, .. } => contains_aggregate(expr),
         SelectItem::Wildcard => false,
-    });
-    let grouped = has_aggregate || !sel.group_by.is_empty();
+    }) || !sel.group_by.is_empty()
+}
 
+/// Single-table query using the index planner for ordered/top-N gathers.
+fn run_simple_select(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSet> {
+    let grouped = is_grouped(sel);
     // An index can satisfy a single ascending `ORDER BY <column>` directly.
     let order_col = if grouped {
         None
@@ -886,9 +1181,11 @@ fn run_select(sel: Select, cluster: &mut dyn Cluster) -> Result<ResultSet> {
         index_order_column(&sel.order_by)
     };
     // Push a fetch limit only when the rows will come back in the requested order
-    // (so truncating the prefix is correct).
-    let fetch_limit = match (&order_col, sel.limit) {
-        (Some(_), Some(limit)) => Some(sel.offset.unwrap_or(0).saturating_add(limit) as usize),
+    // (so truncating the prefix is correct) and the result isn't deduplicated.
+    let fetch_limit = match (&order_col, sel.limit, sel.distinct) {
+        (Some(_), Some(limit), false) => {
+            Some(sel.offset.unwrap_or(0).saturating_add(limit) as usize)
+        }
         _ => None,
     };
 
@@ -897,10 +1194,203 @@ fn run_select(sel: Select, cluster: &mut dyn Cluster) -> Result<ResultSet> {
     let docs: Vec<Document> = keyed.into_iter().map(|(_k, doc)| doc).collect();
 
     if grouped {
-        select_aggregate(&sel, docs)
+        select_aggregate(sel, docs, true)
     } else {
-        select_rows(&sel, docs, presorted)
+        select_rows(sel, docs, presorted, &HashSet::new(), true)
     }
+}
+
+/// Project a query core (its own projection/grouping/having/distinct) to a
+/// `ResultSet`, but **without** applying ORDER BY / LIMIT — those belong to the
+/// enclosing compound query. Join-aware.
+fn project_core(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSet> {
+    let docs: Vec<Document> = if sel.joins.is_empty() {
+        cluster
+            .matching_rows(&sel.from, &sel.filter)?
+            .into_iter()
+            .map(|(_, d)| d)
+            .collect()
+    } else {
+        gather_join_docs(sel, cluster)?
+    };
+    let hide = join_hidden_keys(sel);
+    project(sel, docs, &hide, false)
+}
+
+/// Group-or-row projection over already-gathered docs.
+fn project(
+    sel: &Select,
+    docs: Vec<Document>,
+    hide: &HashSet<String>,
+    finalize: bool,
+) -> Result<ResultSet> {
+    if is_grouped(sel) {
+        select_aggregate(sel, docs, finalize)
+    } else {
+        select_rows(sel, docs, false, hide, finalize)
+    }
+}
+
+/// The set of join-alias container keys to hide from `SELECT *` expansion (so a
+/// join wildcard shows the underlying fields, not the per-table sub-documents).
+/// Empty for a non-join query.
+fn join_hidden_keys(sel: &Select) -> HashSet<String> {
+    if sel.joins.is_empty() {
+        return HashSet::new();
+    }
+    let mut s = HashSet::new();
+    s.insert(sel.from_alias.clone());
+    for j in &sel.joins {
+        s.insert(j.alias.clone());
+    }
+    s
+}
+
+/// One row of an in-progress join: each source alias paired with its document
+/// (`None` for the null side of an outer join).
+type JoinTuple = Vec<(String, Option<Document>)>;
+
+/// Flatten a join tuple into one evaluation document: each present side is
+/// available both qualified (`alias.field`, via a nested sub-document) and
+/// unqualified (`field`, first present side wins on a name clash).
+fn merge_tuple(parts: &JoinTuple) -> Document {
+    let mut row = Document::new();
+    for (alias, doc) in parts {
+        if let Some(d) = doc {
+            row.0.insert(alias.clone(), Value::Document(d.clone()));
+        }
+    }
+    for (_, doc) in parts {
+        if let Some(d) = doc {
+            for (k, v) in &d.0 {
+                row.0.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+    }
+    row
+}
+
+fn join_keep(on: &Option<Expr>, cand: &JoinTuple) -> Result<bool> {
+    match on {
+        None => Ok(true),
+        Some(e) => eval_predicate(e, &merge_tuple(cand)),
+    }
+}
+
+/// Nested-loop evaluation of `FROM` + its joins into flattened result documents
+/// (then filtered by the query `WHERE`). Each table's rows are gathered through
+/// the [`Cluster`] seam, so joins work embedded and cluster-wide alike. Note: in
+/// a cluster this pulls each joined table to the coordinator — there is no join
+/// pushdown — so it suits modest tables / lookups.
+fn gather_join_docs(sel: &Select, cluster: &mut dyn Cluster) -> Result<Vec<Document>> {
+    let base = cluster.matching_rows(&sel.from, &None)?;
+    let mut tuples: Vec<JoinTuple> = base
+        .into_iter()
+        .map(|(_, d)| vec![(sel.from_alias.clone(), Some(d))])
+        .collect();
+    let mut left_aliases = vec![sel.from_alias.clone()];
+
+    for join in &sel.joins {
+        let right = cluster.matching_rows(&join.table, &None)?;
+        let ra = &join.alias;
+        let mut next: Vec<JoinTuple> = Vec::new();
+        match join.kind {
+            JoinKind::Inner | JoinKind::Left | JoinKind::Cross => {
+                for t in &tuples {
+                    let mut matched = false;
+                    for (_, rd) in &right {
+                        let mut cand = t.clone();
+                        cand.push((ra.clone(), Some(rd.clone())));
+                        if join_keep(&join.on, &cand)? {
+                            next.push(cand);
+                            matched = true;
+                        }
+                    }
+                    // LEFT JOIN: emit the left row with a null right side if nothing matched.
+                    if matches!(join.kind, JoinKind::Left) && !matched {
+                        let mut cand = t.clone();
+                        cand.push((ra.clone(), None));
+                        next.push(cand);
+                    }
+                }
+            }
+            JoinKind::Right => {
+                for (_, rd) in &right {
+                    let mut matched = false;
+                    for t in &tuples {
+                        let mut cand = t.clone();
+                        cand.push((ra.clone(), Some(rd.clone())));
+                        if join_keep(&join.on, &cand)? {
+                            next.push(cand);
+                            matched = true;
+                        }
+                    }
+                    // Unmatched right row: emit it with every left alias nulled.
+                    if !matched {
+                        let mut cand: JoinTuple =
+                            left_aliases.iter().map(|a| (a.clone(), None)).collect();
+                        cand.push((ra.clone(), Some(rd.clone())));
+                        next.push(cand);
+                    }
+                }
+            }
+        }
+        left_aliases.push(ra.clone());
+        tuples = next;
+    }
+
+    let mut out = Vec::with_capacity(tuples.len());
+    for t in &tuples {
+        let doc = merge_tuple(t);
+        if matches_filter(&sel.filter, &doc)? {
+            out.push(doc);
+        }
+    }
+    Ok(out)
+}
+
+/// Dedup rows in place, preserving first-seen order (for `DISTINCT` / `UNION`).
+fn dedup_rows(rows: &mut Vec<Vec<Value>>) {
+    let mut seen = BTreeSet::new();
+    rows.retain(|row| seen.insert(Value::Array(row.clone()).encode_key()));
+}
+
+/// Apply the whole-query DISTINCT, ORDER BY, and OFFSET/LIMIT to a combined
+/// compound (`UNION`) result. ORDER BY here references **output columns** by name.
+fn finalize_compound(sel: &Select, mut rs: ResultSet) -> Result<ResultSet> {
+    if sel.distinct {
+        dedup_rows(&mut rs.rows);
+    }
+    if !sel.order_by.is_empty() {
+        sort_result_rows(&mut rs, &sel.order_by)?;
+    }
+    apply_offset_limit(&mut rs.rows, sel.offset, sel.limit);
+    Ok(rs)
+}
+
+/// Sort a `ResultSet`'s rows by `order_by`, evaluating each key against a
+/// document built from the output columns (so `ORDER BY <output-column>` works
+/// over a `UNION`). Non-column order keys still evaluate (e.g. `ORDER BY a + b`
+/// when `a`/`b` are output columns).
+fn sort_result_rows(rs: &mut ResultSet, order_by: &[OrderKey]) -> Result<()> {
+    let mut keyed: Vec<(Vec<Value>, usize)> = Vec::with_capacity(rs.rows.len());
+    for (i, row) in rs.rows.iter().enumerate() {
+        let mut doc = Document::new();
+        for (col, val) in rs.columns.iter().zip(row.iter()) {
+            doc.insert(col.clone(), val.clone());
+        }
+        let mut k = Vec::with_capacity(order_by.len());
+        for ok in order_by {
+            k.push(eval(&ok.expr, &doc)?);
+        }
+        keyed.push((k, i));
+    }
+    keyed.sort_by(|a, b| order_compare(&a.0, &b.0, order_by));
+    let original = rs.rows.clone();
+    for (new_pos, (_, old_idx)) in keyed.into_iter().enumerate() {
+        rs.rows[new_pos] = original[old_idx].clone();
+    }
+    Ok(())
 }
 
 /// The column an index could order by: a lone ascending `ORDER BY <column>`.
@@ -957,6 +1447,9 @@ impl Cluster for LocalCluster<'_> {
         table: &str,
         filter: &Option<Expr>,
     ) -> Result<Vec<(Vec<u8>, Document)>> {
+        if self.db.txn.is_some() {
+            return self.db.gather_with_overlay(table, filter);
+        }
         self.db.gather_rows_keyed(table, filter)
     }
 
@@ -967,10 +1460,20 @@ impl Cluster for LocalCluster<'_> {
         order: Option<&str>,
         fetch_limit: Option<usize>,
     ) -> Result<OrderedRows> {
+        // In a transaction, read through the buffered overlay (unindexed).
+        if self.db.txn.is_some() {
+            return Ok((self.db.gather_with_overlay(table, filter)?, false));
+        }
         self.db.gather_rows_planned(table, filter, order, fetch_limit)
     }
 
     fn put(&mut self, table: &str, key: &[u8], doc: &Document) -> Result<()> {
+        // Buffer the write when a transaction is open (flushed on COMMIT).
+        if let Some(txn) = self.db.txn.as_mut() {
+            txn.writes
+                .insert((table.to_string(), key.to_vec()), Some(doc.clone()));
+            return Ok(());
+        }
         self.db
             .table_engine_mut(table)?
             .put(key, Value::Document(doc.clone()).encode())?;
@@ -982,6 +1485,10 @@ impl Cluster for LocalCluster<'_> {
     }
 
     fn delete(&mut self, table: &str, key: &[u8], doc: &Document) -> Result<()> {
+        if let Some(txn) = self.db.txn.as_mut() {
+            txn.writes.insert((table.to_string(), key.to_vec()), None);
+            return Ok(());
+        }
         self.db.table_engine_mut(table)?.delete(key)?;
         for (name, path) in self.db.indexes_on(table) {
             self.db.index_del(&name, &path, doc, key)?;
@@ -1329,20 +1836,34 @@ fn expr_name(expr: &Expr) -> String {
 }
 
 /// Row-per-document projection (no aggregates).
-fn select_rows(sel: &Select, mut docs: Vec<Document>, presorted: bool) -> Result<ResultSet> {
-    // `presorted` means the gather already returned rows in `ORDER BY` order
-    // (via an index), so the sort pass is skipped.
-    if !presorted {
+fn select_rows(
+    sel: &Select,
+    mut docs: Vec<Document>,
+    presorted: bool,
+    hide: &HashSet<String>,
+    finalize: bool,
+) -> Result<ResultSet> {
+    // `finalize` applies the query's ORDER BY / OFFSET / LIMIT (skipped for a
+    // `UNION` core, where they belong to the whole query). `presorted` means the
+    // gather already returned rows in `ORDER BY` order (via an index).
+    if finalize && !presorted {
         sort_docs(&mut docs, &sel.order_by)?;
     }
-    apply_offset_limit(&mut docs, sel.offset, sel.limit);
+    // Without DISTINCT we can trim to the page before projecting (cheap top-N);
+    // with DISTINCT the dedup must happen first, so we page after projection.
+    if finalize && !sel.distinct {
+        apply_offset_limit(&mut docs, sel.offset, sel.limit);
+    }
 
-    // Wildcard expands to the sorted union of all field names in the output set.
+    // Wildcard expands to the sorted union of field names (minus join-alias
+    // container keys, which would otherwise show as sub-documents).
     let wildcard_fields: Vec<String> = if has_wildcard(sel) {
         let mut set = BTreeSet::new();
         for doc in &docs {
             for k in doc.0.keys() {
-                set.insert(k.clone());
+                if !hide.contains(k) {
+                    set.insert(k.clone());
+                }
             }
         }
         set.into_iter().collect()
@@ -1375,11 +1896,17 @@ fn select_rows(sel: &Select, mut docs: Vec<Document>, presorted: bool) -> Result
         }
         rows.push(row);
     }
+    if sel.distinct {
+        dedup_rows(&mut rows);
+    }
+    if finalize && sel.distinct {
+        apply_offset_limit(&mut rows, sel.offset, sel.limit);
+    }
     Ok(ResultSet::new(columns, rows))
 }
 
-/// Aggregate / grouped projection.
-fn select_aggregate(sel: &Select, docs: Vec<Document>) -> Result<ResultSet> {
+/// Aggregate / grouped projection. `finalize` applies ORDER BY / OFFSET / LIMIT.
+fn select_aggregate(sel: &Select, docs: Vec<Document>, finalize: bool) -> Result<ResultSet> {
     if has_wildcard(sel) {
         return Err(EngineError::Unsupported(
             "`*` cannot be combined with aggregates or GROUP BY".into(),
@@ -1421,6 +1948,14 @@ fn select_aggregate(sel: &Select, docs: Vec<Document>) -> Result<ResultSet> {
     for key in &order {
         let group_docs = &groups[key];
         let rep = group_docs.first().cloned().unwrap_or_default();
+        // HAVING filters whole groups; it may reference aggregates (lowered over
+        // the group) and the group-by columns.
+        if let Some(having) = &sel.having {
+            let lowered = lower_aggregates(having, group_docs)?;
+            if !eval_predicate(&lowered, &rep)? {
+                continue;
+            }
+        }
         let mut row = Vec::with_capacity(columns.len());
         for item in &sel.items {
             if let SelectItem::Expr { expr, .. } = item {
@@ -1437,12 +1972,17 @@ fn select_aggregate(sel: &Select, docs: Vec<Document>) -> Result<ResultSet> {
         keyed_rows.push((sort_vals, row));
     }
 
-    if !sel.order_by.is_empty() {
+    if finalize && !sel.order_by.is_empty() {
         keyed_rows.sort_by(|a, b| order_compare(&a.0, &b.0, &sel.order_by));
     }
 
     let mut rows: Vec<Vec<Value>> = keyed_rows.into_iter().map(|(_, r)| r).collect();
-    apply_offset_limit(&mut rows, sel.offset, sel.limit);
+    if sel.distinct {
+        dedup_rows(&mut rows);
+    }
+    if finalize {
+        apply_offset_limit(&mut rows, sel.offset, sel.limit);
+    }
     Ok(ResultSet::new(columns, rows))
 }
 

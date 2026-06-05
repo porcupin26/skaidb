@@ -11,10 +11,34 @@ pub enum Statement {
     DropIndex { name: String, if_exists: bool },
     CreateVectorIndex(CreateVectorIndex),
     DropVectorIndex { name: String, if_exists: bool },
+    AlterTable(AlterTable),
     Insert(Insert),
     Select(Select),
     Update(Update),
     Delete(Delete),
+    /// `BEGIN [TRANSACTION]` — start a transaction (embedded engine only).
+    Begin,
+    /// `COMMIT [TRANSACTION]` — durably apply the open transaction.
+    Commit,
+    /// `ROLLBACK [TRANSACTION]` — discard the open transaction.
+    Rollback,
+}
+
+/// `ALTER TABLE name <action>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterTable {
+    pub name: String,
+    pub action: AlterAction,
+}
+
+/// What an `ALTER TABLE` does. The store is schema-less, so only structural
+/// renames are meaningful (there is no column list to add/drop columns from).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterAction {
+    /// `RENAME TO <new_name>`.
+    RenameTable { new_name: String },
+    /// `RENAME COLUMN <from> TO <to>` — rewrites the field in every row.
+    RenameColumn { from: String, to: String },
 }
 
 /// `CREATE TABLE [IF NOT EXISTS] name (PRIMARY KEY (cols...))`.
@@ -59,16 +83,56 @@ pub struct Insert {
     pub rows: Vec<Vec<Expr>>,
 }
 
-/// `SELECT items FROM table [WHERE expr] [ORDER BY ..] [LIMIT n] [OFFSET m]`.
+/// `SELECT [DISTINCT] items FROM table [JOIN ...] [WHERE expr] [GROUP BY ..]
+/// [HAVING expr] [UNION [ALL] select] [ORDER BY ..] [LIMIT n] [OFFSET m]`.
+///
+/// `joins`, `having`, and `set_ops` are empty/`None` for the simple single-table
+/// query that the rest of the engine has always handled. When `set_ops` is
+/// non-empty, `order_by`/`limit`/`offset`/`distinct` here apply to the **whole**
+/// combined result (standard SQL set-query semantics); the chained selects carry
+/// only their own projection/source/filter/grouping.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
+    pub distinct: bool,
     pub items: Vec<SelectItem>,
     pub from: String,
+    /// Alias for the `FROM` table (defaults to the table name).
+    pub from_alias: String,
+    pub joins: Vec<Join>,
     pub filter: Option<Expr>,
     pub group_by: Vec<Expr>,
+    pub having: Option<Expr>,
+    pub set_ops: Vec<SetOp>,
     pub order_by: Vec<OrderKey>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+}
+
+/// A joined table: `[<kind>] JOIN <table> [AS alias] [ON <expr>]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Join {
+    pub kind: JoinKind,
+    pub table: String,
+    pub alias: String,
+    /// The `ON` predicate; `None` for a `CROSS JOIN` (full cartesian product).
+    pub on: Option<Expr>,
+}
+
+/// The join flavor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+    Right,
+    Cross,
+}
+
+/// A trailing `UNION [ALL] <select>` combined into the query.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetOp {
+    /// `true` for `UNION ALL` (keep duplicates); `false` for `UNION` (dedup).
+    pub all: bool,
+    pub select: Select,
 }
 
 /// A projected output column.

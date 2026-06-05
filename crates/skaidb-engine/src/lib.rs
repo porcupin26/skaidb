@@ -574,4 +574,299 @@ mod tests {
         );
         assert_eq!(rs.rows, vec![vec![Value::Int(2)], vec![Value::Int(3)]]);
     }
+
+    // ---- DISTINCT / HAVING ----
+
+    #[test]
+    fn select_distinct_dedups() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        db.execute("INSERT INTO t (id, c) VALUES (1,'a'),(2,'a'),(3,'b'),(4,'b'),(5,'a')")
+            .unwrap();
+        let rs = rows(db.execute("SELECT DISTINCT c FROM t ORDER BY c").unwrap());
+        assert_eq!(
+            rs.rows,
+            vec![
+                vec![Value::String("a".into())],
+                vec![Value::String("b".into())]
+            ]
+        );
+    }
+
+    #[test]
+    fn group_by_having_filters_groups() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        db.execute("INSERT INTO t (id, g, v) VALUES (1,'x',10),(2,'x',20),(3,'y',5),(4,'z',40)")
+            .unwrap();
+        let rs = rows(
+            db.execute("SELECT g, SUM(v) FROM t GROUP BY g HAVING SUM(v) > 15 ORDER BY g")
+                .unwrap(),
+        );
+        assert_eq!(
+            rs.rows,
+            vec![
+                vec![Value::String("x".into()), Value::Int(30)],
+                vec![Value::String("z".into()), Value::Int(40)],
+            ]
+        );
+    }
+
+    // ---- JOIN ----
+
+    fn join_db() -> Database {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE users (PRIMARY KEY (id))").unwrap();
+        db.execute("CREATE TABLE orders (PRIMARY KEY (oid))")
+            .unwrap();
+        db.execute("INSERT INTO users (id, name) VALUES (1,'ada'),(2,'bob'),(3,'cy')")
+            .unwrap();
+        // order 13 has uid 99 — no matching user.
+        db.execute(
+            "INSERT INTO orders (oid, uid, amt) VALUES (10,1,100),(11,1,50),(12,2,75),(13,99,5)",
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn inner_join_with_qualified_columns() {
+        let mut db = join_db();
+        let rs = rows(
+            db.execute(
+                "SELECT u.name, o.amt FROM users u JOIN orders o ON u.id = o.uid ORDER BY o.amt",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.columns, vec!["u.name", "o.amt"]);
+        assert_eq!(
+            rs.rows,
+            vec![
+                vec![Value::String("ada".into()), Value::Int(50)],
+                vec![Value::String("bob".into()), Value::Int(75)],
+                vec![Value::String("ada".into()), Value::Int(100)],
+            ]
+        );
+    }
+
+    #[test]
+    fn left_join_keeps_unmatched_left_with_nulls() {
+        let mut db = join_db();
+        // cy (id 3) has no orders → null right side.
+        let rs = rows(
+            db.execute(
+                "SELECT u.name, o.amt FROM users u LEFT JOIN orders o ON u.id = o.uid \
+                 WHERE u.id = 3",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::String("cy".into()), Value::Null]]);
+    }
+
+    #[test]
+    fn right_join_keeps_unmatched_right() {
+        let mut db = join_db();
+        // order 13 (uid 99) has no user → surfaces under RIGHT JOIN with NULL user.
+        let rs = rows(
+            db.execute(
+                "SELECT o.oid FROM users u RIGHT JOIN orders o ON u.id = o.uid \
+                 WHERE u.id IS NULL",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(13)]]);
+    }
+
+    #[test]
+    fn cross_join_is_cartesian() {
+        let mut db = join_db();
+        let rs = rows(
+            db.execute("SELECT COUNT(*) FROM users u CROSS JOIN orders o")
+                .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(12)]]); // 3 users × 4 orders
+    }
+
+    // ---- UNION ----
+
+    fn union_db() -> Database {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE a (PRIMARY KEY (id))").unwrap();
+        db.execute("CREATE TABLE b (PRIMARY KEY (id))").unwrap();
+        db.execute("INSERT INTO a (id) VALUES (1),(2),(3)").unwrap();
+        db.execute("INSERT INTO b (id) VALUES (3),(4)").unwrap();
+        db
+    }
+
+    #[test]
+    fn union_dedups_union_all_keeps() {
+        let mut db = union_db();
+        let rs = rows(
+            db.execute("SELECT id FROM a UNION SELECT id FROM b ORDER BY id")
+                .unwrap(),
+        );
+        assert_eq!(
+            rs.rows,
+            vec![
+                vec![Value::Int(1)],
+                vec![Value::Int(2)],
+                vec![Value::Int(3)],
+                vec![Value::Int(4)],
+            ]
+        );
+        let rs = rows(
+            db.execute("SELECT id FROM a UNION ALL SELECT id FROM b ORDER BY id")
+                .unwrap(),
+        );
+        assert_eq!(
+            rs.rows,
+            vec![
+                vec![Value::Int(1)],
+                vec![Value::Int(2)],
+                vec![Value::Int(3)],
+                vec![Value::Int(3)],
+                vec![Value::Int(4)],
+            ]
+        );
+    }
+
+    // ---- ALTER ----
+
+    #[test]
+    fn alter_table_rename_to() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        db.execute("INSERT INTO t (id, name) VALUES (1, 'ada')")
+            .unwrap();
+        db.execute("ALTER TABLE t RENAME TO people").unwrap();
+        let rs = rows(db.execute("SELECT name FROM people WHERE id = 1").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::String("ada".into())]]);
+        // The old name is gone.
+        assert!(db.execute("SELECT id FROM t").is_err());
+    }
+
+    #[test]
+    fn alter_table_rename_column_rebuilds_index() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        db.execute("CREATE INDEX t_c ON t(c)").unwrap();
+        db.execute("INSERT INTO t (id, c) VALUES (1, 5), (2, 7), (3, 5)")
+            .unwrap();
+        db.execute("ALTER TABLE t RENAME COLUMN c TO d").unwrap();
+        // The renamed field is queryable, and the index (now on `d`) still serves it.
+        let rs = rows(
+            db.execute("SELECT id, d FROM t WHERE d = 5 ORDER BY id")
+                .unwrap(),
+        );
+        assert_eq!(
+            rs.rows,
+            vec![
+                vec![Value::Int(1), Value::Int(5)],
+                vec![Value::Int(3), Value::Int(5)],
+            ]
+        );
+        // The old column name now reads as NULL everywhere.
+        let rs = rows(db.execute("SELECT id FROM t WHERE c IS NULL ORDER BY id").unwrap());
+        assert_eq!(rs.rows.len(), 3);
+    }
+
+    #[test]
+    fn alter_table_rename_primary_key_column() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE k (PRIMARY KEY (uid))").unwrap();
+        db.execute("INSERT INTO k (uid, x) VALUES (1, 'a'), (2, 'b')")
+            .unwrap();
+        db.execute("ALTER TABLE k RENAME COLUMN uid TO user_id")
+            .unwrap();
+        let rs = rows(
+            db.execute("SELECT x FROM k WHERE user_id = 2")
+                .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::String("b".into())]]);
+    }
+
+    // ---- transactions ----
+
+    #[test]
+    fn transaction_commit_persists_read_your_writes() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        db.execute("INSERT INTO t (id, name) VALUES (1, 'a')")
+            .unwrap();
+
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO t (id, name) VALUES (2, 'b')")
+            .unwrap();
+        db.execute("UPDATE t SET name = 'A' WHERE id = 1").unwrap();
+        // Read-your-writes inside the transaction.
+        let rs = rows(db.execute("SELECT id, name FROM t ORDER BY id").unwrap());
+        assert_eq!(
+            rs.rows,
+            vec![
+                vec![Value::Int(1), Value::String("A".into())],
+                vec![Value::Int(2), Value::String("b".into())],
+            ]
+        );
+        db.execute("COMMIT").unwrap();
+
+        // Durable after commit.
+        let rs = rows(db.execute("SELECT id, name FROM t ORDER BY id").unwrap());
+        assert_eq!(
+            rs.rows,
+            vec![
+                vec![Value::Int(1), Value::String("A".into())],
+                vec![Value::Int(2), Value::String("b".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn transaction_rollback_discards_changes() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        db.execute("INSERT INTO t (id) VALUES (1), (2)").unwrap();
+
+        db.execute("BEGIN").unwrap();
+        db.execute("DELETE FROM t WHERE id = 1").unwrap();
+        db.execute("INSERT INTO t (id) VALUES (3)").unwrap();
+        // Visible inside the transaction.
+        let rs = rows(db.execute("SELECT id FROM t ORDER BY id").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::Int(2)], vec![Value::Int(3)]]);
+        db.execute("ROLLBACK").unwrap();
+
+        // Back to the pre-transaction state.
+        let rs = rows(db.execute("SELECT id FROM t ORDER BY id").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+    }
+
+    #[test]
+    fn transaction_state_errors() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        assert!(db.execute("COMMIT").is_err()); // no transaction
+        assert!(db.execute("ROLLBACK").is_err());
+        db.execute("BEGIN").unwrap();
+        assert!(db.execute("BEGIN").is_err()); // already in a transaction
+        db.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn transaction_index_consistent_after_commit() {
+        // A committed transaction must leave secondary indexes correct.
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        db.execute("CREATE INDEX t_r ON t(r)").unwrap();
+        db.execute("INSERT INTO t (id, r) VALUES (1,'eu'),(2,'us')")
+            .unwrap();
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO t (id, r) VALUES (3,'eu')").unwrap();
+        db.execute("UPDATE t SET r = 'eu' WHERE id = 2").unwrap();
+        db.execute("COMMIT").unwrap();
+        // Index-accelerated lookup sees all three 'eu' rows.
+        let rs = rows(db.execute("SELECT id FROM t WHERE r = 'eu' ORDER BY id").unwrap());
+        assert_eq!(
+            rs.rows,
+            vec![vec![Value::Int(1)], vec![Value::Int(2)], vec![Value::Int(3)]]
+        );
+    }
 }

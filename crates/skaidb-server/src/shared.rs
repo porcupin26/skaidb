@@ -122,6 +122,11 @@ fn required_privilege(sql: &str) -> Option<(Privilege, Object)> {
         Statement::DropTable { name, .. } => (Privilege::Drop, Object::Table(name)),
         Statement::DropIndex { .. } => (Privilege::Drop, Object::Global),
         Statement::DropVectorIndex { .. } => (Privilege::Drop, Object::Global),
+        Statement::AlterTable(a) => (Privilege::Create, Object::Table(a.name)),
+        // Transaction control affects writes; gate it like a global write.
+        Statement::Begin | Statement::Commit | Statement::Rollback => {
+            (Privilege::Insert, Object::Global)
+        }
     })
 }
 
@@ -138,7 +143,8 @@ fn statement_type(sql: &str) -> &'static str {
         "INSERT" => "insert",
         "UPDATE" => "update",
         "DELETE" => "delete",
-        "CREATE" | "DROP" => "ddl",
+        "CREATE" | "DROP" | "ALTER" => "ddl",
+        "BEGIN" | "COMMIT" | "ROLLBACK" => "tx",
         _ => "other",
     }
 }

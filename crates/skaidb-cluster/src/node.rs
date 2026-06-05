@@ -371,6 +371,16 @@ impl Node {
     /// Execute a SQL statement as the cluster coordinator.
     pub fn execute(self: &Arc<Self>, sql: &str) -> EngineResult<QueryOutput> {
         let stmt = parse(sql)?;
+        if matches!(
+            stmt,
+            Statement::Begin | Statement::Commit | Statement::Rollback
+        ) {
+            return Err(EngineError::Unsupported(
+                "multi-statement transactions are not supported in cluster mode \
+                 (writes are autocommitted per statement)"
+                    .into(),
+            ));
+        }
         if is_ddl(&stmt) {
             self.broadcast_ddl(sql)?;
             return Ok(QueryOutput::Ddl);
@@ -882,6 +892,7 @@ fn is_ddl(stmt: &Statement) -> bool {
             | Statement::DropIndex { .. }
             | Statement::CreateVectorIndex(_)
             | Statement::DropVectorIndex { .. }
+            | Statement::AlterTable(_)
     )
 }
 

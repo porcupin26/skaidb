@@ -129,8 +129,43 @@ impl Parser {
             Token::Keyword(Keyword::Delete) => self.parse_delete().map(Statement::Delete),
             Token::Keyword(Keyword::Create) => self.parse_create(),
             Token::Keyword(Keyword::Drop) => self.parse_drop(),
+            Token::Keyword(Keyword::Alter) => self.parse_alter(),
+            Token::Keyword(Keyword::Begin) => {
+                self.advance();
+                self.eat_keyword(Keyword::Transaction);
+                Ok(Statement::Begin)
+            }
+            Token::Keyword(Keyword::Commit) => {
+                self.advance();
+                self.eat_keyword(Keyword::Transaction);
+                Ok(Statement::Commit)
+            }
+            Token::Keyword(Keyword::Rollback) => {
+                self.advance();
+                self.eat_keyword(Keyword::Transaction);
+                Ok(Statement::Rollback)
+            }
             _ => Err(self.unexpected("a statement".into())),
         }
+    }
+
+    /// `ALTER TABLE <name> RENAME { TO <new> | COLUMN <from> TO <to> }`.
+    fn parse_alter(&mut self) -> Result<Statement, ParseError> {
+        self.expect_keyword(Keyword::Alter)?;
+        self.expect_keyword(Keyword::Table)?;
+        let name = self.expect_ident()?;
+        self.expect_keyword(Keyword::Rename)?;
+        let action = if self.eat_keyword(Keyword::Column) {
+            let from = self.parse_path()?;
+            self.expect_keyword(Keyword::To)?;
+            let to = self.parse_path()?;
+            AlterAction::RenameColumn { from, to }
+        } else {
+            self.expect_keyword(Keyword::To)?;
+            let new_name = self.expect_ident()?;
+            AlterAction::RenameTable { new_name }
+        };
+        Ok(Statement::AlterTable(AlterTable { name, action }))
     }
 
     fn parse_create(&mut self) -> Result<Statement, ParseError> {
@@ -283,8 +318,39 @@ impl Parser {
         })
     }
 
+    /// A full query: one or more `SELECT` cores chained by `UNION [ALL]`, with a
+    /// trailing `ORDER BY`/`LIMIT`/`OFFSET` that applies to the whole result.
     fn parse_select(&mut self) -> Result<Select, ParseError> {
+        let mut query = self.parse_select_core()?;
+
+        let mut set_ops = Vec::new();
+        while self.eat_keyword(Keyword::Union) {
+            let all = self.eat_keyword(Keyword::All);
+            let select = self.parse_select_core()?;
+            set_ops.push(SetOp { all, select });
+        }
+        query.set_ops = set_ops;
+
+        // Whole-query ORDER BY / LIMIT / OFFSET.
+        query.order_by = self.parse_order_by()?;
+        query.limit = if self.eat_keyword(Keyword::Limit) {
+            Some(self.expect_u64()?)
+        } else {
+            None
+        };
+        query.offset = if self.eat_keyword(Keyword::Offset) {
+            Some(self.expect_u64()?)
+        } else {
+            None
+        };
+        Ok(query)
+    }
+
+    /// One `SELECT` body: `SELECT [DISTINCT] items FROM t [joins] [WHERE]
+    /// [GROUP BY] [HAVING]` — without the query-level `ORDER BY`/`LIMIT`/`UNION`.
+    fn parse_select_core(&mut self) -> Result<Select, ParseError> {
         self.expect_keyword(Keyword::Select)?;
+        let distinct = self.eat_keyword(Keyword::Distinct);
         let mut items = Vec::new();
         loop {
             if self.eat(&Token::Star) {
@@ -307,6 +373,12 @@ impl Parser {
 
         self.expect_keyword(Keyword::From)?;
         let from = self.expect_ident()?;
+        let from_alias = self.parse_table_alias(&from);
+
+        let mut joins = Vec::new();
+        while let Some(kind) = self.peek_join_kind() {
+            joins.push(self.parse_join(kind)?);
+        }
 
         let filter = if self.eat_keyword(Keyword::Where) {
             Some(self.parse_expr()?)
@@ -325,6 +397,87 @@ impl Parser {
             }
         }
 
+        let having = if self.eat_keyword(Keyword::Having) {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        Ok(Select {
+            distinct,
+            items,
+            from,
+            from_alias,
+            joins,
+            filter,
+            group_by,
+            having,
+            set_ops: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        })
+    }
+
+    /// An optional table alias after a table reference: `[AS] <ident>`. Returns
+    /// `default` (the table name) when none is present.
+    fn parse_table_alias(&mut self, default: &str) -> String {
+        if self.eat_keyword(Keyword::As) {
+            return self.expect_ident().unwrap_or_else(|_| default.to_string());
+        }
+        if let Token::Ident(_) = self.peek() {
+            if let Ok(a) = self.expect_ident() {
+                return a;
+            }
+        }
+        default.to_string()
+    }
+
+    /// If the next token begins a join clause, the join flavor it introduces.
+    fn peek_join_kind(&self) -> Option<JoinKind> {
+        match self.peek() {
+            Token::Keyword(Keyword::Join) => Some(JoinKind::Inner),
+            Token::Keyword(Keyword::Inner) => Some(JoinKind::Inner),
+            Token::Keyword(Keyword::Left) => Some(JoinKind::Left),
+            Token::Keyword(Keyword::Right) => Some(JoinKind::Right),
+            Token::Keyword(Keyword::Cross) => Some(JoinKind::Cross),
+            _ => None,
+        }
+    }
+
+    fn parse_join(&mut self, kind: JoinKind) -> Result<Join, ParseError> {
+        // Consume the flavor keyword(s) up to and including JOIN.
+        match self.peek() {
+            Token::Keyword(Keyword::Join) => {
+                self.advance();
+            }
+            Token::Keyword(Keyword::Inner) | Token::Keyword(Keyword::Cross) => {
+                self.advance();
+                self.expect_keyword(Keyword::Join)?;
+            }
+            Token::Keyword(Keyword::Left) | Token::Keyword(Keyword::Right) => {
+                self.advance();
+                self.eat_keyword(Keyword::Outer); // optional
+                self.expect_keyword(Keyword::Join)?;
+            }
+            _ => return Err(self.unexpected("JOIN".into())),
+        }
+        let table = self.expect_ident()?;
+        let alias = self.parse_table_alias(&table);
+        let on = if self.eat_keyword(Keyword::On) {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(Join {
+            kind,
+            table,
+            alias,
+            on,
+        })
+    }
+
+    fn parse_order_by(&mut self) -> Result<Vec<OrderKey>, ParseError> {
         let mut order_by = Vec::new();
         if self.eat_keyword(Keyword::Order) {
             self.expect_keyword(Keyword::By)?;
@@ -342,27 +495,7 @@ impl Parser {
                 }
             }
         }
-
-        let limit = if self.eat_keyword(Keyword::Limit) {
-            Some(self.expect_u64()?)
-        } else {
-            None
-        };
-        let offset = if self.eat_keyword(Keyword::Offset) {
-            Some(self.expect_u64()?)
-        } else {
-            None
-        };
-
-        Ok(Select {
-            items,
-            from,
-            filter,
-            group_by,
-            order_by,
-            limit,
-            offset,
-        })
+        Ok(order_by)
     }
 
     fn parse_update(&mut self) -> Result<Update, ParseError> {
@@ -746,5 +879,78 @@ mod tests {
     #[test]
     fn trailing_semicolon_ok() {
         assert!(parse("SELECT 1 FROM t;").is_ok());
+    }
+
+    #[test]
+    fn parse_distinct_having() {
+        let Statement::Select(sel) =
+            parse("SELECT DISTINCT g, COUNT(*) FROM t GROUP BY g HAVING COUNT(*) > 1").unwrap()
+        else {
+            panic!("expected select")
+        };
+        assert!(sel.distinct);
+        assert!(sel.having.is_some());
+        assert_eq!(sel.group_by.len(), 1);
+    }
+
+    #[test]
+    fn parse_joins_with_aliases() {
+        let Statement::Select(sel) = parse(
+            "SELECT u.name, o.amt FROM users u \
+             JOIN orders o ON u.id = o.uid \
+             LEFT JOIN refunds r ON r.oid = o.oid",
+        )
+        .unwrap() else {
+            panic!("expected select")
+        };
+        assert_eq!(sel.from, "users");
+        assert_eq!(sel.from_alias, "u");
+        assert_eq!(sel.joins.len(), 2);
+        assert_eq!(sel.joins[0].kind, JoinKind::Inner);
+        assert_eq!(sel.joins[0].alias, "o");
+        assert_eq!(sel.joins[1].kind, JoinKind::Left);
+        assert!(sel.joins[1].on.is_some());
+    }
+
+    #[test]
+    fn parse_union_all_with_trailing_order() {
+        let Statement::Select(sel) =
+            parse("SELECT id FROM a UNION ALL SELECT id FROM b ORDER BY id LIMIT 5").unwrap()
+        else {
+            panic!("expected select")
+        };
+        assert_eq!(sel.set_ops.len(), 1);
+        assert!(sel.set_ops[0].all);
+        assert_eq!(sel.set_ops[0].select.from, "b");
+        // Trailing ORDER BY / LIMIT bind to the whole query, not the last leg.
+        assert_eq!(sel.order_by.len(), 1);
+        assert_eq!(sel.limit, Some(5));
+        assert!(sel.set_ops[0].select.order_by.is_empty());
+    }
+
+    #[test]
+    fn parse_alter_and_transactions() {
+        assert_eq!(
+            parse("ALTER TABLE t RENAME TO t2").unwrap(),
+            Statement::AlterTable(AlterTable {
+                name: "t".into(),
+                action: AlterAction::RenameTable {
+                    new_name: "t2".into()
+                },
+            })
+        );
+        assert_eq!(
+            parse("ALTER TABLE t RENAME COLUMN a TO b").unwrap(),
+            Statement::AlterTable(AlterTable {
+                name: "t".into(),
+                action: AlterAction::RenameColumn {
+                    from: "a".into(),
+                    to: "b".into()
+                },
+            })
+        );
+        assert_eq!(parse("BEGIN").unwrap(), Statement::Begin);
+        assert_eq!(parse("COMMIT TRANSACTION").unwrap(), Statement::Commit);
+        assert_eq!(parse("ROLLBACK").unwrap(), Statement::Rollback);
     }
 }
