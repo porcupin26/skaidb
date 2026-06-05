@@ -74,7 +74,7 @@ Full grammar reference: **[docs/QUERY_SYNTAX.md](docs/QUERY_SYNTAX.md)**.
 
 ## Status & deferred work
 
-Implemented end-to-end and tested (141 tests):
+Implemented end-to-end and tested (169 tests):
 
 - soft-schema document model, SQL subset, 3-valued logic
 - LSM storage: WAL recovery, SSTables + Bloom filters, lazy-leveled compaction,
@@ -101,6 +101,12 @@ Implemented end-to-end and tested (141 tests):
   shards; non-indexed reads scatter-gather and merge by HLC LWW (tombstones
   included, so deletes win cluster-wide); quorum-broadcast DDL; one-node-down
   tolerance
+- **online resharding**: a node can **join at runtime** — the coordinator
+  broadcasts the new ring, bootstraps the joiner's schema, and every existing
+  member pushes the keys the joiner now owns (HLC-preserving, tombstones
+  included). Consistent hashing means a single join only moves ~`1/(N+1)` of the
+  keyspace *onto* the new node; placements are otherwise undisturbed. See
+  [docs/RESHARDING.md](docs/RESHARDING.md)
 - **auth**: SCRAM-SHA-256 handshake (mutual auth) on the binary endpoint and
   HTTP Basic on REST, + per-statement **RBAC**
 - binary + REST endpoints, Prometheus metrics, masked audit logs
@@ -111,7 +117,12 @@ Designed for but deliberately not yet built: **QUIC** transport + push-based
 control plane (the raw-TCP fast path is in; QUIC needs an async runtime),
 **distributed/multi-key transactions** (needs a coordinator/2PC), active
 **anti-entropy** (read-repair & hinted handoff — convergence currently relies on
-writes reaching their replicas), **global (value-sharded) secondary indexes** —
+writes reaching their replicas; this is also what online resharding needs to
+reclaim space on a key's former owner and to give a node that missed a
+membership broadcast a topology log to catch up on), graceful node
+**decommission** (online *join* is built — see
+[docs/RESHARDING.md](docs/RESHARDING.md) — but draining a node before removal is
+not), **global (value-sharded) secondary indexes** —
 today's indexes are local per node, so a distributed indexed read still scatters
 to every member (their local indexes return only candidate keys) rather than
 routing to a single owner — and specialized index types (text, geospatial,

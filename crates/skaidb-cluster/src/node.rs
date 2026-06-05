@@ -44,6 +44,31 @@ pub struct NodeConfig {
     pub write_consistency: Consistency,
 }
 
+/// The cluster's placement view: the hash ring plus peer addresses. Held behind
+/// a lock so membership can change at runtime (resharding).
+#[derive(Debug)]
+struct Topology {
+    ring: Ring,
+    /// Peer id → internode address (excludes self).
+    peers: HashMap<NodeId, String>,
+}
+
+impl Topology {
+    /// Build a topology from the full member list, excluding `self_id` from peers.
+    fn from_members(members: &[(NodeId, String)], self_id: &NodeId, vnodes: u32) -> Topology {
+        let mut ring = Ring::new(vnodes);
+        for (id, _) in members {
+            ring.add_node(id.clone());
+        }
+        let peers = members
+            .iter()
+            .filter(|(id, _)| id != self_id)
+            .map(|(id, addr)| (id.clone(), addr.clone()))
+            .collect();
+        Topology { ring, peers }
+    }
+}
+
 /// A cluster member: owns local storage and coordinates cluster operations.
 #[derive(Debug)]
 pub struct Node {
@@ -51,9 +76,8 @@ pub struct Node {
     /// Local storage behind an `RwLock` so concurrent reads share a read lock
     /// while writes are exclusive.
     local: RwLock<Database>,
-    ring: Ring,
-    /// Peer id → internode address (excludes self).
-    peers: HashMap<NodeId, String>,
+    /// Cluster placement, mutable so nodes can join/leave at runtime.
+    topo: RwLock<Topology>,
     clock: HlcClock,
     /// Pooled persistent connections to peers.
     pool: internode::Pool,
@@ -63,22 +87,11 @@ pub struct Node {
 impl Node {
     /// Create a node with the given local database and cluster config.
     pub fn new(local: Database, cfg: NodeConfig) -> Arc<Node> {
-        let mut ring = Ring::new(cfg.vnodes_per_node);
-        for (id, _) in &cfg.members {
-            ring.add_node(id.clone());
-        }
-        let peers = cfg
-            .members
-            .iter()
-            .filter(|(id, _)| *id != cfg.id)
-            .map(|(id, addr)| (id.clone(), addr.clone()))
-            .collect();
-
+        let topo = Topology::from_members(&cfg.members, &cfg.id, cfg.vnodes_per_node);
         Arc::new(Node {
             id: cfg.id.clone(),
             local: RwLock::new(local),
-            ring,
-            peers,
+            topo: RwLock::new(topo),
             clock: HlcClock::new(),
             pool: internode::Pool::new(),
             cfg,
@@ -87,7 +100,174 @@ impl Node {
 
     /// Total member count (peers + self).
     fn member_count(&self) -> usize {
-        self.peers.len() + 1
+        self.topo.read().expect("topo lock").peers.len() + 1
+    }
+
+    /// Replica set for `key` at the configured replication factor (snapshot).
+    fn replicas_for(&self, key: &[u8]) -> Vec<NodeId> {
+        self.topo
+            .read()
+            .expect("topo lock")
+            .ring
+            .replicas_for(key, self.cfg.replication_factor)
+    }
+
+    /// Address of peer `id`, if it is a current peer (snapshot, cloned).
+    fn peer_addr(&self, id: &NodeId) -> Option<String> {
+        self.topo.read().expect("topo lock").peers.get(id).cloned()
+    }
+
+    /// Addresses of all current peers (snapshot, cloned) — never held across I/O.
+    fn peer_addrs(&self) -> Vec<String> {
+        self.topo
+            .read()
+            .expect("topo lock")
+            .peers
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// The full current membership (`(id, addr)` pairs), including this node.
+    fn members_snapshot(&self) -> Vec<(NodeId, String)> {
+        let topo = self.topo.read().expect("topo lock");
+        let mut members: Vec<(NodeId, String)> = topo
+            .peers
+            .iter()
+            .map(|(id, addr)| (id.clone(), addr.clone()))
+            .collect();
+        members.push((self.id.clone(), self.cfg.internode_addr.clone()));
+        members
+    }
+
+    /// Replace this node's topology (ring + peers) with `members`.
+    fn set_membership(&self, members: &[(NodeId, String)]) {
+        let topo = Topology::from_members(members, &self.id, self.cfg.vnodes_per_node);
+        *self.topo.write().expect("topo lock") = topo;
+    }
+
+    /// `CREATE` statements reconstructing the local schema (for joiner bootstrap).
+    fn schema_ddl(&self) -> EngineResult<Vec<String>> {
+        Ok(self
+            .local
+            .read()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .schema_ddl())
+    }
+
+    /// Push every locally-held row whose key `joiner` now owns (under the current
+    /// ring) to that joiner, preserving each row's HLC and tombstone state. Rows
+    /// are snapshotted under a read lock per table, then sent without the lock
+    /// held. Stale copies are intentionally **left in place** on the former owner:
+    /// pushed rows keep their original HLC, so any later write wins last-writer-
+    /// wins, and reads route to the new owner via the ring — reclaiming the old
+    /// copy's space needs a local physical delete that bypasses LWW (deferred with
+    /// anti-entropy). Idempotent and safe to retry.
+    fn rebalance_to(&self, joiner: &NodeId) -> EngineResult<()> {
+        if joiner == &self.id {
+            return Ok(());
+        }
+        let addr = self
+            .peer_addr(joiner)
+            .ok_or_else(|| EngineError::Cluster(format!("joiner {joiner} not in topology")))?;
+
+        let tables = self
+            .local
+            .read()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .table_names();
+
+        for table in tables {
+            let rows = self
+                .local
+                .read()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+                .local_scan_versioned_with_tombstones(&table)?;
+            for (key, value, hlc, is_put) in rows {
+                if !self.replicas_for(&key).contains(joiner) {
+                    continue;
+                }
+                let op = if is_put {
+                    WriteOp::Put(value)
+                } else {
+                    WriteOp::Delete
+                };
+                match self.send_write(&addr, &table, &key, &op, hlc) {
+                    Ok(true) => {}
+                    _ => {
+                        return Err(EngineError::Cluster(format!(
+                            "rebalance to {joiner}: write not acked"
+                        )))
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Add a node to the cluster at runtime and migrate it its share of the
+    /// keyspace (online resharding). Orchestrated from any existing member:
+    ///
+    /// 1. compute the new membership (current members + the joiner) and broadcast
+    ///    [`Request::SetMembership`] so every node (and the joiner) recomputes the
+    ///    same ring;
+    /// 2. bootstrap the joiner's schema with the local catalog's `CREATE` DDL;
+    /// 3. broadcast [`Request::Rebalance`] so every existing member pushes the
+    ///    keys the joiner now owns.
+    ///
+    /// Consistent hashing means a single join only moves keys *onto* the joiner,
+    /// so existing placements are otherwise undisturbed. This assumes a quiescent
+    /// cluster (no concurrent writes to migrating keys) and that the joiner and a
+    /// member quorum are reachable — there is no schema-log catch-up for a member
+    /// that missed the broadcast yet (see [docs/RESHARDING.md]).
+    pub fn add_member(&self, id: &str, addr: &str) -> EngineResult<()> {
+        let joiner = NodeId::new(id);
+        let mut members = self.members_snapshot();
+        if members.iter().any(|(mid, _)| *mid == joiner) {
+            return Ok(()); // already a member
+        }
+        members.push((joiner.clone(), addr.to_string()));
+        let wire: Vec<(String, String)> =
+            members.iter().map(|(id, a)| (id.0.clone(), a.clone())).collect();
+
+        // 1) Everyone (including the joiner) adopts the new ring.
+        self.set_membership(&members);
+        for (mid, maddr) in &members {
+            if *mid == self.id {
+                continue;
+            }
+            match self.pool.call(maddr, &Request::SetMembership { members: wire.clone() }) {
+                Ok(Response::Ack) => {}
+                _ if *mid == joiner => {
+                    return Err(EngineError::Cluster("joiner unreachable".into()))
+                }
+                _ => {} // existing member lagging: best-effort (no catch-up log yet)
+            }
+        }
+
+        // 2) Bootstrap the joiner's schema so it can accept migrated rows.
+        for ddl in self.schema_ddl()? {
+            match self.pool.call(addr, &Request::ApplyDdl { sql: ddl }) {
+                Ok(Response::Ack) => {}
+                Ok(Response::Err(e)) => {
+                    return Err(EngineError::Cluster(format!("joiner DDL failed: {e}")))
+                }
+                _ => return Err(EngineError::Cluster("joiner unreachable during bootstrap".into())),
+            }
+        }
+
+        // 3) Every existing member pushes the keys the joiner now owns.
+        self.rebalance_to(&joiner)?;
+        for (mid, maddr) in &members {
+            if *mid == self.id || *mid == joiner {
+                continue;
+            }
+            match self.pool.call(maddr, &Request::Rebalance { joiner: id.to_string() }) {
+                Ok(Response::Ack) | Ok(Response::Err(_)) => {}
+                _ => {} // unreachable member: its keys migrate when it rejoins
+            }
+        }
+        Ok(())
     }
 
     /// Start serving internode RPC on this node's address (background thread).
@@ -161,6 +341,18 @@ impl Node {
                 write_response(self.apply_write_local(&table, &key, &WriteOp::Delete, hlc))
             }
             Request::ApplyDdl { sql } => self.with_write(|db| db.execute(&sql).map(|_| ())),
+            Request::SetMembership { members } => {
+                let members: Vec<(NodeId, String)> = members
+                    .into_iter()
+                    .map(|(id, addr)| (NodeId::new(id), addr))
+                    .collect();
+                self.set_membership(&members);
+                Response::Ack
+            }
+            Request::Rebalance { joiner } => match self.rebalance_to(&NodeId::new(joiner)) {
+                Ok(()) => Response::Ack,
+                Err(e) => Response::Err(e.to_string()),
+            },
         }
     }
 
@@ -203,7 +395,7 @@ impl Node {
             }
             Err(_) => return Err(EngineError::Cluster("local lock poisoned".into())),
         }
-        for addr in self.peers.values() {
+        for addr in &self.peer_addrs() {
             if let Ok(Response::Ack) = self.pool.call(
                 addr,
                 &Request::ApplyDdl {
@@ -236,7 +428,7 @@ impl Node {
         op: WriteOp,
         hlc: Hlc,
     ) -> EngineResult<()> {
-        let replicas = self.ring.replicas_for(key, self.cfg.replication_factor);
+        let replicas = self.replicas_for(key);
         let needed = self.cfg.write_consistency.required(replicas.len().max(1));
 
         // 1) Apply locally to the memtable + WAL buffer under the write lock (fast),
@@ -262,14 +454,14 @@ impl Node {
             if *replica == self.id {
                 continue;
             }
-            let Some(addr) = self.peers.get(replica) else {
+            let Some(addr) = self.peer_addr(replica) else {
                 continue;
             };
             // Acks we will have once the in-flight local fsync lands.
             let projected = acks + usize::from(local_will_ack);
             if projected >= needed {
-                async_peers.push(addr.clone());
-            } else if matches!(self.send_write(addr, table, key, &op, hlc), Ok(true)) {
+                async_peers.push(addr);
+            } else if matches!(self.send_write(&addr, table, key, &op, hlc), Ok(true)) {
                 acks += 1;
             }
         }
@@ -348,7 +540,7 @@ impl Node {
     /// Point-read `key` from its replica set, resolving by last-writer-wins,
     /// requiring a read quorum of replicas to respond.
     fn point_get(&self, table: &str, key: &[u8]) -> EngineResult<Vec<(Vec<u8>, Document)>> {
-        let replicas = self.ring.replicas_for(key, self.cfg.replication_factor);
+        let replicas = self.replicas_for(key);
         let needed = self.cfg.read_consistency.required(replicas.len().max(1));
         let mut responders = 0usize;
         // Best (highest-stamped) version seen: (hlc, Some(value) | None tombstone).
@@ -360,9 +552,9 @@ impl Node {
                     Ok(db) => db.local_get_versioned(table, key)?,
                     Err(_) => return Err(EngineError::Cluster("local lock poisoned".into())),
                 }
-            } else if let Some(addr) = self.peers.get(replica) {
+            } else if let Some(addr) = self.peer_addr(replica) {
                 match self.pool.call(
-                    addr,
+                    &addr,
                     &Request::LocalGet {
                         table: table.to_string(),
                         key: key.to_vec(),
@@ -455,7 +647,7 @@ impl Node {
         }
 
         // Peers.
-        for addr in self.peers.values() {
+        for addr in &self.peer_addrs() {
             if let Ok(Response::Scan { rows }) = self.pool.call(
                 addr,
                 &Request::LocalScan {
@@ -529,7 +721,7 @@ impl Node {
             start,
             end,
         };
-        for addr in self.peers.values() {
+        for addr in &self.peer_addrs() {
             if let Ok(Response::Keys { keys: ks }) = self.pool.call(addr, &req) {
                 for k in ks {
                     keys.insert(k, ());
@@ -598,7 +790,7 @@ impl Node {
             query: query.to_vec(),
             k: fetch as u32,
         };
-        for addr in self.peers.values() {
+        for addr in &self.peer_addrs() {
             if let Ok(Response::VectorHits { hits }) = self.pool.call(addr, &req) {
                 for (key, dist) in hits {
                     consider(key, dist, &mut best);
@@ -972,6 +1164,92 @@ mod tests {
             ids(nc.vector_search("docs_emb", &[1.0, 0.0, 0.0], 2, &filter).unwrap()),
             vec![1, 3]
         );
+    }
+
+    #[test]
+    fn online_resharding_migrates_keys_to_a_joining_node() {
+        // rf=1, CL=ONE: every key has exactly one owner, so a read that succeeds
+        // proves the row physically lives on whichever node the *current* ring
+        // routes to. Start with {a, b}, fill the table, then join c online and
+        // confirm every row is still readable (the ones c now owns were migrated
+        // to it — otherwise their point reads would route to c and come back
+        // empty).
+        let one = Consistency::One;
+        let rf1 = |id: &str, addr: &str, members: &[(NodeId, String)]| NodeConfig {
+            id: NodeId::new(id),
+            internode_addr: addr.to_string(),
+            members: members.to_vec(),
+            replication_factor: 1,
+            vnodes_per_node: 64,
+            read_consistency: one,
+            write_consistency: one,
+        };
+
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let ab = vec![member("a", &a), member("b", &b)];
+        let abc = vec![member("a", &a), member("b", &b), member("c", &c)];
+
+        let na = Node::new(Database::open(temp_dir("rsa")).unwrap(), rf1("a", &a, &ab));
+        let nb = Node::new(Database::open(temp_dir("rsb")).unwrap(), rf1("b", &b, &ab));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        na.execute("CREATE INDEX t_g ON t(g)").unwrap();
+        let n = 60;
+        for i in 1..=n {
+            na.execute(&format!("INSERT INTO t (id, g) VALUES ({i}, {})", i % 5))
+                .unwrap();
+        }
+
+        // c starts up knowing the eventual membership; add_member rebuilds every
+        // node's ring anyway via SetMembership.
+        let nc = Node::new(Database::open(temp_dir("rsc")).unwrap(), rf1("c", &c, &abc));
+        nc.serve_internode().unwrap();
+
+        // Bring c into the cluster online, orchestrated from a.
+        na.add_member("c", &c).unwrap();
+
+        // Every row is still readable from every coordinator (PK point reads now
+        // route under the 3-node ring; c serves the share migrated to it).
+        for coord in [&na, &nb, &nc] {
+            for i in 1..=n {
+                let rs = rows(
+                    coord
+                        .execute(&format!("SELECT id FROM t WHERE id = {i}"))
+                        .unwrap(),
+                );
+                assert_eq!(rs.rows, vec![vec![Value::Int(i)]], "id {i} via some coord");
+            }
+            // Full table is intact (no key lost or duplicated in the merge).
+            let rs = rows(coord.execute("SELECT id FROM t").unwrap());
+            assert_eq!(rs.rows.len(), n as usize);
+        }
+
+        // The secondary index, bootstrapped onto c, serves a distributed lookup.
+        let rs = rows(nc.execute("SELECT id FROM t WHERE g = 0 ORDER BY id").unwrap());
+        assert_eq!(
+            rs.rows,
+            vec![
+                vec![Value::Int(5)],
+                vec![Value::Int(10)],
+                vec![Value::Int(15)],
+                vec![Value::Int(20)],
+                vec![Value::Int(25)],
+                vec![Value::Int(30)],
+                vec![Value::Int(35)],
+                vec![Value::Int(40)],
+                vec![Value::Int(45)],
+                vec![Value::Int(50)],
+                vec![Value::Int(55)],
+                vec![Value::Int(60)],
+            ]
+        );
+
+        // A write after the join routes under the new ring and is read back.
+        nc.execute("INSERT INTO t (id, g) VALUES (61, 1)").unwrap();
+        let rs = rows(na.execute("SELECT id FROM t WHERE id = 61").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::Int(61)]]);
     }
 
     #[test]

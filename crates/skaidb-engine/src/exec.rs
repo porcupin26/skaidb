@@ -582,6 +582,38 @@ impl Database {
         self.catalog.tables.contains_key(table)
     }
 
+    /// Names of all tables (used to migrate every table during resharding).
+    pub fn table_names(&self) -> Vec<String> {
+        self.catalog.tables.keys().cloned().collect()
+    }
+
+    /// `CREATE` statements that reconstruct this node's schema (tables, then
+    /// secondary indexes, then vector indexes) — sent to a joining node so it can
+    /// receive migrated rows. Identifiers are assumed simple (no quoting).
+    pub fn schema_ddl(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (name, def) in &self.catalog.tables {
+            out.push(format!(
+                "CREATE TABLE IF NOT EXISTS {name} (PRIMARY KEY ({}))",
+                def.primary_key.join(", ")
+            ));
+        }
+        for (name, idx) in &self.catalog.indexes {
+            out.push(format!(
+                "CREATE INDEX IF NOT EXISTS {name} ON {} ({})",
+                idx.table,
+                idx.paths.join(", ")
+            ));
+        }
+        for (name, v) in &self.catalog.vector_indexes {
+            out.push(format!(
+                "CREATE VECTOR INDEX IF NOT EXISTS {name} ON {} ({}) DIM {} USING {}",
+                v.table, v.path, v.dim, v.metric
+            ));
+        }
+        out
+    }
+
     /// Scan a local table returning `(key, encoded_doc, stamp)` for each live
     /// row — the coordinator merges these across replicas by last-writer-wins.
     pub fn local_scan_versioned(&self, table: &str) -> Result<Vec<VersionedRow>> {

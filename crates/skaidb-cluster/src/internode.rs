@@ -50,6 +50,19 @@ pub enum Request {
     ApplyDdl {
         sql: String,
     },
+    /// Replace the recipient's cluster membership/ring with `members`
+    /// (`(id, addr)` pairs, including the recipient). Broadcast when a node joins
+    /// or leaves so every member recomputes the same placement.
+    SetMembership {
+        members: Vec<(String, String)>,
+    },
+    /// Push every locally-held row whose key the named `joiner` now owns (under
+    /// the current ring) to that joiner, preserving each row's HLC. Sent to
+    /// existing members after a [`Request::SetMembership`] so the new node
+    /// receives its share of the keyspace.
+    Rebalance {
+        joiner: String,
+    },
     Ping,
 }
 
@@ -94,6 +107,8 @@ const REQ_PING: u8 = 5;
 const REQ_GET: u8 = 6;
 const REQ_INDEX: u8 = 7;
 const REQ_VECTOR: u8 = 8;
+const REQ_MEMBERS: u8 = 9;
+const REQ_REBAL: u8 = 10;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
@@ -153,6 +168,18 @@ impl Request {
                 o.push(REQ_DDL);
                 put_str(&mut o, sql);
             }
+            Request::SetMembership { members } => {
+                o.push(REQ_MEMBERS);
+                o.extend_from_slice(&(members.len() as u32).to_le_bytes());
+                for (id, addr) in members {
+                    put_str(&mut o, id);
+                    put_str(&mut o, addr);
+                }
+            }
+            Request::Rebalance { joiner } => {
+                o.push(REQ_REBAL);
+                put_str(&mut o, joiner);
+            }
             Request::Ping => o.push(REQ_PING),
         }
         o
@@ -193,6 +220,19 @@ impl Request {
                 Request::VectorSearch { index, query, k }
             }
             REQ_DDL => Request::ApplyDdl { sql: c.string()? },
+            REQ_MEMBERS => {
+                let n = c.u32()? as usize;
+                let mut members = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let id = c.string()?;
+                    let addr = c.string()?;
+                    members.push((id, addr));
+                }
+                Request::SetMembership { members }
+            }
+            REQ_REBAL => Request::Rebalance {
+                joiner: c.string()?,
+            },
             REQ_PING => Request::Ping,
             _ => return Err(WireError::Malformed("unknown request op")),
         })
@@ -517,6 +557,15 @@ mod tests {
                 index: "t_emb".into(),
                 query: vec![0.1, -0.2, 0.3, 0.0],
                 k: 10,
+            },
+            Request::SetMembership {
+                members: vec![
+                    ("a".into(), "127.0.0.1:1".into()),
+                    ("b".into(), "127.0.0.1:2".into()),
+                ],
+            },
+            Request::Rebalance {
+                joiner: "c".into(),
             },
             Request::Ping,
         ] {
