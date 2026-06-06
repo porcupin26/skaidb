@@ -96,7 +96,7 @@ Full grammar reference: **[docs/QUERY_SYNTAX.md](docs/QUERY_SYNTAX.md)**.
 
 ## Status & deferred work
 
-Implemented end-to-end and tested (192 tests):
+Implemented end-to-end and tested (194 tests):
 
 - soft-schema document model, SQL subset, 3-valued logic
 - **SQL surface**: projection over nested paths, `WHERE`, `GROUP BY`/`HAVING`,
@@ -127,7 +127,9 @@ Implemented end-to-end and tested (192 tests):
   quorum (last-writer-wins authoritative version) — instead of shipping whole
   shards; non-indexed reads scatter-gather and merge by HLC LWW (tombstones
   included, so deletes win cluster-wide); quorum-broadcast DDL; one-node-down
-  tolerance
+  tolerance; **anti-entropy** keeps replicas converged — **read-repair** on
+  quorum reads, **hinted handoff** for writes that miss a down replica, and an
+  active **repair** pass (bidirectional version reconciliation)
 - **online resharding**: a node can **join or leave at runtime** — on join the
   coordinator broadcasts the new ring, bootstraps the joiner's schema, and every
   member pushes the keys the joiner now owns; on graceful **decommission** the
@@ -148,13 +150,13 @@ control plane (the raw-TCP fast path is in; QUIC needs an async runtime),
 **distributed/multi-key transactions** (single-node `BEGIN/COMMIT/ROLLBACK` is
 in; spanning nodes needs a coordinator/2PC), **join pushdown** (a clustered join
 gathers each table to the coordinator rather than executing shard-local), active
-**anti-entropy** (read-repair & hinted handoff — convergence currently relies on
-writes reaching their replicas; it is also what would give a node that missed a
-membership broadcast a topology log to catch up on. Online node **join**,
-graceful **decommission**, post-move **space reclamation**, and **versioned +
-persisted membership** (epoch'd, survives restart) are all built — see
-[docs/RESHARDING.md](docs/RESHARDING.md)), **global (value-sharded) secondary
-indexes** —
+**membership gossip/consensus** (data converges via anti-entropy, but a node
+that missed a membership broadcast still needs it re-sent — there's no topology
+gossip yet, and concurrent ring changes aren't linearizable. Online node
+**join**, graceful **decommission**, post-move **space reclamation**, **versioned
++ persisted membership**, and **anti-entropy** (read-repair, hinted handoff,
+active repair) are all built — see [docs/RESHARDING.md](docs/RESHARDING.md)),
+**global (value-sharded) secondary indexes** —
 today's indexes are local per node, so a distributed indexed read still scatters
 to every member (their local indexes return only candidate keys) rather than
 routing to a single owner — and specialized index types (text, geospatial,

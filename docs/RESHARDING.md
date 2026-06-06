@@ -6,10 +6,10 @@ so membership can change while the cluster serves traffic: a node can **join** o
 **leave** online and the keyspace rebalances without a restart or a full reload.
 
 > Status: single-node **join** (`Node::add_member`), graceful **decommission**
-> (`Node::remove_member`), post-move **space reclamation** (`Node::reclaim`), and
-> **versioned + persisted membership** (epoch'd, survives restart) are implemented
-> and tested. Active **anti-entropy** (read-repair, hinted handoff) is deferred —
-> see Limitations.
+> (`Node::remove_member`), post-move **space reclamation** (`Node::reclaim`),
+> **versioned + persisted membership** (epoch'd, survives restart), and active
+> **anti-entropy** — read-repair, [`Node::repair`], and hinted handoff — are all
+> implemented and tested. See Limitations for what remains.
 
 ## Why a single join moves so little
 
@@ -85,6 +85,26 @@ touches nothing else.
 node.remove_member("c")?;   // c drains its keys to their new owners, then leaves
 ```
 
+## Anti-entropy (keeping replicas converged)
+
+Three mechanisms drive replicas toward agreement, so a write that reached only a
+minority — or a replica that was briefly down — doesn't leave a permanent
+divergence:
+
+- **Read-repair.** A quorum point read compares the version each replica
+  returned; the winning (highest-HLC) version is written back to any replica that
+  answered with an older or missing one. Reads themselves heal the data.
+- **Hinted handoff.** When a replicated write can't reach a replica (it's down),
+  the coordinator buffers the write as a *hint* (per replica, bounded) and
+  replays it once that replica is reachable again — opportunistically on the next
+  write, or via `flush_hints`. Faster recovery than waiting for a full repair.
+- **Active anti-entropy** (`Node::repair` / `repair_cluster`). A background pass
+  reconciles each pair of co-replicas: they exchange per-key version stamps and
+  copy the newer side in both directions (tombstones included). This is the
+  durable backstop that converges replicas even with no reads and even if hints
+  were lost. It's a full-table comparison today; a Merkle tree would let it skip
+  identical key ranges instead of streaming the whole shard (future work).
+
 ## Reclaiming space after a move
 
 A join or leave leaves the *former* owner holding copies of keys it no longer
@@ -132,14 +152,14 @@ node.reclaim_cluster()?;  // …and tells every peer to do the same
   (harmless) stale copies. It is also currently a full-table scan with a
   point-read ack-gate per key; fine after a single reshard, heavier on a very
   large dataset.
-- **No catch-up log / no consensus.** `SetMembership`/`Rebalance`/`Drain` are
-  best-effort broadcasts. The epoch stops a node from regressing to an older
-  ring, and persistence means a restart reloads the live ring — but a member
-  that was unreachable for the *whole* change still lags until it is re-broadcast
-  to, and there is no anti-entropy/gossip log it pulls on reconnect yet.
-  Concurrent topology changes converge to the highest epoch, but the losing
-  change is dropped (a single membership coordinator or Raft-for-the-ring would
-  make this linearizable). Bring a lagging node up to date by re-running
+- **Membership has no gossip/consensus.** Data converges via anti-entropy, but
+  *membership* changes (`SetMembership`/`Rebalance`/`Drain`) are still best-effort
+  broadcasts. The epoch stops a node from regressing to an older ring and
+  persistence reloads the live ring on restart, but a member unreachable for the
+  *whole* change lags until re-broadcast to — there is no membership gossip it
+  pulls on reconnect. Concurrent topology changes converge to the highest epoch,
+  but the losing change is dropped (a membership coordinator or Raft-for-the-ring
+  would make this linearizable). Bring a lagging node up to date by re-running
   `add_member`/`remove_member` (idempotent) once it is reachable.
 - **Single sender per key.** Only the key's primary under the pre-join ring
   pushes it during a join, so `rf > 1` no longer re-sends each key from every
@@ -169,3 +189,9 @@ node.reclaim_cluster()?;  // …and tells every peer to do the same
   `SetMembership` is ignored.
 - `rf2_join_migrates_via_single_sender` (rf=2) joins a third node and verifies
   every row is readable, exercising migration under replication.
+- `read_repair_and_anti_entropy_converge_replicas` (rf=3) injects divergence on
+  specific replicas and checks that a quorum read repairs the missing one, and
+  that `repair` reconciles both push and pull directions.
+- `hinted_handoff_replays_to_a_recovered_replica` (rf=3, CL=ALL) writes while a
+  replica is down (buffering a hint), then recovers it and checks `flush_hints`
+  hands the write off.

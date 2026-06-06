@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 
 use skaidb_engine::{filter_rows, run, Cluster, Database, EngineError, IndexScanRange, QueryOutput};
@@ -98,8 +98,20 @@ pub struct Node {
     clock: HlcClock,
     /// Pooled persistent connections to peers.
     pool: internode::Pool,
+    /// Writes that couldn't reach a replica (it was down), buffered per replica
+    /// for replay when it comes back — *hinted handoff*. In-memory and bounded;
+    /// anti-entropy ([`Node::repair`]) is the durable backstop if hints are lost.
+    hints: Mutex<HashMap<NodeId, Vec<HintedWrite>>>,
     cfg: NodeConfig,
 }
+
+/// A buffered write awaiting handoff to a recovered replica:
+/// `(table, key, op, hlc)`.
+type HintedWrite = (String, Vec<u8>, WriteOp, Hlc);
+
+/// Cap on buffered hints per replica, so a long outage can't grow unboundedly
+/// (anti-entropy reconciles whatever overflows).
+const MAX_HINTS_PER_REPLICA: usize = 4096;
 
 impl Node {
     /// Create a node with the given local database and cluster config. If a
@@ -119,6 +131,7 @@ impl Node {
             topo: RwLock::new(topo),
             clock: HlcClock::new(),
             pool: internode::Pool::new(),
+            hints: Mutex::new(HashMap::new()),
             cfg,
         })
     }
@@ -171,6 +184,17 @@ impl Node {
     /// Address of peer `id`, if it is a current peer (snapshot, cloned).
     fn peer_addr(&self, id: &NodeId) -> Option<String> {
         self.topo.read().expect("topo lock").peers.get(id).cloned()
+    }
+
+    /// All current peers as `(id, addr)` pairs (snapshot, cloned).
+    fn peers_with_ids(&self) -> Vec<(NodeId, String)> {
+        self.topo
+            .read()
+            .expect("topo lock")
+            .peers
+            .iter()
+            .map(|(id, addr)| (id.clone(), addr.clone()))
+            .collect()
     }
 
     /// Addresses of all current peers (snapshot, cloned) — never held across I/O.
@@ -565,6 +589,147 @@ impl Node {
         Ok(local)
     }
 
+    /// Active **anti-entropy**: reconcile this node's data with each co-replica
+    /// peer by exchanging per-key version stamps and copying the newer side in
+    /// **both** directions, so replicas converge even without read traffic (the
+    /// gap that read-repair alone leaves — e.g. a write that reached only a
+    /// minority, or a replica that was down). Reconciliation is restricted to
+    /// keys both nodes replicate, and tombstones take part (a newer delete wins).
+    /// This is a full-table comparison; a Merkle tree would let it skip identical
+    /// key ranges instead of streaming the whole shard (future work). Returns the
+    /// number of rows repaired (pulled + pushed).
+    pub fn repair(&self) -> EngineResult<usize> {
+        let mut repaired = 0usize;
+        let tables = self
+            .local
+            .read()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .table_names();
+
+        for table in tables {
+            let local_rows = self
+                .local
+                .read()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+                .local_scan_versioned_with_tombstones(&table)?;
+            let local_map: HashMap<Vec<u8>, (Hlc, bool, Vec<u8>)> = local_rows
+                .into_iter()
+                .map(|(k, v, h, is_put)| (k, (h, is_put, v)))
+                .collect();
+
+            for (pid, addr) in self.peers_with_ids() {
+                let remote = match self.pool.call(
+                    &addr,
+                    &Request::LocalScan {
+                        table: table.clone(),
+                    },
+                ) {
+                    Ok(Response::Scan { rows }) => rows,
+                    _ => continue, // unreachable peer: skip this round
+                };
+
+                // Pull: a remote version newer than ours (for a key we replicate)
+                // is applied locally.
+                let mut remote_hlc: HashMap<Vec<u8>, Hlc> = HashMap::new();
+                for (key, value, hlc, is_put) in &remote {
+                    remote_hlc.insert(key.clone(), *hlc);
+                    if !self.replicas_for(key).contains(&self.id) {
+                        continue;
+                    }
+                    if local_map.get(key).is_some_and(|(lh, _, _)| *lh >= *hlc) {
+                        continue;
+                    }
+                    let op = if *is_put {
+                        WriteOp::Put(value.clone())
+                    } else {
+                        WriteOp::Delete
+                    };
+                    if self.apply_write_local(&table, key, &op, *hlc).is_ok() {
+                        repaired += 1;
+                    }
+                }
+
+                // Push: a local version newer than the peer's (for a key the peer
+                // replicates) is sent to it.
+                for (key, (lh, is_put, value)) in &local_map {
+                    if !self.replicas_for(key).contains(&pid) {
+                        continue;
+                    }
+                    if remote_hlc.get(key).is_some_and(|rh| rh >= lh) {
+                        continue;
+                    }
+                    let op = if *is_put {
+                        WriteOp::Put(value.clone())
+                    } else {
+                        WriteOp::Delete
+                    };
+                    if matches!(self.send_write(&addr, &table, key, &op, *lh), Ok(true)) {
+                        repaired += 1;
+                    }
+                }
+            }
+        }
+        Ok(repaired)
+    }
+
+    /// Trigger [`Node::repair`] on this node and every peer (a cluster-wide
+    /// anti-entropy pass). Returns the rows this node repaired.
+    pub fn repair_cluster(&self) -> EngineResult<usize> {
+        let local = self.repair()?;
+        for addr in &self.peer_addrs() {
+            let _ = self.pool.call(addr, &Request::Repair);
+        }
+        Ok(local)
+    }
+
+    /// Buffer a write that couldn't reach `replica` (for hinted handoff).
+    fn store_hint(&self, replica: &NodeId, table: &str, key: &[u8], op: &WriteOp, hlc: Hlc) {
+        let mut hints = self.hints.lock().expect("hints lock");
+        let bucket = hints.entry(replica.clone()).or_default();
+        if bucket.len() < MAX_HINTS_PER_REPLICA {
+            bucket.push((table.to_string(), key.to_vec(), op.clone(), hlc));
+        }
+    }
+
+    /// Whether any hints are buffered (cheap check before spawning a flush).
+    fn hints_pending(&self) -> bool {
+        !self.hints.lock().expect("hints lock").is_empty()
+    }
+
+    /// Replay buffered hints to replicas that are reachable again — *hinted
+    /// handoff*. A hint that still can't be delivered is kept for the next
+    /// attempt. Returns the number of hinted writes handed off.
+    pub fn flush_hints(&self) -> usize {
+        // Snapshot + clear so the lock isn't held across network I/O.
+        let pending: Vec<(NodeId, Vec<HintedWrite>)> = {
+            let mut hints = self.hints.lock().expect("hints lock");
+            hints.drain().collect()
+        };
+        let mut delivered = 0usize;
+        for (replica, writes) in pending {
+            let Some(addr) = self.peer_addr(&replica) else {
+                continue; // no longer a peer: drop its hints
+            };
+            let mut remaining = Vec::new();
+            for (table, key, op, hlc) in writes {
+                if matches!(self.send_write(&addr, &table, &key, &op, hlc), Ok(true)) {
+                    delivered += 1;
+                } else {
+                    remaining.push((table, key, op, hlc));
+                }
+            }
+            if !remaining.is_empty() {
+                self.hints
+                    .lock()
+                    .expect("hints lock")
+                    .entry(replica)
+                    .or_default()
+                    .extend(remaining);
+            }
+        }
+        delivered
+    }
+
     /// Start serving internode RPC on this node's address (background thread).
     pub fn serve_internode(self: &Arc<Self>) -> std::io::Result<()> {
         let listener = TcpListener::bind(&self.cfg.internode_addr)?;
@@ -662,6 +827,10 @@ impl Node {
                 Ok(_) => Response::Ack,
                 Err(e) => Response::Err(e.to_string()),
             },
+            Request::Repair => match self.repair() {
+                Ok(_) => Response::Ack,
+                Err(e) => Response::Err(e.to_string()),
+            },
         }
     }
 
@@ -750,6 +919,15 @@ impl Node {
         let replicas = self.replicas_for(key);
         let needed = self.cfg.write_consistency.required(replicas.len().max(1));
 
+        // 0) Opportunistically hand off any buffered hints to recovered replicas
+        //    (cheap when there are none; non-blocking).
+        if self.hints_pending() {
+            let node = Arc::clone(self);
+            thread::spawn(move || {
+                node.flush_hints();
+            });
+        }
+
         // 1) Apply locally to the memtable + WAL buffer under the write lock (fast),
         //    then run the local fsync on a separate thread so it overlaps the peer
         //    network round-trips below — instead of fsync-then-send serially. Read-
@@ -768,7 +946,7 @@ impl Node {
         //    up to the quorum; defer the rest to the background.
         let mut acks = 0usize;
         let local_will_ack = fsync.is_some();
-        let mut async_peers: Vec<String> = Vec::new();
+        let mut async_peers: Vec<(NodeId, String)> = Vec::new();
         for replica in &replicas {
             if *replica == self.id {
                 continue;
@@ -779,9 +957,12 @@ impl Node {
             // Acks we will have once the in-flight local fsync lands.
             let projected = acks + usize::from(local_will_ack);
             if projected >= needed {
-                async_peers.push(addr);
+                async_peers.push((replica.clone(), addr));
             } else if matches!(self.send_write(&addr, table, key, &op, hlc), Ok(true)) {
                 acks += 1;
+            } else {
+                // Replica down: buffer the write for hinted handoff.
+                self.store_hint(replica, table, key, &op, hlc);
             }
         }
 
@@ -792,13 +973,16 @@ impl Node {
             }
         }
 
-        // 4) Fire-and-forget the remaining replicas (eventual consistency).
+        // 4) Fire-and-forget the remaining replicas (eventual consistency),
+        //    buffering a hint for any that are unreachable.
         if !async_peers.is_empty() {
             let node = Arc::clone(self);
             let (table, key, op) = (table.to_string(), key.to_vec(), op.clone());
             thread::spawn(move || {
-                for addr in async_peers {
-                    let _ = node.send_write(&addr, &table, &key, &op, hlc);
+                for (replica, addr) in async_peers {
+                    if !matches!(node.send_write(&addr, &table, &key, &op, hlc), Ok(true)) {
+                        node.store_hint(&replica, &table, &key, &op, hlc);
+                    }
                 }
             });
         }
@@ -864,13 +1048,17 @@ impl Node {
         let mut responders = 0usize;
         // Best (highest-stamped) version seen: (hlc, Some(value) | None tombstone).
         let mut best: Option<(Hlc, Option<Vec<u8>>)> = None;
+        // Per-responding-replica version stamp (`None` = it had no entry), with
+        // its address (`None` = the local replica), for read-repair.
+        let mut seen: Vec<(Option<String>, Option<Hlc>)> = Vec::new();
 
         for replica in &replicas {
-            let entry = if *replica == self.id {
-                match self.local.read() {
+            let (addr_opt, entry) = if *replica == self.id {
+                let e = match self.local.read() {
                     Ok(db) => db.local_get_versioned(table, key)?,
                     Err(_) => return Err(EngineError::Cluster("local lock poisoned".into())),
-                }
+                };
+                (None, e)
             } else if let Some(addr) = self.peer_addr(replica) {
                 match self.pool.call(
                     &addr,
@@ -879,18 +1067,20 @@ impl Node {
                         key: key.to_vec(),
                     },
                 ) {
-                    Ok(Response::Get { entry }) => entry,
+                    Ok(Response::Get { entry }) => (Some(addr), entry),
                     _ => continue, // unreachable peer: not a responder
                 }
             } else {
                 continue;
             };
             responders += 1;
+            let entry_hlc = entry.as_ref().map(|(_, h, _)| *h);
             if let Some((value, hlc, is_put)) = entry {
                 if best.as_ref().is_none_or(|(h, _)| hlc > *h) {
                     best = Some((hlc, is_put.then_some(value)));
                 }
             }
+            seen.push((addr_opt, entry_hlc));
         }
 
         if responders < needed {
@@ -906,6 +1096,12 @@ impl Node {
             self.clock.observe(hlc);
         }
 
+        // Read-repair: push the winning version to any replica that responded
+        // with an older or missing version, so reads drive convergence.
+        if let Some((hbest, valopt)) = &best {
+            self.read_repair(table, key, *hbest, valopt, &seen);
+        }
+
         match best {
             Some((_, Some(value))) => {
                 let doc = match Value::decode(&value)
@@ -918,6 +1114,36 @@ impl Node {
             }
             // Absent everywhere, or newest version is a tombstone.
             _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Push the winning version (`hbest`, `valopt`) to every replica in `seen`
+    /// that returned an older or missing version. Best-effort and idempotent (a
+    /// write at `hbest` is a no-op on a replica already at `hbest`).
+    fn read_repair(
+        &self,
+        table: &str,
+        key: &[u8],
+        hbest: Hlc,
+        valopt: &Option<Vec<u8>>,
+        seen: &[(Option<String>, Option<Hlc>)],
+    ) {
+        let op = match valopt {
+            Some(v) => WriteOp::Put(v.clone()),
+            None => WriteOp::Delete,
+        };
+        for (addr_opt, entry_hlc) in seen {
+            if entry_hlc.is_some_and(|h| h >= hbest) {
+                continue; // already up to date
+            }
+            match addr_opt {
+                None => {
+                    let _ = self.apply_write_local(table, key, &op, hbest);
+                }
+                Some(addr) => {
+                    let _ = self.send_write(addr, table, key, &op, hbest);
+                }
+            }
         }
     }
 
@@ -1135,7 +1361,7 @@ impl Node {
 }
 
 /// A pending replicated mutation.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum WriteOp {
     Put(Vec<u8>),
     Delete,
@@ -1609,6 +1835,154 @@ mod tests {
         nc.execute("INSERT INTO t (id, g) VALUES (61, 1)").unwrap();
         let rs = rows(na.execute("SELECT id FROM t WHERE id = 61").unwrap());
         assert_eq!(rs.rows, vec![vec![Value::Int(61)]]);
+    }
+
+    #[test]
+    fn hinted_handoff_replays_to_a_recovered_replica() {
+        // rf=3, CL=ALL so a write must reach all three replicas. c is created but
+        // not served (down), so the write to it fails synchronously and is
+        // buffered as a hint. After c recovers, flush_hints replays it.
+        let all = Consistency::All;
+        let cfg3 = |id: &str, addr: &str, members: &[(NodeId, String)]| NodeConfig {
+            id: NodeId::new(id),
+            internode_addr: addr.to_string(),
+            members: members.to_vec(),
+            replication_factor: 3,
+            vnodes_per_node: 64,
+            read_consistency: all,
+            write_consistency: all,
+        };
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let m = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let na = Node::new(Database::open(temp_dir("hha")).unwrap(), cfg3("a", &a, &m));
+        let nb = Node::new(Database::open(temp_dir("hhb")).unwrap(), cfg3("b", &b, &m));
+        let nc = Node::new(Database::open(temp_dir("hhc")).unwrap(), cfg3("c", &c, &m));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        // c is intentionally NOT served yet.
+
+        // DDL reaches the a+b quorum; the insert can't reach c (down) so it errors
+        // at CL=ALL, but the write to c is buffered as a hint.
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        let _ = na.execute("INSERT INTO t (id, v) VALUES (1, 100)");
+
+        let k1 = Value::Array(vec![Value::Int(1)]).encode_key();
+        let has = |addr: &str, key: &[u8]| -> bool {
+            matches!(
+                internode::call(
+                    addr,
+                    &Request::LocalGet {
+                        table: "t".into(),
+                        key: key.to_vec(),
+                    },
+                ),
+                Ok(Response::Get { entry: Some(_) })
+            )
+        };
+
+        // Bring c up and bootstrap its schema, then hand off the buffered hint.
+        nc.serve_internode().unwrap();
+        let _ = internode::call(
+            &c,
+            &Request::ApplyDdl {
+                sql: "CREATE TABLE t (PRIMARY KEY (id))".into(),
+            },
+        )
+        .unwrap();
+        assert!(!has(&c, &k1), "c has no row before handoff");
+
+        let delivered = na.flush_hints();
+        assert!(delivered >= 1, "the buffered write was handed off to c");
+        assert!(has(&c, &k1), "c received id=1 via hinted handoff");
+    }
+
+    #[test]
+    fn read_repair_and_anti_entropy_converge_replicas() {
+        use skaidb_types::Document;
+        // rf=3 so every node replicates every key. We create controlled
+        // divergence by writing a row to only some replicas (bypassing the
+        // coordinator via a direct internode ApplyPut), then check that (a) a
+        // quorum read repairs the missing replica and (b) repair() reconciles
+        // both directions.
+        let q = Consistency::Quorum;
+        let cfg3 = |id: &str, addr: &str, members: &[(NodeId, String)]| NodeConfig {
+            id: NodeId::new(id),
+            internode_addr: addr.to_string(),
+            members: members.to_vec(),
+            replication_factor: 3,
+            vnodes_per_node: 64,
+            read_consistency: q,
+            write_consistency: q,
+        };
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let m = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let na = Node::new(Database::open(temp_dir("aea")).unwrap(), cfg3("a", &a, &m));
+        let nb = Node::new(Database::open(temp_dir("aeb")).unwrap(), cfg3("b", &b, &m));
+        let nc = Node::new(Database::open(temp_dir("aec")).unwrap(), cfg3("c", &c, &m));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        nc.serve_internode().unwrap();
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+
+        let row = |id: i64, v: i64| -> (Vec<u8>, Vec<u8>) {
+            let mut doc = Document::new();
+            doc.insert("id", Value::Int(id));
+            doc.insert("v", Value::Int(v));
+            (
+                Value::Array(vec![Value::Int(id)]).encode_key(),
+                Value::Document(doc).encode(),
+            )
+        };
+        let inject = |addr: &str, key: &[u8], val: &[u8], hlc: Hlc| {
+            let r = internode::call(
+                addr,
+                &Request::ApplyPut {
+                    table: "t".into(),
+                    key: key.to_vec(),
+                    value: val.to_vec(),
+                    hlc,
+                },
+            )
+            .unwrap();
+            assert!(matches!(r, Response::Ack));
+        };
+        let has = |addr: &str, key: &[u8]| -> bool {
+            matches!(
+                internode::call(
+                    addr,
+                    &Request::LocalGet {
+                        table: "t".into(),
+                        key: key.to_vec(),
+                    },
+                ),
+                Ok(Response::Get { entry: Some(_) })
+            )
+        };
+
+        // (a) read-repair: write id=1 to a and b only; c is missing it.
+        let (k1, v1) = row(1, 100);
+        inject(&a, &k1, &v1, Hlc::new(1000, 0));
+        inject(&b, &k1, &v1, Hlc::new(1000, 0));
+        assert!(!has(&c, &k1), "c starts without id=1");
+        // A quorum read through a touches all replicas and repairs c.
+        let rs = rows(na.execute("SELECT v FROM t WHERE id = 1").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::Int(100)]]);
+        assert!(has(&c, &k1), "read-repair pushed id=1 to c");
+
+        // (b) anti-entropy push: write id=2 to a only; repair fans it out.
+        let (k2, v2) = row(2, 200);
+        inject(&a, &k2, &v2, Hlc::new(2000, 0));
+        assert!(!has(&b, &k2) && !has(&c, &k2));
+        let fixed = na.repair().unwrap();
+        assert!(fixed > 0);
+        assert!(has(&b, &k2) && has(&c, &k2), "repair pushed id=2 to b and c");
+
+        // (c) anti-entropy pull: write id=3 to c only; a's repair pulls it.
+        let (k3, v3) = row(3, 300);
+        inject(&c, &k3, &v3, Hlc::new(3000, 0));
+        assert!(!has(&a, &k3));
+        na.repair().unwrap();
+        assert!(has(&a, &k3), "repair pulled id=3 onto a");
     }
 
     #[test]

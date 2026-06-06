@@ -77,6 +77,9 @@ pub enum Request {
     /// no longer owns under the current ring, after confirming an owner holds it.
     /// A post-resharding "cleanup" trigger.
     Reclaim,
+    /// Run an anti-entropy pass: reconcile this node's replicas with its peers,
+    /// copying the newer version of each key in both directions.
+    Repair,
     Ping,
 }
 
@@ -125,6 +128,7 @@ const REQ_MEMBERS: u8 = 9;
 const REQ_REBAL: u8 = 10;
 const REQ_DRAIN: u8 = 11;
 const REQ_RECLAIM: u8 = 12;
+const REQ_REPAIR: u8 = 13;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
@@ -206,6 +210,7 @@ impl Request {
                 }
             }
             Request::Reclaim => o.push(REQ_RECLAIM),
+            Request::Repair => o.push(REQ_REPAIR),
             Request::Ping => o.push(REQ_PING),
         }
         o
@@ -271,6 +276,7 @@ impl Request {
                 Request::Drain { members }
             }
             REQ_RECLAIM => Request::Reclaim,
+            REQ_REPAIR => Request::Repair,
             REQ_PING => Request::Ping,
             _ => return Err(WireError::Malformed("unknown request op")),
         })
@@ -616,6 +622,7 @@ mod tests {
                 ],
             },
             Request::Reclaim,
+            Request::Repair,
             Request::Ping,
         ] {
             assert_eq!(Request::decode(&req.encode()).unwrap(), req);
