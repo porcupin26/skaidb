@@ -96,7 +96,7 @@ Full grammar reference: **[docs/QUERY_SYNTAX.md](docs/QUERY_SYNTAX.md)**.
 
 ## Status & deferred work
 
-Implemented end-to-end and tested (197 tests):
+Implemented end-to-end and tested (198 tests):
 
 - soft-schema document model, SQL subset, 3-valued logic
 - **SQL surface**: projection over nested paths, `WHERE`, `GROUP BY`/`HAVING`,
@@ -122,11 +122,13 @@ Implemented end-to-end and tested (197 tests):
   levels ack early and replicate the rest in the background, and a coordinated
   write **overlaps its local fsync with peer replication** rather than running
   them serially; **PK point reads** routed to the key's replica set;
-  **non-PK indexed reads pushed down** — the coordinator scatters the index scan
-  to each member's local index, unions the candidate keys, then re-reads each at
-  quorum (last-writer-wins authoritative version) — instead of shipping whole
-  shards; non-indexed reads scatter-gather and merge by HLC LWW (tombstones
-  included, so deletes win cluster-wide); quorum-broadcast DDL; one-node-down
+  **non-PK reads pushed down** — for an indexed predicate the coordinator
+  scatters the index scan, and for a non-indexed `WHERE` it scatters the
+  **filter** itself, so each member returns only matching candidate keys; the
+  coordinator unions them and re-reads each at quorum (last-writer-wins
+  authoritative version) — instead of shipping whole shards. A `SELECT` with no
+  predicate scatter-gathers and merges by HLC LWW (tombstones included, so
+  deletes win cluster-wide); quorum-broadcast DDL; one-node-down
   tolerance; **anti-entropy** keeps replicas converged — **read-repair** on
   quorum reads, **hinted handoff** for writes that miss a down replica, and an
   active **repair** pass (bidirectional version reconciliation)
@@ -150,8 +152,9 @@ Implemented end-to-end and tested (197 tests):
 Designed for but deliberately not yet built: **QUIC** transport + push-based
 control plane (the raw-TCP fast path is in; QUIC needs an async runtime),
 **distributed/multi-key transactions** (single-node `BEGIN/COMMIT/ROLLBACK` is
-in; spanning nodes needs a coordinator/2PC), **join pushdown** (a clustered join
-gathers each table to the coordinator rather than executing shard-local), active
+in; spanning nodes needs a coordinator/2PC), **join pushdown** (a single-table
+`WHERE` is now pushed to the shards, but a clustered *join* still gathers each
+table to the coordinator rather than executing shard-local), active
 **membership gossip/consensus** (data converges via anti-entropy, but a node
 that missed a membership broadcast still needs it re-sent — there's no topology
 gossip yet, and concurrent ring changes aren't linearizable. Online node

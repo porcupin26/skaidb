@@ -9,8 +9,10 @@ use std::io;
 use std::net::TcpStream;
 
 use skaidb_proto::{read_frame, write_frame};
+use skaidb_sql::ast::{BinaryOp, Expr, UnaryOp};
 use skaidb_storage::compress::{compress, decompress, Codec};
 use skaidb_storage::Hlc;
+use skaidb_types::Value;
 
 /// A request from a coordinator to a peer member.
 #[derive(Debug, Clone, PartialEq)]
@@ -28,6 +30,13 @@ pub enum Request {
     },
     LocalScan {
         table: String,
+    },
+    /// Like [`Request::LocalScan`] but pushes a `WHERE` filter to the node: it
+    /// returns only rows matching `filter` (plus all tombstones, for LWW), so a
+    /// non-indexed scan ships far less than the whole shard.
+    FilteredScan {
+        table: String,
+        filter: Expr,
     },
     LocalGet {
         table: String,
@@ -133,6 +142,7 @@ const REQ_REBAL: u8 = 10;
 const REQ_DRAIN: u8 = 11;
 const REQ_RECLAIM: u8 = 12;
 const REQ_REPAIR: u8 = 13;
+const REQ_FSCAN: u8 = 14;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
@@ -167,6 +177,11 @@ impl Request {
             Request::LocalScan { table } => {
                 o.push(REQ_SCAN);
                 put_str(&mut o, table);
+            }
+            Request::FilteredScan { table, filter } => {
+                o.push(REQ_FSCAN);
+                put_str(&mut o, table);
+                put_expr(&mut o, filter);
             }
             Request::LocalGet { table, key } => {
                 o.push(REQ_GET);
@@ -236,6 +251,10 @@ impl Request {
                 hlc: c.hlc()?,
             },
             REQ_SCAN => Request::LocalScan { table: c.string()? },
+            REQ_FSCAN => Request::FilteredScan {
+                table: c.string()?,
+                filter: c.expr()?,
+            },
             REQ_GET => Request::LocalGet {
                 table: c.string()?,
                 key: c.bytes()?,
@@ -501,6 +520,87 @@ impl Pool {
 fn put_str(o: &mut Vec<u8>, s: &str) {
     put_bytes(o, s.as_bytes());
 }
+/// Encode a filter [`Expr`] for pushdown. Aggregates can't appear in a `WHERE`
+/// filter, so they're encoded as a sentinel that fails to decode.
+fn put_expr(o: &mut Vec<u8>, e: &Expr) {
+    match e {
+        Expr::Literal(v) => {
+            o.push(0);
+            put_bytes(o, &v.encode());
+        }
+        Expr::Column(p) => {
+            o.push(1);
+            put_str(o, p);
+        }
+        Expr::Unary { op, expr } => {
+            o.push(2);
+            o.push(unary_code(*op));
+            put_expr(o, expr);
+        }
+        Expr::Binary { op, left, right } => {
+            o.push(3);
+            o.push(binary_code(*op));
+            put_expr(o, left);
+            put_expr(o, right);
+        }
+        Expr::IsNull { expr, negated } => {
+            o.push(4);
+            put_expr(o, expr);
+            o.push(u8::from(*negated));
+        }
+        Expr::Aggregate { .. } => o.push(255), // not valid in a filter
+    }
+}
+
+fn unary_code(op: UnaryOp) -> u8 {
+    match op {
+        UnaryOp::Not => 0,
+        UnaryOp::Neg => 1,
+    }
+}
+fn unary_from(b: u8) -> Result<UnaryOp, WireError> {
+    match b {
+        0 => Ok(UnaryOp::Not),
+        1 => Ok(UnaryOp::Neg),
+        _ => Err(WireError::Malformed("bad unary op")),
+    }
+}
+fn binary_code(op: BinaryOp) -> u8 {
+    use BinaryOp::*;
+    match op {
+        Eq => 0,
+        NotEq => 1,
+        Lt => 2,
+        LtEq => 3,
+        Gt => 4,
+        GtEq => 5,
+        And => 6,
+        Or => 7,
+        Add => 8,
+        Sub => 9,
+        Mul => 10,
+        Div => 11,
+    }
+}
+fn binary_from(b: u8) -> Result<BinaryOp, WireError> {
+    use BinaryOp::*;
+    Ok(match b {
+        0 => Eq,
+        1 => NotEq,
+        2 => Lt,
+        3 => LtEq,
+        4 => Gt,
+        5 => GtEq,
+        6 => And,
+        7 => Or,
+        8 => Add,
+        9 => Sub,
+        10 => Mul,
+        11 => Div,
+        _ => return Err(WireError::Malformed("bad binary op")),
+    })
+}
+
 /// A length-prefixed list of `(id, addr)` member pairs.
 fn put_members(o: &mut Vec<u8>, members: &[(String, String)]) {
     o.extend_from_slice(&(members.len() as u32).to_le_bytes());
@@ -570,6 +670,33 @@ impl<'a> Cur<'a> {
     fn string(&mut self) -> Result<String, WireError> {
         String::from_utf8(self.bytes()?).map_err(|_| WireError::Malformed("bad utf-8"))
     }
+    fn expr(&mut self) -> Result<Expr, WireError> {
+        Ok(match self.u8()? {
+            0 => Expr::Literal(
+                Value::decode(&self.bytes()?).map_err(|_| WireError::Malformed("bad value"))?,
+            ),
+            1 => Expr::Column(self.string()?),
+            2 => {
+                let op = unary_from(self.u8()?)?;
+                Expr::Unary {
+                    op,
+                    expr: Box::new(self.expr()?),
+                }
+            }
+            3 => {
+                let op = binary_from(self.u8()?)?;
+                let left = Box::new(self.expr()?);
+                let right = Box::new(self.expr()?);
+                Expr::Binary { op, left, right }
+            }
+            4 => {
+                let expr = Box::new(self.expr()?);
+                let negated = self.u8()? != 0;
+                Expr::IsNull { expr, negated }
+            }
+            _ => return Err(WireError::Malformed("unsupported filter expr")),
+        })
+    }
     fn members(&mut self) -> Result<Vec<(String, String)>, WireError> {
         let n = self.u32()? as usize;
         let mut out = Vec::with_capacity(n);
@@ -605,6 +732,14 @@ mod tests {
                 hlc: Hlc::new(11, 0),
             },
             Request::LocalScan { table: "t".into() },
+            Request::FilteredScan {
+                table: "t".into(),
+                filter: Expr::Binary {
+                    op: BinaryOp::Eq,
+                    left: Box::new(Expr::Column("region".into())),
+                    right: Box::new(Expr::Literal(Value::String("eu".into()))),
+                },
+            },
             Request::LocalGet {
                 table: "t".into(),
                 key: vec![7, 8, 9],

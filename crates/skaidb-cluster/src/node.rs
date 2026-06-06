@@ -909,6 +909,13 @@ impl Node {
                 },
                 Err(_) => Response::Err("local lock poisoned".into()),
             },
+            Request::FilteredScan { table, filter } => match self.local.read() {
+                Ok(db) => match db.local_scan_filtered_keys(&table, &Some(filter)) {
+                    Ok(keys) => Response::Keys { keys },
+                    Err(e) => Response::Err(e.to_string()),
+                },
+                Err(_) => Response::Err("local lock poisoned".into()),
+            },
             Request::IndexScan { index, start, end } => match self.local.read() {
                 Ok(db) => match db.index_scan_keys(&index, start.as_deref(), end.as_deref()) {
                     Ok(keys) => Response::Keys { keys },
@@ -1417,6 +1424,51 @@ impl Node {
         Ok(out)
     }
 
+    /// Distributed **filter pushdown** for a non-indexed `WHERE`: scatter the
+    /// predicate to every member so each filters its own shard and returns only
+    /// the matching candidate keys, then re-read each at quorum (last-writer-wins
+    /// authoritative version). Like [`Node::index_lookup`] but the candidates come
+    /// from a filtered scan rather than an index — far less data than shipping
+    /// every member's whole shard and filtering at the coordinator. Sound under
+    /// LWW because a stale or since-changed candidate is corrected by the re-read.
+    fn filtered_lookup(
+        &self,
+        table: &str,
+        filter: &Expr,
+    ) -> EngineResult<Vec<(Vec<u8>, Document)>> {
+        let mut keys: BTreeMap<Vec<u8>, ()> = BTreeMap::new();
+
+        // Local shard.
+        {
+            let db = self
+                .local
+                .read()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
+            for k in db.local_scan_filtered_keys(table, &Some(filter.clone()))? {
+                keys.insert(k, ());
+            }
+        }
+
+        // Peer shards.
+        let req = Request::FilteredScan {
+            table: table.to_string(),
+            filter: filter.clone(),
+        };
+        for addr in &self.peer_addrs() {
+            if let Ok(Response::Keys { keys: ks }) = self.pool.call(addr, &req) {
+                for k in ks {
+                    keys.insert(k, ());
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        for key in keys.into_keys() {
+            out.extend(self.point_get(table, &key)?);
+        }
+        Ok(out)
+    }
+
     /// Distributed approximate nearest-neighbor search: scatter the query to
     /// every member's local vector index, merge their per-shard top-k by
     /// distance, then re-read the survivors at quorum and apply `filter`.
@@ -1709,6 +1761,14 @@ impl Cluster for Coordinator {
             let rows = self.node.index_lookup(table, &index, start, end)?;
             return filter_rows(filter, rows);
         }
+        // Non-indexed predicate: push the filter to each node and gather only the
+        // matching candidate keys (then re-read at quorum), instead of shipping
+        // every node's whole shard to the coordinator.
+        if let Some(f) = filter {
+            let rows = self.node.filtered_lookup(table, f)?;
+            return filter_rows(filter, rows);
+        }
+        // No predicate at all: gather the whole table, LWW-merged.
         let rows = self.node.cluster_scan(table)?;
         filter_rows(filter, rows)
     }
@@ -1881,6 +1941,64 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(rs.rows, vec![vec![Value::Int(3)], vec![Value::Int(5)]]);
+    }
+
+    #[test]
+    fn distributed_non_indexed_filter_pushdown() {
+        // A WHERE on a non-indexed column is pushed to each node (filtered scan →
+        // candidate keys → quorum re-read), and stays correct when a row is
+        // updated to no longer match (the re-read sees the authoritative version).
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let na = Node::new(
+            Database::open(temp_dir("fpa")).unwrap(),
+            cfg("a", &a, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("fpb")).unwrap(),
+            cfg("b", &b, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nc = Node::new(
+            Database::open(temp_dir("fpc")).unwrap(),
+            cfg("c", &c, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        nc.serve_internode().unwrap();
+
+        // No index on `status` or `age` — these queries take the pushdown path.
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        na.execute(
+            "INSERT INTO t (id, status, age) VALUES \
+             (1,'active',20),(2,'inactive',35),(3,'active',40),(4,'active',25),(5,'inactive',50)",
+        )
+        .unwrap();
+
+        // Equality filter, coordinated by a different node.
+        let rs = rows(
+            nb.execute("SELECT id FROM t WHERE status = 'active' ORDER BY id")
+                .unwrap(),
+        );
+        assert_eq!(
+            rs.rows,
+            vec![vec![Value::Int(1)], vec![Value::Int(3)], vec![Value::Int(4)]]
+        );
+
+        // Range filter on another non-indexed column.
+        let rs = rows(nc.execute("SELECT id FROM t WHERE age > 30 ORDER BY id").unwrap());
+        assert_eq!(
+            rs.rows,
+            vec![vec![Value::Int(2)], vec![Value::Int(3)], vec![Value::Int(5)]]
+        );
+
+        // Update id=4 to no longer match; the quorum re-read drops it (sound LWW).
+        nc.execute("UPDATE t SET status = 'inactive' WHERE id = 4")
+            .unwrap();
+        let rs = rows(
+            na.execute("SELECT id FROM t WHERE status = 'active' ORDER BY id")
+                .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(1)], vec![Value::Int(3)]]);
     }
 
     #[test]

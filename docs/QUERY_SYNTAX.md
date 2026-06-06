@@ -140,9 +140,10 @@ values arrive via stored data or the value codec, not as SQL literals.
 - **Transactions are embedded-only.** `BEGIN`/`COMMIT`/`ROLLBACK` work against an
   embedded `Database`; the cluster coordinator autocommits each statement and
   rejects transaction control (no distributed 2PC yet).
-- **Joins have no pushdown in a cluster:** a join pulls each table to the
-  coordinator and nested-loops there, so it suits modest tables / lookups, not
-  large fact-to-fact joins.
+- **Joins have no pushdown in a cluster:** a single-table `WHERE` *is* pushed to
+  the shards (each node returns only matching keys, re-read at quorum), but a
+  *join* pulls each table to the coordinator and nested-loops there — so joins
+  suit modest tables / lookups, not large fact-to-fact joins.
 - **Vector index *creation* is SQL** (`CREATE VECTOR INDEX …`), but the
   **nearest-neighbor *query* has no SQL syntax yet** — searches go through the
   `Database::vector_search` / `Node::vector_search` API (see

@@ -914,6 +914,35 @@ impl Database {
             .collect())
     }
 
+    /// **Filter pushdown**: the primary keys of this node's rows whose latest
+    /// local version is a `Put` matching `filter`. The coordinator unions these
+    /// candidate keys across replicas and re-reads each at quorum — exactly like a
+    /// secondary-index scan — so the result is sound under last-writer-wins (a
+    /// newer non-matching or deleted version on another replica is caught by the
+    /// re-read) while shipping only candidate keys instead of the whole shard.
+    pub fn local_scan_filtered_keys(
+        &self,
+        table: &str,
+        filter: &Option<Expr>,
+    ) -> Result<Vec<Vec<u8>>> {
+        let engine = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+        let mut out = Vec::new();
+        for (key, _hlc, value) in engine.scan_versioned_with_tombstones()? {
+            let Some(bytes) = value else { continue }; // tombstone: not a candidate
+            if let Value::Document(doc) = Value::decode(&bytes)
+                .map_err(|e| EngineError::Constraint(format!("corrupt row: {e}")))?
+            {
+                if matches_filter(filter, &doc)? {
+                    out.push(key);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Point-read the latest stored version of `key` in `table`: returns
     /// `(value, stamp, is_put)` where `is_put == false` marks a tombstone, or
     /// `None` if the key was never written here. The coordinator merges these
