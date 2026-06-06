@@ -53,6 +53,12 @@ struct Topology {
     /// concurrent topology updates can't move the ring backward.
     epoch: u64,
     ring: Ring,
+    /// During a membership change, the ring as it was *before* the change. While
+    /// set, a key's replica set is the **union** of its owners on both rings, so
+    /// writes dual-write and reads consult both the old and new owner — keeping
+    /// resharding correct under concurrent writes. Cleared when the change is
+    /// finalized.
+    prev: Option<Ring>,
     /// Peer id → internode address (excludes self).
     peers: HashMap<NodeId, String>,
     /// Full membership (including self) — kept so it can be persisted/rebroadcast.
@@ -61,9 +67,11 @@ struct Topology {
 
 impl Topology {
     /// Build a topology at `epoch` from the full member list, excluding `self_id`
-    /// from peers.
-    fn from_members(
+    /// from peers. `prev_members` (when non-empty) marks an in-progress change:
+    /// the ring they describe is unioned in for placement until finalized.
+    fn build(
         members: &[(NodeId, String)],
+        prev_members: &[(NodeId, String)],
         self_id: &NodeId,
         vnodes: u32,
         epoch: u64,
@@ -72,6 +80,15 @@ impl Topology {
         for (id, _) in members {
             ring.add_node(id.clone());
         }
+        let prev = if prev_members.is_empty() {
+            None
+        } else {
+            let mut r = Ring::new(vnodes);
+            for (id, _) in prev_members {
+                r.add_node(id.clone());
+            }
+            Some(r)
+        };
         let peers = members
             .iter()
             .filter(|(id, _)| id != self_id)
@@ -80,9 +97,20 @@ impl Topology {
         Topology {
             epoch,
             ring,
+            prev,
             peers,
             members: members.to_vec(),
         }
+    }
+
+    /// Build a settled topology (no in-progress change).
+    fn from_members(
+        members: &[(NodeId, String)],
+        self_id: &NodeId,
+        vnodes: u32,
+        epoch: u64,
+    ) -> Topology {
+        Topology::build(members, &[], self_id, vnodes, epoch)
     }
 }
 
@@ -173,12 +201,21 @@ impl Node {
     }
 
     /// Replica set for `key` at the configured replication factor (snapshot).
+    /// During a membership change this is the **union** of the key's owners on
+    /// the new and previous rings, so a migrating key is written to (and read
+    /// from) both its old and new owner until the change is finalized.
     fn replicas_for(&self, key: &[u8]) -> Vec<NodeId> {
-        self.topo
-            .read()
-            .expect("topo lock")
-            .ring
-            .replicas_for(key, self.cfg.replication_factor)
+        let rf = self.cfg.replication_factor;
+        let topo = self.topo.read().expect("topo lock");
+        let mut reps = topo.ring.replicas_for(key, rf);
+        if let Some(prev) = &topo.prev {
+            for n in prev.replicas_for(key, rf) {
+                if !reps.contains(&n) {
+                    reps.push(n);
+                }
+            }
+        }
+        reps
     }
 
     /// Address of peer `id`, if it is a current peer (snapshot, cloned).
@@ -215,14 +252,27 @@ impl Node {
 
     /// Adopt `members` at version `epoch`, but only if `epoch` is newer than the
     /// one currently held (so a stale or concurrent update can't move the ring
-    /// backward). Persists on success. Returns whether it was applied.
-    fn set_membership(&self, members: &[(NodeId, String)], epoch: u64) -> bool {
+    /// backward). A non-empty `prev_members` marks an in-progress change whose old
+    /// ring is unioned in for placement (dual-write/read) until a later
+    /// finalizing update clears it. Persists on success. Returns whether applied.
+    fn set_membership(
+        &self,
+        members: &[(NodeId, String)],
+        prev_members: &[(NodeId, String)],
+        epoch: u64,
+    ) -> bool {
         {
             let mut topo = self.topo.write().expect("topo lock");
             if epoch <= topo.epoch && topo.epoch != 0 {
                 return false; // stale / superseded
             }
-            *topo = Topology::from_members(members, &self.id, self.cfg.vnodes_per_node, epoch);
+            *topo = Topology::build(
+                members,
+                prev_members,
+                &self.id,
+                self.cfg.vnodes_per_node,
+                epoch,
+            );
         }
         self.persist_membership();
         true
@@ -368,32 +418,38 @@ impl Node {
     ///    keys the joiner now owns.
     ///
     /// Consistent hashing means a single join only moves keys *onto* the joiner,
-    /// so existing placements are otherwise undisturbed. This assumes a quiescent
-    /// cluster (no concurrent writes to migrating keys) and that the joiner and a
-    /// member quorum are reachable — there is no schema-log catch-up for a member
-    /// that missed the broadcast yet (see [docs/RESHARDING.md]).
+    /// so existing placements are otherwise undisturbed. The join runs as a
+    /// two-phase **pending-ranges** transition: while migrating, every node treats
+    /// the migrating keys' owners as the **union** of the old and new rings, so
+    /// concurrent writes dual-write to both and reads find not-yet-migrated data
+    /// on the old owner — correct even under live writes, not just a quiescent
+    /// cluster. The joiner and a member quorum must be reachable; a member that
+    /// missed the broadcast needs it re-sent (see [docs/RESHARDING.md]).
     pub fn add_member(&self, id: &str, addr: &str) -> EngineResult<()> {
         let joiner = NodeId::new(id);
-        let mut members = self.members_snapshot();
-        if members.iter().any(|(mid, _)| *mid == joiner) {
+        let old_members = self.members_snapshot();
+        if old_members.iter().any(|(mid, _)| *mid == joiner) {
             return Ok(()); // already a member
         }
-        members.push((joiner.clone(), addr.to_string()));
-        let wire: Vec<(String, String)> =
-            members.iter().map(|(id, a)| (id.0.clone(), a.clone())).collect();
-        let epoch = self.current_epoch() + 1;
+        let mut new_members = old_members.clone();
+        new_members.push((joiner.clone(), addr.to_string()));
+        let new_wire = wire_of(&new_members);
+        let old_wire = wire_of(&old_members);
 
-        // 1) Everyone (including the joiner) adopts the new ring at the new epoch.
-        self.set_membership(&members, epoch);
-        for (mid, maddr) in &members {
+        // 1) Begin the transition: adopt the new ring with the old ring unioned
+        //    in (dual-write/read), so writes during migration reach both owners.
+        let epoch_begin = self.current_epoch() + 1;
+        self.set_membership(&new_members, &old_members, epoch_begin);
+        for (mid, maddr) in &new_members {
             if *mid == self.id {
                 continue;
             }
             match self.pool.call(
                 maddr,
                 &Request::SetMembership {
-                    epoch,
-                    members: wire.clone(),
+                    epoch: epoch_begin,
+                    members: new_wire.clone(),
+                    prev_members: old_wire.clone(),
                 },
             ) {
                 Ok(Response::Ack) => {}
@@ -417,7 +473,7 @@ impl Node {
 
         // 3) Every existing member pushes the keys the joiner now owns.
         self.rebalance_to(&joiner)?;
-        for (mid, maddr) in &members {
+        for (mid, maddr) in &new_members {
             if *mid == self.id || *mid == joiner {
                 continue;
             }
@@ -425,6 +481,24 @@ impl Node {
                 Ok(Response::Ack) | Ok(Response::Err(_)) => {}
                 _ => {} // unreachable member: its keys migrate when it rejoins
             }
+        }
+
+        // 4) Finalize: drop the old ring so placement is the joiner-inclusive ring
+        //    only. (Left set on a failed migration above, keeping dual-read safe.)
+        let epoch_final = self.current_epoch() + 1;
+        self.set_membership(&new_members, &[], epoch_final);
+        for (mid, maddr) in &new_members {
+            if *mid == self.id {
+                continue;
+            }
+            let _ = self.pool.call(
+                maddr,
+                &Request::SetMembership {
+                    epoch: epoch_final,
+                    members: new_wire.clone(),
+                    prev_members: Vec::new(),
+                },
+            );
         }
         Ok(())
     }
@@ -483,10 +557,11 @@ impl Node {
         }
 
         // 2) Survivors adopt the smaller ring at a new epoch; the leaving node is
-        //    dropped from it.
+        //    dropped from it. (Drain already moved the data, so no transition is
+        //    needed — the leaving node served reads up to this point.)
         let epoch = self.current_epoch() + 1;
         if leaving != self.id {
-            self.set_membership(&new_members, epoch);
+            self.set_membership(&new_members, &[], epoch);
         }
         for (mid, maddr) in &new_members {
             if *mid == self.id {
@@ -499,6 +574,7 @@ impl Node {
                 &Request::SetMembership {
                     epoch,
                     members: wire.clone(),
+                    prev_members: Vec::new(),
                 },
             );
         }
@@ -801,12 +877,15 @@ impl Node {
                 write_response(self.apply_write_local(&table, &key, &WriteOp::Delete, hlc))
             }
             Request::ApplyDdl { sql } => self.with_write(|db| db.execute(&sql).map(|_| ())),
-            Request::SetMembership { epoch, members } => {
-                let members: Vec<(NodeId, String)> = members
-                    .into_iter()
-                    .map(|(id, addr)| (NodeId::new(id), addr))
-                    .collect();
-                self.set_membership(&members, epoch);
+            Request::SetMembership {
+                epoch,
+                members,
+                prev_members,
+            } => {
+                let to_ids = |v: Vec<(String, String)>| -> Vec<(NodeId, String)> {
+                    v.into_iter().map(|(id, addr)| (NodeId::new(id), addr)).collect()
+                };
+                self.set_membership(&to_ids(members), &to_ids(prev_members), epoch);
                 Response::Ack
             }
             Request::Rebalance { joiner } => match self.rebalance_to(&NodeId::new(joiner)) {
@@ -1418,6 +1497,14 @@ fn write_response(result: EngineResult<()>) -> Response {
     }
 }
 
+/// Encode a member list as `(id, addr)` string pairs for the wire.
+fn wire_of(members: &[(NodeId, String)]) -> Vec<(String, String)> {
+    members
+        .iter()
+        .map(|(id, a)| (id.0.clone(), a.clone()))
+        .collect()
+}
+
 /// Path of the persisted membership file inside a node's data directory.
 fn membership_path(dir: &Path) -> PathBuf {
     dir.join("topology")
@@ -1838,6 +1925,100 @@ mod tests {
     }
 
     #[test]
+    fn pending_ranges_dual_write_to_old_and_new_owner() {
+        // rf=1, CL=ALL. We impose a transition (current ring {a,b,c}, previous
+        // ring {a,b}); a key that moved onto c must, while the transition is
+        // active, be written to BOTH its new owner (c) and its old owner (a/b),
+        // so concurrent reads still find it on the old owner until migration
+        // finishes.
+        let all = Consistency::All;
+        let cfg1 = |id: &str, addr: &str, members: &[(NodeId, String)]| NodeConfig {
+            id: NodeId::new(id),
+            internode_addr: addr.to_string(),
+            members: members.to_vec(),
+            replication_factor: 1,
+            vnodes_per_node: 64,
+            read_consistency: all,
+            write_consistency: all,
+        };
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let abc = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let na = Node::new(Database::open(temp_dir("pra")).unwrap(), cfg1("a", &a, &abc));
+        let nb = Node::new(Database::open(temp_dir("prb")).unwrap(), cfg1("b", &b, &abc));
+        let nc = Node::new(Database::open(temp_dir("prc")).unwrap(), cfg1("c", &c, &abc));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        nc.serve_internode().unwrap();
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+
+        // Impose the transition on every node: ring {a,b,c}, prev {a,b}.
+        let abc_w = vec![
+            ("a".into(), a.clone()),
+            ("b".into(), b.clone()),
+            ("c".into(), c.clone()),
+        ];
+        let ab_w = vec![("a".into(), a.clone()), ("b".into(), b.clone())];
+        for addr in [&a, &b, &c] {
+            let r = internode::call(
+                addr,
+                &Request::SetMembership {
+                    epoch: 1,
+                    members: abc_w.clone(),
+                    prev_members: ab_w.clone(),
+                },
+            )
+            .unwrap();
+            assert!(matches!(r, Response::Ack));
+        }
+
+        let addr_of = |n: &NodeId| -> String {
+            match n.0.as_str() {
+                "a" => a.clone(),
+                "b" => b.clone(),
+                _ => c.clone(),
+            }
+        };
+        let mut new_ring = Ring::new(64);
+        let mut old_ring = Ring::new(64);
+        for n in ["a", "b", "c"] {
+            new_ring.add_node(NodeId::new(n));
+        }
+        for n in ["a", "b"] {
+            old_ring.add_node(NodeId::new(n));
+        }
+        let has = |addr: &str, key: &[u8]| -> bool {
+            matches!(
+                internode::call(
+                    addr,
+                    &Request::LocalGet {
+                        table: "t".into(),
+                        key: key.to_vec(),
+                    },
+                ),
+                Ok(Response::Get { entry: Some(_) })
+            )
+        };
+
+        let mut moved = 0;
+        for id in 1..=40i64 {
+            na.execute(&format!("INSERT INTO t (id, v) VALUES ({id}, {})", id * 10))
+                .unwrap();
+            let key = Value::Array(vec![Value::Int(id)]).encode_key();
+            let new_owner = new_ring.primary_for(&key).unwrap();
+            let old_owner = old_ring.primary_for(&key).unwrap();
+            if new_owner != old_owner {
+                moved += 1;
+                assert!(has(&addr_of(&new_owner), &key), "new owner has id {id}");
+                assert!(
+                    has(&addr_of(&old_owner), &key),
+                    "old owner also has id {id} (dual-write)"
+                );
+            }
+        }
+        assert!(moved > 0, "some keys moved to c under the new ring");
+    }
+
+    #[test]
     fn hinted_handoff_replays_to_a_recovered_replica() {
         // rf=3, CL=ALL so a write must reach all three replicas. c is created but
         // not served (down), so the write to it fails synchronously and is
@@ -2013,12 +2194,13 @@ mod tests {
         let nc = Node::new(Database::open(temp_dir("pm-c")).unwrap(), rf1("c", &c, &abc));
         nc.serve_internode().unwrap();
         na.add_member("c", &c).unwrap();
-        assert_eq!(na.membership_epoch(), 1);
+        // A join is a two-phase transition (begin + finalize), so two epoch bumps.
+        assert_eq!(na.membership_epoch(), 2);
 
         // Restart b from the same data dir but with the *stale* bootstrap config
-        // [a, b]. It must load the persisted live ring [a, b, c] at epoch 1.
+        // [a, b]. It must load the persisted live ring [a, b, c] at epoch 2.
         let nb2 = Node::new(Database::open(&bdir).unwrap(), rf1("b", &b, &ab));
-        assert_eq!(nb2.membership_epoch(), 1, "loaded persisted epoch");
+        assert_eq!(nb2.membership_epoch(), 2, "loaded persisted epoch");
         let mut ids = nb2.member_ids();
         ids.sort();
         assert_eq!(ids, vec!["a", "b", "c"], "loaded live ring, not stale cfg");
@@ -2029,9 +2211,10 @@ mod tests {
             &Request::SetMembership {
                 epoch: 0,
                 members: vec![("a".into(), a.clone())],
+                prev_members: Vec::new(),
             },
         );
-        assert_eq!(na.membership_epoch(), 1);
+        assert_eq!(na.membership_epoch(), 2);
         assert_eq!(na.member_ids().len(), 3, "stale update ignored");
     }
 

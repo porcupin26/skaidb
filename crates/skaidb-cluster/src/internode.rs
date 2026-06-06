@@ -58,6 +58,10 @@ pub enum Request {
     SetMembership {
         epoch: u64,
         members: Vec<(String, String)>,
+        /// The pre-change ring during an in-progress membership change (empty for
+        /// a settled/finalizing update). While set, recipients union it in for
+        /// placement so migrating keys dual-write/read.
+        prev_members: Vec<(String, String)>,
     },
     /// Push every locally-held row whose key the named `joiner` now owns (under
     /// the current ring) to that joiner, preserving each row's HLC. Sent to
@@ -188,14 +192,15 @@ impl Request {
                 o.push(REQ_DDL);
                 put_str(&mut o, sql);
             }
-            Request::SetMembership { epoch, members } => {
+            Request::SetMembership {
+                epoch,
+                members,
+                prev_members,
+            } => {
                 o.push(REQ_MEMBERS);
                 o.extend_from_slice(&epoch.to_le_bytes());
-                o.extend_from_slice(&(members.len() as u32).to_le_bytes());
-                for (id, addr) in members {
-                    put_str(&mut o, id);
-                    put_str(&mut o, addr);
-                }
+                put_members(&mut o, members);
+                put_members(&mut o, prev_members);
             }
             Request::Rebalance { joiner } => {
                 o.push(REQ_REBAL);
@@ -253,14 +258,13 @@ impl Request {
             REQ_DDL => Request::ApplyDdl { sql: c.string()? },
             REQ_MEMBERS => {
                 let epoch = c.u64()?;
-                let n = c.u32()? as usize;
-                let mut members = Vec::with_capacity(n);
-                for _ in 0..n {
-                    let id = c.string()?;
-                    let addr = c.string()?;
-                    members.push((id, addr));
+                let members = c.members()?;
+                let prev_members = c.members()?;
+                Request::SetMembership {
+                    epoch,
+                    members,
+                    prev_members,
                 }
-                Request::SetMembership { epoch, members }
             }
             REQ_REBAL => Request::Rebalance {
                 joiner: c.string()?,
@@ -497,6 +501,14 @@ impl Pool {
 fn put_str(o: &mut Vec<u8>, s: &str) {
     put_bytes(o, s.as_bytes());
 }
+/// A length-prefixed list of `(id, addr)` member pairs.
+fn put_members(o: &mut Vec<u8>, members: &[(String, String)]) {
+    o.extend_from_slice(&(members.len() as u32).to_le_bytes());
+    for (id, addr) in members {
+        put_str(o, id);
+        put_str(o, addr);
+    }
+}
 fn put_bytes(o: &mut Vec<u8>, b: &[u8]) {
     o.extend_from_slice(&(b.len() as u32).to_le_bytes());
     o.extend_from_slice(b);
@@ -558,6 +570,16 @@ impl<'a> Cur<'a> {
     fn string(&mut self) -> Result<String, WireError> {
         String::from_utf8(self.bytes()?).map_err(|_| WireError::Malformed("bad utf-8"))
     }
+    fn members(&mut self) -> Result<Vec<(String, String)>, WireError> {
+        let n = self.u32()? as usize;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let id = self.string()?;
+            let addr = self.string()?;
+            out.push((id, addr));
+        }
+        Ok(out)
+    }
     fn hlc(&mut self) -> Result<Hlc, WireError> {
         let b: [u8; 12] = self.take(12)?.try_into().unwrap();
         Ok(Hlc::from_bytes(b))
@@ -611,6 +633,7 @@ mod tests {
                     ("a".into(), "127.0.0.1:1".into()),
                     ("b".into(), "127.0.0.1:2".into()),
                 ],
+                prev_members: vec![("a".into(), "127.0.0.1:1".into())],
             },
             Request::Rebalance {
                 joiner: "c".into(),

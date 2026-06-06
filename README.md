@@ -96,7 +96,7 @@ Full grammar reference: **[docs/QUERY_SYNTAX.md](docs/QUERY_SYNTAX.md)**.
 
 ## Status & deferred work
 
-Implemented end-to-end and tested (194 tests):
+Implemented end-to-end and tested (195 tests):
 
 - soft-schema document model, SQL subset, 3-valued logic
 - **SQL surface**: projection over nested paths, `WHERE`, `GROUP BY`/`HAVING`,
@@ -130,9 +130,11 @@ Implemented end-to-end and tested (194 tests):
   tolerance; **anti-entropy** keeps replicas converged — **read-repair** on
   quorum reads, **hinted handoff** for writes that miss a down replica, and an
   active **repair** pass (bidirectional version reconciliation)
-- **online resharding**: a node can **join or leave at runtime** — on join the
-  coordinator broadcasts the new ring, bootstraps the joiner's schema, and every
-  member pushes the keys the joiner now owns; on graceful **decommission** the
+- **online resharding**: a node can **join or leave at runtime** — a join is a
+  two-phase **pending-ranges** transition (the migrating keys' old and new owners
+  are unioned, so writes dual-write and reads dual-read during the move — correct
+  under live writes), bootstrapping the joiner's schema and pushing it the keys
+  it now owns; on graceful **decommission** the
   leaving node first drains its keys to their new owners, then the ring shrinks
   (HLC-preserving, tombstones included, both ways). Consistent hashing means a
   single membership change only moves ~`1/N` of the keyspace; placements are

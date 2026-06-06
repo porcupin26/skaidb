@@ -143,10 +143,15 @@ node.reclaim_cluster()?;  // …and tells every peer to do the same
 
 ## Assumptions & limitations
 
-- **Quiescent migration.** The join assumes no concurrent writes to the specific
-  keys being migrated. A write that races the push can be ordered correctly by
-  HLC, but the design target is "add capacity during a calm window," not a
-  guaranteed-consistent live cutover under peak write load.
+- **Live migration (pending ranges).** A join runs as a two-phase transition:
+  it first broadcasts the new ring with the **old ring unioned in**, so while
+  data is migrating every coordinator treats a migrating key's owners as *both*
+  its old and new node — writes dual-write to both and reads consult both — then
+  finalizes to drop the old ring. So concurrent writes during a join stay
+  consistent, not just on a quiescent cluster. (A node that *restarts* mid-
+  transition reloads only the finalized ring, since the pending state isn't
+  persisted; re-run `add_member` if a migration was interrupted. `remove_member`
+  drains before changing the ring, so it needs no transition.)
 - **Reclamation is a manual pass.** `reclaim`/`reclaim_cluster` are explicit
   calls run after a move, not automatic — until then the former owner keeps the
   (harmless) stale copies. It is also currently a full-table scan with a
@@ -195,3 +200,6 @@ node.reclaim_cluster()?;  // …and tells every peer to do the same
 - `hinted_handoff_replays_to_a_recovered_replica` (rf=3, CL=ALL) writes while a
   replica is down (buffering a hint), then recovers it and checks `flush_hints`
   hands the write off.
+- `pending_ranges_dual_write_to_old_and_new_owner` (rf=1, CL=ALL) imposes a
+  ring transition and checks a write to a migrating key lands on **both** its old
+  and new owner.
