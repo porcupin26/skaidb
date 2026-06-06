@@ -46,13 +46,15 @@ and `.rpm` (x86_64 + aarch64), `.dmg` (Intel + Apple Silicon), a Windows `.zip`/
 `.exe`, and `.tar.gz` tarballs (incl. a static musl build), with `SHA256SUMS`.
 Each bundle ships both the `skaidb` server and the `skaidb-cli` shell.
 
+**Full, OS-by-OS instructions (packages, tarballs, source, binary-only,
+verification, upgrade/uninstall) are in [docs/INSTALL.md](docs/INSTALL.md).**
+The short version:
+
 ```sh
-# Debian/Ubuntu
-sudo dpkg -i skaidb_*_amd64.deb
-# Fedora/RHEL
-sudo rpm -i skaidb-*.x86_64.rpm
-# or just grab a tarball
-tar xzf skaidb-*-x86_64-unknown-linux-gnu.tar.gz
+# Debian/Ubuntu              # Fedora/RHEL/openSUSE          # any Linux / macOS
+sudo apt install ./skaidb_*_amd64.deb
+sudo dnf install ./skaidb-*-1.x86_64.rpm
+tar xzf skaidb-*-x86_64-unknown-linux-gnu.tar.gz && sudo install -m755 skaidb skaidb-cli /usr/local/bin/
 ```
 
 Releases are cut automatically on every push to `main` with SemVer version
