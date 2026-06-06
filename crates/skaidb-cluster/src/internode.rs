@@ -51,9 +51,12 @@ pub enum Request {
         sql: String,
     },
     /// Replace the recipient's cluster membership/ring with `members`
-    /// (`(id, addr)` pairs, including the recipient). Broadcast when a node joins
-    /// or leaves so every member recomputes the same placement.
+    /// (`(id, addr)` pairs, including the recipient) at version `epoch`. Broadcast
+    /// when a node joins or leaves. The recipient applies it only if `epoch` is
+    /// newer than the one it holds, so stale updates and concurrent topology
+    /// changes can't move a node's ring backward.
     SetMembership {
+        epoch: u64,
         members: Vec<(String, String)>,
     },
     /// Push every locally-held row whose key the named `joiner` now owns (under
@@ -181,8 +184,9 @@ impl Request {
                 o.push(REQ_DDL);
                 put_str(&mut o, sql);
             }
-            Request::SetMembership { members } => {
+            Request::SetMembership { epoch, members } => {
                 o.push(REQ_MEMBERS);
+                o.extend_from_slice(&epoch.to_le_bytes());
                 o.extend_from_slice(&(members.len() as u32).to_le_bytes());
                 for (id, addr) in members {
                     put_str(&mut o, id);
@@ -243,6 +247,7 @@ impl Request {
             }
             REQ_DDL => Request::ApplyDdl { sql: c.string()? },
             REQ_MEMBERS => {
+                let epoch = c.u64()?;
                 let n = c.u32()? as usize;
                 let mut members = Vec::with_capacity(n);
                 for _ in 0..n {
@@ -250,7 +255,7 @@ impl Request {
                     let addr = c.string()?;
                     members.push((id, addr));
                 }
-                Request::SetMembership { members }
+                Request::SetMembership { epoch, members }
             }
             REQ_REBAL => Request::Rebalance {
                 joiner: c.string()?,
@@ -527,6 +532,9 @@ impl<'a> Cur<'a> {
     fn u32(&mut self) -> Result<u32, WireError> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
+    fn u64(&mut self) -> Result<u64, WireError> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
     fn f32(&mut self) -> Result<f32, WireError> {
         Ok(f32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
@@ -592,6 +600,7 @@ mod tests {
                 k: 10,
             },
             Request::SetMembership {
+                epoch: 7,
                 members: vec![
                     ("a".into(), "127.0.0.1:1".into()),
                     ("b".into(), "127.0.0.1:2".into()),

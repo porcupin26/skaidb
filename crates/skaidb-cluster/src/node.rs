@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::thread;
 
@@ -48,14 +49,25 @@ pub struct NodeConfig {
 /// a lock so membership can change at runtime (resharding).
 #[derive(Debug)]
 struct Topology {
+    /// Membership version: a higher epoch supersedes a lower one, so stale or
+    /// concurrent topology updates can't move the ring backward.
+    epoch: u64,
     ring: Ring,
     /// Peer id → internode address (excludes self).
     peers: HashMap<NodeId, String>,
+    /// Full membership (including self) — kept so it can be persisted/rebroadcast.
+    members: Vec<(NodeId, String)>,
 }
 
 impl Topology {
-    /// Build a topology from the full member list, excluding `self_id` from peers.
-    fn from_members(members: &[(NodeId, String)], self_id: &NodeId, vnodes: u32) -> Topology {
+    /// Build a topology at `epoch` from the full member list, excluding `self_id`
+    /// from peers.
+    fn from_members(
+        members: &[(NodeId, String)],
+        self_id: &NodeId,
+        vnodes: u32,
+        epoch: u64,
+    ) -> Topology {
         let mut ring = Ring::new(vnodes);
         for (id, _) in members {
             ring.add_node(id.clone());
@@ -65,7 +77,12 @@ impl Topology {
             .filter(|(id, _)| id != self_id)
             .map(|(id, addr)| (id.clone(), addr.clone()))
             .collect();
-        Topology { ring, peers }
+        Topology {
+            epoch,
+            ring,
+            peers,
+            members: members.to_vec(),
+        }
     }
 }
 
@@ -85,9 +102,17 @@ pub struct Node {
 }
 
 impl Node {
-    /// Create a node with the given local database and cluster config.
+    /// Create a node with the given local database and cluster config. If a
+    /// persisted membership from a prior run exists (a node that joined/left
+    /// while this one was up), it is loaded so the node rejoins with the **live**
+    /// ring rather than its bootstrap `cfg.members`.
     pub fn new(local: Database, cfg: NodeConfig) -> Arc<Node> {
-        let topo = Topology::from_members(&cfg.members, &cfg.id, cfg.vnodes_per_node);
+        let path = membership_path(local.dir());
+        let (members, epoch) = match load_membership(&path) {
+            Some((members, epoch)) => (members, epoch),
+            None => (cfg.members.clone(), 0),
+        };
+        let topo = Topology::from_members(&members, &cfg.id, cfg.vnodes_per_node, epoch);
         Arc::new(Node {
             id: cfg.id.clone(),
             local: RwLock::new(local),
@@ -96,6 +121,37 @@ impl Node {
             pool: internode::Pool::new(),
             cfg,
         })
+    }
+
+    /// The current membership epoch.
+    fn current_epoch(&self) -> u64 {
+        self.topo.read().expect("topo lock").epoch
+    }
+
+    /// The current membership version (for diagnostics).
+    pub fn membership_epoch(&self) -> u64 {
+        self.current_epoch()
+    }
+
+    /// The current membership as node ids (for diagnostics).
+    pub fn member_ids(&self) -> Vec<String> {
+        self.topo
+            .read()
+            .expect("topo lock")
+            .members
+            .iter()
+            .map(|(id, _)| id.0.clone())
+            .collect()
+    }
+
+    /// Persist the current membership + epoch so it survives a restart.
+    fn persist_membership(&self) {
+        let topo = self.topo.read().expect("topo lock");
+        let path = {
+            let db = self.local.read().expect("local lock");
+            membership_path(db.dir())
+        };
+        save_membership(&path, topo.epoch, &topo.members);
     }
 
     /// Total member count (peers + self).
@@ -130,20 +186,22 @@ impl Node {
 
     /// The full current membership (`(id, addr)` pairs), including this node.
     fn members_snapshot(&self) -> Vec<(NodeId, String)> {
-        let topo = self.topo.read().expect("topo lock");
-        let mut members: Vec<(NodeId, String)> = topo
-            .peers
-            .iter()
-            .map(|(id, addr)| (id.clone(), addr.clone()))
-            .collect();
-        members.push((self.id.clone(), self.cfg.internode_addr.clone()));
-        members
+        self.topo.read().expect("topo lock").members.clone()
     }
 
-    /// Replace this node's topology (ring + peers) with `members`.
-    fn set_membership(&self, members: &[(NodeId, String)]) {
-        let topo = Topology::from_members(members, &self.id, self.cfg.vnodes_per_node);
-        *self.topo.write().expect("topo lock") = topo;
+    /// Adopt `members` at version `epoch`, but only if `epoch` is newer than the
+    /// one currently held (so a stale or concurrent update can't move the ring
+    /// backward). Persists on success. Returns whether it was applied.
+    fn set_membership(&self, members: &[(NodeId, String)], epoch: u64) -> bool {
+        {
+            let mut topo = self.topo.write().expect("topo lock");
+            if epoch <= topo.epoch && topo.epoch != 0 {
+                return false; // stale / superseded
+            }
+            *topo = Topology::from_members(members, &self.id, self.cfg.vnodes_per_node, epoch);
+        }
+        self.persist_membership();
+        true
     }
 
     /// `CREATE` statements reconstructing the local schema (for joiner bootstrap).
@@ -299,14 +357,21 @@ impl Node {
         members.push((joiner.clone(), addr.to_string()));
         let wire: Vec<(String, String)> =
             members.iter().map(|(id, a)| (id.0.clone(), a.clone())).collect();
+        let epoch = self.current_epoch() + 1;
 
-        // 1) Everyone (including the joiner) adopts the new ring.
-        self.set_membership(&members);
+        // 1) Everyone (including the joiner) adopts the new ring at the new epoch.
+        self.set_membership(&members, epoch);
         for (mid, maddr) in &members {
             if *mid == self.id {
                 continue;
             }
-            match self.pool.call(maddr, &Request::SetMembership { members: wire.clone() }) {
+            match self.pool.call(
+                maddr,
+                &Request::SetMembership {
+                    epoch,
+                    members: wire.clone(),
+                },
+            ) {
                 Ok(Response::Ack) => {}
                 _ if *mid == joiner => {
                     return Err(EngineError::Cluster("joiner unreachable".into()))
@@ -393,9 +458,11 @@ impl Node {
             }
         }
 
-        // 2) Survivors adopt the smaller ring; the leaving node is dropped from it.
+        // 2) Survivors adopt the smaller ring at a new epoch; the leaving node is
+        //    dropped from it.
+        let epoch = self.current_epoch() + 1;
         if leaving != self.id {
-            self.set_membership(&new_members);
+            self.set_membership(&new_members, epoch);
         }
         for (mid, maddr) in &new_members {
             if *mid == self.id {
@@ -403,7 +470,13 @@ impl Node {
             }
             // Best-effort: a lagging survivor catches up when re-broadcast to
             // (no membership catch-up log yet).
-            let _ = self.pool.call(maddr, &Request::SetMembership { members: wire.clone() });
+            let _ = self.pool.call(
+                maddr,
+                &Request::SetMembership {
+                    epoch,
+                    members: wire.clone(),
+                },
+            );
         }
         Ok(())
     }
@@ -563,12 +636,12 @@ impl Node {
                 write_response(self.apply_write_local(&table, &key, &WriteOp::Delete, hlc))
             }
             Request::ApplyDdl { sql } => self.with_write(|db| db.execute(&sql).map(|_| ())),
-            Request::SetMembership { members } => {
+            Request::SetMembership { epoch, members } => {
                 let members: Vec<(NodeId, String)> = members
                     .into_iter()
                     .map(|(id, addr)| (NodeId::new(id), addr))
                     .collect();
-                self.set_membership(&members);
+                self.set_membership(&members, epoch);
                 Response::Ack
             }
             Request::Rebalance { joiner } => match self.rebalance_to(&NodeId::new(joiner)) {
@@ -1119,6 +1192,45 @@ fn write_response(result: EngineResult<()>) -> Response {
     }
 }
 
+/// Path of the persisted membership file inside a node's data directory.
+fn membership_path(dir: &Path) -> PathBuf {
+    dir.join("topology")
+}
+
+/// Persist `epoch` + `members` as a small text file (first line the epoch, then
+/// one `id<space>addr` per line), written atomically. Best-effort: a failed
+/// write is non-fatal (the in-memory ring stays authoritative for this run).
+fn save_membership(path: &Path, epoch: u64, members: &[(NodeId, String)]) {
+    let mut body = format!("{epoch}\n");
+    for (id, addr) in members {
+        body.push_str(&format!("{} {}\n", id.0, addr));
+    }
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, &body).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+/// Load a persisted membership written by [`save_membership`], if present.
+fn load_membership(path: &Path) -> Option<(Vec<(NodeId, String)>, u64)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    let epoch: u64 = lines.next()?.trim().parse().ok()?;
+    let mut members = Vec::new();
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (id, addr) = line.split_once(' ')?;
+        members.push((NodeId::new(id), addr.to_string()));
+    }
+    if members.is_empty() {
+        return None;
+    }
+    Some((members, epoch))
+}
+
 fn is_ddl(stmt: &Statement) -> bool {
     matches!(
         stmt,
@@ -1497,6 +1609,56 @@ mod tests {
         nc.execute("INSERT INTO t (id, g) VALUES (61, 1)").unwrap();
         let rs = rows(na.execute("SELECT id FROM t WHERE id = 61").unwrap());
         assert_eq!(rs.rows, vec![vec![Value::Int(61)]]);
+    }
+
+    #[test]
+    fn membership_persists_across_restart_and_rejects_stale_epoch() {
+        let one = Consistency::One;
+        let rf1 = |id: &str, addr: &str, members: &[(NodeId, String)]| NodeConfig {
+            id: NodeId::new(id),
+            internode_addr: addr.to_string(),
+            members: members.to_vec(),
+            replication_factor: 1,
+            vnodes_per_node: 64,
+            read_consistency: one,
+            write_consistency: one,
+        };
+
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let ab = vec![member("a", &a), member("b", &b)];
+        let abc = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let adir = temp_dir("pm-a");
+        let bdir = temp_dir("pm-b");
+
+        let na = Node::new(Database::open(&adir).unwrap(), rf1("a", &a, &ab));
+        let nb = Node::new(Database::open(&bdir).unwrap(), rf1("b", &b, &ab));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        let nc = Node::new(Database::open(temp_dir("pm-c")).unwrap(), rf1("c", &c, &abc));
+        nc.serve_internode().unwrap();
+        na.add_member("c", &c).unwrap();
+        assert_eq!(na.membership_epoch(), 1);
+
+        // Restart b from the same data dir but with the *stale* bootstrap config
+        // [a, b]. It must load the persisted live ring [a, b, c] at epoch 1.
+        let nb2 = Node::new(Database::open(&bdir).unwrap(), rf1("b", &b, &ab));
+        assert_eq!(nb2.membership_epoch(), 1, "loaded persisted epoch");
+        let mut ids = nb2.member_ids();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "b", "c"], "loaded live ring, not stale cfg");
+
+        // A stale SetMembership (epoch 0) is rejected — a's ring doesn't regress.
+        let _ = internode::call(
+            &a,
+            &Request::SetMembership {
+                epoch: 0,
+                members: vec![("a".into(), a.clone())],
+            },
+        );
+        assert_eq!(na.membership_epoch(), 1);
+        assert_eq!(na.member_ids().len(), 3, "stale update ignored");
     }
 
     #[test]

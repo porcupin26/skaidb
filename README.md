@@ -96,7 +96,7 @@ Full grammar reference: **[docs/QUERY_SYNTAX.md](docs/QUERY_SYNTAX.md)**.
 
 ## Status & deferred work
 
-Implemented end-to-end and tested (190 tests):
+Implemented end-to-end and tested (192 tests):
 
 - soft-schema document model, SQL subset, 3-valued logic
 - **SQL surface**: projection over nested paths, `WHERE`, `GROUP BY`/`HAVING`,
@@ -151,8 +151,9 @@ gathers each table to the coordinator rather than executing shard-local), active
 **anti-entropy** (read-repair & hinted handoff — convergence currently relies on
 writes reaching their replicas; it is also what would give a node that missed a
 membership broadcast a topology log to catch up on. Online node **join**,
-graceful **decommission**, and post-move **space reclamation** are all built —
-see [docs/RESHARDING.md](docs/RESHARDING.md)), **global (value-sharded) secondary
+graceful **decommission**, post-move **space reclamation**, and **versioned +
+persisted membership** (epoch'd, survives restart) are all built — see
+[docs/RESHARDING.md](docs/RESHARDING.md)), **global (value-sharded) secondary
 indexes** —
 today's indexes are local per node, so a distributed indexed read still scatters
 to every member (their local indexes return only candidate keys) rather than

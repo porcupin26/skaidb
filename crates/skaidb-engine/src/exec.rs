@@ -849,6 +849,12 @@ impl Database {
         self.catalog.tables.keys().cloned().collect()
     }
 
+    /// The directory backing this database — the cluster layer persists its
+    /// membership/topology alongside the data here.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// `CREATE` statements that reconstruct this node's schema (tables, then
     /// secondary indexes, then vector indexes) — sent to a joining node so it can
     /// receive migrated rows. Identifiers are assumed simple (no quoting).

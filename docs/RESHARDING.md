@@ -6,9 +6,10 @@ so membership can change while the cluster serves traffic: a node can **join** o
 **leave** online and the keyspace rebalances without a restart or a full reload.
 
 > Status: single-node **join** (`Node::add_member`), graceful **decommission**
-> (`Node::remove_member`), and post-move **space reclamation** (`Node::reclaim`)
-> are implemented and tested. Active **anti-entropy** (read-repair, hinted
-> handoff) is deferred — see Limitations.
+> (`Node::remove_member`), post-move **space reclamation** (`Node::reclaim`), and
+> **versioned + persisted membership** (epoch'd, survives restart) are implemented
+> and tested. Active **anti-entropy** (read-repair, hinted handoff) is deferred —
+> see Limitations.
 
 ## Why a single join moves so little
 
@@ -17,6 +18,18 @@ change owner are the ones whose hash now lands on the joiner's vnodes. Every
 other key keeps its current placement. So a join moves roughly `1/(N+1)` of the
 keyspace **onto** the new node and disturbs nothing else — no global reshuffle.
 (Contrast hash-modulo-N sharding, where bumping `N` remaps almost every key.)
+
+## Versioned, persisted membership
+
+The ring carries a monotonically increasing **epoch**. Every `SetMembership`
+broadcast carries the new epoch, and a node applies it **only if it is newer**
+than the one it holds — so a stale or out-of-order broadcast can't move a node's
+ring backward, and two concurrent topology changes can't both win (the higher
+epoch supersedes; a losing orchestrator must retry at the next epoch). The
+membership + epoch are **persisted** to a small `topology` file in the data
+directory, so a node that restarts rejoins with the **live** ring (the one in
+effect when it went down) instead of its original bootstrap config. See
+`Node::membership_epoch` / `member_ids`.
 
 ## How a join works
 
@@ -119,11 +132,15 @@ node.reclaim_cluster()?;  // …and tells every peer to do the same
   (harmless) stale copies. It is also currently a full-table scan with a
   point-read ack-gate per key; fine after a single reshard, heavier on a very
   large dataset.
-- **No catch-up log.** `SetMembership`/`Rebalance`/`Drain` are best-effort
-  broadcasts. A member that is unreachable during the change keeps the old ring
-  until it is re-broadcast to; there is no schema/topology log it replays on
-  reconnect yet. Bring such a node back by re-running `add_member` (idempotent)
-  once it is up.
+- **No catch-up log / no consensus.** `SetMembership`/`Rebalance`/`Drain` are
+  best-effort broadcasts. The epoch stops a node from regressing to an older
+  ring, and persistence means a restart reloads the live ring — but a member
+  that was unreachable for the *whole* change still lags until it is re-broadcast
+  to, and there is no anti-entropy/gossip log it pulls on reconnect yet.
+  Concurrent topology changes converge to the highest epoch, but the losing
+  change is dropped (a single membership coordinator or Raft-for-the-ring would
+  make this linearizable). Bring a lagging node up to date by re-running
+  `add_member`/`remove_member` (idempotent) once it is reachable.
 - **Single sender per key.** Only the key's primary under the pre-join ring
   pushes it during a join, so `rf > 1` no longer re-sends each key from every
   replica. The trade-off: if that one sender is unreachable mid-join the key
@@ -146,3 +163,9 @@ node.reclaim_cluster()?;  // …and tells every peer to do the same
   no row is lost, and a second pass is a no-op (idempotent). The storage-level
   `retain_physically_drops_keys_without_resurrection` checks the purge leaves no
   tombstone and survives reopen.
+- `membership_persists_across_restart_and_rejects_stale_epoch` joins a node, then
+  restarts a peer from its data dir with the *stale* bootstrap config and asserts
+  it reloads the live ring at the right epoch, and that a stale (lower-epoch)
+  `SetMembership` is ignored.
+- `rf2_join_migrates_via_single_sender` (rf=2) joins a third node and verifies
+  every row is readable, exercising migration under replication.
