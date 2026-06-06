@@ -44,7 +44,8 @@ Prebuilt binaries and packages for Linux, macOS, and Windows are attached to
 every [GitHub Release](https://github.com/porcupin26/skaidb/releases) — `.deb`
 and `.rpm` (x86_64 + aarch64), `.dmg` (Intel + Apple Silicon), a Windows `.zip`/
 `.exe`, and `.tar.gz` tarballs (incl. a static musl build), with `SHA256SUMS`.
-Each bundle ships both the `skaidb` server and the `skaidb-cli` shell.
+Each bundle ships the `skaidb` server, the `skaidb-cli` shell, and the
+`skaidbctl` cluster admin client.
 
 **Full, OS-by-OS instructions (packages, tarballs, source, binary-only,
 verification, upgrade/uninstall) are in [docs/INSTALL.md](docs/INSTALL.md).**
@@ -96,10 +97,20 @@ skaidb --data-dir /var/lib/skaidb --bind-addr 10.0.0.1 \
   --seeds 10.0.0.1:7100,10.0.0.2:7100,10.0.0.3:7100
 ```
 
-Every node serves reads and writes; data is replicated and quorum-tuned. Adding
-or removing nodes at runtime, replication factor, consistency, ports, and
-internode auth are covered in **[docs/CLUSTERING.md](docs/CLUSTERING.md)**
-(mechanics in [docs/RESHARDING.md](docs/RESHARDING.md)).
+Every node serves reads and writes; data is replicated and quorum-tuned. Inspect
+and reshape a live cluster with **`skaidbctl`** (the admin client, shipped
+alongside `skaidb`/`skaidb-cli`):
+
+```sh
+skaidbctl --addr 10.0.0.1:7080 status                 # ring, epoch, members, RF
+skaidbctl --addr 10.0.0.1:7080 add-node 10.0.0.4:7100 # join + migrate its share online
+skaidbctl --addr 10.0.0.1:7080 remove-node 10.0.0.3:7100   # drain, then decommission
+```
+
+It drives an authenticated `POST /admin/*` control plane on the node's REST port.
+Replication factor, consistency, ports, internode auth, and the full admin
+surface are in **[docs/CLUSTERING.md](docs/CLUSTERING.md)** (mechanics in
+[docs/RESHARDING.md](docs/RESHARDING.md)).
 
 ## SQL surface (phase 1)
 
@@ -116,7 +127,7 @@ Full grammar reference: **[docs/QUERY_SYNTAX.md](docs/QUERY_SYNTAX.md)**.
 
 ## Status & deferred work
 
-Implemented end-to-end and tested (198 tests):
+Implemented end-to-end and tested (202 tests):
 
 - soft-schema document model, SQL subset, 3-valued logic
 - **SQL surface**: projection over nested paths, `WHERE`, `GROUP BY`/`HAVING`,
@@ -161,7 +172,9 @@ Implemented end-to-end and tested (198 tests):
   (HLC-preserving, tombstones included, both ways). Consistent hashing means a
   single membership change only moves ~`1/N` of the keyspace; placements are
   otherwise undisturbed. A `reclaim` pass then physically frees the space the
-  former owner held (ack-gated, no tombstone). See
+  former owner held (ack-gated, no tombstone). All driven by **`skaidbctl`** over
+  an authenticated `POST /admin/*` **control plane** (RBAC-gated, membership
+  changes serialized). See [docs/CLUSTERING.md](docs/CLUSTERING.md) /
   [docs/RESHARDING.md](docs/RESHARDING.md)
 - **auth**: SCRAM-SHA-256 handshake (mutual auth) on the binary endpoint and
   HTTP Basic on REST, + per-statement **RBAC**

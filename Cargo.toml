@@ -12,6 +12,7 @@ members = [
     "crates/skaidb-server",
     "crates/skaidb-driver",
     "crates/skaidb-cli",
+    "crates/skaidb-ctl",
 ]
 
 [workspace.package]

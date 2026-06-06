@@ -47,6 +47,9 @@ pub struct Context {
     pub authn: AuthState,
     /// Role used for the REST gateway and anonymous connections.
     pub superuser_role: String,
+    /// Serializes cluster membership changes (add/remove node) so only one runs
+    /// at a time — concurrent ring changes aren't linearizable yet.
+    pub admin_lock: Mutex<()>,
 }
 
 /// A reference-counted [`Context`] shared by all handlers.

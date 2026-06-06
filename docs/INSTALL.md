@@ -2,11 +2,13 @@
 
 Every push to `main` publishes a versioned [GitHub Release](https://github.com/porcupin26/skaidb/releases)
 with prebuilt binaries and packages for Linux, macOS, and Windows, plus a
-`SHA256SUMS` file. You can also build from source. Every bundle ships **two
+`SHA256SUMS` file. You can also build from source. Every bundle ships **three
 binaries**:
 
 - `skaidb` — the database **server** (binary + REST endpoints, clustering).
 - `skaidb-cli` — an embedded **SQL shell** that opens a data directory directly.
+- `skaidbctl` — the **cluster admin** client (status, add/remove node, repair,
+  reclaim) — see [CLUSTERING.md](CLUSTERING.md).
 
 > Replace `X.Y.Z` below with the release you want (e.g. `0.3.0`), or use the
 > latest-version snippet in [Downloading the right file](#downloading-the-right-file).
@@ -95,7 +97,7 @@ GPG-signed; verify over HTTPS from the official repo.)
 
 ## Linux
 
-The `.deb`/`.rpm` install `skaidb` and `skaidb-cli` to `/usr/bin` and drop the
+The `.deb`/`.rpm` install `skaidb`, `skaidb-cli`, and `skaidbctl` to `/usr/bin` and drop the
 license + README under `/usr/share/doc/skaidb/`.
 
 ### Debian / Ubuntu (.deb)
@@ -134,10 +136,10 @@ sudo zypper install ./skaidb-X.Y.Z-1.x86_64.rpm
 For distros where you'd rather not use a package, or to install without root:
 
 ```sh
-tar xzf skaidb-X.Y.Z-x86_64-unknown-linux-gnu.tar.gz   # → skaidb, skaidb-cli, LICENSE, README.md
-sudo install -m 0755 skaidb skaidb-cli /usr/local/bin/
+tar xzf skaidb-X.Y.Z-x86_64-unknown-linux-gnu.tar.gz   # → skaidb, skaidb-cli, skaidbctl, LICENSE, README.md
+sudo install -m 0755 skaidb skaidb-cli skaidbctl /usr/local/bin/
 # …or, no root, into your user path:
-mkdir -p ~/.local/bin && install -m 0755 skaidb skaidb-cli ~/.local/bin/
+mkdir -p ~/.local/bin && install -m 0755 skaidb skaidb-cli skaidbctl ~/.local/bin/
 ```
 
 Use the `aarch64-unknown-linux-gnu` tarball on ARM64. The glibc build needs a
@@ -150,7 +152,7 @@ glibc build won't:
 
 ```sh
 tar xzf skaidb-X.Y.Z-x86_64-unknown-linux-musl.tar.gz
-sudo install -m 0755 skaidb skaidb-cli /usr/local/bin/
+sudo install -m 0755 skaidb skaidb-cli skaidbctl /usr/local/bin/
 ```
 
 ## macOS
@@ -163,13 +165,14 @@ right-click the binary in Finder and choose **Open**.
 ### Disk image (.dmg)
 
 ```sh
-# Mount, copy both binaries to a directory on your PATH, unmount.
+# Mount, copy the binaries to a directory on your PATH, unmount.
 hdiutil attach skaidb-X.Y.Z-aarch64-apple-darwin.dmg
-sudo cp "/Volumes/skaidb X.Y.Z/skaidb" "/Volumes/skaidb X.Y.Z/skaidb-cli" /usr/local/bin/
-hdiutil detach "/Volumes/skaidb X.Y.Z"
+vol="/Volumes/skaidb X.Y.Z"
+sudo cp "$vol/skaidb" "$vol/skaidb-cli" "$vol/skaidbctl" /usr/local/bin/
+hdiutil detach "$vol"
 
 # Clear the quarantine flag so Gatekeeper allows them to run.
-sudo xattr -d com.apple.quarantine /usr/local/bin/skaidb /usr/local/bin/skaidb-cli
+sudo xattr -d com.apple.quarantine /usr/local/bin/skaidb /usr/local/bin/skaidb-cli /usr/local/bin/skaidbctl
 ```
 
 (Use the `x86_64-apple-darwin` dmg on Intel Macs.) There is no Homebrew tap yet.
@@ -178,8 +181,8 @@ sudo xattr -d com.apple.quarantine /usr/local/bin/skaidb /usr/local/bin/skaidb-c
 
 ```sh
 tar xzf skaidb-X.Y.Z-aarch64-apple-darwin.tar.gz
-sudo install -m 0755 skaidb skaidb-cli /usr/local/bin/
-sudo xattr -d com.apple.quarantine /usr/local/bin/skaidb /usr/local/bin/skaidb-cli
+sudo install -m 0755 skaidb skaidb-cli skaidbctl /usr/local/bin/
+sudo xattr -d com.apple.quarantine /usr/local/bin/skaidb /usr/local/bin/skaidb-cli /usr/local/bin/skaidbctl
 ```
 
 ## Windows
@@ -190,7 +193,7 @@ The binaries are not code-signed, so SmartScreen may warn on first run
 ### Zip archive
 
 1. Download `skaidb-X.Y.Z-x86_64-pc-windows-msvc.zip` and extract it (it contains
-   `skaidb.exe`, `skaidb-cli.exe`, `LICENSE`, `README.md`).
+   `skaidb.exe`, `skaidb-cli.exe`, `skaidbctl.exe`, `LICENSE`, `README.md`).
 2. Move the folder somewhere stable (e.g. `C:\Program Files\skaidb`) and add it
    to your `PATH`:
 
@@ -225,7 +228,7 @@ cargo build --release --locked
 # Binaries land here:
 #   target/release/skaidb
 #   target/release/skaidb-cli
-sudo install -m 0755 target/release/skaidb target/release/skaidb-cli /usr/local/bin/
+sudo install -m 0755 target/release/skaidb target/release/skaidb-cli target/release/skaidbctl /usr/local/bin/
 ```
 
 Or install straight into Cargo's bin directory (`~/.cargo/bin`, usually already
@@ -234,6 +237,7 @@ on your `PATH`):
 ```sh
 cargo install --path crates/skaidb-server   # installs `skaidb`
 cargo install --path crates/skaidb-cli      # installs `skaidb-cli`
+cargo install --path crates/skaidb-ctl      # installs `skaidbctl`
 ```
 
 Run the test suite or lints if you're hacking on it:
@@ -273,6 +277,7 @@ and have no runtime dependencies beyond the OS (the musl build has none at all).
 ```sh
 skaidb --version
 skaidb-cli --version
+skaidbctl --version
 ```
 
 Start the server (creates the data dir if missing):
@@ -322,9 +327,9 @@ sudo apt remove skaidb
 # Fedora/RHEL/openSUSE
 sudo dnf remove skaidb        # or: sudo rpm -e skaidb / sudo zypper remove skaidb
 # Tarball / source install
-sudo rm /usr/local/bin/skaidb /usr/local/bin/skaidb-cli
+sudo rm /usr/local/bin/skaidb /usr/local/bin/skaidb-cli /usr/local/bin/skaidbctl
 # cargo install
-cargo uninstall skaidb-server skaidb-cli
+cargo uninstall skaidb-server skaidb-cli skaidb-ctl
 ```
 
 Your data directory (e.g. `./data`) is never touched by uninstalling — remove it

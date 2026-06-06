@@ -5,6 +5,7 @@
 //! eventual WAN default. Both endpoints execute SQL against one [`Database`]
 //! guarded by a mutex (thread-per-connection model).
 
+pub mod admin;
 pub mod audit;
 pub mod authn;
 pub mod binary;
@@ -99,6 +100,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         roles,
         authn,
         superuser_role: config.auth.superuser.clone(),
+        admin_lock: Mutex::new(()),
     });
 
     println!(
@@ -178,6 +180,7 @@ mod tests {
             roles,
             authn: AuthState::disabled(),
             superuser_role: "superuser".into(),
+            admin_lock: Mutex::new(()),
         })
     }
 
@@ -273,6 +276,7 @@ mod tests {
             roles,
             authn,
             superuser_role: "admin".into(),
+            admin_lock: Mutex::new(()),
         })
     }
 
@@ -309,6 +313,7 @@ mod tests {
             roles,
             authn: AuthState::disabled(),
             superuser_role: "superuser".into(),
+            admin_lock: Mutex::new(()),
         });
 
         // Superuser sets up the table.
@@ -374,6 +379,100 @@ mod tests {
             .map(|(_, b)| b.to_string())
             .unwrap_or_default();
         (status, body)
+    }
+
+    /// POST `body` to an arbitrary `path`; returns `(status, body)`.
+    fn http_post_path(addr: std::net::SocketAddr, path: &str, body: &str) -> (u16, String) {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        let req = format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        let status = resp
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let body = resp
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_string())
+            .unwrap_or_default();
+        (status, body)
+    }
+
+    /// A single-node cluster `Context`: superuser has `Admin`, `reader` does not.
+    fn cluster_ctx() -> Shared {
+        let mut roles = RoleStore::new();
+        roles.create_superuser("superuser");
+        roles.create_role("reader").unwrap();
+        roles
+            .grant("reader", Privilege::Select, Object::Global)
+            .unwrap();
+        let id = "127.0.0.1:0"; // not served — status needs no network
+        let cfg = NodeConfig {
+            id: NodeId::new(id),
+            internode_addr: id.to_string(),
+            members: vec![(NodeId::new(id), id.to_string())],
+            replication_factor: 1,
+            vnodes_per_node: 64,
+            read_consistency: ClusterConsistency::Quorum,
+            write_consistency: ClusterConsistency::Quorum,
+        };
+        let node = Node::new(Database::open(temp_dir()).unwrap(), cfg);
+        Arc::new(Context {
+            backend: Backend::Cluster(node),
+            metrics: Metrics::new(),
+            audit: quiet_audit(),
+            roles,
+            authn: AuthState::disabled(),
+            superuser_role: "superuser".into(),
+            admin_lock: Mutex::new(()),
+        })
+    }
+
+    #[test]
+    fn admin_status_and_rbac() {
+        use crate::admin::{self, AdminCmd};
+        let ctx = cluster_ctx();
+
+        // Admin sees topology.
+        let (status, body) = admin::handle(&ctx, "superuser", AdminCmd::Status);
+        assert_eq!(status, 200);
+        let s = body.to_string();
+        assert!(s.contains("\"clustered\":true"), "got: {s}");
+        assert!(s.contains("\"replication_factor\":1"), "got: {s}");
+        assert!(s.contains("\"epoch\":0"), "got: {s}");
+
+        // A non-admin role is denied even read-only status.
+        let (status, _) = admin::handle(&ctx, "reader", AdminCmd::Status);
+        assert_eq!(status, 403);
+
+        // A standalone (non-cluster) node reports clustered:false and rejects ops.
+        let local = temp_ctx();
+        assert_eq!(admin::handle(&local, "superuser", AdminCmd::Status).0, 200);
+        assert!(admin::handle(&local, "superuser", AdminCmd::Status)
+            .1
+            .to_string()
+            .contains("\"clustered\":false"));
+        assert_eq!(
+            admin::handle(&local, "superuser", AdminCmd::AddNode("x:1".into())).0,
+            400
+        );
+    }
+
+    #[test]
+    fn admin_status_over_rest() {
+        let ctx = cluster_ctx();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
+        let (status, body) = http_post_path(addr, "/admin/status", "");
+        assert_eq!(status, 200);
+        assert!(body.contains("\"clustered\":true"), "got: {body}");
+        // Unknown admin route → 404.
+        assert_eq!(http_post_path(addr, "/admin/bogus", "").0, 404);
     }
 
     fn http_get(addr: std::net::SocketAddr, path: &str) -> String {

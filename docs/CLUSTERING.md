@@ -186,34 +186,40 @@ The full mechanics — pending-ranges dual-write during a join, single-sender
 migration, epoch'd membership, throttling/resume — are in
 [RESHARDING.md](RESHARDING.md).
 
-These operations are exposed today as **`Node` library APIs**, not yet as a
-`skaidb` server subcommand or admin endpoint:
+Drive them with **`skaidbctl`**, the cluster admin client (shipped alongside
+`skaidb`/`skaidb-cli`). It talks to any node's REST endpoint over an
+authenticated `POST /admin/*` control plane (RBAC: the role needs `Admin` on the
+whole cluster; membership changes are serialized server-side, one at a time):
 
-```rust
-// Driven from an embedded/admin context holding the cluster `Node`:
-node.add_member("10.0.0.4:7100", "10.0.0.4:7100")?; // join: migrates its share in
-node.remove_member("10.0.0.3:7100")?;               // decommission: drains, then leaves
-node.reclaim_cluster()?;                             // free space former owners no longer own
-node.repair_cluster()?;                              // anti-entropy: converge replicas
+```sh
+# Point it at any node's REST port (default 127.0.0.1:7080); add --user/--password
+# if the server requires auth.
+skaidbctl --addr 10.0.0.1:7080 status            # show the ring, epoch, members, RF
+
+skaidbctl --addr 10.0.0.1:7080 add-node 10.0.0.4:7100    # join: migrates its share in
+skaidbctl --addr 10.0.0.1:7080 remove-node 10.0.0.3:7100 # decommission: drains, then leaves
+skaidbctl --addr 10.0.0.1:7080 repair            # anti-entropy: converge all replicas
+skaidbctl --addr 10.0.0.1:7080 reclaim           # free space former owners no longer own
 ```
 
-`add_member` broadcasts the new ring, bootstraps the joiner's schema, and streams
-it the keys it now owns (dual-writing during the move so concurrent writes stay
-correct); `remove_member` drains the leaving node's keys to their new owners
-before dropping it from the ring.
+`status` prints JSON like:
 
-**Server-managed alternative (maintenance window), no runtime API:**
+```json
+{ "clustered": true, "node_id": "10.0.0.1:7100", "epoch": 3,
+  "replication_factor": 3, "members": ["10.0.0.1:7100", "10.0.0.2:7100", "10.0.0.4:7100"] }
+```
 
-1. Add the new node's `host:internode_port` to the `seeds` list on **every** node
-   (and on the new node).
-2. Start the new node; restart the existing nodes so they adopt the larger ring.
-3. Run an anti-entropy pass so the new node's replicas fill in.
+Under the hood these call the coordinator: `add-node` broadcasts the new ring,
+bootstraps the joiner's schema, and streams it the keys it now owns (dual-writing
+during the move so concurrent writes stay correct); `remove-node` drains the
+leaving node's keys to their new owners before dropping it from the ring. The
+same operations are also available as raw HTTP (`POST /admin/status`,
+`/admin/add-node` with `{"addr":"…"}`, `/admin/remove-node` with `{"id":"…"}`,
+`/admin/repair`, `/admin/reclaim`) and as `skaidb_cluster::Node` library methods.
 
-This works best with `replication_factor > 1` (anti-entropy can populate the new
-replica from a peer). With `RF = 1` a moved key's *only* owner becomes the new
-(empty) node, so prefer the online `add_member` path, which actually migrates the
-data. Note: a node that has already gone through an online membership change
-persists its ring and uses that over the static `seeds` list on restart.
+A long migration keeps the `skaidbctl` request open until it finishes; tune the
+push rate per node with the migration throttle (see
+[RESHARDING.md](RESHARDING.md)). Run one membership change at a time.
 
 ## Anti-entropy: repair & space reclamation
 

@@ -191,6 +191,16 @@ impl Node {
         self.current_epoch()
     }
 
+    /// This node's id (its `host:internode_port` on the ring).
+    pub fn id(&self) -> String {
+        self.id.0.clone()
+    }
+
+    /// The configured replication factor.
+    pub fn replication_factor(&self) -> usize {
+        self.cfg.replication_factor
+    }
+
     /// The current membership as node ids (for diagnostics).
     pub fn member_ids(&self) -> Vec<String> {
         self.topo

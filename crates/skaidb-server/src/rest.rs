@@ -46,6 +46,23 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) -> io::Result<()> {
         return write_text(&mut stream, 200, &ctx.metrics.render());
     }
 
+    // Cluster control plane: POST /admin/* (RBAC-gated inside admin::handle).
+    if req.method == "POST" && req.path.starts_with("/admin/") {
+        let Some(cmd) = crate::admin::parse(&req.path, &req.body) else {
+            return write_response(&mut stream, 404, &json!({"error": "unknown admin route"}));
+        };
+        let role = if ctx.authn.required {
+            match basic_auth_role(&ctx, req.authorization.as_deref()) {
+                Some(role) => role,
+                None => return write_unauthorized(&mut stream),
+            }
+        } else {
+            ctx.superuser_role.clone()
+        };
+        let (status, payload) = crate::admin::handle(&ctx, &role, cmd);
+        return write_response(&mut stream, status, &payload);
+    }
+
     if req.method != "POST" || !req.path.starts_with("/query") {
         return write_response(
             &mut stream,
@@ -207,6 +224,7 @@ fn write_response(stream: &mut TcpStream, status: u16, body: &Json) -> io::Resul
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         _ => "Error",
     };

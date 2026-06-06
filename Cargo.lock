@@ -304,6 +304,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "skaidb-ctl"
+version = "0.3.0"
+dependencies = [
+ "clap",
+ "serde_json",
+]
+
+[[package]]
 name = "skaidb-driver"
 version = "0.3.0"
 dependencies = [
