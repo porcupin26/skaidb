@@ -299,8 +299,9 @@ skaidb-cli --dir ./data -e "SELECT COUNT(*) FROM users"
 skaidb-cli --dir ./data            # interactive REPL
 ```
 
-See the [README](../README.md) for clustering flags and
-[QUERY_SYNTAX.md](QUERY_SYNTAX.md) for the SQL surface.
+To run multiple nodes, see **[CLUSTERING.md](CLUSTERING.md)** (seeds, ports,
+replication factor, consistency, adding/removing nodes). For the SQL surface, see
+[QUERY_SYNTAX.md](QUERY_SYNTAX.md).
 
 ## Upgrading
 

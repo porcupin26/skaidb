@@ -83,6 +83,24 @@ Or use the embedded shell:
 skaidb-cli --dir ./data -e "SELECT COUNT(*) FROM users"
 ```
 
+## Run a cluster
+
+Give every node the same `--seeds` list (each entry a member's
+`host:internode_port`, including itself) and set `--bind-addr`/`--internode-port`
+to match its own entry:
+
+```sh
+# one of three nodes — only --bind-addr differs across the cluster
+skaidb --data-dir /var/lib/skaidb --bind-addr 10.0.0.1 \
+  --internode-port 7100 --replication-factor 3 \
+  --seeds 10.0.0.1:7100,10.0.0.2:7100,10.0.0.3:7100
+```
+
+Every node serves reads and writes; data is replicated and quorum-tuned. Adding
+or removing nodes at runtime, replication factor, consistency, ports, and
+internode auth are covered in **[docs/CLUSTERING.md](docs/CLUSTERING.md)**
+(mechanics in [docs/RESHARDING.md](docs/RESHARDING.md)).
+
 ## SQL surface (phase 1)
 
 `CREATE/DROP TABLE` (declares only the primary key — no column list),
