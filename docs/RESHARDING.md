@@ -1,14 +1,14 @@
-# Online resharding — adding a node at runtime
+# Online resharding — adding and removing nodes at runtime
 
 skaidb places keys on a **consistent-hash ring** (vnodes; see SPEC §4 and
 [ring.rs](../crates/skaidb-cluster/src/ring.rs)). The ring is held behind a lock
-so membership can change while the cluster serves traffic: a new node can **join
-online** and receive its share of the keyspace without a restart or a full
-reload.
+so membership can change while the cluster serves traffic: a node can **join** or
+**leave** online and the keyspace rebalances without a restart or a full reload.
 
-> Status: single-node **join** is implemented and tested (`Node::add_member`).
-> Node **removal/decommission** and active **anti-entropy** (read-repair, hinted
-> handoff, space reclamation on the former owner) are deferred — see Limitations.
+> Status: single-node **join** (`Node::add_member`) and graceful **decommission**
+> (`Node::remove_member`) are implemented and tested. Active **anti-entropy**
+> (read-repair, hinted handoff, space reclamation on the former owner) is
+> deferred — see Limitations.
 
 ## Why a single join moves so little
 
@@ -49,6 +49,29 @@ last-writer-wins.
 node.add_member("c", "10.0.0.3:7100")?;   // c joins; its share is migrated to it
 ```
 
+## How a graceful leave works
+
+`Node::remove_member(id)` is the inverse of a join and can be driven from any
+member — including the leaving node itself (self-decommission):
+
+1. **Drain.** The orchestrator sends the leaving node a `Drain` carrying the
+   *post-removal* membership. The leaving node walks every local row and, for
+   each key, computes its owners under the smaller ring; for any owner that is
+   not already a replica (i.e. a node that must pick up this key now), it pushes
+   the row — HLC and tombstone preserved. So every key keeps its full replica set
+   before the node disappears.
+2. **Shrink the ring.** The orchestrator broadcasts `SetMembership` with the node
+   removed, so the survivors stop routing to it.
+
+After this the leaving node still has its (now unowned) data on disk but serves
+no key, so it is safe to shut down. Because consistent hashing only reassigns the
+departing node's keys, a single leave moves about `1/N` of the keyspace and
+touches nothing else.
+
+```rust
+node.remove_member("c")?;   // c drains its keys to their new owners, then leaves
+```
+
 ## Correctness model
 
 - **LWW is preserved.** Migrated rows carry their original HLC, so they neither
@@ -73,20 +96,23 @@ node.add_member("c", "10.0.0.3:7100")?;   // c joins; its share is migrated to i
   copy elsewhere). That belongs with active anti-entropy, which isn't built yet —
   so a long-lived cluster that reshards repeatedly will accumulate stale copies
   until compaction + a future GC pass removes them.
-- **No catch-up log.** `SetMembership`/`Rebalance` are best-effort broadcasts.
-  A member that is unreachable during the join keeps the old ring until it is
-  re-broadcast to; there is no schema/topology log it replays on reconnect yet.
-  Bring such a node back by re-running `add_member` (idempotent) once it is up.
-- **Join only.** Graceful **decommission** (drain a node's keys to its successors
-  before removing it) reuses the same machinery but is not wired up yet.
+- **No catch-up log.** `SetMembership`/`Rebalance`/`Drain` are best-effort
+  broadcasts. A member that is unreachable during the change keeps the old ring
+  until it is re-broadcast to; there is no schema/topology log it replays on
+  reconnect yet. Bring such a node back by re-running `add_member` (idempotent)
+  once it is up.
 - **rf > 1.** Every replica that holds a migrating key independently pushes it,
   which is correct (idempotent) but does redundant work; a future version can
   elect one sender per key.
 
 ## Tested
 
-`online_resharding_migrates_keys_to_a_joining_node` (rf=1, CL=ONE) fills a table
-on a two-node cluster, joins a third node online, and asserts every row is still
-readable from every coordinator (so the rows the new node now owns were migrated
-to it), the secondary index bootstrapped onto the joiner serves a distributed
-lookup, and a write after the join routes under the new ring.
+- `online_resharding_migrates_keys_to_a_joining_node` (rf=1, CL=ONE) fills a
+  table on a two-node cluster, joins a third node online, and asserts every row
+  is still readable from every coordinator (so the rows the new node now owns
+  were migrated to it), the secondary index bootstrapped onto the joiner serves a
+  distributed lookup, and a write after the join routes under the new ring.
+- `graceful_decommission_drains_keys_before_leaving` (rf=1, CL=ONE) removes a
+  node from a three-node cluster and asserts every key it owned was drained to
+  its new owner (all rows stay readable from the survivors) and that writes after
+  the leave route under the smaller ring.

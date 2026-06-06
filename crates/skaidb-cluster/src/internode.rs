@@ -63,6 +63,13 @@ pub enum Request {
     Rebalance {
         joiner: String,
     },
+    /// Drain this (leaving) node: push every locally-held row to its new owners
+    /// under the post-removal ring described by `members` (which excludes the
+    /// leaving node), so no key loses a replica when the node departs. Sent to a
+    /// node being gracefully decommissioned, before it is removed from the ring.
+    Drain {
+        members: Vec<(String, String)>,
+    },
     Ping,
 }
 
@@ -109,6 +116,7 @@ const REQ_INDEX: u8 = 7;
 const REQ_VECTOR: u8 = 8;
 const REQ_MEMBERS: u8 = 9;
 const REQ_REBAL: u8 = 10;
+const REQ_DRAIN: u8 = 11;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
@@ -180,6 +188,14 @@ impl Request {
                 o.push(REQ_REBAL);
                 put_str(&mut o, joiner);
             }
+            Request::Drain { members } => {
+                o.push(REQ_DRAIN);
+                o.extend_from_slice(&(members.len() as u32).to_le_bytes());
+                for (id, addr) in members {
+                    put_str(&mut o, id);
+                    put_str(&mut o, addr);
+                }
+            }
             Request::Ping => o.push(REQ_PING),
         }
         o
@@ -233,6 +249,16 @@ impl Request {
             REQ_REBAL => Request::Rebalance {
                 joiner: c.string()?,
             },
+            REQ_DRAIN => {
+                let n = c.u32()? as usize;
+                let mut members = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let id = c.string()?;
+                    let addr = c.string()?;
+                    members.push((id, addr));
+                }
+                Request::Drain { members }
+            }
             REQ_PING => Request::Ping,
             _ => return Err(WireError::Malformed("unknown request op")),
         })
@@ -566,6 +592,12 @@ mod tests {
             },
             Request::Rebalance {
                 joiner: "c".into(),
+            },
+            Request::Drain {
+                members: vec![
+                    ("a".into(), "127.0.0.1:1".into()),
+                    ("b".into(), "127.0.0.1:2".into()),
+                ],
             },
             Request::Ping,
         ] {

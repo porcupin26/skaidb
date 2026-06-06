@@ -205,6 +205,60 @@ impl Node {
         Ok(())
     }
 
+    /// Drain this (leaving) node: push every locally-held row to the owners it
+    /// will have under `new_members` (the post-removal ring, excluding this
+    /// node), so every key keeps its full replica set after the node departs.
+    /// Only rows destined for a *new* owner — one that isn't already a replica
+    /// under the current ring — are sent; existing replicas already hold them.
+    /// HLC/tombstone state is preserved. Idempotent and safe to retry.
+    fn drain_to(&self, new_members: &[(NodeId, String)]) -> EngineResult<()> {
+        let mut new_ring = Ring::new(self.cfg.vnodes_per_node);
+        let mut addr_of: HashMap<NodeId, String> = HashMap::new();
+        for (id, addr) in new_members {
+            new_ring.add_node(id.clone());
+            addr_of.insert(id.clone(), addr.clone());
+        }
+        let rf = self.cfg.replication_factor;
+
+        let tables = self
+            .local
+            .read()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .table_names();
+        for table in tables {
+            let rows = self
+                .local
+                .read()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+                .local_scan_versioned_with_tombstones(&table)?;
+            for (key, value, hlc, is_put) in rows {
+                let old = self.replicas_for(&key); // current ring (includes self)
+                let op = if is_put {
+                    WriteOp::Put(value)
+                } else {
+                    WriteOp::Delete
+                };
+                for replica in new_ring.replicas_for(&key, rf) {
+                    if old.contains(&replica) {
+                        continue; // that node already holds this row
+                    }
+                    let Some(addr) = addr_of.get(&replica) else {
+                        continue;
+                    };
+                    match self.send_write(addr, &table, &key, &op, hlc) {
+                        Ok(true) => {}
+                        _ => {
+                            return Err(EngineError::Cluster(format!(
+                                "drain: write to {replica} not acked"
+                            )))
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Add a node to the cluster at runtime and migrate it its share of the
     /// keyspace (online resharding). Orchestrated from any existing member:
     ///
@@ -266,6 +320,74 @@ impl Node {
                 Ok(Response::Ack) | Ok(Response::Err(_)) => {}
                 _ => {} // unreachable member: its keys migrate when it rejoins
             }
+        }
+        Ok(())
+    }
+
+    /// Gracefully remove a node from the cluster at runtime (the inverse of
+    /// [`Node::add_member`]). Orchestrated from any member — including the
+    /// leaving node itself (self-decommission):
+    ///
+    /// 1. ask the leaving node to [`Request::Drain`] — push each of its keys to
+    ///    the owners it will have once it is gone (the post-removal ring), so no
+    ///    key loses a replica;
+    /// 2. broadcast [`Request::SetMembership`] with the node removed so the
+    ///    survivors recompute the smaller ring and stop routing to it.
+    ///
+    /// The leaving node keeps its now-unowned data on disk (reclaiming it is the
+    /// separate space-reclamation step) but no longer serves any key, so it is
+    /// safe to shut down. Draining requires the leaving node and the affected new
+    /// owners to be reachable, and assumes a quiescent cluster — as `add_member`
+    /// does. See [docs/RESHARDING.md].
+    pub fn remove_member(&self, id: &str) -> EngineResult<()> {
+        let leaving = NodeId::new(id);
+        let members = self.members_snapshot();
+        if !members.iter().any(|(m, _)| *m == leaving) {
+            return Ok(()); // not a member
+        }
+        if members.len() <= 1 {
+            return Err(EngineError::Cluster(
+                "cannot remove the last node in the cluster".into(),
+            ));
+        }
+        let new_members: Vec<(NodeId, String)> =
+            members.into_iter().filter(|(m, _)| *m != leaving).collect();
+        let wire: Vec<(String, String)> = new_members
+            .iter()
+            .map(|(id, a)| (id.0.clone(), a.clone()))
+            .collect();
+
+        // 1) Drain the leaving node's keys to their new owners.
+        if leaving == self.id {
+            self.drain_to(&new_members)?;
+        } else {
+            let addr = self.peer_addr(&leaving).ok_or_else(|| {
+                EngineError::Cluster(format!("leaving node {leaving} not in topology"))
+            })?;
+            match self.pool.call(&addr, &Request::Drain { members: wire.clone() }) {
+                Ok(Response::Ack) => {}
+                Ok(Response::Err(e)) => {
+                    return Err(EngineError::Cluster(format!("drain failed: {e}")))
+                }
+                _ => {
+                    return Err(EngineError::Cluster(
+                        "leaving node unreachable; cannot drain its keyspace safely".into(),
+                    ))
+                }
+            }
+        }
+
+        // 2) Survivors adopt the smaller ring; the leaving node is dropped from it.
+        if leaving != self.id {
+            self.set_membership(&new_members);
+        }
+        for (mid, maddr) in &new_members {
+            if *mid == self.id {
+                continue;
+            }
+            // Best-effort: a lagging survivor catches up when re-broadcast to
+            // (no membership catch-up log yet).
+            let _ = self.pool.call(maddr, &Request::SetMembership { members: wire.clone() });
         }
         Ok(())
     }
@@ -353,6 +475,16 @@ impl Node {
                 Ok(()) => Response::Ack,
                 Err(e) => Response::Err(e.to_string()),
             },
+            Request::Drain { members } => {
+                let members: Vec<(NodeId, String)> = members
+                    .into_iter()
+                    .map(|(id, addr)| (NodeId::new(id), addr))
+                    .collect();
+                match self.drain_to(&members) {
+                    Ok(()) => Response::Ack,
+                    Err(e) => Response::Err(e.to_string()),
+                }
+            }
         }
     }
 
@@ -1261,6 +1393,65 @@ mod tests {
         nc.execute("INSERT INTO t (id, g) VALUES (61, 1)").unwrap();
         let rs = rows(na.execute("SELECT id FROM t WHERE id = 61").unwrap());
         assert_eq!(rs.rows, vec![vec![Value::Int(61)]]);
+    }
+
+    #[test]
+    fn graceful_decommission_drains_keys_before_leaving() {
+        // rf=1, CL=ONE: remove c from a 3-node cluster and confirm every key it
+        // owned was drained to its new owner under the 2-node ring — every row
+        // stays readable, and c is no longer routed to.
+        let one = Consistency::One;
+        let rf1 = |id: &str, addr: &str, members: &[(NodeId, String)]| NodeConfig {
+            id: NodeId::new(id),
+            internode_addr: addr.to_string(),
+            members: members.to_vec(),
+            replication_factor: 1,
+            vnodes_per_node: 64,
+            read_consistency: one,
+            write_consistency: one,
+        };
+
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let abc = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let na = Node::new(Database::open(temp_dir("dca")).unwrap(), rf1("a", &a, &abc));
+        let nb = Node::new(Database::open(temp_dir("dcb")).unwrap(), rf1("b", &b, &abc));
+        let nc = Node::new(Database::open(temp_dir("dcc")).unwrap(), rf1("c", &c, &abc));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        nc.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        let n = 60;
+        for i in 1..=n {
+            na.execute(&format!("INSERT INTO t (id, v) VALUES ({i}, {})", i * 10))
+                .unwrap();
+        }
+
+        // Removing a non-member is a no-op; removing the last node is rejected.
+        na.remove_member("ghost").unwrap();
+
+        // Gracefully decommission c (orchestrated from a).
+        na.remove_member("c").unwrap();
+
+        // Every row is still readable from the survivors — the keys c owned were
+        // drained to their new owners under the {a, b} ring before c left.
+        for coord in [&na, &nb] {
+            for i in 1..=n {
+                let rs = rows(
+                    coord
+                        .execute(&format!("SELECT v FROM t WHERE id = {i}"))
+                        .unwrap(),
+                );
+                assert_eq!(rs.rows, vec![vec![Value::Int(i * 10)]], "id {i} after drain");
+            }
+            let rs = rows(coord.execute("SELECT id FROM t").unwrap());
+            assert_eq!(rs.rows.len(), n as usize, "no rows lost or duplicated");
+        }
+
+        // Writes after the decommission route under the 2-node ring.
+        nb.execute("INSERT INTO t (id, v) VALUES (61, 610)").unwrap();
+        let rs = rows(na.execute("SELECT v FROM t WHERE id = 61").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::Int(610)]]);
     }
 
     #[test]
