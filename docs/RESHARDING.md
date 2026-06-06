@@ -124,9 +124,11 @@ node.reclaim_cluster()?;  // …and tells every peer to do the same
   until it is re-broadcast to; there is no schema/topology log it replays on
   reconnect yet. Bring such a node back by re-running `add_member` (idempotent)
   once it is up.
-- **rf > 1.** Every replica that holds a migrating key independently pushes it,
-  which is correct (idempotent) but does redundant work; a future version can
-  elect one sender per key.
+- **Single sender per key.** Only the key's primary under the pre-join ring
+  pushes it during a join, so `rf > 1` no longer re-sends each key from every
+  replica. The trade-off: if that one sender is unreachable mid-join the key
+  isn't migrated until the join is retried (the old all-replicas-push behavior
+  was more redundant but more resilient).
 
 ## Tested
 

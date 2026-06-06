@@ -155,14 +155,26 @@ impl Node {
             .schema_ddl())
     }
 
-    /// Push every locally-held row whose key `joiner` now owns (under the current
-    /// ring) to that joiner, preserving each row's HLC and tombstone state. Rows
-    /// are snapshotted under a read lock per table, then sent without the lock
-    /// held. Stale copies are intentionally **left in place** on the former owner:
-    /// pushed rows keep their original HLC, so any later write wins last-writer-
-    /// wins, and reads route to the new owner via the ring — reclaiming the old
-    /// copy's space needs a local physical delete that bypasses LWW (deferred with
-    /// anti-entropy). Idempotent and safe to retry.
+    /// The hash ring as it was **before** `exclude` joined — the current
+    /// membership minus that node. Used to elect a single migration sender per
+    /// key (the key's primary under the pre-join ring).
+    fn ring_excluding(&self, exclude: &NodeId) -> Ring {
+        let mut ring = Ring::new(self.cfg.vnodes_per_node);
+        for (id, _) in self.members_snapshot() {
+            if &id != exclude {
+                ring.add_node(id);
+            }
+        }
+        ring
+    }
+
+    /// Push the rows `joiner` now owns to it, preserving each row's HLC and
+    /// tombstone state. To avoid every replica re-sending the same key, **only
+    /// the key's primary under the pre-join ring** sends it — a single,
+    /// deterministic sender per key (it is also a current holder, since it was a
+    /// replica before the join). Rows are snapshotted under a read lock per
+    /// table, then sent without the lock held. Stale copies are left in place on
+    /// the former owner until [`Node::reclaim`] purges them. Idempotent.
     fn rebalance_to(&self, joiner: &NodeId) -> EngineResult<()> {
         if joiner == &self.id {
             return Ok(());
@@ -170,6 +182,7 @@ impl Node {
         let addr = self
             .peer_addr(joiner)
             .ok_or_else(|| EngineError::Cluster(format!("joiner {joiner} not in topology")))?;
+        let old_ring = self.ring_excluding(joiner);
 
         let tables = self
             .local
@@ -185,7 +198,10 @@ impl Node {
                 .local_scan_versioned_with_tombstones(&table)?;
             for (key, value, hlc, is_put) in rows {
                 if !self.replicas_for(&key).contains(joiner) {
-                    continue;
+                    continue; // the joiner does not own this key
+                }
+                if old_ring.primary_for(&key) != Some(self.id.clone()) {
+                    continue; // not the elected sender for this key
                 }
                 let op = if is_put {
                     WriteOp::Put(value)
@@ -1481,6 +1497,54 @@ mod tests {
         nc.execute("INSERT INTO t (id, g) VALUES (61, 1)").unwrap();
         let rs = rows(na.execute("SELECT id FROM t WHERE id = 61").unwrap());
         assert_eq!(rs.rows, vec![vec![Value::Int(61)]]);
+    }
+
+    #[test]
+    fn rf2_join_migrates_via_single_sender() {
+        // rf=2: every key starts on both a and b. When c joins, each key c now
+        // owns is sent by exactly one node (the key's primary under the {a,b}
+        // ring), not both. Correctness check: every row is readable after the
+        // join from every coordinator.
+        let one = Consistency::One;
+        let rf2 = |id: &str, addr: &str, members: &[(NodeId, String)]| NodeConfig {
+            id: NodeId::new(id),
+            internode_addr: addr.to_string(),
+            members: members.to_vec(),
+            replication_factor: 2,
+            vnodes_per_node: 64,
+            read_consistency: one,
+            write_consistency: one,
+        };
+
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let ab = vec![member("a", &a), member("b", &b)];
+        let abc = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let na = Node::new(Database::open(temp_dir("r2a")).unwrap(), rf2("a", &a, &ab));
+        let nb = Node::new(Database::open(temp_dir("r2b")).unwrap(), rf2("b", &b, &ab));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        let n = 40;
+        for i in 1..=n {
+            na.execute(&format!("INSERT INTO t (id, v) VALUES ({i}, {})", i * 10))
+                .unwrap();
+        }
+
+        let nc = Node::new(Database::open(temp_dir("r2c")).unwrap(), rf2("c", &c, &abc));
+        nc.serve_internode().unwrap();
+        na.add_member("c", &c).unwrap();
+
+        for coord in [&na, &nb, &nc] {
+            for i in 1..=n {
+                let rs = rows(
+                    coord
+                        .execute(&format!("SELECT v FROM t WHERE id = {i}"))
+                        .unwrap(),
+                );
+                assert_eq!(rs.rows, vec![vec![Value::Int(i * 10)]], "rf2 id {i}");
+            }
+        }
     }
 
     #[test]
