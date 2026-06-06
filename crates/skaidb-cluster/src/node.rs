@@ -15,7 +15,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 use std::thread;
 
 use skaidb_engine::{filter_rows, run, Cluster, Database, EngineError, IndexScanRange, QueryOutput};
@@ -130,6 +132,11 @@ pub struct Node {
     /// for replay when it comes back — *hinted handoff*. In-memory and bounded;
     /// anti-entropy ([`Node::repair`]) is the durable backstop if hints are lost.
     hints: Mutex<HashMap<NodeId, Vec<HintedWrite>>>,
+    /// Rows pushed per migration batch before a checkpoint + throttle pause.
+    migration_batch: AtomicUsize,
+    /// Pause (ms) between migration batches — throttles a reshard so it doesn't
+    /// saturate the cluster. `0` = no throttle.
+    migration_pause_ms: AtomicU64,
     cfg: NodeConfig,
 }
 
@@ -160,8 +167,18 @@ impl Node {
             clock: HlcClock::new(),
             pool: internode::Pool::new(),
             hints: Mutex::new(HashMap::new()),
+            migration_batch: AtomicUsize::new(1024),
+            migration_pause_ms: AtomicU64::new(0),
             cfg,
         })
+    }
+
+    /// Tune migration throttling: push at most `batch` rows between checkpoints,
+    /// pausing `pause_ms` between batches (0 = no throttle). Lets a reshard of a
+    /// large shard proceed without saturating the cluster.
+    pub fn set_migration_throttle(&self, batch: usize, pause_ms: u64) {
+        self.migration_batch.store(batch.max(1), Ordering::Relaxed);
+        self.migration_pause_ms.store(pause_ms, Ordering::Relaxed);
     }
 
     /// The current membership epoch.
@@ -315,41 +332,80 @@ impl Node {
             .peer_addr(joiner)
             .ok_or_else(|| EngineError::Cluster(format!("joiner {joiner} not in topology")))?;
         let old_ring = self.ring_excluding(joiner);
+        let batch = self.migration_batch.load(Ordering::Relaxed).max(1);
+        let pause = self.migration_pause_ms.load(Ordering::Relaxed);
 
-        let tables = self
+        // Resume from a checkpoint left by an interrupted migration, if any.
+        let dir = {
+            let db = self
+                .local
+                .read()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
+            db.dir().to_path_buf()
+        };
+        let ckpt = migrate_ckpt_path(&dir, joiner);
+        let resume = load_migrate_ckpt(&ckpt);
+
+        // Tables in deterministic (sorted) order, so the checkpoint advances
+        // monotonically and a resume can skip whole tables already migrated.
+        let mut tables = self
             .local
             .read()
             .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
             .table_names();
+        tables.sort();
 
         for table in tables {
+            // Resume handling: a table sorting before the checkpoint's table is
+            // already done; within the checkpoint's table, skip keys <= last sent.
+            let skip_until: Option<Vec<u8>> = match &resume {
+                Some((ct, _)) if &table < ct => continue,
+                Some((ct, lk)) if ct == &table => Some(lk.clone()),
+                _ => None,
+            };
+
             let rows = self
                 .local
                 .read()
                 .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
                 .local_scan_versioned_with_tombstones(&table)?;
-            for (key, value, hlc, is_put) in rows {
-                if !self.replicas_for(&key).contains(joiner) {
-                    continue; // the joiner does not own this key
-                }
-                if old_ring.primary_for(&key) != Some(self.id.clone()) {
-                    continue; // not the elected sender for this key
-                }
-                let op = if is_put {
-                    WriteOp::Put(value)
-                } else {
-                    WriteOp::Delete
-                };
-                match self.send_write(&addr, &table, &key, &op, hlc) {
-                    Ok(true) => {}
-                    _ => {
-                        return Err(EngineError::Cluster(format!(
-                            "rebalance to {joiner}: write not acked"
-                        )))
+            // Keys this node should send for the joiner, in key order.
+            let pending: Vec<(Vec<u8>, Vec<u8>, Hlc, bool)> = rows
+                .into_iter()
+                .filter(|(key, _, _, _)| {
+                    skip_until.as_ref().is_none_or(|lk| key > lk)
+                        && self.replicas_for(key).contains(joiner)
+                        && old_ring.primary_for(key) == Some(self.id.clone())
+                })
+                .collect();
+
+            // Stream in throttled batches, checkpointing after each.
+            for chunk in pending.chunks(batch) {
+                for (key, value, hlc, is_put) in chunk {
+                    let op = if *is_put {
+                        WriteOp::Put(value.clone())
+                    } else {
+                        WriteOp::Delete
+                    };
+                    match self.send_write(&addr, &table, key, &op, *hlc) {
+                        Ok(true) => {}
+                        _ => {
+                            return Err(EngineError::Cluster(format!(
+                                "rebalance to {joiner}: write not acked"
+                            )))
+                        }
                     }
+                }
+                if let Some((last_key, _, _, _)) = chunk.last() {
+                    save_migrate_ckpt(&ckpt, &table, last_key);
+                }
+                if pause > 0 {
+                    thread::sleep(Duration::from_millis(pause));
                 }
             }
         }
+        // Done — clear the checkpoint.
+        let _ = std::fs::remove_file(&ckpt);
         Ok(())
     }
 
@@ -1497,6 +1553,51 @@ fn write_response(result: EngineResult<()>) -> Response {
     }
 }
 
+/// Path of the per-joiner migration checkpoint file in a node's data directory.
+fn migrate_ckpt_path(dir: &Path, joiner: &NodeId) -> PathBuf {
+    let safe: String = joiner
+        .0
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect();
+    dir.join(format!("migrate-{safe}"))
+}
+
+/// Persist migration progress as `<table>\n<hex(last_key)>` (atomic). Best-effort:
+/// a failed write just means a re-run does a little extra (idempotent) work.
+fn save_migrate_ckpt(path: &Path, table: &str, last_key: &[u8]) {
+    let body = format!("{table}\n{}", to_hex(last_key));
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, &body).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+/// Load a migration checkpoint written by [`save_migrate_ckpt`], if present.
+fn load_migrate_ckpt(path: &Path) -> Option<(String, Vec<u8>)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let (table, hex) = text.split_once('\n')?;
+    Some((table.to_string(), from_hex(hex.trim())?))
+}
+
+fn to_hex(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b {
+        s.push_str(&format!("{x:02x}"));
+    }
+    s
+}
+
+fn from_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
 /// Encode a member list as `(id, addr)` string pairs for the wire.
 fn wire_of(members: &[(NodeId, String)]) -> Vec<(String, String)> {
     members
@@ -2264,6 +2365,65 @@ mod tests {
                 assert_eq!(rs.rows, vec![vec![Value::Int(i * 10)]], "rf2 id {i}");
             }
         }
+    }
+
+    #[test]
+    fn migrate_checkpoint_roundtrips() {
+        let dir = temp_dir("ckpt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = migrate_ckpt_path(&dir, &NodeId::new("node:7000"));
+        save_migrate_ckpt(&path, "orders", &[0, 255, 16, 7]);
+        let (table, key) = load_migrate_ckpt(&path).unwrap();
+        assert_eq!(table, "orders");
+        assert_eq!(key, vec![0, 255, 16, 7]);
+        assert_eq!(from_hex(&to_hex(&[1, 2, 250])).unwrap(), vec![1, 2, 250]);
+    }
+
+    #[test]
+    fn throttled_migration_completes_and_clears_checkpoint() {
+        // A join with a tiny batch size + pause still migrates everything, and
+        // the resume checkpoint is removed once migration finishes.
+        let one = Consistency::One;
+        let rf1 = |id: &str, addr: &str, members: &[(NodeId, String)]| NodeConfig {
+            id: NodeId::new(id),
+            internode_addr: addr.to_string(),
+            members: members.to_vec(),
+            replication_factor: 1,
+            vnodes_per_node: 64,
+            read_consistency: one,
+            write_consistency: one,
+        };
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let ab = vec![member("a", &a), member("b", &b)];
+        let abc = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let adir = temp_dir("tma");
+        let bdir = temp_dir("tmb");
+        let na = Node::new(Database::open(&adir).unwrap(), rf1("a", &a, &ab));
+        let nb = Node::new(Database::open(&bdir).unwrap(), rf1("b", &b, &ab));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        let n = 60;
+        for i in 1..=n {
+            na.execute(&format!("INSERT INTO t (id, v) VALUES ({i}, {})", i * 10))
+                .unwrap();
+        }
+        // Tiny batches with a small throttle pause on both potential senders.
+        na.set_migration_throttle(7, 1);
+        nb.set_migration_throttle(7, 1);
+
+        let nc = Node::new(Database::open(temp_dir("tmc")).unwrap(), rf1("c", &c, &abc));
+        nc.serve_internode().unwrap();
+        na.add_member("c", &c).unwrap();
+
+        for i in 1..=n {
+            let rs = rows(nc.execute(&format!("SELECT v FROM t WHERE id = {i}")).unwrap());
+            assert_eq!(rs.rows, vec![vec![Value::Int(i * 10)]], "id {i} migrated");
+        }
+        // The checkpoint is cleared on the former owners after a clean finish.
+        let cid = NodeId::new("c");
+        assert!(!migrate_ckpt_path(&adir, &cid).exists());
+        assert!(!migrate_ckpt_path(&bdir, &cid).exists());
     }
 
     #[test]

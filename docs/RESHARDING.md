@@ -48,9 +48,15 @@ three broadcast steps over the internode RPC
    and build the same local + vector indexes over its shard.
 3. **Migrate the keys.** The coordinator broadcasts `Rebalance { joiner }`. Each
    existing member scans every table and, for each row whose key the joiner now
-   owns (recomputed against the new ring), **pushes** it to the joiner with the
-   row's original `(value | tombstone, HLC)` preserved. Tombstones migrate too,
-   so a delete that hasn't compacted away still wins after the move.
+   owns (recomputed against the new ring) **and that it is the elected sender
+   for**, **pushes** it to the joiner with the row's original
+   `(value | tombstone, HLC)` preserved. Tombstones migrate too, so a delete that
+   hasn't compacted away still wins after the move. The push is **throttled and
+   resumable**: rows are sent in batches (`set_migration_throttle(batch,
+   pause_ms)` rate-limits so a large move doesn't saturate the cluster), and a
+   per-joiner checkpoint records progress so an interrupted migration resumes
+   where it left off instead of re-sending from the start (it's idempotent either
+   way).
 
 After step 3 the joiner holds (and indexes) every key the ring assigns it, and
 reads route to it normally. Because pushed rows keep their **original HLC**, any
@@ -157,6 +163,11 @@ node.reclaim_cluster()?;  // …and tells every peer to do the same
   (harmless) stale copies. It is also currently a full-table scan with a
   point-read ack-gate per key; fine after a single reshard, heavier on a very
   large dataset.
+- **Migration materializes a table at a time.** The push is throttled, batched,
+  and resumable, but each table's rows are still scanned into memory once per
+  pass (then streamed out in batches). A bounded-memory disk cursor (lazy,
+  range-limited SSTable iteration) would remove that last in-memory step — future
+  work.
 - **Membership has no gossip/consensus.** Data converges via anti-entropy, but
   *membership* changes (`SetMembership`/`Rebalance`/`Drain`) are still best-effort
   broadcasts. The epoch stops a node from regressing to an older ring and
@@ -203,3 +214,6 @@ node.reclaim_cluster()?;  // …and tells every peer to do the same
 - `pending_ranges_dual_write_to_old_and_new_owner` (rf=1, CL=ALL) imposes a
   ring transition and checks a write to a migrating key lands on **both** its old
   and new owner.
+- `throttled_migration_completes_and_clears_checkpoint` joins a node with a tiny
+  batch size + pause and checks everything migrates and the resume checkpoint is
+  removed; `migrate_checkpoint_roundtrips` covers the checkpoint codec.
