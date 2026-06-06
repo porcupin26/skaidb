@@ -437,6 +437,61 @@ impl Engine {
         Ok(())
     }
 
+    /// Physically drop every key for which `keep` returns false, leaving **no
+    /// tombstone**: the retained latest versions are rewritten into one fresh
+    /// SSTable and all prior tables + the WAL are discarded, so dropped keys
+    /// vanish from every scan and cannot resurrect via compaction. This is the
+    /// "cleanup" a node runs to reclaim space for keys it no longer owns after
+    /// resharding (unlike `delete`, which writes a replicable tombstone that
+    /// would re-enter migration and LWW merges). Returns the number of keys
+    /// dropped. Crash-safe: the new table is written and the manifest repointed
+    /// before any old file is removed.
+    pub fn retain(&mut self, keep: impl Fn(&[u8]) -> bool) -> Result<usize> {
+        let all = self.scan_versioned_with_tombstones()?;
+        let dropped = all.iter().filter(|(k, _, _)| !keep(k)).count();
+        if dropped == 0 {
+            return Ok(0);
+        }
+        let entries: Vec<SstEntry> = all
+            .into_iter()
+            .filter(|(k, _, _)| keep(k))
+            .map(|(key, hlc, value)| SstEntry {
+                key,
+                hlc,
+                value: match value {
+                    Some(bytes) => VersionValue::Put(bytes),
+                    None => VersionValue::Delete,
+                },
+            })
+            .collect();
+
+        let old_paths: Vec<PathBuf> = self
+            .l0
+            .iter()
+            .chain(self.levels.iter())
+            .map(|t| t.path().to_path_buf())
+            .collect();
+
+        // Write survivors into one new table *before* dropping the old ones.
+        let new_table = if entries.is_empty() {
+            None
+        } else {
+            Some(self.write_table(&entries, self.opts.bottom_compression)?.0)
+        };
+
+        self.l0.clear();
+        self.levels.clear();
+        if let Some(sst) = new_table {
+            self.levels.push(sst);
+        }
+        self.mem = Memtable::new();
+        self.wal.truncate()?;
+        self.read_cache = ReadCache::new(self.opts.read_cache_capacity);
+        self.persist_manifest()?;
+        remove_files(&old_paths);
+        Ok(dropped)
+    }
+
     /// Whether the memtable has grown past its flush threshold.
     pub fn needs_flush(&self) -> bool {
         self.mem.approx_bytes() >= self.opts.flush_threshold_bytes
@@ -784,6 +839,41 @@ mod tests {
         let e = Engine::open_with_options(&dir, small_opts()).unwrap();
         assert_eq!(e.scan().unwrap().len(), 60);
         assert!(count >= 1);
+    }
+
+    #[test]
+    fn retain_physically_drops_keys_without_resurrection() {
+        let dir = tempdir();
+        let mut e = Engine::open_with_options(&dir, small_opts()).unwrap();
+        for i in 0..40u32 {
+            e.put(format!("k{i:04}").as_bytes(), vec![7u8; 40]).unwrap();
+        }
+        e.flush().unwrap();
+
+        // Keep only even-numbered keys; drop the rest physically.
+        let dropped = e
+            .retain(|k| {
+                let n: u32 = std::str::from_utf8(&k[1..]).unwrap().parse().unwrap();
+                n.is_multiple_of(2)
+            })
+            .unwrap();
+        assert_eq!(dropped, 20);
+
+        let live = e.scan().unwrap();
+        assert_eq!(live.len(), 20, "only retained keys remain");
+        assert_eq!(e.get(b"k0001").unwrap(), None, "dropped key is gone");
+        assert_eq!(e.get(b"k0002").unwrap(), Some(vec![7u8; 40]));
+
+        // Dropped keys leave no tombstone and never resurrect across reopen.
+        drop(e);
+        let e = Engine::open_with_options(&dir, small_opts()).unwrap();
+        assert_eq!(e.scan().unwrap().len(), 20);
+        assert_eq!(e.get(b"k0001").unwrap(), None);
+
+        // Idempotent: retaining the same predicate again drops nothing.
+        let mut e = e;
+        let again = e.retain(|_| true).unwrap();
+        assert_eq!(again, 0);
     }
 
     #[test]

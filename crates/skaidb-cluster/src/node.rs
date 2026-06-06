@@ -12,7 +12,7 @@
 //! gathers from all reachable members (strongest read), and requires at least a
 //! cluster quorum of members to respond.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -392,6 +392,90 @@ impl Node {
         Ok(())
     }
 
+    /// Reclaim local disk space after resharding: physically drop every
+    /// locally-held key this node **no longer owns** under the current ring, but
+    /// only once an actual owner is confirmed to hold that key at a version at
+    /// least as new (the *ack-gate*, so a key whose migration never completed is
+    /// never dropped from its last copy). The drop is a physical purge — no
+    /// tombstone — so it neither re-enters migration nor poisons an LWW merge.
+    /// Returns the number of rows dropped. Idempotent.
+    pub fn reclaim(&self) -> EngineResult<usize> {
+        let tables = self
+            .local
+            .read()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .table_names();
+
+        let mut total = 0;
+        for table in tables {
+            let rows = self
+                .local
+                .read()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+                .local_scan_versioned_with_tombstones(&table)?;
+
+            // Collect unowned keys whose owners confirm a copy at >= our version.
+            let mut confirmed: HashSet<Vec<u8>> = HashSet::new();
+            for (key, _value, hlc, _is_put) in rows {
+                let owners = self.replicas_for(&key);
+                if owners.contains(&self.id) {
+                    continue; // we still own it
+                }
+                if self.owners_hold(&table, &key, hlc, &owners) {
+                    confirmed.insert(key);
+                }
+            }
+            if confirmed.is_empty() {
+                continue;
+            }
+            let dropped = self
+                .local
+                .write()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+                .retain_rows(&table, |k| !confirmed.contains(k))?;
+            total += dropped;
+        }
+        Ok(total)
+    }
+
+    /// Whether at least one current owner of `key` (other than self) holds a
+    /// version stamped at or after `our_hlc` — the ack-gate for [`Node::reclaim`].
+    fn owners_hold(&self, table: &str, key: &[u8], our_hlc: Hlc, owners: &[NodeId]) -> bool {
+        for owner in owners {
+            if *owner == self.id {
+                continue;
+            }
+            let Some(addr) = self.peer_addr(owner) else {
+                continue;
+            };
+            if let Ok(Response::Get {
+                entry: Some((_, hlc, _)),
+            }) = self.pool.call(
+                &addr,
+                &Request::LocalGet {
+                    table: table.to_string(),
+                    key: key.to_vec(),
+                },
+            ) {
+                if hlc >= our_hlc {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Trigger [`Node::reclaim`] on this node and every peer (a cluster-wide
+    /// post-resharding cleanup). Returns the number of rows this node dropped;
+    /// peers reclaim best-effort (their counts are not returned over the wire).
+    pub fn reclaim_cluster(&self) -> EngineResult<usize> {
+        let local = self.reclaim()?;
+        for addr in &self.peer_addrs() {
+            let _ = self.pool.call(addr, &Request::Reclaim);
+        }
+        Ok(local)
+    }
+
     /// Start serving internode RPC on this node's address (background thread).
     pub fn serve_internode(self: &Arc<Self>) -> std::io::Result<()> {
         let listener = TcpListener::bind(&self.cfg.internode_addr)?;
@@ -485,6 +569,10 @@ impl Node {
                     Err(e) => Response::Err(e.to_string()),
                 }
             }
+            Request::Reclaim => match self.reclaim() {
+                Ok(_) => Response::Ack,
+                Err(e) => Response::Err(e.to_string()),
+            },
         }
     }
 
@@ -1393,6 +1481,64 @@ mod tests {
         nc.execute("INSERT INTO t (id, g) VALUES (61, 1)").unwrap();
         let rs = rows(na.execute("SELECT id FROM t WHERE id = 61").unwrap());
         assert_eq!(rs.rows, vec![vec![Value::Int(61)]]);
+    }
+
+    #[test]
+    fn reclaim_drops_unowned_keys_after_join() {
+        // rf=1: after a node joins and takes its share, the former owners still
+        // hold stale copies. reclaim() physically drops the keys they no longer
+        // own (once an owner confirms it holds them) without losing any data.
+        let one = Consistency::One;
+        let rf1 = |id: &str, addr: &str, members: &[(NodeId, String)]| NodeConfig {
+            id: NodeId::new(id),
+            internode_addr: addr.to_string(),
+            members: members.to_vec(),
+            replication_factor: 1,
+            vnodes_per_node: 64,
+            read_consistency: one,
+            write_consistency: one,
+        };
+
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let ab = vec![member("a", &a), member("b", &b)];
+        let abc = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let na = Node::new(Database::open(temp_dir("rca")).unwrap(), rf1("a", &a, &ab));
+        let nb = Node::new(Database::open(temp_dir("rcb")).unwrap(), rf1("b", &b, &ab));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        let n = 60;
+        for i in 1..=n {
+            na.execute(&format!("INSERT INTO t (id, v) VALUES ({i}, {})", i * 10))
+                .unwrap();
+        }
+
+        let nc = Node::new(Database::open(temp_dir("rcc")).unwrap(), rf1("c", &c, &abc));
+        nc.serve_internode().unwrap();
+        na.add_member("c", &c).unwrap();
+
+        // Former owners reclaim the keys that moved onto c.
+        let dropped = na.reclaim().unwrap() + nb.reclaim().unwrap() + nc.reclaim().unwrap();
+        assert!(dropped > 0, "some keys moved to c and were reclaimed by a/b");
+
+        // No data lost — every row still readable from every coordinator.
+        for coord in [&na, &nb, &nc] {
+            for i in 1..=n {
+                let rs = rows(
+                    coord
+                        .execute(&format!("SELECT v FROM t WHERE id = {i}"))
+                        .unwrap(),
+                );
+                assert_eq!(rs.rows, vec![vec![Value::Int(i * 10)]], "id {i} after reclaim");
+            }
+        }
+
+        // Idempotent: a second pass drops nothing (everyone owns what they hold).
+        assert_eq!(
+            na.reclaim().unwrap() + nb.reclaim().unwrap() + nc.reclaim().unwrap(),
+            0
+        );
     }
 
     #[test]

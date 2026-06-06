@@ -5,10 +5,10 @@ skaidb places keys on a **consistent-hash ring** (vnodes; see SPEC §4 and
 so membership can change while the cluster serves traffic: a node can **join** or
 **leave** online and the keyspace rebalances without a restart or a full reload.
 
-> Status: single-node **join** (`Node::add_member`) and graceful **decommission**
-> (`Node::remove_member`) are implemented and tested. Active **anti-entropy**
-> (read-repair, hinted handoff, space reclamation on the former owner) is
-> deferred — see Limitations.
+> Status: single-node **join** (`Node::add_member`), graceful **decommission**
+> (`Node::remove_member`), and post-move **space reclamation** (`Node::reclaim`)
+> are implemented and tested. Active **anti-entropy** (read-repair, hinted
+> handoff) is deferred — see Limitations.
 
 ## Why a single join moves so little
 
@@ -72,15 +72,39 @@ touches nothing else.
 node.remove_member("c")?;   // c drains its keys to their new owners, then leaves
 ```
 
+## Reclaiming space after a move
+
+A join or leave leaves the *former* owner holding copies of keys it no longer
+owns. `Node::reclaim` frees that space: it walks each local key, and for any key
+this node is no longer a replica of, it **physically purges** the key — but only
+after an actual current owner confirms it holds that key at a version at least as
+new (the *ack-gate*, so a key whose migration never completed is never dropped
+from its last copy). `reclaim_cluster` fans the cleanup out to every node.
+
+The purge is a real physical drop ([`Engine::retain`](../crates/skaidb-storage/src/engine.rs)),
+**not a tombstone**: it rewrites the table keeping only retained keys and discards
+the rest, so dropped keys vanish from every scan and never resurrect via
+compaction. That matters because a tombstone would carry a newer HLC than the
+migrated copy and could (a) re-enter a later migration and delete the key on its
+new owner, or (b) win an LWW merge and mask the live value elsewhere — a physical
+purge does neither. Secondary-index entries for purged rows are left dangling;
+reads already skip an index entry whose row is absent, and they compact away.
+
+```rust
+node.reclaim()?;          // this node drops keys it no longer owns
+node.reclaim_cluster()?;  // …and tells every peer to do the same
+```
+
 ## Correctness model
 
 - **LWW is preserved.** Migrated rows carry their original HLC, so they neither
   shadow nor are shadowed by concurrent writes incorrectly — the newest stamp
   wins as always.
-- **Stale copies are harmless.** The former owner keeps its physical copy (see
-  Limitations); but with rf=1 a point read routes only to the new owner via the
-  ring, and with rf>1 a cluster/index read merges by HLC, so the migrated copy
-  (equal or newer) wins or ties. No read returns a lost or resurrected row.
+- **Stale copies are harmless, then reclaimed.** Until reclamation runs the
+  former owner keeps its physical copy, but with rf=1 a point read routes only to
+  the new owner via the ring, and with rf>1 a cluster/index read merges by HLC,
+  so the migrated copy (equal or newer) wins or ties — no read returns a lost or
+  resurrected row. `Node::reclaim` (below) then frees the space.
 - **Idempotent.** `Rebalance` can be re-sent; re-pushing a row at the same HLC is
   a no-op under LWW. A join that half-completes can be retried.
 
@@ -90,12 +114,11 @@ node.remove_member("c")?;   // c drains its keys to their new owners, then leave
   keys being migrated. A write that races the push can be ordered correctly by
   HLC, but the design target is "add capacity during a calm window," not a
   guaranteed-consistent live cutover under peak write load.
-- **No space reclamation yet.** The former owner does **not** delete keys it
-  handed off. Reclaiming that space needs a *local physical delete that bypasses
-  LWW* (a normal tombstone would carry a newer HLC and could mask the migrated
-  copy elsewhere). That belongs with active anti-entropy, which isn't built yet —
-  so a long-lived cluster that reshards repeatedly will accumulate stale copies
-  until compaction + a future GC pass removes them.
+- **Reclamation is a manual pass.** `reclaim`/`reclaim_cluster` are explicit
+  calls run after a move, not automatic — until then the former owner keeps the
+  (harmless) stale copies. It is also currently a full-table scan with a
+  point-read ack-gate per key; fine after a single reshard, heavier on a very
+  large dataset.
 - **No catch-up log.** `SetMembership`/`Rebalance`/`Drain` are best-effort
   broadcasts. A member that is unreachable during the change keeps the old ring
   until it is re-broadcast to; there is no schema/topology log it replays on
@@ -116,3 +139,8 @@ node.remove_member("c")?;   // c drains its keys to their new owners, then leave
   node from a three-node cluster and asserts every key it owned was drained to
   its new owner (all rows stay readable from the survivors) and that writes after
   the leave route under the smaller ring.
+- `reclaim_drops_unowned_keys_after_join` (rf=1) joins a node, then has the
+  former owners `reclaim`; it asserts space is actually freed (rows dropped > 0),
+  no row is lost, and a second pass is a no-op (idempotent). The storage-level
+  `retain_physically_drops_keys_without_resurrection` checks the purge leaves no
+  tombstone and survives reopen.

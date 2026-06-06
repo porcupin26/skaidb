@@ -949,6 +949,17 @@ impl Database {
         Ok(())
     }
 
+    /// Physically drop local rows of `table` whose key fails `keep`, reclaiming
+    /// space for keys this node no longer owns after resharding. Unlike a delete
+    /// this leaves **no tombstone** (dropped keys vanish from scans and from
+    /// migration), so it must only be used for keys whose authoritative copy
+    /// lives on another node. Secondary-index entries pointing at dropped rows
+    /// are left dangling — reads already skip an index entry whose row is absent,
+    /// and they are reclaimed as the index compacts. Returns the rows dropped.
+    pub fn retain_rows(&mut self, table: &str, keep: impl Fn(&[u8]) -> bool) -> Result<usize> {
+        Ok(self.table_engine_mut(table)?.retain(keep)?)
+    }
+
     /// Apply a replicated delete at an explicit stamp, maintaining indexes.
     pub fn apply_delete(&mut self, table: &str, key: &[u8], hlc: Hlc) -> Result<()> {
         // Read the local row first so its index entries can be removed.

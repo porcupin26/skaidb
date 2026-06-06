@@ -70,6 +70,10 @@ pub enum Request {
     Drain {
         members: Vec<(String, String)>,
     },
+    /// Reclaim local disk space: physically drop every locally-held key this node
+    /// no longer owns under the current ring, after confirming an owner holds it.
+    /// A post-resharding "cleanup" trigger.
+    Reclaim,
     Ping,
 }
 
@@ -117,6 +121,7 @@ const REQ_VECTOR: u8 = 8;
 const REQ_MEMBERS: u8 = 9;
 const REQ_REBAL: u8 = 10;
 const REQ_DRAIN: u8 = 11;
+const REQ_RECLAIM: u8 = 12;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
@@ -196,6 +201,7 @@ impl Request {
                     put_str(&mut o, addr);
                 }
             }
+            Request::Reclaim => o.push(REQ_RECLAIM),
             Request::Ping => o.push(REQ_PING),
         }
         o
@@ -259,6 +265,7 @@ impl Request {
                 }
                 Request::Drain { members }
             }
+            REQ_RECLAIM => Request::Reclaim,
             REQ_PING => Request::Ping,
             _ => return Err(WireError::Malformed("unknown request op")),
         })
@@ -599,6 +606,7 @@ mod tests {
                     ("b".into(), "127.0.0.1:2".into()),
                 ],
             },
+            Request::Reclaim,
             Request::Ping,
         ] {
             assert_eq!(Request::decode(&req.encode()).unwrap(), req);

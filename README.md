@@ -96,7 +96,7 @@ Full grammar reference: **[docs/QUERY_SYNTAX.md](docs/QUERY_SYNTAX.md)**.
 
 ## Status & deferred work
 
-Implemented end-to-end and tested (188 tests):
+Implemented end-to-end and tested (190 tests):
 
 - soft-schema document model, SQL subset, 3-valued logic
 - **SQL surface**: projection over nested paths, `WHERE`, `GROUP BY`/`HAVING`,
@@ -134,7 +134,9 @@ Implemented end-to-end and tested (188 tests):
   leaving node first drains its keys to their new owners, then the ring shrinks
   (HLC-preserving, tombstones included, both ways). Consistent hashing means a
   single membership change only moves ~`1/N` of the keyspace; placements are
-  otherwise undisturbed. See [docs/RESHARDING.md](docs/RESHARDING.md)
+  otherwise undisturbed. A `reclaim` pass then physically frees the space the
+  former owner held (ack-gated, no tombstone). See
+  [docs/RESHARDING.md](docs/RESHARDING.md)
 - **auth**: SCRAM-SHA-256 handshake (mutual auth) on the binary endpoint and
   HTTP Basic on REST, + per-statement **RBAC**
 - binary + REST endpoints, Prometheus metrics, masked audit logs
@@ -147,11 +149,10 @@ control plane (the raw-TCP fast path is in; QUIC needs an async runtime),
 in; spanning nodes needs a coordinator/2PC), **join pushdown** (a clustered join
 gathers each table to the coordinator rather than executing shard-local), active
 **anti-entropy** (read-repair & hinted handoff — convergence currently relies on
-writes reaching their replicas; this is also what online resharding needs to
-reclaim space on a key's former owner and to give a node that missed a
-membership broadcast a topology log to catch up on; online node **join** and
-graceful **decommission** are both built — see
-[docs/RESHARDING.md](docs/RESHARDING.md)), **global (value-sharded) secondary
+writes reaching their replicas; it is also what would give a node that missed a
+membership broadcast a topology log to catch up on. Online node **join**,
+graceful **decommission**, and post-move **space reclamation** are all built —
+see [docs/RESHARDING.md](docs/RESHARDING.md)), **global (value-sharded) secondary
 indexes** —
 today's indexes are local per node, so a distributed indexed read still scatters
 to every member (their local indexes return only candidate keys) rather than
