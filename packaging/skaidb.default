@@ -1,0 +1,11 @@
+# Environment overrides for the skaidb systemd service (sourced by skaidb.service).
+#
+# Anything set here wins over /etc/skaidb/skaidb.toml. Handy for per-host values
+# without editing the shared config. Examples:
+#
+#   SKAIDB_BIND_ADDR=192.168.7.3
+#   SKAIDB_SEEDS=192.168.7.3:7100,192.168.7.4:7100
+#   SKAIDB_REPLICATION_FACTOR=2
+#   SKAIDB_DEFAULT_READ_CONSISTENCY=ALL
+#   SKAIDB_DEFAULT_WRITE_CONSISTENCY=ALL
+#   SKAIDB_SUPERUSER_PASSWORD=change-me

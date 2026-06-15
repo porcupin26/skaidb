@@ -1,0 +1,36 @@
+# skaidb server configuration.
+#
+# Every option also has a built-in default, a matching `--flag`, and a `SKAIDB_*`
+# environment variable. Precedence: CLI args > env vars > this file > defaults.
+# Run `skaidb --print-config` to see the full effective configuration.
+#
+# This file ships a single-node (standalone) default. To form a cluster, set
+# `bind_addr` to a routable address and fill in `[cluster].seeds`.
+
+[server]
+bind_addr = "127.0.0.1"        # set to a routable IP to serve clients and peers
+quic_port = 7000               # binary fast-path client port
+rest_port = 7080               # REST/HTTP gateway (also serves /query, /health)
+data_dir  = "/var/lib/skaidb"
+
+[cluster]
+# Standalone when empty. To cluster, list every member's internode address
+# (including this node), e.g.:
+#   seeds = ["192.168.7.3:7100", "192.168.7.4:7100"]
+seeds = []
+internode_port = 7100
+replication_factor = 3
+# ONE | QUORUM | ALL  (case-insensitive on the CLI and in env vars)
+default_read_consistency = "QUORUM"
+default_write_consistency = "QUORUM"
+
+[auth]
+# Set a password to require SCRAM authentication. Empty = anonymous (dev only).
+superuser = "admin"
+superuser_password = ""
+
+[observability]
+prometheus_port = 9090         # dedicated metrics/health listener (/metrics, /ready)
+slow_query_ms = 200
+# log_format = "json"          # one JSON object per log line, for a log agent
+# per_table_metrics = true     # opt-in per-table gauges (bounded cardinality)

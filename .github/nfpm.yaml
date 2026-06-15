@@ -26,3 +26,19 @@ contents:
     dst: /usr/share/doc/skaidb/LICENSE
   - src: ./README.md
     dst: /usr/share/doc/skaidb/README.md
+  # systemd service + default config (config files are not overwritten on upgrade)
+  - src: ./packaging/skaidb.service
+    dst: /lib/systemd/system/skaidb.service
+  - src: ./packaging/skaidb.toml
+    dst: /etc/skaidb/skaidb.toml
+    type: config|noreplace
+    file_info:
+      mode: 0640
+  - src: ./packaging/skaidb.default
+    dst: /etc/default/skaidb
+    type: config|noreplace
+
+scripts:
+  postinstall: ./packaging/postinstall.sh
+  preremove: ./packaging/preremove.sh
+  postremove: ./packaging/postremove.sh

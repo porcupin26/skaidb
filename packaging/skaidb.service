@@ -1,0 +1,35 @@
+[Unit]
+Description=skaidb — schema-less, SQL-speaking, leaderless distributed database
+Documentation=https://github.com/porcupin26/skaidb
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=skaidb
+Group=skaidb
+# Base configuration file; per-host overrides go in /etc/default/skaidb as
+# SKAIDB_* environment variables (env > file, see `skaidb --print-config`).
+EnvironmentFile=-/etc/default/skaidb
+ExecStart=/usr/bin/skaidb --config /etc/skaidb/skaidb.toml
+Restart=on-failure
+RestartSec=2s
+# LSM compaction + many client connections want a high fd ceiling.
+LimitNOFILE=1048576
+
+# State directory: systemd creates/owns /var/lib/skaidb for User=skaidb.
+StateDirectory=skaidb
+StateDirectoryMode=0750
+ReadWritePaths=/var/lib/skaidb
+
+# Hardening — skaidb only needs to read its config and write its data dir.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

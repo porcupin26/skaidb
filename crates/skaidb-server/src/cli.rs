@@ -26,7 +26,7 @@ pub struct Cli {
     pub quic_port: Option<u16>,
     #[arg(long, env = "SKAIDB_REST_PORT")]
     pub rest_port: Option<u16>,
-    #[arg(long, value_enum, env = "SKAIDB_NODE_ROLE")]
+    #[arg(long, value_enum, ignore_case = true, env = "SKAIDB_NODE_ROLE")]
     pub node_role: Option<NodeRole>,
     #[arg(long, env = "SKAIDB_DATA_DIR")]
     pub data_dir: Option<String>,
@@ -40,9 +40,19 @@ pub struct Cli {
     pub replication_factor: Option<u32>,
     #[arg(long, env = "SKAIDB_VNODES_PER_NODE")]
     pub vnodes_per_node: Option<u32>,
-    #[arg(long, value_enum, env = "SKAIDB_DEFAULT_READ_CONSISTENCY")]
+    #[arg(
+        long,
+        value_enum,
+        ignore_case = true,
+        env = "SKAIDB_DEFAULT_READ_CONSISTENCY"
+    )]
     pub default_read_consistency: Option<Consistency>,
-    #[arg(long, value_enum, env = "SKAIDB_DEFAULT_WRITE_CONSISTENCY")]
+    #[arg(
+        long,
+        value_enum,
+        ignore_case = true,
+        env = "SKAIDB_DEFAULT_WRITE_CONSISTENCY"
+    )]
     pub default_write_consistency: Option<Consistency>,
 
     // ---- [agent] ----
@@ -58,7 +68,7 @@ pub struct Cli {
     pub x509_enabled: Option<bool>,
     #[arg(long, env = "SKAIDB_X509_CA_FILE")]
     pub x509_ca_file: Option<String>,
-    #[arg(long, value_enum, env = "SKAIDB_INTERNODE_AUTH")]
+    #[arg(long, value_enum, ignore_case = true, env = "SKAIDB_INTERNODE_AUTH")]
     pub internode_auth: Option<InternodeAuth>,
     #[arg(long, env = "SKAIDB_INTERNODE_KEYFILE")]
     pub internode_keyfile: Option<String>,
@@ -74,7 +84,7 @@ pub struct Cli {
     pub tls_key_file: Option<String>,
     #[arg(long, env = "SKAIDB_AT_REST_ENABLED")]
     pub at_rest_enabled: Option<bool>,
-    #[arg(long, value_enum, env = "SKAIDB_AT_REST_KEK_SOURCE")]
+    #[arg(long, value_enum, ignore_case = true, env = "SKAIDB_AT_REST_KEK_SOURCE")]
     pub at_rest_kek_source: Option<KekSource>,
     #[arg(long, env = "SKAIDB_AT_REST_KEYFILE")]
     pub at_rest_keyfile: Option<String>,
@@ -165,5 +175,30 @@ impl Cli {
             per_table_metrics => config.observability.per_table_metrics,
             log_format => config.observability.log_format,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The enum flags accept any letter case (docs and the TOML config use
+    /// upper-case `ALL`/`QUORUM`/`ONE`; the CLI must too).
+    #[test]
+    fn enum_flags_are_case_insensitive() {
+        for v in ["ALL", "all", "All"] {
+            let cli = Cli::try_parse_from(["skaidb", "--default-read-consistency", v]).unwrap();
+            assert_eq!(cli.default_read_consistency, Some(Consistency::All));
+        }
+        let cli = Cli::try_parse_from([
+            "skaidb",
+            "--default-write-consistency",
+            "QUORUM",
+            "--node-role",
+            "AGENT",
+        ])
+        .unwrap();
+        assert_eq!(cli.default_write_consistency, Some(Consistency::Quorum));
+        assert_eq!(cli.node_role, Some(NodeRole::Agent));
     }
 }

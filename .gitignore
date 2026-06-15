@@ -12,6 +12,10 @@ CLAUDE.md
 **/*.rs.bk
 # Cargo.lock IS committed: skaidb ships binaries, so lockfile reproducibility matters.
 
+# Release packaging scratch (produced by nfpm in CI / local builds)
+/dist/
+/staging/
+
 # OS / editor
 .DS_Store
 *.swp

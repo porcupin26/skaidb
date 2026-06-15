@@ -155,6 +155,47 @@ tar xzf skaidb-X.Y.Z-x86_64-unknown-linux-musl.tar.gz
 sudo install -m 0755 skaidb skaidb-cli skaidbctl /usr/local/bin/
 ```
 
+### Run as a service (systemd)
+
+The `.deb` / `.rpm` install a systemd unit and a default config, and create an
+unprivileged `skaidb` system account that owns the data directory:
+
+| Path | Purpose |
+|------|---------|
+| `/lib/systemd/system/skaidb.service` | the service unit |
+| `/etc/skaidb/skaidb.toml` | main configuration (not overwritten on upgrade) |
+| `/etc/default/skaidb` | optional `SKAIDB_*` env overrides (win over the file) |
+| `/var/lib/skaidb` | data directory, owned by the `skaidb` user |
+
+Installing does **not** auto-start the server, so you can configure it first:
+
+```sh
+sudoedit /etc/skaidb/skaidb.toml          # set bind_addr, cluster seeds, etc.
+sudo systemctl enable --now skaidb        # start now and on boot
+systemctl status skaidb
+journalctl -u skaidb -f                    # follow the logs
+```
+
+For a cluster, the per-host bits are easiest as env overrides in
+`/etc/default/skaidb` (consistency levels are case-insensitive):
+
+```sh
+SKAIDB_BIND_ADDR=192.168.7.3
+SKAIDB_SEEDS=192.168.7.3:7100,192.168.7.4:7100
+SKAIDB_REPLICATION_FACTOR=2
+SKAIDB_DEFAULT_READ_CONSISTENCY=ALL
+SKAIDB_DEFAULT_WRITE_CONSISTENCY=ALL
+```
+
+Then `sudo systemctl restart skaidb`. Health is at
+`http://<bind_addr>:7080/health` and metrics at `:9090/metrics`
+(see [METRICS.md](METRICS.md)). Uninstalling leaves `/var/lib/skaidb` and the
+`skaidb` account in place so data is never destroyed by a package removal.
+
+For the **tarball** installs above there is no service unit; either run `skaidb`
+under your own process manager or copy the unit from the repo's
+[`packaging/skaidb.service`](../packaging/skaidb.service) and adjust paths.
+
 ## macOS
 
 Builds are provided for both **Apple Silicon** (`aarch64-apple-darwin`) and
