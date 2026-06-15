@@ -11,7 +11,7 @@ mod result;
 pub mod vector;
 
 pub use error::EngineError;
-pub use exec::{filter_rows, run, Cluster, Database, IndexScanRange};
+pub use exec::{filter_rows, run, Cluster, Database, DbStats, IndexScanRange, TableStats};
 pub use result::{QueryOutput, ResultSet};
 
 #[cfg(test)]

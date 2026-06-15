@@ -20,8 +20,9 @@ pub mod wal;
 
 mod error;
 
+pub use cache::CacheStats;
 pub use compress::Codec;
-pub use engine::{Engine, EngineOptions, DEFAULT_FLUSH_THRESHOLD_BYTES};
+pub use engine::{Engine, EngineOptions, EngineStats, KeyStats, DEFAULT_FLUSH_THRESHOLD_BYTES};
 pub use error::{Result, StorageError};
 pub use hlc::{Hlc, HlcClock};
 pub use memtable::{Memtable, VersionValue};

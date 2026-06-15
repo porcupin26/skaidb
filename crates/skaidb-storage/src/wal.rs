@@ -121,6 +121,9 @@ pub struct WalSync {
     /// Bumped on truncate; commits from an older generation are already durable
     /// (their data was flushed to an SSTable), so their fsync is a no-op.
     generation: AtomicU64,
+    /// Count of fsync (`sync_data`) calls actually issued — surfaced as a metric
+    /// so operators can see group-commit coalescing (commits ≫ fsyncs is healthy).
+    fsyncs: AtomicU64,
     /// Serializes the fsync critical section.
     sync_lock: Mutex<()>,
 }
@@ -144,8 +147,19 @@ impl WalSync {
         }
         let durable = self.write_offset.load(Ordering::SeqCst);
         self.file.sync_data()?;
+        self.fsyncs.fetch_add(1, Ordering::SeqCst);
         self.synced.store(durable, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Number of fsyncs issued against this WAL since open.
+    pub fn fsync_count(&self) -> u64 {
+        self.fsyncs.load(Ordering::Relaxed)
+    }
+
+    /// Current append offset (≈ live WAL size in bytes).
+    pub fn size_bytes(&self) -> u64 {
+        self.write_offset.load(Ordering::Relaxed)
     }
 }
 
@@ -177,6 +191,7 @@ impl Wal {
             write_offset: AtomicU64::new(good_len),
             synced: AtomicU64::new(good_len),
             generation: AtomicU64::new(0),
+            fsyncs: AtomicU64::new(0),
             sync_lock: Mutex::new(()),
         });
         Ok((Wal { sync, path }, records))
@@ -219,6 +234,7 @@ impl Wal {
         let _guard = self.sync.sync_lock.lock().expect("wal sync lock");
         self.sync.file.set_len(0)?;
         self.sync.file.sync_data()?;
+        self.sync.fsyncs.fetch_add(1, Ordering::SeqCst);
         self.sync.write_offset.store(0, Ordering::SeqCst);
         self.sync.synced.store(0, Ordering::SeqCst);
         self.sync.generation.fetch_add(1, Ordering::SeqCst);
@@ -228,6 +244,16 @@ impl Wal {
     /// Path backing this WAL.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Number of fsyncs issued against this WAL since open.
+    pub fn fsync_count(&self) -> u64 {
+        self.sync.fsync_count()
+    }
+
+    /// Current append offset (≈ live WAL size in bytes).
+    pub fn size_bytes(&self) -> u64 {
+        self.sync.size_bytes()
     }
 }
 

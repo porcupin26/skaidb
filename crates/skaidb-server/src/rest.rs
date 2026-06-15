@@ -12,7 +12,7 @@ use std::thread::{self, JoinHandle};
 use serde_json::{json, Value as Json};
 use skaidb_proto::Response;
 
-use crate::shared::{execute_as, Shared};
+use crate::shared::{collect_runtime_metrics, execute_as, Shared};
 
 /// Bind the REST endpoint and serve it on a background thread.
 pub fn spawn(addr: &str, ctx: Shared) -> io::Result<(std::net::SocketAddr, JoinHandle<()>)> {
@@ -27,7 +27,13 @@ pub fn serve(listener: TcpListener, ctx: Shared) {
     for stream in listener.incoming().flatten() {
         let ctx = ctx.clone();
         thread::spawn(move || {
-            let _ = handle_connection(stream, ctx);
+            ctx.metrics
+                .incr("skaidb_connections_total{endpoint=\"rest\"}");
+            ctx.metrics
+                .gauge_inc("skaidb_connections_active{endpoint=\"rest\"}");
+            let _ = handle_connection(stream, ctx.clone());
+            ctx.metrics
+                .gauge_dec("skaidb_connections_active{endpoint=\"rest\"}");
         });
     }
 }
@@ -41,9 +47,35 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) -> io::Result<()> {
         }
     };
 
-    // Prometheus scrape endpoint stays open for scraping (SPEC §10).
-    if req.method == "GET" && req.path.starts_with("/metrics") {
-        return write_text(&mut stream, 200, &ctx.metrics.render());
+    // Unauthenticated read-only operational endpoints (SPEC §10). These exist so
+    // orchestrators, load balancers, and metrics scrapers need no credentials and
+    // no admin rights.
+    if req.method == "GET" {
+        match req.path.split('?').next().unwrap_or(&req.path) {
+            // Prometheus scrape: refresh pull-model gauges, then render.
+            "/metrics" => {
+                collect_runtime_metrics(&ctx);
+                return write_text(&mut stream, 200, &ctx.metrics.render());
+            }
+            // Liveness: the process is up and serving. Always 200.
+            "/health" | "/healthz" => {
+                return write_text(&mut stream, 200, "ok\n");
+            }
+            // Readiness: storage is open (and, clustered, the node has a topology).
+            "/ready" | "/readyz" => {
+                let (status, body) = if ctx.backend.is_ready() {
+                    (200, "ready\n")
+                } else {
+                    (503, "not ready\n")
+                };
+                return write_text(&mut stream, status, body);
+            }
+            // Low-privilege topology read: ring/epoch/members only, no secrets.
+            "/status" => {
+                return write_response(&mut stream, 200, &status_json(&ctx));
+            }
+            _ => {}
+        }
     }
 
     // Cluster control plane: POST /admin/* (RBAC-gated inside admin::handle).
@@ -86,6 +118,10 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) -> io::Result<()> {
     let sql = extract_sql(&req.body);
     let response = execute_as(&ctx, &role, &sql);
     let (status, payload) = response_to_json(response);
+    ctx.metrics.add(
+        "skaidb_bytes_returned_total{endpoint=\"rest\"}",
+        payload.to_string().len() as u64,
+    );
     write_response(&mut stream, status, &payload)
 }
 
@@ -205,6 +241,27 @@ fn extract_sql(body: &str) -> String {
     trimmed.to_string()
 }
 
+/// A low-privilege, unauthenticated topology snapshot — ring/epoch/members and
+/// the default consistency levels. Deliberately carries no credentials, data, or
+/// peer addresses, so it can be handed to a monitoring scraper.
+fn status_json(ctx: &Shared) -> Json {
+    match ctx.backend.cluster_stats() {
+        Some(c) => json!({
+            "clustered": true,
+            "node_id": c.node_id,
+            "epoch": c.epoch,
+            "members": c.members,
+            "replication_factor": c.replication_factor,
+            "resharding": c.resharding_active,
+            "hints_pending": c.hints_pending,
+            "read_consistency": c.read_consistency,
+            "write_consistency": c.write_consistency,
+            "ready": ctx.backend.is_ready(),
+        }),
+        None => json!({ "clustered": false, "ready": ctx.backend.is_ready() }),
+    }
+}
+
 fn response_to_json(response: Response) -> (u16, Json) {
     match response {
         Response::Rows { columns, rows } => {
@@ -221,13 +278,7 @@ fn response_to_json(response: Response) -> (u16, Json) {
 }
 
 fn write_response(stream: &mut TcpStream, status: u16, body: &Json) -> io::Result<()> {
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        403 => "Forbidden",
-        404 => "Not Found",
-        _ => "Error",
-    };
+    let reason = http_reason(status);
     let body = body.to_string();
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -238,13 +289,26 @@ fn write_response(stream: &mut TcpStream, status: u16, body: &Json) -> io::Resul
     stream.flush()
 }
 
-/// Write a plain-text response (used by `/metrics`).
+/// Write a plain-text response (used by `/metrics`, `/health`, `/ready`).
 fn write_text(stream: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
+    let reason = http_reason(status);
     let head = format!(
-        "HTTP/1.1 {status} OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes())?;
     stream.write_all(body.as_bytes())?;
     stream.flush()
+}
+
+/// The HTTP reason phrase for a status code used by this gateway.
+fn http_reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        503 => "Service Unavailable",
+        _ => "Error",
+    }
 }

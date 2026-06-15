@@ -100,6 +100,10 @@ pub struct Cli {
     pub login_log_enabled: Option<bool>,
     #[arg(long, env = "SKAIDB_ERROR_LOG_LEVEL")]
     pub error_log_level: Option<String>,
+    #[arg(long, env = "SKAIDB_PER_TABLE_METRICS")]
+    pub per_table_metrics: Option<bool>,
+    #[arg(long, env = "SKAIDB_LOG_FORMAT")]
+    pub log_format: Option<String>,
 }
 
 /// For each `field => target` pair, copy `self.field` onto `target` when the
@@ -158,6 +162,8 @@ impl Cli {
             query_log_masked => config.observability.query_log_masked,
             login_log_enabled => config.observability.login_log_enabled,
             error_log_level => config.observability.error_log_level,
+            per_table_metrics => config.observability.per_table_metrics,
+            log_format => config.observability.log_format,
         );
     }
 }

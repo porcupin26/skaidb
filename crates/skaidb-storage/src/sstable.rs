@@ -196,6 +196,11 @@ impl SsTable {
         &self.path
     }
 
+    /// On-disk size of this table in bytes (0 if the file can't be stat'd).
+    pub fn disk_len(&self) -> u64 {
+        self.file.metadata().map(|m| m.len()).unwrap_or(0)
+    }
+
     /// Point lookup: returns the stored version for `key` if present.
     pub fn get(&self, key: &[u8]) -> Result<Option<(Hlc, VersionValue)>> {
         if !self.bloom.contains(key) {

@@ -24,12 +24,15 @@ pub enum AdminCmd {
     Repair,
     /// Reclaim space former owners no longer own (post-resharding cleanup).
     Reclaim,
+    /// Return a sample of recent slow queries (masked), for drill-down.
+    Slow,
 }
 
 /// Map an admin route + body to a command. `None` for an unknown route.
 pub fn parse(path: &str, body: &str) -> Option<AdminCmd> {
     match path {
         "/admin/status" => Some(AdminCmd::Status),
+        "/admin/slow" => Some(AdminCmd::Slow),
         "/admin/repair" => Some(AdminCmd::Repair),
         "/admin/reclaim" => Some(AdminCmd::Reclaim),
         "/admin/add-node" => Some(AdminCmd::AddNode(field(body, "addr")?)),
@@ -59,6 +62,12 @@ pub fn handle(ctx: &Shared, role: &str, cmd: AdminCmd) -> (u16, Json) {
     if !ctx.roles.has_privilege(role, Privilege::Admin, &Object::Global) {
         ctx.metrics.incr("skaidb_authz_denied_total");
         return (403, json!({ "error": "permission denied: Admin on Global" }));
+    }
+
+    // Slow-query sample is available in both standalone and cluster mode.
+    if let AdminCmd::Slow = cmd {
+        ctx.metrics.incr("skaidb_admin_total{op=\"slow\"}");
+        return (200, ctx.slow_log.snapshot());
     }
 
     let node = match &ctx.backend {
@@ -121,6 +130,8 @@ pub fn handle(ctx: &Shared, role: &str, cmd: AdminCmd) -> (u16, Json) {
             Ok(n) => (200, json!({ "ok": true, "reclaimed": n })),
             Err(e) => (400, json!({ "error": e.to_string() })),
         },
+        // Handled before the cluster-node match (works standalone too).
+        AdminCmd::Slow => unreachable!("slow is handled before the cluster dispatch"),
     }
 }
 
@@ -136,6 +147,7 @@ fn op_label(cmd: &AdminCmd) -> &'static str {
         AdminCmd::RemoveNode(_) => "remove_node",
         AdminCmd::Repair => "repair",
         AdminCmd::Reclaim => "reclaim",
+        AdminCmd::Slow => "slow",
     }
 }
 

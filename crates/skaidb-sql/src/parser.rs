@@ -145,6 +145,16 @@ impl Parser {
                 self.eat_keyword(Keyword::Transaction);
                 Ok(Statement::Rollback)
             }
+            Token::Keyword(Keyword::Show) => {
+                self.advance();
+                if self.eat_keyword(Keyword::Tables) {
+                    Ok(Statement::ShowTables)
+                } else if self.eat_keyword(Keyword::Indexes) {
+                    Ok(Statement::ShowIndexes)
+                } else {
+                    Err(self.unexpected("TABLES or INDEXES after SHOW".into()))
+                }
+            }
             _ => Err(self.unexpected("a statement".into())),
         }
     }

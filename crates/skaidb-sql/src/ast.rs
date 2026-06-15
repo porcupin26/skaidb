@@ -22,6 +22,10 @@ pub enum Statement {
     Commit,
     /// `ROLLBACK [TRANSACTION]` — discard the open transaction.
     Rollback,
+    /// `SHOW TABLES` — list the tables in the catalog (read-only introspection).
+    ShowTables,
+    /// `SHOW INDEXES` — list secondary and vector indexes in the catalog.
+    ShowIndexes,
 }
 
 /// `ALTER TABLE name <action>`.

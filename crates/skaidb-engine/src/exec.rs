@@ -56,6 +56,47 @@ pub struct Database {
     vector_indexes: HashMap<String, Hnsw>,
     /// The open transaction's buffered writes, if a `BEGIN` is in flight.
     txn: Option<TxnBuffer>,
+    /// Wall-clock spent rebuilding HNSW vector indexes during the last `open`
+    /// (they live only in RAM and are reconstructed from table rows), in
+    /// milliseconds — surfaced as a metric so a slow open is visible.
+    vector_rebuild_ms: u64,
+}
+
+/// Aggregate storage/runtime statistics across all of a database's tables and
+/// indexes, surfaced as Prometheus metrics by the server at scrape time.
+#[derive(Debug, Clone, Default)]
+pub struct DbStats {
+    pub tables: usize,
+    pub secondary_indexes: usize,
+    pub vector_indexes: usize,
+    /// Total vectors held across all in-memory HNSW indexes.
+    pub vectors_indexed: usize,
+    /// Wall-clock spent rebuilding vector indexes on the last open (ms).
+    pub vector_rebuild_ms: u64,
+    pub memtable_bytes: u64,
+    pub sstable_count: u64,
+    pub disk_bytes: u64,
+    pub wal_bytes: u64,
+    pub wal_fsyncs: u64,
+    pub compactions: u64,
+    pub compaction_bytes: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub cache_evictions: u64,
+    pub cache_entries: u64,
+    pub bloom_negatives: u64,
+    /// Per-table breakdown (only populated when per-table metrics are enabled).
+    pub per_table: Vec<TableStats>,
+}
+
+/// Per-table live-key / tombstone / size breakdown.
+#[derive(Debug, Clone, Default)]
+pub struct TableStats {
+    pub name: String,
+    pub live_keys: u64,
+    pub tombstones: u64,
+    pub disk_bytes: u64,
+    pub sstables: u64,
 }
 
 /// Buffered writes of an open transaction: `(table, key) -> Some(doc)` for a
@@ -87,6 +128,7 @@ impl Database {
         }
 
         // Vector indexes live in memory; rebuild each from its table's rows.
+        let rebuild_start = std::time::Instant::now();
         let mut vector_indexes = HashMap::new();
         for (name, def) in &catalog.vector_indexes {
             let mut hnsw = new_hnsw(def);
@@ -101,6 +143,7 @@ impl Database {
             }
             vector_indexes.insert(name.clone(), hnsw);
         }
+        let vector_rebuild_ms = rebuild_start.elapsed().as_millis() as u64;
 
         Ok(Database {
             dir,
@@ -109,6 +152,7 @@ impl Database {
             indexes,
             vector_indexes,
             txn: None,
+            vector_rebuild_ms,
         })
     }
 
@@ -310,6 +354,8 @@ impl Database {
             Statement::Begin => self.begin(),
             Statement::Commit => self.commit(),
             Statement::Rollback => self.rollback(),
+            Statement::ShowTables => Ok(QueryOutput::Rows(self.show_tables())),
+            Statement::ShowIndexes => Ok(QueryOutput::Rows(self.show_indexes())),
             // DML and SELECT run through the storage-agnostic executor so the
             // exact same logic serves the local engine and the cluster
             // coordinator (which replaces LocalCluster with a networked one).
@@ -880,6 +926,104 @@ impl Database {
             ));
         }
         out
+    }
+
+    /// `SHOW TABLES`: the catalog's tables and their primary keys, in name order.
+    pub fn show_tables(&self) -> ResultSet {
+        let rows = self
+            .catalog
+            .tables
+            .iter()
+            .map(|(name, def)| {
+                vec![
+                    Value::String(name.clone()),
+                    Value::String(def.primary_key.join(", ")),
+                ]
+            })
+            .collect();
+        ResultSet {
+            columns: vec!["table".into(), "primary_key".into()],
+            rows,
+        }
+    }
+
+    /// `SHOW INDEXES`: secondary and vector indexes, in name order.
+    pub fn show_indexes(&self) -> ResultSet {
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        for (name, idx) in &self.catalog.indexes {
+            rows.push(vec![
+                Value::String(name.clone()),
+                Value::String(idx.table.clone()),
+                Value::String("secondary".into()),
+                Value::String(idx.paths.join(", ")),
+            ]);
+        }
+        for (name, v) in &self.catalog.vector_indexes {
+            rows.push(vec![
+                Value::String(name.clone()),
+                Value::String(v.table.clone()),
+                Value::String(format!("vector({}, dim={})", v.metric, v.dim)),
+                Value::String(v.path.clone()),
+            ]);
+        }
+        rows.sort_by(|a, b| match (&a[0], &b[0]) {
+            (Value::String(x), Value::String(y)) => x.cmp(y),
+            _ => std::cmp::Ordering::Equal,
+        });
+        ResultSet {
+            columns: vec![
+                "index".into(),
+                "table".into(),
+                "kind".into(),
+                "columns".into(),
+            ],
+            rows,
+        }
+    }
+
+    /// Aggregate storage/runtime statistics for metrics. When `per_table` is set,
+    /// each table is scanned for live-key/tombstone counts (O(rows)); otherwise
+    /// only cheap engine snapshots are gathered.
+    pub fn stats(&self, per_table: bool) -> DbStats {
+        let mut agg = DbStats {
+            tables: self.catalog.tables.len(),
+            secondary_indexes: self.catalog.indexes.len(),
+            vector_indexes: self.catalog.vector_indexes.len(),
+            vector_rebuild_ms: self.vector_rebuild_ms,
+            vectors_indexed: self.vector_indexes.values().map(|h| h.len()).sum(),
+            ..Default::default()
+        };
+        // Fold in every table and index storage engine.
+        for engine in self.tables.values().chain(self.indexes.values()) {
+            let s = engine.stats();
+            agg.memtable_bytes += s.memtable_bytes as u64;
+            agg.sstable_count += s.sstable_count as u64;
+            agg.disk_bytes += s.disk_bytes;
+            agg.wal_bytes += s.wal_bytes;
+            agg.wal_fsyncs += s.wal_fsyncs;
+            agg.compactions += s.compactions;
+            agg.compaction_bytes += s.compaction_bytes;
+            agg.cache_hits += s.cache.hits;
+            agg.cache_misses += s.cache.misses;
+            agg.cache_evictions += s.cache.evictions;
+            agg.cache_entries += s.cache.entries as u64;
+            agg.bloom_negatives += s.bloom_negatives;
+        }
+        if per_table {
+            for (name, engine) in &self.tables {
+                let s = engine.stats();
+                let ks = engine.key_stats().unwrap_or_default();
+                agg.per_table.push(TableStats {
+                    name: name.clone(),
+                    live_keys: ks.live_keys as u64,
+                    tombstones: ks.tombstones as u64,
+                    disk_bytes: s.disk_bytes,
+                    sstables: s.sstable_count as u64,
+                });
+            }
+            agg.per_table.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        agg
     }
 
     /// Scan a local table returning `(key, encoded_doc, stamp)` for each live

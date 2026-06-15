@@ -12,8 +12,9 @@
 //! snapshot history is bounded to the live memtable.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::cache::ReadCache;
+use crate::cache::{CacheStats, ReadCache};
 use crate::compress::Codec;
 use crate::error::{Result, StorageError};
 use crate::hlc::{Hlc, HlcClock};
@@ -85,6 +86,49 @@ pub struct Engine {
     next_seq: u64,
     /// RAM cache for point reads that fall through to SSTables.
     read_cache: ReadCache,
+    /// Number of compaction passes completed (cumulative).
+    compactions: u64,
+    /// Bytes written out by compaction outputs (cumulative).
+    compaction_bytes: u64,
+    /// Point reads that fell through to the SSTable layer and found nothing —
+    /// i.e. Bloom-filtered negative lookups served without touching a data block.
+    sst_negative_lookups: AtomicU64,
+}
+
+/// A point-in-time snapshot of a single storage engine's internal state,
+/// surfaced as Prometheus gauges/counters by the server at scrape time.
+#[derive(Debug, Clone, Default)]
+pub struct EngineStats {
+    /// Approximate live memtable footprint, bytes.
+    pub memtable_bytes: usize,
+    /// Versions held in the active memtable (includes superseded versions).
+    pub memtable_versions: usize,
+    /// Total SSTable count across all levels.
+    pub sstable_count: usize,
+    /// SSTable count per level; index 0 is L0, index 1 is L1, …
+    pub sstables_per_level: Vec<usize>,
+    /// On-disk bytes across all SSTables.
+    pub disk_bytes: u64,
+    /// Live WAL size, bytes.
+    pub wal_bytes: u64,
+    /// Cumulative WAL fsyncs.
+    pub wal_fsyncs: u64,
+    /// Cumulative compaction passes.
+    pub compactions: u64,
+    /// Cumulative bytes written by compaction.
+    pub compaction_bytes: u64,
+    /// Read-cache effectiveness.
+    pub cache: CacheStats,
+    /// Bloom-filtered negative point lookups (cumulative).
+    pub bloom_negatives: u64,
+}
+
+/// Live-key and tombstone counts for an engine (a full merged scan — only
+/// computed when per-table metrics are enabled, since it is O(rows)).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KeyStats {
+    pub live_keys: usize,
+    pub tombstones: usize,
 }
 
 impl Engine {
@@ -141,6 +185,9 @@ impl Engine {
             levels,
             next_seq,
             read_cache,
+            compactions: 0,
+            compaction_bytes: 0,
+            sst_negative_lookups: AtomicU64::new(0),
         })
     }
 
@@ -259,6 +306,9 @@ impl Engine {
                 found = Some((hlc, value));
                 break;
             }
+        }
+        if found.is_none() {
+            self.sst_negative_lookups.fetch_add(1, Ordering::Relaxed);
         }
         self.read_cache.insert(key, found.clone());
         Ok(found)
@@ -507,6 +557,46 @@ impl Engine {
         self.l0.len() + self.levels.len()
     }
 
+    /// A cheap snapshot of this engine's internal state for metrics. Does **not**
+    /// scan rows — use [`Engine::key_stats`] for live-key/tombstone counts.
+    pub fn stats(&self) -> EngineStats {
+        let mut per_level = Vec::with_capacity(1 + self.levels.len());
+        per_level.push(self.l0.len());
+        // Each deeper level holds exactly one merged run.
+        per_level.extend(std::iter::repeat_n(1, self.levels.len()));
+        let disk_bytes = self
+            .l0
+            .iter()
+            .chain(self.levels.iter())
+            .map(|t| t.disk_len())
+            .sum();
+        EngineStats {
+            memtable_bytes: self.mem.approx_bytes(),
+            memtable_versions: self.mem.version_count(),
+            sstable_count: self.sstable_count(),
+            sstables_per_level: per_level,
+            disk_bytes,
+            wal_bytes: self.wal.size_bytes(),
+            wal_fsyncs: self.wal.fsync_count(),
+            compactions: self.compactions,
+            compaction_bytes: self.compaction_bytes,
+            cache: self.read_cache.stats(),
+            bloom_negatives: self.sst_negative_lookups.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Live-key and tombstone counts via a full merged scan (O(rows)).
+    pub fn key_stats(&self) -> Result<KeyStats> {
+        let mut stats = KeyStats::default();
+        for (_, _, value) in self.scan_versioned_with_tombstones()? {
+            match value {
+                Some(_) => stats.live_keys += 1,
+                None => stats.tombstones += 1,
+            }
+        }
+        Ok(stats)
+    }
+
     /// Directory backing this engine.
     pub fn dir(&self) -> &Path {
         &self.dir
@@ -553,6 +643,8 @@ impl Engine {
 
         let codec = self.codec_for(deepest);
         let (new_l1, _) = self.write_table(&merged, codec)?;
+        self.compactions += 1;
+        self.compaction_bytes += new_l1.disk_len();
         self.l0.clear();
         if self.levels.is_empty() {
             self.levels.push(new_l1);
@@ -582,6 +674,8 @@ impl Engine {
 
             let codec = self.codec_for(deepest);
             let (new_run, _) = self.write_table(&merged, codec)?;
+            self.compactions += 1;
+            self.compaction_bytes += new_run.disk_len();
             if has_next {
                 self.levels[level + 1] = new_run;
                 self.levels.remove(level);

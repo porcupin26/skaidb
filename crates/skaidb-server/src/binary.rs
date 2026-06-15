@@ -27,7 +27,15 @@ pub fn spawn(addr: &str, ctx: Shared) -> io::Result<(std::net::SocketAddr, JoinH
 pub fn serve(listener: TcpListener, ctx: Shared) {
     for stream in listener.incoming().flatten() {
         let ctx = ctx.clone();
-        thread::spawn(move || handle_connection(stream, ctx));
+        thread::spawn(move || {
+            ctx.metrics
+                .incr("skaidb_connections_total{endpoint=\"binary\"}");
+            ctx.metrics
+                .gauge_inc("skaidb_connections_active{endpoint=\"binary\"}");
+            handle_connection(stream, ctx.clone());
+            ctx.metrics
+                .gauge_dec("skaidb_connections_active{endpoint=\"binary\"}");
+        });
     }
 }
 
@@ -50,7 +58,12 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) {
             Ok(req) => execute_as(&ctx, &role, &req.sql),
             Err(e) => Response::Error(format!("protocol error: {e}")),
         };
-        if write_frame(&mut stream, &response.encode()).is_err() {
+        let encoded = response.encode();
+        ctx.metrics.add(
+            "skaidb_bytes_returned_total{endpoint=\"binary\"}",
+            encoded.len() as u64,
+        );
+        if write_frame(&mut stream, &encoded).is_err() {
             return;
         }
     }
@@ -90,17 +103,13 @@ fn authenticate(stream: &mut TcpStream, ctx: &Shared) -> Result<String, ()> {
         } => {
             write_frame(stream, &AuthOutcome::Ok { server_signature }.encode()).map_err(|_| ())?;
             ctx.metrics.incr("skaidb_logins_total");
-            if ctx.audit.login_log {
-                eprintln!("[login] user={} role={role}", start.username);
-            }
+            ctx.audit.log_login(&start.username, Some(&role), true);
             Ok(role)
         }
         AuthResult::Denied(reason) => {
             let _ = write_frame(stream, &AuthOutcome::Denied { reason }.encode());
             ctx.metrics.incr("skaidb_login_failures_total");
-            if ctx.audit.login_log {
-                eprintln!("[login-failed] user={}", start.username);
-            }
+            ctx.audit.log_login(&start.username, None, false);
             Err(())
         }
     }

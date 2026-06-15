@@ -20,7 +20,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use std::thread;
 
-use skaidb_engine::{filter_rows, run, Cluster, Database, EngineError, IndexScanRange, QueryOutput};
+use skaidb_engine::{
+    filter_rows, run, Cluster, Database, DbStats, EngineError, IndexScanRange, QueryOutput,
+};
 use skaidb_proto::{read_frame, write_frame};
 use skaidb_sql::ast::{BinaryOp, Expr, Statement};
 use skaidb_sql::parse;
@@ -137,7 +139,48 @@ pub struct Node {
     /// Pause (ms) between migration batches — throttles a reshard so it doesn't
     /// saturate the cluster. `0` = no throttle.
     migration_pause_ms: AtomicU64,
+    /// Cumulative coordinator/replication counters, surfaced as metrics.
+    counters: Counters,
     cfg: NodeConfig,
+}
+
+/// Cumulative cluster counters (correctness-critical replication/anti-entropy
+/// activity that is otherwise invisible). All monotonic; read via [`Node::stats`].
+#[derive(Debug, Default)]
+struct Counters {
+    writes_total: AtomicU64,
+    write_quorum_failures: AtomicU64,
+    reads_total: AtomicU64,
+    read_quorum_failures: AtomicU64,
+    read_repairs: AtomicU64,
+    hints_stored: AtomicU64,
+    hints_replayed: AtomicU64,
+    peer_requests: AtomicU64,
+    peer_errors: AtomicU64,
+}
+
+/// A point-in-time snapshot of cluster state and counters for metrics/`/status`.
+#[derive(Debug, Clone)]
+pub struct ClusterStats {
+    pub node_id: String,
+    pub epoch: u64,
+    pub members: usize,
+    pub replication_factor: usize,
+    /// True while a join/decommission is in flight (dual-write window open).
+    pub resharding_active: bool,
+    /// Hinted writes currently buffered for unreachable replicas.
+    pub hints_pending: usize,
+    pub write_consistency: &'static str,
+    pub read_consistency: &'static str,
+    pub writes_total: u64,
+    pub write_quorum_failures: u64,
+    pub reads_total: u64,
+    pub read_quorum_failures: u64,
+    pub read_repairs: u64,
+    pub hints_stored: u64,
+    pub hints_replayed: u64,
+    pub peer_requests: u64,
+    pub peer_errors: u64,
 }
 
 /// A buffered write awaiting handoff to a recovered replica:
@@ -169,6 +212,7 @@ impl Node {
             hints: Mutex::new(HashMap::new()),
             migration_batch: AtomicUsize::new(1024),
             migration_pause_ms: AtomicU64::new(0),
+            counters: Counters::default(),
             cfg,
         })
     }
@@ -199,6 +243,47 @@ impl Node {
     /// The configured replication factor.
     pub fn replication_factor(&self) -> usize {
         self.cfg.replication_factor
+    }
+
+    /// A snapshot of cluster state and replication counters for metrics and the
+    /// read-only `/status` endpoint.
+    pub fn stats(&self) -> ClusterStats {
+        let c = &self.counters;
+        let (epoch, members, resharding) = {
+            let topo = self.topo.read().expect("topo lock");
+            (topo.epoch, topo.peers.len() + 1, topo.prev.is_some())
+        };
+        let hints_pending = self
+            .hints
+            .lock()
+            .expect("hints lock")
+            .values()
+            .map(|v| v.len())
+            .sum();
+        ClusterStats {
+            node_id: self.id.0.clone(),
+            epoch,
+            members,
+            replication_factor: self.cfg.replication_factor,
+            resharding_active: resharding,
+            hints_pending,
+            write_consistency: consistency_label(self.cfg.write_consistency),
+            read_consistency: consistency_label(self.cfg.read_consistency),
+            writes_total: c.writes_total.load(Ordering::Relaxed),
+            write_quorum_failures: c.write_quorum_failures.load(Ordering::Relaxed),
+            reads_total: c.reads_total.load(Ordering::Relaxed),
+            read_quorum_failures: c.read_quorum_failures.load(Ordering::Relaxed),
+            read_repairs: c.read_repairs.load(Ordering::Relaxed),
+            hints_stored: c.hints_stored.load(Ordering::Relaxed),
+            hints_replayed: c.hints_replayed.load(Ordering::Relaxed),
+            peer_requests: c.peer_requests.load(Ordering::Relaxed),
+            peer_errors: c.peer_errors.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Storage/runtime statistics for this node's local engine (for metrics).
+    pub fn db_stats(&self, per_table: bool) -> Option<DbStats> {
+        self.local.read().ok().map(|db| db.stats(per_table))
     }
 
     /// The current membership as node ids (for diagnostics).
@@ -830,6 +915,7 @@ impl Node {
         let bucket = hints.entry(replica.clone()).or_default();
         if bucket.len() < MAX_HINTS_PER_REPLICA {
             bucket.push((table.to_string(), key.to_vec(), op.clone(), hlc));
+            self.counters.hints_stored.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -869,6 +955,9 @@ impl Node {
                     .extend(remaining);
             }
         }
+        self.counters
+            .hints_replayed
+            .fetch_add(delivered as u64, Ordering::Relaxed);
         delivered
     }
 
@@ -1015,6 +1104,25 @@ impl Node {
             self.broadcast_ddl(sql)?;
             return Ok(QueryOutput::Ddl);
         }
+        // Read-only catalog introspection: the schema is identical on every node
+        // (DDL is broadcast), so answer from the local catalog without fan-out.
+        match stmt {
+            Statement::ShowTables => {
+                let db = self
+                    .local
+                    .read()
+                    .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
+                return Ok(QueryOutput::Rows(db.show_tables()));
+            }
+            Statement::ShowIndexes => {
+                let db = self
+                    .local
+                    .read()
+                    .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
+                return Ok(QueryOutput::Rows(db.show_indexes()));
+            }
+            _ => {}
+        }
         let mut coord = Coordinator {
             node: Arc::clone(self),
         };
@@ -1068,6 +1176,7 @@ impl Node {
         op: WriteOp,
         hlc: Hlc,
     ) -> EngineResult<()> {
+        self.counters.writes_total.fetch_add(1, Ordering::Relaxed);
         let replicas = self.replicas_for(key);
         let needed = self.cfg.write_consistency.required(replicas.len().max(1));
 
@@ -1142,6 +1251,9 @@ impl Node {
         if acks >= needed {
             Ok(())
         } else {
+            self.counters
+                .write_quorum_failures
+                .fetch_add(1, Ordering::Relaxed);
             Err(EngineError::Cluster(format!(
                 "write quorum not met: {acks}/{needed} acks"
             )))
@@ -1195,6 +1307,7 @@ impl Node {
     /// Point-read `key` from its replica set, resolving by last-writer-wins,
     /// requiring a read quorum of replicas to respond.
     fn point_get(&self, table: &str, key: &[u8]) -> EngineResult<Vec<(Vec<u8>, Document)>> {
+        self.counters.reads_total.fetch_add(1, Ordering::Relaxed);
         let replicas = self.replicas_for(key);
         let needed = self.cfg.read_consistency.required(replicas.len().max(1));
         let mut responders = 0usize;
@@ -1212,6 +1325,7 @@ impl Node {
                 };
                 (None, e)
             } else if let Some(addr) = self.peer_addr(replica) {
+                self.counters.peer_requests.fetch_add(1, Ordering::Relaxed);
                 match self.pool.call(
                     &addr,
                     &Request::LocalGet {
@@ -1220,7 +1334,10 @@ impl Node {
                     },
                 ) {
                     Ok(Response::Get { entry }) => (Some(addr), entry),
-                    _ => continue, // unreachable peer: not a responder
+                    _ => {
+                        self.counters.peer_errors.fetch_add(1, Ordering::Relaxed);
+                        continue; // unreachable peer: not a responder
+                    }
                 }
             } else {
                 continue;
@@ -1236,6 +1353,9 @@ impl Node {
         }
 
         if responders < needed {
+            self.counters
+                .read_quorum_failures
+                .fetch_add(1, Ordering::Relaxed);
             return Err(EngineError::Cluster(format!(
                 "read quorum not met: {responders}/{needed} replicas responded"
             )));
@@ -1288,6 +1408,7 @@ impl Node {
             if entry_hlc.is_some_and(|h| h >= hbest) {
                 continue; // already up to date
             }
+            self.counters.read_repairs.fetch_add(1, Ordering::Relaxed);
             match addr_opt {
                 None => {
                     let _ = self.apply_write_local(table, key, &op, hbest);
@@ -1320,13 +1441,21 @@ impl Node {
                 hlc,
             },
         };
-        Ok(matches!(self.pool.call(addr, &req)?, Response::Ack))
+        self.counters.peer_requests.fetch_add(1, Ordering::Relaxed);
+        match self.pool.call(addr, &req) {
+            Ok(resp) => Ok(matches!(resp, Response::Ack)),
+            Err(e) => {
+                self.counters.peer_errors.fetch_add(1, Ordering::Relaxed);
+                Err(e)
+            }
+        }
     }
 
     /// Gather a table from all reachable members, merged by last-writer-wins.
     /// Tombstones participate in the merge so a delete on one replica correctly
     /// masks a stale `Put` gathered from another (quorum read ∩ quorum write).
     fn cluster_scan(&self, table: &str) -> EngineResult<Vec<(Vec<u8>, Document)>> {
+        self.counters.reads_total.fetch_add(1, Ordering::Relaxed);
         // key -> (hlc, Some(encoded value) | None tombstone)
         let mut merged: BTreeMap<Vec<u8>, (Hlc, Option<Vec<u8>>)> = BTreeMap::new();
         let mut responders = 0usize;
@@ -1345,6 +1474,7 @@ impl Node {
 
         // Peers.
         for addr in &self.peer_addrs() {
+            self.counters.peer_requests.fetch_add(1, Ordering::Relaxed);
             if let Ok(Response::Scan { rows }) = self.pool.call(
                 addr,
                 &Request::LocalScan {
@@ -1355,11 +1485,16 @@ impl Node {
                     merge_row(&mut merged, key, is_put.then_some(value), hlc);
                 }
                 responders += 1;
+            } else {
+                self.counters.peer_errors.fetch_add(1, Ordering::Relaxed);
             }
         }
 
         let needed = self.cfg.read_consistency.required(self.member_count());
         if responders < needed {
+            self.counters
+                .read_quorum_failures
+                .fetch_add(1, Ordering::Relaxed);
             return Err(EngineError::Cluster(format!(
                 "read quorum not met: {responders}/{needed} members responded"
             )));
@@ -1705,6 +1840,15 @@ fn load_membership(path: &Path) -> Option<(Vec<(NodeId, String)>, u64)> {
         return None;
     }
     Some((members, epoch))
+}
+
+/// A stable Prometheus label for a consistency level.
+fn consistency_label(c: Consistency) -> &'static str {
+    match c {
+        Consistency::One => "one",
+        Consistency::Quorum => "quorum",
+        Consistency::All => "all",
+    }
 }
 
 fn is_ddl(stmt: &Statement) -> bool {

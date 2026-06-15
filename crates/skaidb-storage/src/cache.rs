@@ -16,6 +16,7 @@
 //! `Mutex`) so it can be shared across reader threads behind the engine.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::hlc::Hlc;
@@ -25,10 +26,22 @@ use crate::memtable::VersionValue;
 /// key is absent everywhere below the memtable (a cached negative lookup).
 pub type CachedRead = Option<(Hlc, VersionValue)>;
 
+/// A point-in-time snapshot of read-cache effectiveness, surfaced as metrics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub entries: usize,
+}
+
 #[derive(Debug)]
 pub struct ReadCache {
     capacity: usize,
     inner: Mutex<Inner>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    evictions: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -45,6 +58,9 @@ impl ReadCache {
         ReadCache {
             capacity,
             inner: Mutex::new(Inner::default()),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
         }
     }
 
@@ -54,7 +70,23 @@ impl ReadCache {
         if self.capacity == 0 {
             return None;
         }
-        self.inner.lock().expect("read cache").map.get(key).cloned()
+        let found = self.inner.lock().expect("read cache").map.get(key).cloned();
+        if found.is_some() {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+        }
+        found
+    }
+
+    /// A snapshot of cumulative hit/miss/eviction counts and the live entry count.
+    pub fn stats(&self) -> CacheStats {
+        CacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+            entries: self.inner.lock().expect("read cache").map.len(),
+        }
     }
 
     /// Record the resolved result for `key`.
@@ -71,7 +103,9 @@ impl ReadCache {
         while inner.map.len() > self.capacity {
             match inner.fifo.pop_front() {
                 Some(old) => {
-                    inner.map.remove(&old);
+                    if inner.map.remove(&old).is_some() {
+                        self.evictions.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 None => break,
             }

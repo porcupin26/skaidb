@@ -12,8 +12,10 @@ pub mod binary;
 pub mod metrics;
 pub mod rest;
 pub mod shared;
+pub mod slowlog;
 
 use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use skaidb_auth::RoleStore;
 use skaidb_cluster::{Consistency as ClusterConsistency, Node, NodeConfig, NodeId};
@@ -87,10 +89,42 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    let clustered = !config.cluster.seeds.is_empty();
+    let bind = config.server.bind_addr.clone();
+    // Node identity: its ring id when clustered, else its client endpoint.
+    let node_id = if clustered {
+        format!("{}:{}", bind, config.cluster.internode_port)
+    } else {
+        format!("{}:{}", bind, config.server.quic_port)
+    };
+    let role_label = match config.server.node_role {
+        skaidb_config::NodeRole::Member => "member",
+        skaidb_config::NodeRole::Agent => "agent",
+    };
+
     let metrics = Metrics::new();
     metrics.set("skaidb_up", 1);
+    // Build/identity info as labelled `=1` gauges (standard deploy/restart
+    // tracking), plus the process start time for uptime computation.
+    metrics.set(
+        &format!(
+            "skaidb_build_info{{version=\"{}\",git_sha=\"{}\",rustc=\"{}\"}}",
+            env!("CARGO_PKG_VERSION"),
+            option_env!("SKAIDB_GIT_SHA").unwrap_or("unknown"),
+            option_env!("SKAIDB_RUSTC").unwrap_or("unknown"),
+        ),
+        1,
+    );
+    metrics.set(
+        &format!("skaidb_node_info{{node_id=\"{node_id}\",role=\"{role_label}\"}}"),
+        1,
+    );
+    let start_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    metrics.set("skaidb_start_time_seconds", start_unix);
 
-    let clustered = !config.cluster.seeds.is_empty();
     let backend = build_backend(db, &config)?;
 
     let ctx: Shared = Arc::new(Context {
@@ -101,6 +135,9 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         authn,
         superuser_role: config.auth.superuser.clone(),
         admin_lock: Mutex::new(()),
+        start: Instant::now(),
+        per_table_metrics: config.observability.per_table_metrics,
+        slow_log: crate::slowlog::SlowLog::new(),
     });
 
     println!(
@@ -124,7 +161,6 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
     );
 
-    let bind = &config.server.bind_addr;
     let binary_addr = format!("{}:{}", bind, config.server.quic_port);
     let rest_addr = format!("{}:{}", bind, config.server.rest_port);
 
@@ -133,6 +169,22 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     println!("skaidb binary endpoint listening on {binary_local}");
     println!("skaidb REST endpoint listening on http://{rest_local}/query");
+
+    // Dedicated metrics/health listener on `observability.prometheus_port`. It
+    // reuses the same handler (so `/metrics`, `/health`, `/ready`, `/status` are
+    // served), giving scrapers a port separate from the data plane. Bound only
+    // when it differs from the REST port (otherwise `/metrics` on the REST port
+    // already covers it) and is non-zero.
+    let prom_port = config.observability.prometheus_port;
+    if prom_port != 0 && prom_port != config.server.rest_port {
+        let prom_addr = format!("{}:{}", bind, prom_port);
+        match rest::spawn(&prom_addr, ctx.clone()) {
+            Ok((prom_local, _h)) => {
+                println!("skaidb metrics endpoint listening on http://{prom_local}/metrics")
+            }
+            Err(e) => eprintln!("skaidb: could not bind metrics port {prom_addr}: {e}"),
+        }
+    }
 
     binary_handle.join().ok();
     Ok(())
@@ -157,6 +209,7 @@ mod tests {
             slow_query_ms: 0,
             login_log: false,
             error_log: false,
+            json: false,
         }
     }
 
@@ -181,6 +234,9 @@ mod tests {
             authn: AuthState::disabled(),
             superuser_role: "superuser".into(),
             admin_lock: Mutex::new(()),
+            start: Instant::now(),
+            per_table_metrics: false,
+            slow_log: crate::slowlog::SlowLog::new(),
         })
     }
 
@@ -263,6 +319,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn metrics_render_correct_types_and_histogram() {
+        let ctx = temp_ctx();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
+        http_post(addr, "CREATE TABLE t (PRIMARY KEY (id))");
+        http_post(addr, "INSERT INTO t (id) VALUES (1)");
+        http_post(addr, "SELECT * FROM t");
+
+        let m = http_get(addr, "/metrics");
+        // Query latency is a histogram with buckets/sum/count.
+        assert!(m.contains("# TYPE skaidb_query_duration_seconds histogram"));
+        assert!(m.contains("skaidb_query_duration_seconds_count{type=\"select\"}"));
+        // HELP lines are emitted.
+        assert!(m.contains("# HELP skaidb_queries_total"));
+        // Storage gauges are populated at scrape time via the pull model.
+        assert!(m.contains("# TYPE skaidb_storage_tables gauge"));
+        assert!(m.contains("skaidb_uptime_seconds"));
+    }
+
+    #[test]
+    fn health_ready_and_status_endpoints() {
+        let ctx = temp_ctx();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
+
+        assert_eq!(http_get_status(addr, "/health"), 200);
+        assert_eq!(http_get_status(addr, "/ready"), 200);
+        let status = http_get(addr, "/status");
+        assert!(status.contains("\"clustered\":false"), "got: {status}");
+    }
+
+    #[test]
+    fn show_tables_over_rest() {
+        let ctx = temp_ctx();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
+        http_post(addr, "CREATE TABLE alpha (PRIMARY KEY (id))");
+        http_post(addr, "CREATE TABLE beta (PRIMARY KEY (id))");
+        let body = http_post(addr, "SHOW TABLES");
+        assert!(body.contains("alpha"), "got: {body}");
+        assert!(body.contains("beta"), "got: {body}");
+        assert!(body.contains("\"columns\":[\"table\",\"primary_key\"]"), "got: {body}");
+    }
+
+    /// GET `path`, returning the HTTP status code.
+    fn http_get_status(addr: std::net::SocketAddr, path: &str) -> u16 {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        stream.write_all(req.as_bytes()).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    }
+
     /// Context requiring SCRAM auth: user `ada`/`pencil` acting as `admin`.
     fn auth_ctx() -> Shared {
         let mut roles = RoleStore::new();
@@ -277,6 +389,9 @@ mod tests {
             authn,
             superuser_role: "admin".into(),
             admin_lock: Mutex::new(()),
+            start: Instant::now(),
+            per_table_metrics: false,
+            slow_log: crate::slowlog::SlowLog::new(),
         })
     }
 
@@ -314,6 +429,9 @@ mod tests {
             authn: AuthState::disabled(),
             superuser_role: "superuser".into(),
             admin_lock: Mutex::new(()),
+            start: Instant::now(),
+            per_table_metrics: false,
+            slow_log: crate::slowlog::SlowLog::new(),
         });
 
         // Superuser sets up the table.
@@ -431,6 +549,9 @@ mod tests {
             authn: AuthState::disabled(),
             superuser_role: "superuser".into(),
             admin_lock: Mutex::new(()),
+            start: Instant::now(),
+            per_table_metrics: false,
+            slow_log: crate::slowlog::SlowLog::new(),
         })
     }
 

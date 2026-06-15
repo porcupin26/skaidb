@@ -102,6 +102,9 @@ pub enum Keyword {
     Right,
     Outer,
     Cross,
+    Show,
+    Tables,
+    Indexes,
 }
 
 impl Keyword {
@@ -167,6 +170,9 @@ impl Keyword {
             "RIGHT" => Right,
             "OUTER" => Outer,
             "CROSS" => Cross,
+            "SHOW" => Show,
+            "TABLES" => Tables,
+            "INDEXES" => Indexes,
             _ => return None,
         };
         Some(kw)

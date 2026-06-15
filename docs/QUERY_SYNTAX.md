@@ -43,6 +43,10 @@ FROM <table> [[AS] <alias>]
 BEGIN [TRANSACTION]
 COMMIT [TRANSACTION]
 ROLLBACK [TRANSACTION]
+
+-- Introspection (read-only catalog)
+SHOW TABLES
+SHOW INDEXES
 ```
 
 - `CREATE TABLE` declares **only the primary key** — there is no column list;
@@ -61,6 +65,12 @@ ROLLBACK [TRANSACTION]
   every row (recomputing the primary key if it is a key column) and rebuilds any
   index that referenced it. The store is schema-less, so there is no
   `ADD`/`DROP COLUMN` — a field simply exists in the rows that set it.
+- **`SHOW TABLES`** lists catalog tables as `(table, primary_key)` rows;
+  **`SHOW INDEXES`** lists secondary and vector indexes as
+  `(index, table, kind, columns)`. Both are read-only and require no special
+  privilege, so a monitoring/tooling agent can enumerate the schema without
+  `/query` data access. In cluster mode they answer from the local catalog (the
+  schema is identical on every node).
 - **`DISTINCT`** removes duplicate output rows. **`HAVING`** filters groups after
   aggregation (it may reference aggregates and the `GROUP BY` columns).
 - **`JOIN`** combines tables by nested-loop. `INNER`/`LEFT`/`RIGHT`/`CROSS` are

@@ -144,6 +144,13 @@ pub struct ObservabilityConfig {
     pub query_log_masked: bool,
     pub login_log_enabled: bool,
     pub error_log_level: String,
+    /// Emit per-table metrics (live keys, tombstones, on-disk bytes). Off by
+    /// default because table count is unbounded — keep label cardinality bounded
+    /// (SPEC §10) and only enable this when the table set is known and small.
+    pub per_table_metrics: bool,
+    /// Audit/query/login log format: `"text"` (human-readable, default) or
+    /// `"json"` (one JSON object per line, for a log agent to parse reliably).
+    pub log_format: String,
 }
 
 impl Config {
@@ -248,6 +255,8 @@ impl Default for ObservabilityConfig {
             query_log_masked: true,
             login_log_enabled: true,
             error_log_level: "warn".to_string(),
+            per_table_metrics: false,
+            log_format: "text".to_string(),
         }
     }
 }
