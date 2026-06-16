@@ -192,6 +192,11 @@ type HintedWrite = (String, Vec<u8>, WriteOp, Hlc);
 /// (anti-entropy reconciles whatever overflows).
 const MAX_HINTS_PER_REPLICA: usize = 4096;
 
+/// Startup catch-up: how many times to wait for a peer to become reachable
+/// before giving up, and how long between attempts.
+const CATCH_UP_ATTEMPTS: usize = 15;
+const CATCH_UP_DELAY: Duration = Duration::from_secs(2);
+
 impl Node {
     /// Create a node with the given local database and cluster config. If a
     /// persisted membership from a prior run exists (a node that joined/left
@@ -399,6 +404,29 @@ impl Node {
             .read()
             .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
             .schema_ddl())
+    }
+
+    /// Bidirectionally converge the catalog with the peer at `addr`: pull the
+    /// peer's schema and apply anything missing locally, then push the local
+    /// schema so the peer learns anything it is missing. All statements are
+    /// idempotent (`CREATE ... IF NOT EXISTS`), so this is safe to repeat and to
+    /// run concurrently with normal traffic. Best-effort: an unreachable peer or
+    /// an individual statement error is skipped rather than failing the pass.
+    fn sync_schema_with(&self, addr: &str) {
+        // Pull: apply the peer's schema locally.
+        if let Ok(Response::Schema { entries }) = self.pool.call(addr, &Request::SchemaDdl) {
+            for (db, sql) in entries {
+                if let Ok(mut d) = self.local.write() {
+                    let _ = d.execute_session(&db, &sql);
+                }
+            }
+        }
+        // Push: send the local schema so the peer converges too.
+        if let Ok(mine) = self.schema_ddl() {
+            for (db, sql) in mine {
+                let _ = self.pool.call(addr, &Request::ApplyDdl { db, sql });
+            }
+        }
     }
 
     /// The hash ring as it was **before** `exclude` joined — the current
@@ -830,6 +858,13 @@ impl Node {
     /// number of rows repaired (pulled + pushed).
     pub fn repair(&self) -> EngineResult<usize> {
         let mut repaired = 0usize;
+        // Converge the catalog first (databases/tables/indexes), both directions,
+        // so a node that missed a DDL broadcast learns it — and so the data pass
+        // below sees any newly-created tables. Schema DDL is idempotent
+        // (`CREATE ... IF NOT EXISTS`), so this is safe to run repeatedly.
+        for (_pid, addr) in self.peers_with_ids() {
+            self.sync_schema_with(&addr);
+        }
         let tables = self
             .local
             .read()
@@ -974,7 +1009,38 @@ impl Node {
                 thread::spawn(move || node.handle_internode(stream));
             }
         });
+        // Catch up on anything missed while this node was down: once a peer is
+        // reachable, reconcile schema + data from the cluster. Runs in the
+        // background so startup isn't blocked; a no-op when standalone.
+        let node = Arc::clone(self);
+        thread::spawn(move || node.startup_catch_up());
         Ok(())
+    }
+
+    /// Background catch-up after a (re)join: wait for a peer to come up, then run
+    /// a full anti-entropy pass (schema + data) so a node that missed DDL or
+    /// writes while it was down converges automatically.
+    fn startup_catch_up(self: Arc<Self>) {
+        if self.member_count() <= 1 {
+            return; // standalone: nothing to catch up from
+        }
+        for attempt in 1..=CATCH_UP_ATTEMPTS {
+            thread::sleep(CATCH_UP_DELAY);
+            let peer_up = self
+                .peer_addrs()
+                .iter()
+                .any(|a| matches!(self.pool.call(a, &Request::Ping), Ok(Response::Pong)));
+            if !peer_up {
+                continue; // no peer yet — keep waiting
+            }
+            match self.repair() {
+                Ok(n) => {
+                    eprintln!("skaidb: startup catch-up complete ({n} rows reconciled)");
+                    return;
+                }
+                Err(e) => eprintln!("skaidb: startup catch-up attempt {attempt} failed: {e}"),
+            }
+        }
     }
 
     fn handle_internode(&self, mut stream: TcpStream) {
@@ -1075,6 +1141,10 @@ impl Node {
             },
             Request::Repair => match self.repair() {
                 Ok(_) => Response::Ack,
+                Err(e) => Response::Err(e.to_string()),
+            },
+            Request::SchemaDdl => match self.schema_ddl() {
+                Ok(entries) => Response::Schema { entries },
                 Err(e) => Response::Err(e.to_string()),
             },
         }
@@ -1185,8 +1255,9 @@ impl Node {
     /// Broadcast DDL to all members; require a member quorum to apply it (so a
     /// single node being down does not block schema changes). Each node applies
     /// it within `current_db` so table/index names resolve identically. A node
-    /// that missed the broadcast would need to catch up via a schema log — not
-    /// yet built, so phase 1 relies on the broadcast reaching each node.
+    /// that missed the broadcast (down at the time) converges later: schema is
+    /// reconciled by [`Node::sync_schema_with`] during [`Node::repair`], which
+    /// also runs automatically on (re)join via [`Node::startup_catch_up`].
     fn broadcast_ddl(&self, current_db: &str, sql: &str) -> EngineResult<()> {
         let mut acks = 0usize;
         // Local first.

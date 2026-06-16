@@ -96,6 +96,9 @@ pub enum Request {
     /// Run an anti-entropy pass: reconcile this node's replicas with its peers,
     /// copying the newer version of each key in both directions.
     Repair,
+    /// Ask the peer for its full schema as idempotent `CREATE ... IF NOT EXISTS`
+    /// statements, so a (re)joining node can converge its catalog.
+    SchemaDdl,
     Ping,
 }
 
@@ -120,6 +123,10 @@ pub enum Response {
     /// `(key, distance)` hits from a [`Request::VectorSearch`], nearest-first.
     VectorHits {
         hits: Vec<(Vec<u8>, f32)>,
+    },
+    /// A node's full schema as `(database, ddl)` pairs (reply to `SchemaDdl`).
+    Schema {
+        entries: Vec<(String, String)>,
     },
     Err(String),
     Pong,
@@ -146,6 +153,7 @@ const REQ_DRAIN: u8 = 11;
 const REQ_RECLAIM: u8 = 12;
 const REQ_REPAIR: u8 = 13;
 const REQ_FSCAN: u8 = 14;
+const REQ_SCHEMA: u8 = 15;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
@@ -154,6 +162,7 @@ const RES_PONG: u8 = 3;
 const RES_GET: u8 = 4;
 const RES_KEYS: u8 = 5;
 const RES_VHITS: u8 = 6;
+const RES_SCHEMA: u8 = 7;
 
 impl Request {
     pub fn encode(&self) -> Vec<u8> {
@@ -235,6 +244,7 @@ impl Request {
             }
             Request::Reclaim => o.push(REQ_RECLAIM),
             Request::Repair => o.push(REQ_REPAIR),
+            Request::SchemaDdl => o.push(REQ_SCHEMA),
             Request::Ping => o.push(REQ_PING),
         }
         o
@@ -307,6 +317,7 @@ impl Request {
             }
             REQ_RECLAIM => Request::Reclaim,
             REQ_REPAIR => Request::Repair,
+            REQ_SCHEMA => Request::SchemaDdl,
             REQ_PING => Request::Ping,
             _ => return Err(WireError::Malformed("unknown request op")),
         })
@@ -353,6 +364,14 @@ impl Response {
                 for (key, dist) in hits {
                     put_bytes(&mut o, key);
                     o.extend_from_slice(&dist.to_le_bytes());
+                }
+            }
+            Response::Schema { entries } => {
+                o.push(RES_SCHEMA);
+                o.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+                for (db, ddl) in entries {
+                    put_str(&mut o, db);
+                    put_str(&mut o, ddl);
                 }
             }
             Response::Err(msg) => {
@@ -407,6 +426,16 @@ impl Response {
                     hits.push((key, c.f32()?));
                 }
                 Response::VectorHits { hits }
+            }
+            RES_SCHEMA => {
+                let n = c.u32()? as usize;
+                let mut entries = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let db = c.string()?;
+                    let ddl = c.string()?;
+                    entries.push((db, ddl));
+                }
+                Response::Schema { entries }
             }
             RES_ERR => Response::Err(c.string()?),
             RES_PONG => Response::Pong,
@@ -789,6 +818,7 @@ mod tests {
             },
             Request::Reclaim,
             Request::Repair,
+            Request::SchemaDdl,
             Request::Ping,
         ] {
             assert_eq!(Request::decode(&req.encode()).unwrap(), req);
@@ -819,6 +849,12 @@ mod tests {
                 entry: Some((vec![], Hlc::new(9, 2), false)),
             },
             Response::Get { entry: None },
+            Response::Schema {
+                entries: vec![
+                    ("default".into(), "CREATE DATABASE IF NOT EXISTS foo".into()),
+                    ("foo".into(), "CREATE TABLE IF NOT EXISTS t (PRIMARY KEY (id))".into()),
+                ],
+            },
             Response::Err("x".into()),
             Response::Pong,
         ] {
