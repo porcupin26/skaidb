@@ -4,9 +4,11 @@
 //! one-shot statement via `-e`, or an interactive REPL reading from stdin.
 //! Remote connection over the driver lands in a later phase.
 
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal};
 
 use clap::Parser;
+use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
 use skaidb_engine::{Database, QueryOutput, ResultSet};
 
 #[derive(Debug, Parser)]
@@ -20,6 +22,11 @@ struct Cli {
     #[arg(short = 'e', long = "execute")]
     execute: Option<String>,
 }
+
+/// Prompt shown when waiting for a fresh statement.
+const PROMPT: &str = "skaidb> ";
+/// Prompt shown while a statement is still being typed (no terminating `;`).
+const CONT_PROMPT: &str = "   ...> ";
 
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
@@ -38,7 +45,11 @@ fn main() -> std::process::ExitCode {
         };
     }
 
-    repl(&mut db);
+    if io::stdin().is_terminal() {
+        repl_interactive(&mut db);
+    } else {
+        repl_piped(&mut db);
+    }
     std::process::ExitCode::SUCCESS
 }
 
@@ -47,24 +58,79 @@ fn run_script(db: &mut Database, script: &str) -> Result<(), ()> {
     for stmt in split_statements(script) {
         if let Err(e) = run_one(db, &stmt) {
             eprintln!("error: {e}");
+            if let Some(hint) = suggest(&stmt, &e) {
+                eprintln!("hint: {hint}");
+            }
             return Err(());
         }
     }
     Ok(())
 }
 
-fn repl(db: &mut Database) {
-    let stdin = io::stdin();
-    let interactive = stdin.is_terminal();
-    if interactive {
-        eprintln!("skaidb interactive shell. End statements with ';'. Ctrl-D to exit.");
+/// Interactive REPL with line editing, history, and arrow-key recall.
+fn repl_interactive(db: &mut Database) {
+    eprintln!("skaidb interactive shell. Type 'help' for commands, Ctrl-D to exit.");
+
+    let mut rl = match DefaultEditor::new() {
+        Ok(rl) => rl,
+        Err(e) => {
+            // Fall back to the dumb reader if the terminal can't be put in raw mode.
+            eprintln!("skaidb-cli: line editor unavailable ({e}); using basic input");
+            repl_piped(db);
+            return;
+        }
+    };
+    let history = history_path();
+    if let Some(path) = &history {
+        let _ = rl.load_history(path);
     }
+
     let mut buffer = String::new();
     loop {
-        if interactive && buffer.is_empty() {
-            eprint!("skaidb> ");
-            let _ = io::stderr().flush();
+        let prompt = if buffer.is_empty() { PROMPT } else { CONT_PROMPT };
+        match rl.readline(prompt) {
+            Ok(line) => {
+                let _ = rl.add_history_entry(line.as_str());
+
+                // Meta-commands work on their own line, no `;` required, but only
+                // when we are not in the middle of typing a SQL statement.
+                if buffer.is_empty() {
+                    match meta_command(line.trim()) {
+                        Meta::Help => {
+                            print_help();
+                            continue;
+                        }
+                        Meta::Quit => break,
+                        Meta::None => {}
+                    }
+                }
+
+                buffer.push_str(&line);
+                buffer.push('\n');
+                drain_statements(db, &mut buffer);
+            }
+            Err(ReadlineError::Interrupted) => {
+                // Ctrl-C abandons the half-typed statement, like a shell.
+                buffer.clear();
+            }
+            Err(ReadlineError::Eof) => break,
+            Err(e) => {
+                eprintln!("read error: {e}");
+                break;
+            }
         }
+    }
+
+    if let Some(path) = &history {
+        let _ = rl.save_history(path);
+    }
+}
+
+/// REPL for piped / non-tty input: no prompts, no line editing.
+fn repl_piped(db: &mut Database) {
+    let stdin = io::stdin();
+    let mut buffer = String::new();
+    loop {
         let mut line = String::new();
         match stdin.lock().read_line(&mut line) {
             Ok(0) => break, // EOF
@@ -75,17 +141,29 @@ fn repl(db: &mut Database) {
             }
         }
         buffer.push_str(&line);
+        drain_statements(db, &mut buffer);
+    }
+}
 
-        // Execute complete (semicolon-terminated) statements as they accumulate.
-        while let Some(idx) = find_statement_end(&buffer) {
-            let stmt: String = buffer.drain(..=idx).collect();
-            let stmt = stmt.trim();
-            if !stmt.is_empty() && stmt != ";" {
-                if let Err(e) = run_one(db, stmt) {
-                    eprintln!("error: {e}");
+/// Execute every complete (`;`-terminated) statement sitting in `buffer`,
+/// removing it as we go and leaving any trailing partial statement behind.
+fn drain_statements(db: &mut Database, buffer: &mut String) {
+    while let Some(idx) = find_statement_end(buffer) {
+        let stmt: String = buffer.drain(..=idx).collect();
+        let stmt = stmt.trim();
+        if !stmt.is_empty() && stmt != ";" {
+            if let Err(e) = run_one(db, stmt) {
+                eprintln!("error: {e}");
+                if let Some(hint) = suggest(stmt, &e) {
+                    eprintln!("hint: {hint}");
                 }
             }
         }
+    }
+    // A buffer that holds only whitespace can never start a statement; clear it
+    // so the next prompt is the fresh `skaidb> ` rather than a continuation.
+    if buffer.trim().is_empty() {
+        buffer.clear();
     }
 }
 
@@ -96,6 +174,154 @@ fn run_one(db: &mut Database, sql: &str) -> Result<(), skaidb_engine::EngineErro
         QueryOutput::Ddl => println!("OK"),
     }
     Ok(())
+}
+
+/// Meta (non-SQL) commands recognised at the start of a statement.
+enum Meta {
+    Help,
+    Quit,
+    None,
+}
+
+fn meta_command(line: &str) -> Meta {
+    match line.trim_end_matches(';').trim().to_ascii_lowercase().as_str() {
+        "help" | "?" | "\\h" | "\\?" => Meta::Help,
+        "quit" | "exit" | "\\q" => Meta::Quit,
+        _ => Meta::None,
+    }
+}
+
+fn print_help() {
+    println!(
+        "\
+skaidb interactive shell — commands
+
+  Meta:
+    help, ?            show this help
+    quit, exit         leave the shell (or press Ctrl-D)
+    Ctrl-C             discard the line you are typing
+
+  Statements (end each with ';'):
+    SELECT <cols> FROM <table> [WHERE ...] [ORDER BY ...] [LIMIT n];
+    INSERT INTO <table> (<cols>) VALUES (...);
+    UPDATE <table> SET ... [WHERE ...];
+    DELETE FROM <table> [WHERE ...];
+    CREATE TABLE <name> (PRIMARY KEY (<col> [, ...]));
+    CREATE INDEX <name> ON <table> (<path> [, ...]);
+    DROP   TABLE|INDEX <name>;
+    SHOW   TABLES;
+    SHOW   INDEXES;
+    BEGIN; COMMIT; ROLLBACK;
+
+  skaidb is schema-less and single-namespace: there are no databases and no
+  column definitions — CREATE TABLE only declares the primary key.
+
+  Full grammar: docs/QUERY_SYNTAX.md"
+    );
+}
+
+/// Suggest a fix for a failed statement, when we can recognise the mistake.
+///
+/// Returns `None` rather than guessing wildly — a misleading hint is worse than
+/// none. Recognised cases mirror the parser's own "expected …" messages.
+fn suggest(sql: &str, err: &skaidb_engine::EngineError) -> Option<String> {
+    let msg = err.to_string();
+    let trimmed = sql.trim_start();
+    let mut words = trimmed.split_whitespace();
+    let first = words.next().unwrap_or("").trim_end_matches(';');
+    let second = words.next().unwrap_or("").trim_end_matches(';');
+    let first_up = first.to_ascii_uppercase();
+    let second_low = second.to_ascii_lowercase();
+
+    // The whole statement could not even be tokenised.
+    if msg.contains("lex error") {
+        if trimmed.contains('\\') {
+            return Some("stray '\\' character — skaidb does not use backslash line continuations; just keep typing until ';'.".into());
+        }
+        return Some("the statement contains a character skaidb cannot read; type 'help' to see valid syntax.".into());
+    }
+
+    // First word is not a known statement keyword.
+    if msg.contains("expected a statement") {
+        if let Some(close) = closest_statement(&first_up) {
+            return Some(format!("did you mean {close}? Type 'help' for the full list of commands."));
+        }
+        return Some(format!(
+            "'{first}' is not a statement. Try SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, SHOW — or 'help'."
+        ));
+    }
+
+    // SHOW with the wrong target.
+    if msg.contains("expected TABLES or INDEXES after SHOW") {
+        return Some("skaidb has no databases. Try: SHOW TABLES;  or  SHOW INDEXES;".into());
+    }
+
+    // CREATE / DROP with the wrong object kind.
+    if msg.contains("expected TABLE or INDEX") {
+        if matches!(second_low.as_str(), "database" | "databases" | "db" | "schema") {
+            return Some(format!(
+                "skaidb is single-namespace and has no databases. Use {first_up} TABLE <name> ...;"
+            ));
+        }
+        return Some(format!("{first_up} what? Try {first_up} TABLE <name> (...);  or  {first_up} INDEX <name> ON <table> (...);"));
+    }
+
+    // CREATE TABLE without its primary-key clause: `expected LParen`.
+    if msg.contains("expected LParen") && first_up == "CREATE" {
+        // The table name is the token after the TABLE keyword.
+        let name = words.next().unwrap_or("").trim_end_matches(';');
+        let name = if name.is_empty() { "<name>" } else { name };
+        return Some(format!(
+            "CREATE TABLE needs a primary key, e.g.  CREATE TABLE {name} (PRIMARY KEY (id));"
+        ));
+    }
+
+    None
+}
+
+/// SQL statement keywords, used for "did you mean …?" suggestions.
+const STATEMENT_KEYWORDS: &[&str] = &[
+    "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "SHOW", "BEGIN", "COMMIT",
+    "ROLLBACK",
+];
+
+/// Closest statement keyword to `word` within a small edit distance, if any.
+fn closest_statement(word: &str) -> Option<&'static str> {
+    if word.is_empty() {
+        return None;
+    }
+    let mut best: Option<(&'static str, usize)> = None;
+    for &kw in STATEMENT_KEYWORDS {
+        let d = edit_distance(word, kw);
+        if best.is_none_or(|(_, bd)| d < bd) {
+            best = Some((kw, d));
+        }
+    }
+    // Only suggest when the typo is plausibly the same word.
+    best.filter(|&(kw, d)| d <= 2.max(kw.len() / 3)).map(|(kw, _)| kw)
+}
+
+/// Levenshtein edit distance between two ASCII-ish words.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Location of the persistent history file, under the user's home directory.
+fn history_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::Path::new(&home).join(".skaidb_history"))
 }
 
 /// Split a script into statements on top-level semicolons (ignoring `;` inside
@@ -188,4 +414,60 @@ fn join_padded<S: AsRef<str>>(cells: &[S], widths: &[usize]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" | ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use skaidb_engine::EngineError;
+
+    fn parse_err(sql: &str) -> EngineError {
+        // Drive a real parse failure through the engine's error type.
+        EngineError::Parse(skaidb_sql::parse(sql).unwrap_err())
+    }
+
+    #[test]
+    fn suggests_show_tables() {
+        let e = parse_err("show dbs;");
+        let hint = suggest("show dbs;", &e).unwrap();
+        assert!(hint.contains("SHOW TABLES"), "{hint}");
+    }
+
+    #[test]
+    fn suggests_create_table_for_database() {
+        let e = parse_err("create database meh;");
+        let hint = suggest("create database meh;", &e).unwrap();
+        assert!(hint.contains("no databases"), "{hint}");
+        assert!(hint.contains("CREATE TABLE"), "{hint}");
+    }
+
+    #[test]
+    fn suggests_primary_key_clause() {
+        let e = parse_err("create table test;");
+        let hint = suggest("create table test;", &e).unwrap();
+        assert!(hint.contains("PRIMARY KEY"), "{hint}");
+        assert!(hint.contains("test"), "{hint}");
+    }
+
+    #[test]
+    fn suggests_closest_statement_keyword() {
+        let e = parse_err("slect 1;");
+        let hint = suggest("slect 1;", &e).unwrap();
+        assert!(hint.contains("SELECT"), "{hint}");
+    }
+
+    #[test]
+    fn flags_stray_backslash() {
+        let e = parse_err("create table meh;\\");
+        let hint = suggest("create table meh;\\", &e).unwrap();
+        assert!(hint.contains('\\'), "{hint}");
+    }
+
+    #[test]
+    fn meta_help_and_quit() {
+        assert!(matches!(meta_command("help"), Meta::Help));
+        assert!(matches!(meta_command("?"), Meta::Help));
+        assert!(matches!(meta_command("exit"), Meta::Quit));
+        assert!(matches!(meta_command("select 1"), Meta::None));
+    }
 }
