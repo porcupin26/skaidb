@@ -10,6 +10,10 @@ declared primary key; any field not present reads as `NULL`.
 
 ## Statements
 
+A `<table>` reference may be qualified by a database: `<database> . <table>`
+(e.g. `shop.orders`). An unqualified table resolves against the connection's
+current database (see *Databases* below).
+
 ```sql
 -- DDL
 CREATE TABLE [IF NOT EXISTS] <table> (PRIMARY KEY (<col> [, <col> ...]))
@@ -44,9 +48,16 @@ BEGIN [TRANSACTION]
 COMMIT [TRANSACTION]
 ROLLBACK [TRANSACTION]
 
+-- Databases (see note)
+CREATE DATABASE [IF NOT EXISTS] <name>
+DROP   DATABASE [IF EXISTS] <name>
+USE    [DATABASE] <name>
+
 -- Introspection (read-only catalog)
 SHOW TABLES
 SHOW INDEXES
+SHOW STATUS
+SHOW DATABASES
 ```
 
 - `CREATE TABLE` declares **only the primary key** — there is no column list;
@@ -71,6 +82,28 @@ SHOW INDEXES
   privilege, so a monitoring/tooling agent can enumerate the schema without
   `/query` data access. In cluster mode they answer from the local catalog (the
   schema is identical on every node).
+- **`SHOW STATUS`** returns storage and runtime statistics for the current
+  database as `(metric, value)` rows — table/index counts, on-disk and memtable
+  bytes, SSTable count, WAL bytes/fsyncs, compactions, cache hit/miss/hit-rate,
+  and a per-table `table.<name>.{live_keys,tombstones,disk_bytes}` breakdown. It
+  is the same data the server publishes at `GET /metrics`, surfaced as SQL.
+- **`CREATE`/`DROP DATABASE`**, **`USE`**, and **`SHOW DATABASES`** manage
+  databases — each is an isolated set of tables and indexes. A database is a
+  **namespace**: internally a table is stored under a per-database name, with the
+  implicit `default` database using unprefixed names (so an existing
+  single-database directory keeps working unchanged — its tables are the
+  `default` database). `USE` sets the **current database** for the connection
+  (the `skaidb-cli` shell, or a binary-protocol connection); unqualified table
+  names resolve against it, and `db.table` reaches another database without
+  switching. `SHOW DATABASES` lists them as `(database, current)` rows with `*`
+  marking the current one; `SHOW TABLES`/`SHOW INDEXES` are scoped to the current
+  database. The `default` database cannot be dropped; dropping the current
+  database (or its cascade) reverts the connection to `default`.
+  - **Replication:** in cluster mode, `CREATE`/`DROP DATABASE` broadcast to every
+    node (like other DDL), and writes inside any database replicate by the same
+    quorum/hinted-handoff/read-repair path as the `default` database. The REST
+    `/query` gateway is stateless — it always starts at `default`, so reach other
+    databases there with `db.table` qualifiers rather than `USE`.
 - **`DISTINCT`** removes duplicate output rows. **`HAVING`** filters groups after
   aggregation (it may reference aggregates and the `GROUP BY` columns).
 - **`JOIN`** combines tables by nested-loop. `INNER`/`LEFT`/`RIGHT`/`CROSS` are

@@ -7,12 +7,16 @@ pub mod catalog;
 mod error;
 mod eval;
 mod exec;
+pub mod namespace;
 mod result;
+mod session;
 pub mod vector;
 
 pub use error::EngineError;
 pub use exec::{filter_rows, run, Cluster, Database, DbStats, IndexScanRange, TableStats};
-pub use result::{QueryOutput, ResultSet};
+pub use namespace::DEFAULT_DATABASE;
+pub use result::{QueryOutput, ResultSet, SessionEffect};
+pub use session::Session;
 
 #[cfg(test)]
 mod tests {

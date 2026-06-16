@@ -27,6 +27,12 @@ pub enum EngineError {
     #[error("index {0:?} already exists")]
     IndexExists(String),
 
+    #[error("database {0:?} does not exist")]
+    DatabaseNotFound(String),
+
+    #[error("database {0:?} already exists")]
+    DatabaseExists(String),
+
     #[error("constraint violation: {0}")]
     Constraint(String),
 

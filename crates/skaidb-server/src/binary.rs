@@ -10,7 +10,7 @@ use skaidb_proto::{
 };
 
 use crate::authn::AuthResult;
-use crate::shared::{execute_as, Shared};
+use crate::shared::{execute_session_as, Shared};
 
 /// Bind the binary endpoint and serve it on a background thread.
 ///
@@ -49,13 +49,17 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) {
         Err(()) => return, // denied or framing error → drop the connection
     };
 
+    // The current database is per-connection state: `USE` sets it for the life
+    // of this connection; it starts at `default`.
+    let mut current_db = skaidb_engine::DEFAULT_DATABASE.to_string();
+
     loop {
         let payload = match read_frame(&mut stream) {
             Ok(p) => p,
             Err(_) => return, // disconnect or framing error
         };
         let response = match Request::decode(&payload) {
-            Ok(req) => execute_as(&ctx, &role, &req.sql),
+            Ok(req) => execute_session_as(&ctx, &role, &mut current_db, &req.sql),
             Err(e) => Response::Error(format!("protocol error: {e}")),
         };
         let encoded = response.encode();

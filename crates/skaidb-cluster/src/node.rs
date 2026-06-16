@@ -21,7 +21,8 @@ use std::time::Duration;
 use std::thread;
 
 use skaidb_engine::{
-    filter_rows, run, Cluster, Database, DbStats, EngineError, IndexScanRange, QueryOutput,
+    filter_rows, namespace, run, Cluster, Database, DbStats, EngineError, IndexScanRange,
+    QueryOutput, SessionEffect, DEFAULT_DATABASE,
 };
 use skaidb_proto::{read_frame, write_frame};
 use skaidb_sql::ast::{BinaryOp, Expr, Statement};
@@ -390,8 +391,9 @@ impl Node {
         true
     }
 
-    /// `CREATE` statements reconstructing the local schema (for joiner bootstrap).
-    fn schema_ddl(&self) -> EngineResult<Vec<String>> {
+    /// `(database, CREATE-sql)` pairs reconstructing the local schema — databases,
+    /// tables, and indexes — for joiner bootstrap.
+    fn schema_ddl(&self) -> EngineResult<Vec<(String, String)>> {
         Ok(self
             .local
             .read()
@@ -611,9 +613,10 @@ impl Node {
             }
         }
 
-        // 2) Bootstrap the joiner's schema so it can accept migrated rows.
-        for ddl in self.schema_ddl()? {
-            match self.pool.call(addr, &Request::ApplyDdl { sql: ddl }) {
+        // 2) Bootstrap the joiner's schema (databases + tables + indexes) so it
+        //    can accept migrated rows.
+        for (db, ddl) in self.schema_ddl()? {
+            match self.pool.call(addr, &Request::ApplyDdl { db, sql: ddl }) {
                 Ok(Response::Ack) => {}
                 Ok(Response::Err(e)) => {
                     return Err(EngineError::Cluster(format!("joiner DDL failed: {e}")))
@@ -1038,7 +1041,9 @@ impl Node {
             Request::ApplyDelete { table, key, hlc } => {
                 write_response(self.apply_write_local(&table, &key, &WriteOp::Delete, hlc))
             }
-            Request::ApplyDdl { sql } => self.with_write(|db| db.execute(&sql).map(|_| ())),
+            Request::ApplyDdl { db, sql } => {
+                self.with_write(|d| d.execute_session(&db, &sql).map(|_| ()))
+            }
             Request::SetMembership {
                 epoch,
                 members,
@@ -1087,9 +1092,26 @@ impl Node {
         }
     }
 
-    /// Execute a SQL statement as the cluster coordinator.
+    /// Execute a SQL statement as the cluster coordinator against the `default`
+    /// database. Convenience wrapper over [`Node::execute_session`].
     pub fn execute(self: &Arc<Self>, sql: &str) -> EngineResult<QueryOutput> {
-        let stmt = parse(sql)?;
+        match self.execute_session(DEFAULT_DATABASE, sql)? {
+            SessionEffect::Output(out) => Ok(out),
+            // `USE` outside a stateful session is a no-op acknowledgement.
+            SessionEffect::UseDatabase(_) => Ok(QueryOutput::Ddl),
+        }
+    }
+
+    /// Execute a SQL statement as the cluster coordinator within a session whose
+    /// current database is `current_db`. Table/index names resolve against it
+    /// (and `db.table` overrides it); `CREATE`/`DROP DATABASE` and table DDL are
+    /// broadcast to every member; `USE` is returned for the caller to apply.
+    pub fn execute_session(
+        self: &Arc<Self>,
+        current_db: &str,
+        sql: &str,
+    ) -> EngineResult<SessionEffect> {
+        let mut stmt = parse(sql)?;
         if matches!(
             stmt,
             Statement::Begin | Statement::Commit | Statement::Rollback
@@ -1100,45 +1122,64 @@ impl Node {
                     .into(),
             ));
         }
+        // `USE` validates against the (replicated) database registry and asks the
+        // caller to switch; it never touches storage.
+        if let Statement::UseDatabase { name } = &stmt {
+            let exists = self
+                .local
+                .read()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+                .has_database(name);
+            if !exists {
+                return Err(EngineError::DatabaseNotFound(name.clone()));
+            }
+            return Ok(SessionEffect::UseDatabase(name.clone()));
+        }
+        // DDL — including CREATE/DROP DATABASE — broadcasts to every member so the
+        // schema and database registry stay identical cluster-wide.
         if is_ddl(&stmt) {
-            self.broadcast_ddl(sql)?;
-            return Ok(QueryOutput::Ddl);
+            self.broadcast_ddl(current_db, sql)?;
+            return Ok(SessionEffect::Output(QueryOutput::Ddl));
         }
-        // Read-only catalog introspection: the schema is identical on every node
-        // (DDL is broadcast), so answer from the local catalog without fan-out.
-        match stmt {
-            Statement::ShowTables => {
-                let db = self
-                    .local
-                    .read()
-                    .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
-                return Ok(QueryOutput::Rows(db.show_tables()));
-            }
-            Statement::ShowIndexes => {
-                let db = self
-                    .local
-                    .read()
-                    .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
-                return Ok(QueryOutput::Rows(db.show_indexes()));
-            }
-            _ => {}
+        // Read-only catalog/stat introspection: the catalog is identical on every
+        // node (DDL is broadcast), so answer from the local engine, filtered to
+        // the current database, without fan-out.
+        if matches!(
+            stmt,
+            Statement::ShowTables
+                | Statement::ShowIndexes
+                | Statement::ShowStatus
+                | Statement::ShowDatabases
+        ) {
+            return self
+                .local
+                .write()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+                .execute_session(current_db, sql);
         }
+        // DML/SELECT: resolve names to internal (database-qualified) form, then
+        // coordinate. The resolved table name is opaque to replication, so quorum
+        // writes, hinted handoff, read-repair, and scatter/gather all work as-is.
+        namespace::resolve_statement(&mut stmt, current_db);
         let mut coord = Coordinator {
             node: Arc::clone(self),
         };
         run(stmt, &mut coord)
+            .map(SessionEffect::Output)
+            .map_err(|e| namespace::humanize_error(e, current_db))
     }
 
     /// Broadcast DDL to all members; require a member quorum to apply it (so a
-    /// single node being down does not block schema changes). A node that missed
-    /// the broadcast would need to catch up via a schema log — not yet built, so
-    /// phase 1 relies on the broadcast reaching each node.
-    fn broadcast_ddl(&self, sql: &str) -> EngineResult<()> {
+    /// single node being down does not block schema changes). Each node applies
+    /// it within `current_db` so table/index names resolve identically. A node
+    /// that missed the broadcast would need to catch up via a schema log — not
+    /// yet built, so phase 1 relies on the broadcast reaching each node.
+    fn broadcast_ddl(&self, current_db: &str, sql: &str) -> EngineResult<()> {
         let mut acks = 0usize;
         // Local first.
         match self.local.write() {
             Ok(mut db) => {
-                db.execute(sql)?;
+                db.execute_session(current_db, sql)?;
                 acks += 1;
             }
             Err(_) => return Err(EngineError::Cluster("local lock poisoned".into())),
@@ -1147,6 +1188,7 @@ impl Node {
             if let Ok(Response::Ack) = self.pool.call(
                 addr,
                 &Request::ApplyDdl {
+                    db: current_db.to_string(),
                     sql: sql.to_string(),
                 },
             ) {
@@ -1861,6 +1903,8 @@ fn is_ddl(stmt: &Statement) -> bool {
             | Statement::CreateVectorIndex(_)
             | Statement::DropVectorIndex { .. }
             | Statement::AlterTable(_)
+            | Statement::CreateDatabase { .. }
+            | Statement::DropDatabase { .. }
     )
 }
 
@@ -2156,6 +2200,75 @@ mod tests {
     }
 
     #[test]
+    fn distributed_databases_replicate() {
+        use skaidb_engine::SessionEffect;
+        // `CREATE DATABASE`, DDL, and DML inside a non-default database all
+        // replicate across the cluster, and databases are isolated.
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let na = Node::new(
+            Database::open(temp_dir("dba")).unwrap(),
+            cfg("a", &a, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("dbb")).unwrap(),
+            cfg("b", &b, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nc = Node::new(
+            Database::open(temp_dir("dbc")).unwrap(),
+            cfg("c", &c, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        nc.serve_internode().unwrap();
+
+        // Create a database + table + rows in it, coordinated by node A.
+        na.execute("CREATE DATABASE shop").unwrap();
+        na.execute_session("shop", "CREATE TABLE orders (PRIMARY KEY (id))")
+            .unwrap();
+        na.execute_session("shop", "INSERT INTO orders (id, total) VALUES (1, 10), (2, 20)")
+            .unwrap();
+
+        // The database is visible cluster-wide (registry replicated via DDL).
+        assert!(nb
+            .local
+            .read()
+            .unwrap()
+            .has_database("shop"));
+
+        // Rows are readable from another node within `shop`, and via an explicit
+        // qualifier from the default database.
+        let got = |node: &std::sync::Arc<Node>, db: &str, sql: &str| match node
+            .execute_session(db, sql)
+            .unwrap()
+        {
+            SessionEffect::Output(QueryOutput::Rows(r)) => r.rows,
+            other => panic!("expected rows, got {other:?}"),
+        };
+        assert_eq!(
+            got(&nb, "shop", "SELECT id FROM orders ORDER BY id"),
+            vec![vec![Value::Int(1)], vec![Value::Int(2)]]
+        );
+        assert_eq!(
+            got(&nc, "default", "SELECT total FROM shop.orders WHERE id = 2"),
+            vec![vec![Value::Int(20)]]
+        );
+
+        // Isolation: `orders` does not exist in the default database.
+        assert!(nb
+            .execute_session("default", "SELECT id FROM orders")
+            .is_err());
+
+        // A delete inside `shop` from node C replicates back to A.
+        nc.execute_session("shop", "DELETE FROM orders WHERE id = 1")
+            .unwrap();
+        assert_eq!(
+            got(&na, "shop", "SELECT id FROM orders ORDER BY id"),
+            vec![vec![Value::Int(2)]]
+        );
+    }
+
+    #[test]
     fn distributed_vector_search() {
         use skaidb_sql::ast::{BinaryOp, Expr};
         let (a, b, c) = (free_addr(), free_addr(), free_addr());
@@ -2439,6 +2552,7 @@ mod tests {
         let _ = internode::call(
             &c,
             &Request::ApplyDdl {
+                db: "default".into(),
                 sql: "CREATE TABLE t (PRIMARY KEY (id))".into(),
             },
         )

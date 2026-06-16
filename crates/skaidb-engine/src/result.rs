@@ -25,3 +25,16 @@ pub enum QueryOutput {
     /// A DDL statement succeeded.
     Ddl,
 }
+
+/// The effect of executing one statement in a *session* that has a current
+/// database. Most statements produce a [`QueryOutput`]; `USE <db>` instead asks
+/// the stateful caller (the embedded session or a server connection) to switch
+/// its current database, which the engine cannot hold itself.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionEffect {
+    /// A normal statement result.
+    Output(QueryOutput),
+    /// `USE <name>` — set the caller's current database to `name` (already
+    /// validated to exist).
+    UseDatabase(String),
+}

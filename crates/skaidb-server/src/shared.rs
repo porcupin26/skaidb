@@ -8,7 +8,7 @@ use crate::slowlog::SlowLog;
 
 use skaidb_auth::{Object, Privilege, RoleStore};
 use skaidb_cluster::{ClusterStats, Node};
-use skaidb_engine::{Database, DbStats, EngineError, QueryOutput};
+use skaidb_engine::{Database, DbStats, EngineError, QueryOutput, SessionEffect, DEFAULT_DATABASE};
 use skaidb_proto::Response;
 use skaidb_sql::ast::Statement;
 
@@ -26,13 +26,21 @@ pub enum Backend {
 }
 
 impl Backend {
-    fn execute(&self, sql: &str) -> Result<QueryOutput, EngineError> {
+    /// Execute `sql` in a session whose current database is `current_db`,
+    /// resolving names against it and replicating database/table DDL across the
+    /// cluster. `USE` returns [`SessionEffect::UseDatabase`] for the caller to
+    /// apply to the connection's current-database state.
+    fn execute_session(
+        &self,
+        current_db: &str,
+        sql: &str,
+    ) -> Result<SessionEffect, EngineError> {
         match self {
             Backend::Local(db) => db
                 .lock()
                 .map_err(|_| EngineError::Cluster("server lock poisoned".into()))?
-                .execute(sql),
-            Backend::Cluster(node) => node.execute(sql),
+                .execute_session(current_db, sql),
+            Backend::Cluster(node) => node.execute_session(current_db, sql),
         }
     }
 
@@ -179,15 +187,30 @@ fn escape_label(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// Execute as the superuser role (used by the REST gateway).
+/// Execute as the superuser role against the `default` database (used by the
+/// stateless REST gateway). Cross-database access there is via `db.table`.
 pub fn execute(ctx: &Shared, sql: &str) -> Response {
     let role = ctx.superuser_role.clone();
     execute_as(ctx, &role, sql)
 }
 
-/// Execute one SQL statement on behalf of `role`: enforce RBAC, then run it,
-/// recording metrics and audit logs. All errors become [`Response::Error`].
+/// Execute one statement on behalf of `role` against the `default` database
+/// (stateless: any `USE` applies only for this single call).
 pub fn execute_as(ctx: &Shared, role: &str, sql: &str) -> Response {
+    let mut current_db = DEFAULT_DATABASE.to_string();
+    execute_session_as(ctx, role, &mut current_db, sql)
+}
+
+/// Execute one SQL statement on behalf of `role` within a session whose current
+/// database is `current_db`: enforce RBAC, run it, and record metrics/audit. A
+/// successful `USE` updates `current_db` in place (the connection's state). All
+/// errors become [`Response::Error`].
+pub fn execute_session_as(
+    ctx: &Shared,
+    role: &str,
+    current_db: &mut String,
+    sql: &str,
+) -> Response {
     // Authorization: check the role may perform the statement before executing.
     if let Some((privilege, object)) = required_privilege(sql) {
         if !ctx.roles.has_privilege(role, privilege, &object) {
@@ -199,15 +222,20 @@ pub fn execute_as(ctx: &Shared, role: &str, sql: &str) -> Response {
     let start = Instant::now();
     ctx.metrics.gauge_inc("skaidb_queries_in_flight");
 
-    let response = match ctx.backend.execute(sql) {
-        Ok(QueryOutput::Rows(rs)) => Response::Rows {
+    let response = match ctx.backend.execute_session(current_db, sql) {
+        Ok(SessionEffect::Output(QueryOutput::Rows(rs))) => Response::Rows {
             columns: rs.columns,
             rows: rs.rows,
         },
-        Ok(QueryOutput::Mutation { affected }) => Response::Mutation {
+        Ok(SessionEffect::Output(QueryOutput::Mutation { affected })) => Response::Mutation {
             affected: affected as u64,
         },
-        Ok(QueryOutput::Ddl) => Response::Ddl,
+        Ok(SessionEffect::Output(QueryOutput::Ddl)) => Response::Ddl,
+        // `USE <db>` switched the connection's current database.
+        Ok(SessionEffect::UseDatabase(name)) => {
+            *current_db = name;
+            Response::Ddl
+        }
         Err(e) => Response::Error(e.to_string()),
     };
 
@@ -335,7 +363,15 @@ fn required_privilege(sql: &str) -> Option<(Privilege, Object)> {
         // Read-only catalog introspection needs no special privilege — it exposes
         // only table/index names, letting a monitoring agent enumerate the schema
         // without `/query` data access.
-        Statement::ShowTables | Statement::ShowIndexes => return None,
+        Statement::ShowTables
+        | Statement::ShowIndexes
+        | Statement::ShowStatus
+        | Statement::ShowDatabases => return None,
+        // Multi-database statements are an embedded-CLI concept; the clustered
+        // engine rejects them, but gate the mutating ones as global writes.
+        Statement::CreateDatabase { .. } => (Privilege::Create, Object::Global),
+        Statement::DropDatabase { .. } => (Privilege::Drop, Object::Global),
+        Statement::UseDatabase { .. } => return None,
     })
 }
 

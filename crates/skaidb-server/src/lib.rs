@@ -452,6 +452,49 @@ mod tests {
     }
 
     #[test]
+    fn connection_scoped_current_database() {
+        use crate::shared::execute_session_as;
+        let mut roles = RoleStore::new();
+        roles.create_superuser("su");
+        let ctx: Shared = Arc::new(Context {
+            backend: Backend::Local(Box::new(Mutex::new(Database::open(temp_dir()).unwrap()))),
+            metrics: Metrics::new(),
+            audit: quiet_audit(),
+            roles,
+            authn: AuthState::disabled(),
+            superuser_role: "su".into(),
+            admin_lock: Mutex::new(()),
+            start: Instant::now(),
+            per_table_metrics: false,
+            slow_log: crate::slowlog::SlowLog::new(),
+        });
+
+        // One connection's current database, carried across statements.
+        let mut db = skaidb_engine::DEFAULT_DATABASE.to_string();
+        let run = |db: &mut String, sql: &str| execute_session_as(&ctx, "su", db, sql);
+
+        assert_eq!(run(&mut db, "CREATE DATABASE shop"), Response::Ddl);
+        assert_eq!(run(&mut db, "USE shop"), Response::Ddl);
+        assert_eq!(db, "shop"); // USE updated the connection state
+        run(&mut db, "CREATE TABLE orders (PRIMARY KEY (id))");
+        run(&mut db, "INSERT INTO orders (id) VALUES (1)");
+
+        // The table is visible in shop...
+        assert!(matches!(
+            run(&mut db, "SELECT id FROM orders"),
+            Response::Rows { rows, .. } if rows.len() == 1
+        ));
+        // ...isolated from default...
+        run(&mut db, "USE default");
+        assert!(matches!(run(&mut db, "SELECT id FROM orders"), Response::Error(_)));
+        // ...and reachable cross-database by qualifier.
+        assert!(matches!(
+            run(&mut db, "SELECT id FROM shop.orders"),
+            Response::Rows { rows, .. } if rows.len() == 1
+        ));
+    }
+
+    #[test]
     fn rest_basic_auth_enforced() {
         let (addr, _h) = rest::spawn("127.0.0.1:0", auth_ctx()).unwrap();
 

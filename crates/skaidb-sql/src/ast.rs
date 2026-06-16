@@ -26,6 +26,72 @@ pub enum Statement {
     ShowTables,
     /// `SHOW INDEXES` — list secondary and vector indexes in the catalog.
     ShowIndexes,
+    /// `SHOW STATUS` — storage/runtime statistics for the current database.
+    ShowStatus,
+    /// `SHOW DATABASES` — list the databases in this data directory.
+    ///
+    /// The four database statements below operate across databases, so a single
+    /// `Database` cannot execute them; they are handled by the multi-database
+    /// session layer in `skaidb-engine`.
+    ShowDatabases,
+    /// `CREATE DATABASE [IF NOT EXISTS] <name>`.
+    CreateDatabase { name: String, if_not_exists: bool },
+    /// `DROP DATABASE [IF EXISTS] <name>`.
+    DropDatabase { name: String, if_exists: bool },
+    /// `USE [DATABASE] <name>` — switch the session's current database.
+    UseDatabase { name: String },
+}
+
+impl Statement {
+    /// Visit every **table reference** in the statement (each possibly written
+    /// as `db.table`) so a caller can rewrite it to an internal, database-resolved
+    /// name. Centralizes the set of table positions for namespace resolution.
+    pub fn for_each_table_mut(&mut self, mut f: impl FnMut(&mut String)) {
+        match self {
+            Statement::CreateTable(c) => f(&mut c.name),
+            Statement::DropTable { name, .. } => f(name),
+            Statement::CreateIndex(c) => f(&mut c.table),
+            Statement::CreateVectorIndex(c) => f(&mut c.table),
+            Statement::AlterTable(a) => {
+                f(&mut a.name);
+                if let AlterAction::RenameTable { new_name } = &mut a.action {
+                    f(new_name);
+                }
+            }
+            Statement::Insert(i) => f(&mut i.table),
+            Statement::Update(u) => f(&mut u.table),
+            Statement::Delete(d) => f(&mut d.table),
+            Statement::Select(s) => s.for_each_table_mut(&mut f),
+            _ => {}
+        }
+    }
+
+    /// Visit every **local object name** — one that lives inside the current
+    /// database and is never `db.`-qualified by the user: secondary and vector
+    /// index names.
+    pub fn for_each_local_name_mut(&mut self, mut f: impl FnMut(&mut String)) {
+        match self {
+            Statement::CreateIndex(c) => f(&mut c.name),
+            Statement::DropIndex { name, .. } => f(name),
+            Statement::CreateVectorIndex(c) => f(&mut c.name),
+            Statement::DropVectorIndex { name, .. } => f(name),
+            _ => {}
+        }
+    }
+}
+
+impl Select {
+    /// Visit the `FROM` table, every joined table, and the tables of any
+    /// trailing `UNION` branches.
+    pub fn for_each_table_mut(&mut self, f: &mut impl FnMut(&mut String)) {
+        f(&mut self.from);
+        for join in &mut self.joins {
+            f(&mut join.table);
+        }
+        for set_op in &mut self.set_ops {
+            set_op.select.for_each_table_mut(f);
+        }
+    }
 }
 
 /// `ALTER TABLE name <action>`.

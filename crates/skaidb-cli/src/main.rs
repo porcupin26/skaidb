@@ -9,7 +9,7 @@ use std::io::{self, BufRead, IsTerminal};
 use clap::Parser;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
-use skaidb_engine::{Database, QueryOutput, ResultSet};
+use skaidb_engine::{QueryOutput, ResultSet, Session};
 
 #[derive(Debug, Parser)]
 #[command(name = "skaidb-cli", version, about = "skaidb SQL client (embedded)")]
@@ -23,14 +23,12 @@ struct Cli {
     execute: Option<String>,
 }
 
-/// Prompt shown when waiting for a fresh statement.
-const PROMPT: &str = "skaidb> ";
 /// Prompt shown while a statement is still being typed (no terminating `;`).
 const CONT_PROMPT: &str = "   ...> ";
 
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
-    let mut db = match Database::open(&cli.dir) {
+    let mut db = match Session::open(&cli.dir) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("skaidb-cli: cannot open {}: {e}", cli.dir);
@@ -54,7 +52,7 @@ fn main() -> std::process::ExitCode {
 }
 
 /// Execute a `;`-separated script, stopping at the first error.
-fn run_script(db: &mut Database, script: &str) -> Result<(), ()> {
+fn run_script(db: &mut Session, script: &str) -> Result<(), ()> {
     for stmt in split_statements(script) {
         if let Err(e) = run_one(db, &stmt) {
             eprintln!("error: {e}");
@@ -68,7 +66,7 @@ fn run_script(db: &mut Database, script: &str) -> Result<(), ()> {
 }
 
 /// Interactive REPL with line editing, history, and arrow-key recall.
-fn repl_interactive(db: &mut Database) {
+fn repl_interactive(db: &mut Session) {
     eprintln!("skaidb interactive shell. Type 'help' for commands, Ctrl-D to exit.");
 
     let mut rl = match DefaultEditor::new() {
@@ -87,8 +85,14 @@ fn repl_interactive(db: &mut Database) {
 
     let mut buffer = String::new();
     loop {
-        let prompt = if buffer.is_empty() { PROMPT } else { CONT_PROMPT };
-        match rl.readline(prompt) {
+        // The fresh prompt names the current database so it's always visible
+        // which one statements run against; the continuation prompt is fixed.
+        let prompt = if buffer.is_empty() {
+            format!("skaidb:{}> ", db.current_database())
+        } else {
+            CONT_PROMPT.to_string()
+        };
+        match rl.readline(&prompt) {
             Ok(line) => {
                 let _ = rl.add_history_entry(line.as_str());
 
@@ -127,7 +131,7 @@ fn repl_interactive(db: &mut Database) {
 }
 
 /// REPL for piped / non-tty input: no prompts, no line editing.
-fn repl_piped(db: &mut Database) {
+fn repl_piped(db: &mut Session) {
     let stdin = io::stdin();
     let mut buffer = String::new();
     loop {
@@ -147,7 +151,7 @@ fn repl_piped(db: &mut Database) {
 
 /// Execute every complete (`;`-terminated) statement sitting in `buffer`,
 /// removing it as we go and leaving any trailing partial statement behind.
-fn drain_statements(db: &mut Database, buffer: &mut String) {
+fn drain_statements(db: &mut Session, buffer: &mut String) {
     while let Some(idx) = find_statement_end(buffer) {
         let stmt: String = buffer.drain(..=idx).collect();
         let stmt = stmt.trim();
@@ -167,7 +171,7 @@ fn drain_statements(db: &mut Database, buffer: &mut String) {
     }
 }
 
-fn run_one(db: &mut Database, sql: &str) -> Result<(), skaidb_engine::EngineError> {
+fn run_one(db: &mut Session, sql: &str) -> Result<(), skaidb_engine::EngineError> {
     match db.execute(sql)? {
         QueryOutput::Rows(rs) => print_table(&rs),
         QueryOutput::Mutation { affected } => println!("OK, {affected} row(s) affected"),
@@ -211,10 +215,19 @@ skaidb interactive shell — commands
     DROP   TABLE|INDEX <name>;
     SHOW   TABLES;
     SHOW   INDEXES;
+    SHOW   STATUS;          storage/runtime stats for the current database
     BEGIN; COMMIT; ROLLBACK;
 
-  skaidb is schema-less and single-namespace: there are no databases and no
-  column definitions — CREATE TABLE only declares the primary key.
+  Databases (each is an isolated set of tables; the prompt shows the current one):
+    CREATE DATABASE <name>;
+    DROP   DATABASE <name>;
+    USE    <name>;          switch the current database (default: 'default')
+    SHOW   DATABASES;
+    Reach another database without switching by qualifying: db.table
+    (e.g. SELECT * FROM shop.orders;). In a cluster, databases replicate.
+
+  skaidb is schema-less: CREATE TABLE only declares the primary key — there are
+  no column definitions.
 
   Full grammar: docs/QUERY_SYNTAX.md"
     );
@@ -252,18 +265,23 @@ fn suggest(sql: &str, err: &skaidb_engine::EngineError) -> Option<String> {
     }
 
     // SHOW with the wrong target.
-    if msg.contains("expected TABLES or INDEXES after SHOW") {
-        return Some("skaidb has no databases. Try: SHOW TABLES;  or  SHOW INDEXES;".into());
+    if msg.contains("after SHOW") {
+        return Some("try: SHOW TABLES;  SHOW INDEXES;  SHOW STATUS;  or  SHOW DATABASES;".into());
     }
 
     // CREATE / DROP with the wrong object kind.
-    if msg.contains("expected TABLE or INDEX") {
-        if matches!(second_low.as_str(), "database" | "databases" | "db" | "schema") {
-            return Some(format!(
-                "skaidb is single-namespace and has no databases. Use {first_up} TABLE <name> ...;"
-            ));
+    if msg.contains("expected TABLE, INDEX") {
+        if matches!(second_low.as_str(), "db" | "schema") {
+            return Some(format!("did you mean {first_up} DATABASE <name>?"));
         }
-        return Some(format!("{first_up} what? Try {first_up} TABLE <name> (...);  or  {first_up} INDEX <name> ON <table> (...);"));
+        return Some(format!(
+            "{first_up} what? Try {first_up} TABLE <name> (...);  {first_up} INDEX ...;  or  {first_up} DATABASE <name>;"
+        ));
+    }
+
+    // A USE / DROP DATABASE naming a database that isn't there.
+    if msg.contains("does not exist") && msg.contains("database") {
+        return Some("no such database — run SHOW DATABASES; to list them, or CREATE DATABASE <name>; first.".into());
     }
 
     // CREATE TABLE without its primary-key clause: `expected LParen`.
@@ -281,8 +299,8 @@ fn suggest(sql: &str, err: &skaidb_engine::EngineError) -> Option<String> {
 
 /// SQL statement keywords, used for "did you mean …?" suggestions.
 const STATEMENT_KEYWORDS: &[&str] = &[
-    "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "SHOW", "BEGIN", "COMMIT",
-    "ROLLBACK",
+    "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "SHOW", "USE", "BEGIN",
+    "COMMIT", "ROLLBACK",
 ];
 
 /// Closest statement keyword to `word` within a small edit distance, if any.
@@ -434,11 +452,11 @@ mod tests {
     }
 
     #[test]
-    fn suggests_create_table_for_database() {
-        let e = parse_err("create database meh;");
-        let hint = suggest("create database meh;", &e).unwrap();
-        assert!(hint.contains("no databases"), "{hint}");
-        assert!(hint.contains("CREATE TABLE"), "{hint}");
+    fn suggests_database_for_unknown_create_object() {
+        // `db` is not a keyword, so the parser rejects the object kind.
+        let e = parse_err("create db foo;");
+        let hint = suggest("create db foo;", &e).unwrap();
+        assert!(hint.contains("CREATE DATABASE"), "{hint}");
     }
 
     #[test]

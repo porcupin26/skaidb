@@ -20,7 +20,8 @@ use skaidb_types::{Document, Value};
 use crate::catalog::{Catalog, IndexDef, TableDef, VectorIndexDef};
 use crate::error::{EngineError, Result};
 use crate::eval::{compare, eval, eval_predicate};
-use crate::result::{QueryOutput, ResultSet};
+use crate::namespace::{self, DEFAULT_DATABASE};
+use crate::result::{QueryOutput, ResultSet, SessionEffect};
 use crate::vector::{Hnsw, Metric};
 
 /// A live row with its encoded document and version stamp.
@@ -335,7 +336,14 @@ impl Database {
 
     /// Parse and execute a single SQL statement.
     pub fn execute(&mut self, sql: &str) -> Result<QueryOutput> {
-        match parse(sql)? {
+        self.execute_statement(parse(sql)?)
+    }
+
+    /// Execute an already-parsed statement. This lets the multi-database
+    /// [`Session`](crate::Session) dispatch a statement it has classified
+    /// without re-parsing it.
+    pub fn execute_statement(&mut self, stmt: Statement) -> Result<QueryOutput> {
+        match stmt {
             Statement::CreateTable(ct) => {
                 self.create_table(&ct.name, ct.primary_key, ct.if_not_exists)
             }
@@ -356,6 +364,15 @@ impl Database {
             Statement::Rollback => self.rollback(),
             Statement::ShowTables => Ok(QueryOutput::Rows(self.show_tables())),
             Statement::ShowIndexes => Ok(QueryOutput::Rows(self.show_indexes())),
+            Statement::ShowStatus => Ok(QueryOutput::Rows(self.show_status())),
+            // Database statements span databases and so cannot run against a
+            // single engine; the session layer handles them before dispatch.
+            Statement::ShowDatabases
+            | Statement::CreateDatabase { .. }
+            | Statement::DropDatabase { .. }
+            | Statement::UseDatabase { .. } => Err(EngineError::Unsupported(
+                "database statements require a multi-database session".into(),
+            )),
             // DML and SELECT run through the storage-agnostic executor so the
             // exact same logic serves the local engine and the cluster
             // coordinator (which replaces LocalCluster with a networked one).
@@ -363,6 +380,200 @@ impl Database {
                 let mut local = LocalCluster { db: self };
                 run(dml, &mut local)
             }
+        }
+    }
+
+    // ---- databases (namespace layer) ----
+
+    /// Execute a statement in a session whose current database is `current_db`.
+    ///
+    /// This is the database-aware entry point: it resolves table/index names
+    /// against `current_db` (so unqualified names land in the current database
+    /// and `db.table` names override it), handles the cross-database statements
+    /// itself, and otherwise delegates to [`Database::execute_statement`]. `USE`
+    /// returns [`SessionEffect::UseDatabase`] for the caller to apply.
+    pub fn execute_session(
+        &mut self,
+        current_db: &str,
+        sql: &str,
+    ) -> Result<SessionEffect> {
+        let mut stmt = parse(sql)?;
+        let out = match stmt {
+            Statement::CreateDatabase {
+                name,
+                if_not_exists,
+            } => self.create_database(&name, if_not_exists)?,
+            Statement::DropDatabase { name, if_exists } => self.drop_database(&name, if_exists)?,
+            Statement::ShowDatabases => QueryOutput::Rows(self.show_databases(current_db)),
+            Statement::UseDatabase { name } => {
+                if !self.has_database(&name) {
+                    return Err(EngineError::DatabaseNotFound(name));
+                }
+                return Ok(SessionEffect::UseDatabase(name));
+            }
+            // Catalog introspection is filtered to the current database.
+            Statement::ShowTables => QueryOutput::Rows(self.show_tables_in(current_db)),
+            Statement::ShowIndexes => QueryOutput::Rows(self.show_indexes_in(current_db)),
+            _ => {
+                namespace::resolve_statement(&mut stmt, current_db);
+                self.execute_statement(stmt)
+                    .map_err(|e| namespace::humanize_error(e, current_db))?
+            }
+        };
+        Ok(SessionEffect::Output(out))
+    }
+
+    /// True if `name` is the default database or a registered database.
+    pub fn has_database(&self, name: &str) -> bool {
+        name == DEFAULT_DATABASE || self.catalog.databases.contains(name)
+    }
+
+    /// All database names (the implicit `default` plus registered ones), sorted.
+    pub fn database_names(&self) -> Vec<String> {
+        let mut names = vec![DEFAULT_DATABASE.to_string()];
+        names.extend(self.catalog.databases.iter().cloned());
+        names
+    }
+
+    fn create_database(&mut self, name: &str, if_not_exists: bool) -> Result<QueryOutput> {
+        if !namespace::valid_database_name(name) {
+            return Err(EngineError::Constraint(format!(
+                "invalid database name {name:?}: use letters, digits, '_' or '-' (max 64 chars)"
+            )));
+        }
+        if self.has_database(name) {
+            if if_not_exists {
+                return Ok(QueryOutput::Ddl);
+            }
+            return Err(EngineError::DatabaseExists(name.to_string()));
+        }
+        self.catalog.databases.insert(name.to_string());
+        self.save_catalog()?;
+        Ok(QueryOutput::Ddl)
+    }
+
+    fn drop_database(&mut self, name: &str, if_exists: bool) -> Result<QueryOutput> {
+        if name == DEFAULT_DATABASE {
+            return Err(EngineError::Constraint(
+                "cannot drop the default database".into(),
+            ));
+        }
+        if !self.catalog.databases.contains(name) {
+            if if_exists {
+                return Ok(QueryOutput::Ddl);
+            }
+            return Err(EngineError::DatabaseNotFound(name.to_string()));
+        }
+        // Cascade: drop every table (and its indexes) in this database, then any
+        // remaining indexes that belong to it, then deregister it.
+        let tables: Vec<String> = self
+            .catalog
+            .tables
+            .keys()
+            .filter(|t| namespace::belongs_to(t, name))
+            .cloned()
+            .collect();
+        for table in tables {
+            self.drop_table(&table, true)?;
+        }
+        let vec_indexes: Vec<String> = self
+            .catalog
+            .vector_indexes
+            .keys()
+            .filter(|i| namespace::belongs_to(i, name))
+            .cloned()
+            .collect();
+        for index in vec_indexes {
+            self.drop_vector_index(&index, true)?;
+        }
+        let sec_indexes: Vec<String> = self
+            .catalog
+            .indexes
+            .keys()
+            .filter(|i| namespace::belongs_to(i, name))
+            .cloned()
+            .collect();
+        for index in sec_indexes {
+            self.drop_index(&index, true)?;
+        }
+        self.catalog.databases.remove(name);
+        self.save_catalog()?;
+        Ok(QueryOutput::Ddl)
+    }
+
+    /// `SHOW DATABASES`: every database, with `*` marking the current one.
+    fn show_databases(&self, current_db: &str) -> ResultSet {
+        let rows = self
+            .database_names()
+            .into_iter()
+            .map(|name| {
+                let marker = if name == current_db { "*" } else { "" };
+                vec![Value::String(name), Value::String(marker.into())]
+            })
+            .collect();
+        ResultSet {
+            columns: vec!["database".into(), "current".into()],
+            rows,
+        }
+    }
+
+    /// `SHOW TABLES` filtered to `current_db`, with names de-qualified.
+    fn show_tables_in(&self, current_db: &str) -> ResultSet {
+        let rows = self
+            .catalog
+            .tables
+            .iter()
+            .filter(|(name, _)| namespace::belongs_to(name, current_db))
+            .map(|(name, def)| {
+                vec![
+                    Value::String(namespace::split(name).1.to_string()),
+                    Value::String(def.primary_key.join(", ")),
+                ]
+            })
+            .collect();
+        ResultSet {
+            columns: vec!["table".into(), "primary_key".into()],
+            rows,
+        }
+    }
+
+    /// `SHOW INDEXES` filtered to `current_db`, with names de-qualified.
+    fn show_indexes_in(&self, current_db: &str) -> ResultSet {
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        for (name, idx) in &self.catalog.indexes {
+            if !namespace::belongs_to(name, current_db) {
+                continue;
+            }
+            rows.push(vec![
+                Value::String(namespace::split(name).1.to_string()),
+                Value::String(namespace::split(&idx.table).1.to_string()),
+                Value::String("secondary".into()),
+                Value::String(idx.paths.join(", ")),
+            ]);
+        }
+        for (name, v) in &self.catalog.vector_indexes {
+            if !namespace::belongs_to(name, current_db) {
+                continue;
+            }
+            rows.push(vec![
+                Value::String(namespace::split(name).1.to_string()),
+                Value::String(namespace::split(&v.table).1.to_string()),
+                Value::String(format!("vector({}, dim={})", v.metric, v.dim)),
+                Value::String(v.path.clone()),
+            ]);
+        }
+        rows.sort_by(|a, b| match (&a[0], &b[0]) {
+            (Value::String(x), Value::String(y)) => x.cmp(y),
+            _ => std::cmp::Ordering::Equal,
+        });
+        ResultSet {
+            columns: vec![
+                "index".into(),
+                "table".into(),
+                "kind".into(),
+                "columns".into(),
+            ],
+            rows,
         }
     }
 
@@ -904,25 +1115,48 @@ impl Database {
     /// `CREATE` statements that reconstruct this node's schema (tables, then
     /// secondary indexes, then vector indexes) — sent to a joining node so it can
     /// receive migrated rows. Identifiers are assumed simple (no quoting).
-    pub fn schema_ddl(&self) -> Vec<String> {
+    /// Returns `(database, sql)` pairs: each statement applied via
+    /// [`Database::execute_session`] with the given current database recreates
+    /// the object in its correct namespace, using bare (de-qualified) names so
+    /// the SQL is parseable. Databases come first so their tables can follow.
+    pub fn schema_ddl(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
+        for db in &self.catalog.databases {
+            out.push((
+                DEFAULT_DATABASE.to_string(),
+                format!("CREATE DATABASE IF NOT EXISTS {db}"),
+            ));
+        }
         for (name, def) in &self.catalog.tables {
-            out.push(format!(
-                "CREATE TABLE IF NOT EXISTS {name} (PRIMARY KEY ({}))",
-                def.primary_key.join(", ")
+            let (db, bare) = namespace::split(name);
+            out.push((
+                db.to_string(),
+                format!(
+                    "CREATE TABLE IF NOT EXISTS {bare} (PRIMARY KEY ({}))",
+                    def.primary_key.join(", ")
+                ),
             ));
         }
         for (name, idx) in &self.catalog.indexes {
-            out.push(format!(
-                "CREATE INDEX IF NOT EXISTS {name} ON {} ({})",
-                idx.table,
-                idx.paths.join(", ")
+            let (db, bare) = namespace::split(name);
+            let table = namespace::split(&idx.table).1;
+            out.push((
+                db.to_string(),
+                format!(
+                    "CREATE INDEX IF NOT EXISTS {bare} ON {table} ({})",
+                    idx.paths.join(", ")
+                ),
             ));
         }
         for (name, v) in &self.catalog.vector_indexes {
-            out.push(format!(
-                "CREATE VECTOR INDEX IF NOT EXISTS {name} ON {} ({}) DIM {} USING {}",
-                v.table, v.path, v.dim, v.metric
+            let (db, bare) = namespace::split(name);
+            let table = namespace::split(&v.table).1;
+            out.push((
+                db.to_string(),
+                format!(
+                    "CREATE VECTOR INDEX IF NOT EXISTS {bare} ON {table} ({}) DIM {} USING {}",
+                    v.path, v.dim, v.metric
+                ),
             ));
         }
         out
@@ -977,6 +1211,52 @@ impl Database {
                 "kind".into(),
                 "columns".into(),
             ],
+            rows,
+        }
+    }
+
+    /// `SHOW STATUS`: storage and runtime statistics as a `metric | value`
+    /// table, plus a per-table live-key/tombstone/disk breakdown.
+    pub fn show_status(&self) -> ResultSet {
+        let s = self.stats(true);
+        let hit_rate = {
+            let total = s.cache_hits + s.cache_misses;
+            if total == 0 {
+                "n/a".to_string()
+            } else {
+                format!("{:.1}%", 100.0 * s.cache_hits as f64 / total as f64)
+            }
+        };
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        {
+            let mut row =
+                |metric: &str, value: Value| rows.push(vec![Value::String(metric.into()), value]);
+            row("tables", Value::Int(s.tables as i64));
+            row("secondary_indexes", Value::Int(s.secondary_indexes as i64));
+            row("vector_indexes", Value::Int(s.vector_indexes as i64));
+            row("vectors_indexed", Value::Int(s.vectors_indexed as i64));
+            row("vector_rebuild_ms", Value::Int(s.vector_rebuild_ms as i64));
+            row("disk_bytes", Value::Int(s.disk_bytes as i64));
+            row("memtable_bytes", Value::Int(s.memtable_bytes as i64));
+            row("sstable_count", Value::Int(s.sstable_count as i64));
+            row("wal_bytes", Value::Int(s.wal_bytes as i64));
+            row("wal_fsyncs", Value::Int(s.wal_fsyncs as i64));
+            row("compactions", Value::Int(s.compactions as i64));
+            row("compaction_bytes", Value::Int(s.compaction_bytes as i64));
+            row("cache_hits", Value::Int(s.cache_hits as i64));
+            row("cache_misses", Value::Int(s.cache_misses as i64));
+            row("cache_hit_rate", Value::String(hit_rate));
+            row("cache_entries", Value::Int(s.cache_entries as i64));
+            row("cache_evictions", Value::Int(s.cache_evictions as i64));
+            row("bloom_negatives", Value::Int(s.bloom_negatives as i64));
+            for t in &s.per_table {
+                row(&format!("table.{}.live_keys", t.name), Value::Int(t.live_keys as i64));
+                row(&format!("table.{}.tombstones", t.name), Value::Int(t.tombstones as i64));
+                row(&format!("table.{}.disk_bytes", t.name), Value::Int(t.disk_bytes as i64));
+            }
+        }
+        ResultSet {
+            columns: vec!["metric".into(), "value".into()],
             rows,
         }
     }

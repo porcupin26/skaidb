@@ -33,6 +33,12 @@ struct Parser {
     pos: usize,
 }
 
+/// The bare table name from a (possibly `db.table`-qualified) reference — used
+/// as the default alias, which is matched against unqualified column prefixes.
+fn bare_table(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
 impl Parser {
     fn peek(&self) -> &Token {
         &self.tokens[self.pos]
@@ -58,6 +64,25 @@ impl Parser {
 
     fn eat_keyword(&mut self, kw: Keyword) -> bool {
         if self.peek() == &Token::Keyword(kw) {
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// True if the next token is an identifier equal to `word` (case-insensitive).
+    ///
+    /// Used for *contextual* keywords (`STATUS`, `DATABASE`, `DATABASES`, `USE`):
+    /// they only act as keywords in specific positions, so they stay usable as
+    /// ordinary column/table names everywhere else.
+    fn peek_ident_ci(&self, word: &str) -> bool {
+        matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case(word))
+    }
+
+    /// Consume the next token if it is an identifier equal to `word` (ci).
+    fn eat_ident_ci(&mut self, word: &str) -> bool {
+        if self.peek_ident_ci(word) {
             self.advance();
             true
         } else {
@@ -122,6 +147,21 @@ impl Parser {
     // ---- statements ----
 
     fn parse_statement(&mut self) -> Result<Statement, ParseError> {
+        // `USE <name>` — `use` is a contextual keyword (still a valid identifier
+        // elsewhere), so it is matched here rather than in the lexer.
+        if self.peek_ident_ci("use") {
+            self.advance();
+            // Optional `USE DATABASE <name>` — only treat a leading "database" as
+            // the keyword when another identifier follows, so a database actually
+            // named "database" can still be selected with `USE database`.
+            if self.peek_ident_ci("database")
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(_)))
+            {
+                self.advance();
+            }
+            let name = self.expect_ident()?;
+            return Ok(Statement::UseDatabase { name });
+        }
         match self.peek() {
             Token::Keyword(Keyword::Select) => self.parse_select().map(Statement::Select),
             Token::Keyword(Keyword::Insert) => self.parse_insert().map(Statement::Insert),
@@ -151,8 +191,12 @@ impl Parser {
                     Ok(Statement::ShowTables)
                 } else if self.eat_keyword(Keyword::Indexes) {
                     Ok(Statement::ShowIndexes)
+                } else if self.eat_ident_ci("status") {
+                    Ok(Statement::ShowStatus)
+                } else if self.eat_ident_ci("databases") {
+                    Ok(Statement::ShowDatabases)
                 } else {
-                    Err(self.unexpected("TABLES or INDEXES after SHOW".into()))
+                    Err(self.unexpected("TABLES, INDEXES, STATUS, or DATABASES after SHOW".into()))
                 }
             }
             _ => Err(self.unexpected("a statement".into())),
@@ -163,7 +207,7 @@ impl Parser {
     fn parse_alter(&mut self) -> Result<Statement, ParseError> {
         self.expect_keyword(Keyword::Alter)?;
         self.expect_keyword(Keyword::Table)?;
-        let name = self.expect_ident()?;
+        let name = self.parse_table_name()?;
         self.expect_keyword(Keyword::Rename)?;
         let action = if self.eat_keyword(Keyword::Column) {
             let from = self.parse_path()?;
@@ -172,7 +216,7 @@ impl Parser {
             AlterAction::RenameColumn { from, to }
         } else {
             self.expect_keyword(Keyword::To)?;
-            let new_name = self.expect_ident()?;
+            let new_name = self.parse_table_name()?;
             AlterAction::RenameTable { new_name }
         };
         Ok(Statement::AlterTable(AlterTable { name, action }))
@@ -182,7 +226,7 @@ impl Parser {
         self.expect_keyword(Keyword::Create)?;
         if self.eat_keyword(Keyword::Table) {
             let if_not_exists = self.parse_if_not_exists()?;
-            let name = self.expect_ident()?;
+            let name = self.parse_table_name()?;
             self.expect(&Token::LParen)?;
             self.expect_keyword(Keyword::Primary)?;
             self.expect_keyword(Keyword::Key)?;
@@ -200,7 +244,7 @@ impl Parser {
             let if_not_exists = self.parse_if_not_exists()?;
             let name = self.expect_ident()?;
             self.expect_keyword(Keyword::On)?;
-            let table = self.expect_ident()?;
+            let table = self.parse_table_name()?;
             self.expect(&Token::LParen)?;
             let path = self.parse_path()?;
             self.expect(&Token::RParen)?;
@@ -230,7 +274,7 @@ impl Parser {
             let if_not_exists = self.parse_if_not_exists()?;
             let name = self.expect_ident()?;
             self.expect_keyword(Keyword::On)?;
-            let table = self.expect_ident()?;
+            let table = self.parse_table_name()?;
             self.expect(&Token::LParen)?;
             let mut paths = vec![self.parse_path()?];
             while self.eat(&Token::Comma) {
@@ -243,8 +287,15 @@ impl Parser {
                 table,
                 paths,
             }))
+        } else if self.eat_ident_ci("database") {
+            let if_not_exists = self.parse_if_not_exists()?;
+            let name = self.expect_ident()?;
+            Ok(Statement::CreateDatabase {
+                name,
+                if_not_exists,
+            })
         } else {
-            Err(self.unexpected("TABLE or INDEX".into()))
+            Err(self.unexpected("TABLE, INDEX, or DATABASE".into()))
         }
     }
 
@@ -252,7 +303,7 @@ impl Parser {
         self.expect_keyword(Keyword::Drop)?;
         if self.eat_keyword(Keyword::Table) {
             let if_exists = self.parse_if_exists()?;
-            let name = self.expect_ident()?;
+            let name = self.parse_table_name()?;
             Ok(Statement::DropTable { name, if_exists })
         } else if self.eat_keyword(Keyword::Vector) {
             self.expect_keyword(Keyword::Index)?;
@@ -263,8 +314,12 @@ impl Parser {
             let if_exists = self.parse_if_exists()?;
             let name = self.expect_ident()?;
             Ok(Statement::DropIndex { name, if_exists })
+        } else if self.eat_ident_ci("database") {
+            let if_exists = self.parse_if_exists()?;
+            let name = self.expect_ident()?;
+            Ok(Statement::DropDatabase { name, if_exists })
         } else {
-            Err(self.unexpected("TABLE, INDEX, or VECTOR INDEX".into()))
+            Err(self.unexpected("TABLE, INDEX, VECTOR INDEX, or DATABASE".into()))
         }
     }
 
@@ -290,7 +345,7 @@ impl Parser {
     fn parse_insert(&mut self) -> Result<Insert, ParseError> {
         self.expect_keyword(Keyword::Insert)?;
         self.expect_keyword(Keyword::Into)?;
-        let table = self.expect_ident()?;
+        let table = self.parse_table_name()?;
         self.expect(&Token::LParen)?;
         let columns = self.parse_ident_list()?;
         self.expect(&Token::RParen)?;
@@ -382,8 +437,8 @@ impl Parser {
         }
 
         self.expect_keyword(Keyword::From)?;
-        let from = self.expect_ident()?;
-        let from_alias = self.parse_table_alias(&from);
+        let from = self.parse_table_name()?;
+        let from_alias = self.parse_table_alias(bare_table(&from));
 
         let mut joins = Vec::new();
         while let Some(kind) = self.peek_join_kind() {
@@ -472,8 +527,8 @@ impl Parser {
             }
             _ => return Err(self.unexpected("JOIN".into())),
         }
-        let table = self.expect_ident()?;
-        let alias = self.parse_table_alias(&table);
+        let table = self.parse_table_name()?;
+        let alias = self.parse_table_alias(bare_table(&table));
         let on = if self.eat_keyword(Keyword::On) {
             Some(self.parse_expr()?)
         } else {
@@ -510,7 +565,7 @@ impl Parser {
 
     fn parse_update(&mut self) -> Result<Update, ParseError> {
         self.expect_keyword(Keyword::Update)?;
-        let table = self.expect_ident()?;
+        let table = self.parse_table_name()?;
         self.expect_keyword(Keyword::Set)?;
         let mut assignments = Vec::new();
         loop {
@@ -537,7 +592,7 @@ impl Parser {
     fn parse_delete(&mut self) -> Result<Delete, ParseError> {
         self.expect_keyword(Keyword::Delete)?;
         self.expect_keyword(Keyword::From)?;
-        let table = self.expect_ident()?;
+        let table = self.parse_table_name()?;
         let filter = if self.eat_keyword(Keyword::Where) {
             Some(self.parse_expr()?)
         } else {
@@ -554,6 +609,21 @@ impl Parser {
             out.push(self.expect_ident()?);
         }
         Ok(out)
+    }
+
+    /// Parse a table reference: `<table>` or `<database> . <table>`. A database
+    /// qualifier is preserved verbatim as the string `"db.table"`; the engine
+    /// resolves it (or a bare name) against the connection's current database.
+    /// Table and database identifiers never contain `.`, so the join is
+    /// unambiguous.
+    fn parse_table_name(&mut self) -> Result<String, ParseError> {
+        let first = self.expect_ident()?;
+        if self.eat(&Token::Dot) {
+            let table = self.expect_ident()?;
+            Ok(format!("{first}.{table}"))
+        } else {
+            Ok(first)
+        }
     }
 
     /// Parse a dotted path `a.b.c` into the string `"a.b.c"`.
@@ -962,5 +1032,97 @@ mod tests {
         assert_eq!(parse("BEGIN").unwrap(), Statement::Begin);
         assert_eq!(parse("COMMIT TRANSACTION").unwrap(), Statement::Commit);
         assert_eq!(parse("ROLLBACK").unwrap(), Statement::Rollback);
+    }
+
+    #[test]
+    fn parse_status_and_database_statements() {
+        assert_eq!(parse("SHOW STATUS").unwrap(), Statement::ShowStatus);
+        assert_eq!(parse("SHOW DATABASES").unwrap(), Statement::ShowDatabases);
+        assert_eq!(
+            parse("CREATE DATABASE shop").unwrap(),
+            Statement::CreateDatabase {
+                name: "shop".into(),
+                if_not_exists: false,
+            }
+        );
+        assert_eq!(
+            parse("CREATE DATABASE IF NOT EXISTS shop").unwrap(),
+            Statement::CreateDatabase {
+                name: "shop".into(),
+                if_not_exists: true,
+            }
+        );
+        assert_eq!(
+            parse("DROP DATABASE IF EXISTS shop").unwrap(),
+            Statement::DropDatabase {
+                name: "shop".into(),
+                if_exists: true,
+            }
+        );
+        assert_eq!(
+            parse("USE shop").unwrap(),
+            Statement::UseDatabase { name: "shop".into() }
+        );
+        assert_eq!(
+            parse("USE DATABASE shop").unwrap(),
+            Statement::UseDatabase { name: "shop".into() }
+        );
+    }
+
+    #[test]
+    fn contextual_keywords_remain_usable_as_identifiers() {
+        // `status`, `database`, `databases`, and `use` are contextual keywords:
+        // they must still parse as ordinary column/table names.
+        let stmt = parse("SELECT status, use, database FROM databases WHERE status = 'x'").unwrap();
+        match stmt {
+            Statement::Select(s) => assert_eq!(s.from, "databases"),
+            other => panic!("expected select, got {other:?}"),
+        }
+        assert_eq!(
+            parse("CREATE TABLE status (PRIMARY KEY (use))").unwrap(),
+            Statement::CreateTable(CreateTable {
+                name: "status".into(),
+                if_not_exists: false,
+                primary_key: vec!["use".into()],
+            })
+        );
+        // A database genuinely named "database" is still selectable.
+        assert_eq!(
+            parse("USE database").unwrap(),
+            Statement::UseDatabase {
+                name: "database".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_qualified_table_names() {
+        match parse("SELECT id FROM shop.orders").unwrap() {
+            Statement::Select(s) => {
+                assert_eq!(s.from, "shop.orders");
+                assert_eq!(s.from_alias, "orders"); // alias defaults to the bare name
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse("INSERT INTO shop.orders (id) VALUES (1)").unwrap() {
+            Statement::Insert(i) => assert_eq!(i.table, "shop.orders"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            parse("CREATE TABLE shop.orders (PRIMARY KEY (id))").unwrap(),
+            Statement::CreateTable(CreateTable {
+                name: "shop.orders".into(),
+                if_not_exists: false,
+                primary_key: vec!["id".into()],
+            })
+        );
+        // Joins and the ON-table of an index can be qualified too.
+        match parse("SELECT * FROM shop.a JOIN shop.b ON a.id = b.id").unwrap() {
+            Statement::Select(s) => {
+                assert_eq!(s.from, "shop.a");
+                assert_eq!(s.joins[0].table, "shop.b");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

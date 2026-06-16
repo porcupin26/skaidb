@@ -57,6 +57,9 @@ pub enum Request {
         k: u32,
     },
     ApplyDdl {
+        /// The coordinator's current database, so table/index names in `sql`
+        /// resolve to the same internal namespace on every node.
+        db: String,
         sql: String,
     },
     /// Replace the recipient's cluster membership/ring with `members`
@@ -203,8 +206,9 @@ impl Request {
                 }
                 o.extend_from_slice(&k.to_le_bytes());
             }
-            Request::ApplyDdl { sql } => {
+            Request::ApplyDdl { db, sql } => {
                 o.push(REQ_DDL);
+                put_str(&mut o, db);
                 put_str(&mut o, sql);
             }
             Request::SetMembership {
@@ -274,7 +278,10 @@ impl Request {
                 let k = c.u32()?;
                 Request::VectorSearch { index, query, k }
             }
-            REQ_DDL => Request::ApplyDdl { sql: c.string()? },
+            REQ_DDL => Request::ApplyDdl {
+                db: c.string()?,
+                sql: c.string()?,
+            },
             REQ_MEMBERS => {
                 let epoch = c.u64()?;
                 let members = c.members()?;
@@ -745,6 +752,7 @@ mod tests {
                 key: vec![7, 8, 9],
             },
             Request::ApplyDdl {
+                db: "default".into(),
                 sql: "CREATE TABLE t (PRIMARY KEY (id))".into(),
             },
             Request::IndexScan {

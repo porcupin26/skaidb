@@ -45,6 +45,12 @@ pub struct Catalog {
     /// Vector indexes (rebuilt in memory on open). `default` so older catalogs load.
     #[serde(default)]
     pub vector_indexes: BTreeMap<String, VectorIndexDef>,
+    /// Named databases other than the implicit `default`. A database is a
+    /// namespace prefix on table/index names; this set lets an empty database
+    /// (created but holding no tables yet) persist. `default` so older catalogs
+    /// load with no databases. See [`crate::namespace`].
+    #[serde(default)]
+    pub databases: std::collections::BTreeSet<String>,
 }
 
 impl Catalog {
