@@ -26,6 +26,12 @@ pub enum AdminCmd {
     Reclaim,
     /// Return a sample of recent slow queries (masked), for drill-down.
     Slow,
+    /// Show the whole configuration (secrets masked).
+    ConfigShow,
+    /// Read one dotted `section.field` config key.
+    ConfigGet(String),
+    /// Set one config key; applies live when mutable, else persisted for restart.
+    ConfigSet { key: String, value: String },
 }
 
 /// Map an admin route + body to a command. `None` for an unknown route.
@@ -37,8 +43,32 @@ pub fn parse(path: &str, body: &str) -> Option<AdminCmd> {
         "/admin/reclaim" => Some(AdminCmd::Reclaim),
         "/admin/add-node" => Some(AdminCmd::AddNode(field(body, "addr")?)),
         "/admin/remove-node" => Some(AdminCmd::RemoveNode(field(body, "id")?)),
+        "/admin/config" => Some(AdminCmd::ConfigShow),
+        "/admin/config/get" => Some(AdminCmd::ConfigGet(field(body, "key")?)),
+        "/admin/config/set" => Some(AdminCmd::ConfigSet {
+            key: field(body, "key")?,
+            // The value may legitimately be empty (clearing a path), so don't
+            // require it to be non-empty like `field` does.
+            value: opt_field(body, "value").unwrap_or_default(),
+        }),
         _ => None,
     }
+}
+
+/// Like [`field`], but returns `Some("")` for an empty value rather than `None`.
+/// `None` only when the key is absent or the body isn't the expected shape.
+fn opt_field(body: &str, key: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.starts_with('{') {
+        if let Ok(Json::Object(map)) = serde_json::from_str::<Json>(trimmed) {
+            return match map.get(key) {
+                Some(Json::String(s)) => Some(s.clone()),
+                _ => None,
+            };
+        }
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 /// Extract a value from the body: JSON `{"<key>": "..."}` or a raw string.
@@ -68,6 +98,23 @@ pub fn handle(ctx: &Shared, role: &str, cmd: AdminCmd) -> (u16, Json) {
     if let AdminCmd::Slow = cmd {
         ctx.metrics.incr("skaidb_admin_total{op=\"slow\"}");
         return (200, ctx.slow_log.snapshot());
+    }
+
+    // Config inspection/control is local to each node (works standalone too).
+    match cmd {
+        AdminCmd::ConfigShow => {
+            ctx.metrics.incr("skaidb_admin_total{op=\"config_show\"}");
+            return (200, ctx.config_show_json());
+        }
+        AdminCmd::ConfigGet(key) => {
+            ctx.metrics.incr("skaidb_admin_total{op=\"config_get\"}");
+            return ctx.config_get_json(&key);
+        }
+        AdminCmd::ConfigSet { key, value } => {
+            ctx.metrics.incr("skaidb_admin_total{op=\"config_set\"}");
+            return ctx.config_set(&key, &value);
+        }
+        _ => {}
     }
 
     let node = match &ctx.backend {
@@ -130,8 +177,13 @@ pub fn handle(ctx: &Shared, role: &str, cmd: AdminCmd) -> (u16, Json) {
             Ok(n) => (200, json!({ "ok": true, "reclaimed": n })),
             Err(e) => (400, json!({ "error": e.to_string() })),
         },
-        // Handled before the cluster-node match (works standalone too).
-        AdminCmd::Slow => unreachable!("slow is handled before the cluster dispatch"),
+        // Handled before the cluster-node match (work standalone too).
+        AdminCmd::Slow
+        | AdminCmd::ConfigShow
+        | AdminCmd::ConfigGet(_)
+        | AdminCmd::ConfigSet { .. } => {
+            unreachable!("handled before the cluster dispatch")
+        }
     }
 }
 
@@ -148,6 +200,9 @@ fn op_label(cmd: &AdminCmd) -> &'static str {
         AdminCmd::Repair => "repair",
         AdminCmd::Reclaim => "reclaim",
         AdminCmd::Slow => "slow",
+        AdminCmd::ConfigShow => "config_show",
+        AdminCmd::ConfigGet(_) => "config_get",
+        AdminCmd::ConfigSet { .. } => "config_set",
     }
 }
 

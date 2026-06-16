@@ -24,11 +24,11 @@ the others. Full multi-database, multi-consistency results are in
 | `skaidb-engine` | Catalog + query execution (embeddable `Database`) |
 | `skaidb-cluster` | Consistent-hash ring (vnodes), tunable quorum, LWW conflict resolution |
 | `skaidb-proto` | Binary wire protocol (framing + messages) |
-| `skaidb-driver` | Synchronous client over the binary endpoint |
+| `skaidb-driver` | Synchronous client over the binary endpoint, with nearest-node selection and failover |
 | `skaidb-auth` | SHA-256/HMAC/PBKDF2 → SCRAM-SHA-256, and RBAC |
 | `skaidb-config` | TOML config with full CLI + env overrides |
 | `skaidb-server` | `skaidb` binary: binary + REST endpoints, metrics, audit logging |
-| `skaidb-cli` | `skaidb-cli`: embedded SQL shell |
+| `skaidb-cli` | `skaidbsh`: unified network shell + cluster/config admin client (also embedded via `--local`) |
 
 ## Build & test
 
@@ -44,8 +44,8 @@ Prebuilt binaries and packages for Linux, macOS, and Windows are attached to
 every [GitHub Release](https://github.com/porcupin26/skaidb/releases) — `.deb`
 and `.rpm` (x86_64 + aarch64), `.dmg` (Intel + Apple Silicon), a Windows `.zip`/
 `.exe`, and `.tar.gz` tarballs (incl. a static musl build), with `SHA256SUMS`.
-Each bundle ships the `skaidb` server, the `skaidb-cli` shell, and the
-`skaidbctl` cluster admin client.
+Each bundle ships the `skaidb` server and `skaidbsh` — the unified interactive
+shell and cluster/config admin client.
 
 **Full, OS-by-OS instructions (packages, tarballs, source, binary-only,
 verification, upgrade/uninstall) are in [docs/INSTALL.md](docs/INSTALL.md).**
@@ -55,7 +55,7 @@ The short version:
 # Debian/Ubuntu              # Fedora/RHEL/openSUSE          # any Linux / macOS
 sudo apt install ./skaidb_*_amd64.deb
 sudo dnf install ./skaidb-*-1.x86_64.rpm
-tar xzf skaidb-*-x86_64-unknown-linux-gnu.tar.gz && sudo install -m755 skaidb skaidb-cli /usr/local/bin/
+tar xzf skaidb-*-x86_64-unknown-linux-gnu.tar.gz && sudo install -m755 skaidb skaidbsh /usr/local/bin/
 ```
 
 Releases are cut automatically on every push to `main` with SemVer version
@@ -78,11 +78,21 @@ curl -X POST 127.0.0.1:7080/query -d '{"sql":"SELECT * FROM users"}'
 curl 127.0.0.1:7080/metrics
 ```
 
-Or use the embedded shell:
+Or use the shell — `skaidbsh` connects over the network, picking the nearest
+reachable node and failing over to another if the connected one dies. Pointed at
+a single node it **discovers the rest of the cluster** (via `/status`) and adds
+them to its failover pool, so one `--host` still survives a node loss:
 
 ```sh
-skaidb-cli --dir ./data -e "SELECT COUNT(*) FROM users"
+skaidbsh --host 127.0.0.1 -e "SELECT COUNT(*) FROM users"   # one-shot
+skaidbsh --host node1                                        # interactive; auto-discovers peers
+skaidbsh --host node1,node2,node3                            # explicit seed list
+skaidbsh --local ./data -e "SELECT COUNT(*) FROM users"     # offline embedded engine
 ```
+
+Discovery assumes a uniform client (SQL) port across the cluster — the standard
+deployment. If nodes use different client ports, list them explicitly with
+`--host`.
 
 ## Run a cluster
 
@@ -98,16 +108,20 @@ skaidb --data-dir /var/lib/skaidb --bind-addr 10.0.0.1 \
 ```
 
 Every node serves reads and writes; data is replicated and quorum-tuned. Inspect
-and reshape a live cluster with **`skaidbctl`** (the admin client, shipped
-alongside `skaidb`/`skaidb-cli`):
+and reshape a live cluster — and read or change configuration — with
+**`skaidbsh`** (the same binary as the shell):
 
 ```sh
-skaidbctl --addr 10.0.0.1:7080 status                 # ring, epoch, members, RF
-skaidbctl --addr 10.0.0.1:7080 add-node 10.0.0.4:7100 # join + migrate its share online
-skaidbctl --addr 10.0.0.1:7080 remove-node 10.0.0.3:7100   # drain, then decommission
+skaidbsh --host 10.0.0.1 cluster status                  # ring, epoch, members, RF
+skaidbsh --host 10.0.0.1 cluster add-node 10.0.0.4:7100  # join + migrate its share online
+skaidbsh --host 10.0.0.1 cluster remove-node 10.0.0.3:7100  # drain, then decommission
+skaidbsh --host 10.0.0.1 config show                     # all settings (secrets masked)
+skaidbsh --host 10.0.0.1 config set observability.slow_query_ms 100
 ```
 
-It drives an authenticated `POST /admin/*` control plane on the node's REST port.
+These drive an authenticated `POST /admin/*` control plane on the node's REST
+port (RBAC-gated). Inside the interactive shell the same operations are available
+as `\cluster`, `\node`, `\config`, `\status`, and `\metrics`.
 Replication factor, consistency, ports, internode auth, and the full admin
 surface are in **[docs/CLUSTERING.md](docs/CLUSTERING.md)** (mechanics in
 [docs/RESHARDING.md](docs/RESHARDING.md)).
@@ -172,7 +186,7 @@ Implemented end-to-end and tested (202 tests):
   (HLC-preserving, tombstones included, both ways). Consistent hashing means a
   single membership change only moves ~`1/N` of the keyspace; placements are
   otherwise undisturbed. A `reclaim` pass then physically frees the space the
-  former owner held (ack-gated, no tombstone). All driven by **`skaidbctl`** over
+  former owner held (ack-gated, no tombstone). All driven by **`skaidbsh`** over
   an authenticated `POST /admin/*` **control plane** (RBAC-gated, membership
   changes serialized). See [docs/CLUSTERING.md](docs/CLUSTERING.md) /
   [docs/RESHARDING.md](docs/RESHARDING.md)

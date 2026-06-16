@@ -93,7 +93,7 @@ SHOW DATABASES
   implicit `default` database using unprefixed names (so an existing
   single-database directory keeps working unchanged — its tables are the
   `default` database). `USE` sets the **current database** for the connection
-  (the `skaidb-cli` shell, or a binary-protocol connection); unqualified table
+  (the `skaidbsh` shell, or a binary-protocol connection); unqualified table
   names resolve against it, and `db.table` reaches another database without
   switching. `SHOW DATABASES` lists them as `(database, current)` rows with `*`
   marking the current one; `SHOW TABLES`/`SHOW INDEXES` are scoped to the current

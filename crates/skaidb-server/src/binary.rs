@@ -59,7 +59,9 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) {
             Err(_) => return, // disconnect or framing error
         };
         let response = match Request::decode(&payload) {
-            Ok(req) => execute_session_as(&ctx, &role, &mut current_db, &req.sql),
+            Ok(req) => {
+                execute_session_as(&ctx, &role, &mut current_db, &req.sql, Some(req.consistency))
+            }
             Err(e) => Response::Error(format!("protocol error: {e}")),
         };
         let encoded = response.encode();
@@ -107,13 +109,13 @@ fn authenticate(stream: &mut TcpStream, ctx: &Shared) -> Result<String, ()> {
         } => {
             write_frame(stream, &AuthOutcome::Ok { server_signature }.encode()).map_err(|_| ())?;
             ctx.metrics.incr("skaidb_logins_total");
-            ctx.audit.log_login(&start.username, Some(&role), true);
+            ctx.audit().log_login(&start.username, Some(&role), true);
             Ok(role)
         }
         AuthResult::Denied(reason) => {
             let _ = write_frame(stream, &AuthOutcome::Denied { reason }.encode());
             ctx.metrics.incr("skaidb_login_failures_total");
-            ctx.audit.log_login(&start.username, None, false);
+            ctx.audit().log_login(&start.username, None, false);
             Err(())
         }
     }

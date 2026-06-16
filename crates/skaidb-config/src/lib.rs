@@ -174,6 +174,107 @@ impl Config {
     pub fn to_toml_string(&self) -> String {
         toml::to_string_pretty(self).expect("config serializes to TOML")
     }
+
+    /// The whole configuration as a nested JSON object (`section.field`), with
+    /// secrets masked — for `config show` over the admin API.
+    pub fn to_redacted_json(&self) -> serde_json::Value {
+        let mut root = serde_json::to_value(self).expect("config serializes to JSON");
+        redact(&mut root);
+        root
+    }
+
+    /// Read one dotted `section.field` key, with secrets masked. `None` if the
+    /// key does not exist.
+    pub fn get_key_redacted(&self, key: &str) -> Option<serde_json::Value> {
+        let (section, field) = key.split_once('.')?;
+        self.to_redacted_json()
+            .get(section)?
+            .get(field)
+            .cloned()
+    }
+
+    /// Return a copy of this config with `section.field` set from the string
+    /// `value`. The value is coerced to the field's existing JSON type and the
+    /// result is validated by round-tripping through the typed `Config`, so an
+    /// unknown key or an ill-typed / invalid-enum value is rejected with a
+    /// descriptive error rather than silently corrupting the config.
+    pub fn with_key_set(&self, key: &str, value: &str) -> Result<Config, String> {
+        let (section, field) = key
+            .split_once('.')
+            .ok_or_else(|| format!("key must be `section.field`, got `{key}`"))?;
+        let mut root = serde_json::to_value(self).expect("config serializes to JSON");
+        let obj = root
+            .get_mut(section)
+            .and_then(|s| s.as_object_mut())
+            .ok_or_else(|| format!("unknown config section: `{section}`"))?;
+        let existing = obj
+            .get(field)
+            .ok_or_else(|| format!("unknown config key: `{key}`"))?;
+        let coerced = coerce(existing, value)
+            .map_err(|e| format!("invalid value for `{key}`: {e}"))?;
+        obj.insert(field.to_string(), coerced);
+        serde_json::from_value(root).map_err(|e| format!("invalid value for `{key}`: {e}"))
+    }
+}
+
+/// Dotted config keys whose changes take effect immediately, without a restart.
+/// Everything else is read once at startup, so changing it only takes effect
+/// after the server is restarted (it is still persisted to the config file).
+pub const RUNTIME_MUTABLE_KEYS: &[&str] = &[
+    "observability.slow_query_ms",
+    "observability.query_log_enabled",
+    "observability.query_log_masked",
+    "observability.login_log_enabled",
+    "observability.error_log_level",
+    "observability.per_table_metrics",
+    "observability.log_format",
+];
+
+/// Whether changing `key` takes effect live (see [`RUNTIME_MUTABLE_KEYS`]).
+pub fn is_runtime_mutable(key: &str) -> bool {
+    RUNTIME_MUTABLE_KEYS.contains(&key)
+}
+
+/// Mask secret fields in a serialized config so they are never echoed back.
+fn redact(root: &mut serde_json::Value) {
+    if let Some(p) = root
+        .get_mut("auth")
+        .and_then(|a| a.get_mut("superuser_password"))
+    {
+        if p.as_str().is_some_and(|s| !s.is_empty()) {
+            *p = serde_json::Value::String("***".into());
+        }
+    }
+}
+
+/// Coerce a string into the JSON type of the field's `existing` value, so a
+/// plain CLI string lands as the right type for re-deserialization.
+fn coerce(existing: &serde_json::Value, value: &str) -> Result<serde_json::Value, String> {
+    use serde_json::Value;
+    match existing {
+        Value::Bool(_) => match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Ok(Value::Bool(true)),
+            "false" | "0" | "no" | "off" => Ok(Value::Bool(false)),
+            _ => Err(format!("expected a boolean, got `{value}`")),
+        },
+        Value::Number(_) => value
+            .trim()
+            .parse::<i64>()
+            .map(|n| Value::Number(n.into()))
+            .map_err(|_| format!("expected an integer, got `{value}`")),
+        // Comma-separated list (e.g. cluster seeds, agent subset tables).
+        Value::Array(_) => Ok(Value::Array(
+            value
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| Value::String(s.to_string()))
+                .collect(),
+        )),
+        // Strings and enums (which serialize as strings); validation happens on
+        // the round-trip back into the typed Config.
+        _ => Ok(Value::String(value.to_string())),
+    }
 }
 
 impl Default for ServerConfig {
@@ -295,6 +396,50 @@ mod tests {
         // Untouched fields keep their defaults.
         assert_eq!(c.server.bind_addr, "127.0.0.1");
         assert_eq!(c.cluster.default_write_consistency, Consistency::Quorum);
+    }
+
+    #[test]
+    fn set_key_coerces_and_validates() {
+        let c = Config::default();
+        // Number, bool, enum, and list coercions.
+        let c = c.with_key_set("observability.slow_query_ms", "500").unwrap();
+        assert_eq!(c.observability.slow_query_ms, 500);
+        let c = c.with_key_set("observability.per_table_metrics", "yes").unwrap();
+        assert!(c.observability.per_table_metrics);
+        let c = c
+            .with_key_set("cluster.default_read_consistency", "ONE")
+            .unwrap();
+        assert_eq!(c.cluster.default_read_consistency, Consistency::One);
+        let c = c
+            .with_key_set("cluster.seeds", "a:7100, b:7100 , c:7100")
+            .unwrap();
+        assert_eq!(c.cluster.seeds, vec!["a:7100", "b:7100", "c:7100"]);
+    }
+
+    #[test]
+    fn set_key_rejects_bad_input() {
+        let c = Config::default();
+        assert!(c.with_key_set("cluster.nope", "1").is_err()); // unknown key
+        assert!(c.with_key_set("nope.field", "1").is_err()); // unknown section
+        assert!(c.with_key_set("cluster.replication_factor", "abc").is_err()); // not a number
+        assert!(c
+            .with_key_set("cluster.default_read_consistency", "MAYBE")
+            .is_err()); // bad enum
+        assert!(c.with_key_set("server", "x").is_err()); // not dotted
+    }
+
+    #[test]
+    fn redacts_superuser_password() {
+        let mut c = Config::default();
+        c.auth.superuser_password = "hunter2".into();
+        let json = c.to_redacted_json();
+        assert_eq!(json["auth"]["superuser_password"], "***");
+        assert_eq!(
+            c.get_key_redacted("auth.superuser_password").unwrap(),
+            "***"
+        );
+        // An empty password is shown as empty, not masked.
+        assert_eq!(Config::default().to_redacted_json()["auth"]["superuser_password"], "");
     }
 
     #[test]

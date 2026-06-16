@@ -42,5 +42,5 @@ fn run(args: cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
         config.server.node_role,
         config.server.data_dir,
     );
-    skaidb_server::run(config)
+    skaidb_server::run(config, args.config.clone())
 }

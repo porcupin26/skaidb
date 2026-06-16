@@ -156,7 +156,7 @@ jobs:
           echo "CARGO_TARGET_$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')_LINKER=${{ matrix.linker }}" >>"$GITHUB_ENV"
 
       - name: Build release binaries
-        run: cargo build --release --target ${{ matrix.target }} -p skaidb-server -p skaidb-cli -p skaidb-ctl
+        run: cargo build --release --target ${{ matrix.target }} -p skaidb-server -p skaidb-cli
 
       # ---- packaging: Linux (tarball + .deb + .rpm) ----
       - name: Install nfpm
@@ -172,7 +172,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist staging
-          cp "target/$TARGET/release/skaidb" "target/$TARGET/release/skaidb-cli" "target/$TARGET/release/skaidbctl" staging/
+          cp "target/$TARGET/release/skaidb" "target/$TARGET/release/skaidbsh" staging/
           cp LICENSE README.md staging/
           tar -C staging -czf "dist/skaidb-$VERSION-$TARGET.tar.gz" .
           "$(go env GOPATH)/bin/nfpm" package -f .github/nfpm.yaml -p deb -t dist/
@@ -188,7 +188,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist staging
-          cp "target/$TARGET/release/skaidb" "target/$TARGET/release/skaidb-cli" "target/$TARGET/release/skaidbctl" staging/
+          cp "target/$TARGET/release/skaidb" "target/$TARGET/release/skaidbsh" staging/
           cp LICENSE README.md staging/
           tar -C staging -czf "dist/skaidb-$VERSION-$TARGET.tar.gz" .
 
@@ -202,7 +202,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist dmgroot
-          cp "target/$TARGET/release/skaidb" "target/$TARGET/release/skaidb-cli" "target/$TARGET/release/skaidbctl" dmgroot/
+          cp "target/$TARGET/release/skaidb" "target/$TARGET/release/skaidbsh" dmgroot/
           cp LICENSE README.md dmgroot/
           tar -C dmgroot -czf "dist/skaidb-$VERSION-$TARGET.tar.gz" .
           hdiutil create -volname "skaidb $VERSION" -srcfolder dmgroot \
@@ -218,13 +218,11 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist,staging | Out-Null
           Copy-Item "target/$env:TARGET/release/skaidb.exe" staging/
-          Copy-Item "target/$env:TARGET/release/skaidb-cli.exe" staging/
-          Copy-Item "target/$env:TARGET/release/skaidbctl.exe" staging/
+          Copy-Item "target/$env:TARGET/release/skaidbsh.exe" staging/
           Copy-Item LICENSE,README.md staging/
           Compress-Archive -Path staging/* -DestinationPath "dist/skaidb-$env:VERSION-$env:TARGET.zip" -Force
           Copy-Item "target/$env:TARGET/release/skaidb.exe" "dist/skaidb-$env:VERSION-$env:TARGET.exe"
-          Copy-Item "target/$env:TARGET/release/skaidb-cli.exe" "dist/skaidb-cli-$env:VERSION-$env:TARGET.exe"
-          Copy-Item "target/$env:TARGET/release/skaidbctl.exe" "dist/skaidbctl-$env:VERSION-$env:TARGET.exe"
+          Copy-Item "target/$env:TARGET/release/skaidbsh.exe" "dist/skaidbsh-$env:VERSION-$env:TARGET.exe"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

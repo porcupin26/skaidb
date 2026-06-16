@@ -10,18 +10,16 @@ priority: optional
 maintainer: skaidb maintainers <release@users.noreply.github.com>
 description: |
   skaidb — a schema-less, SQL-speaking, leaderless distributed database.
-  Bundles the server (skaidb), the embedded SQL shell (skaidb-cli), and the
-  cluster admin client (skaidbctl).
+  Bundles the server (skaidb) and the unified shell + cluster/config admin
+  client (skaidbsh).
 vendor: skaidb
 homepage: https://github.com/porcupin26/skaidb
 license: SSPL-1.0
 contents:
   - src: ./staging/skaidb
     dst: /usr/bin/skaidb
-  - src: ./staging/skaidb-cli
-    dst: /usr/bin/skaidb-cli
-  - src: ./staging/skaidbctl
-    dst: /usr/bin/skaidbctl
+  - src: ./staging/skaidbsh
+    dst: /usr/bin/skaidbsh
   - src: ./LICENSE
     dst: /usr/share/doc/skaidb/LICENSE
   - src: ./README.md

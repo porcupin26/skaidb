@@ -1,244 +1,649 @@
-//! skaidb SQL client.
+//! skaidbsh — the skaidb interactive shell and admin client.
 //!
-//! Phase 1 runs an **embedded** engine against a local data directory: either a
-//! one-shot statement via `-e`, or an interactive REPL reading from stdin.
-//! Remote connection over the driver lands in a later phase.
+//! Network-first: SQL runs over the binary fast-path driver (with nearest-node
+//! selection and failover across cluster members), while cluster/config/status
+//! operations use the REST control plane. An embedded engine is still available
+//! offline via `--local <dir>`.
+
+mod http;
+mod render;
 
 use std::io::{self, BufRead, IsTerminal};
+use std::process::ExitCode;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
-use skaidb_engine::{QueryOutput, ResultSet, Session};
 
-#[derive(Debug, Parser)]
-#[command(name = "skaidb-cli", version, about = "skaidb SQL client (embedded)")]
-struct Cli {
-    /// Data directory for the embedded engine.
-    #[arg(long, default_value = "./skaidb-data")]
-    dir: String,
-
-    /// Execute one or more `;`-separated statements, print results, and exit.
-    #[arg(short = 'e', long = "execute")]
-    execute: Option<String>,
-}
+use skaidb_driver::Client;
+use skaidb_engine::Session;
+use skaidb_proto::Consistency;
 
 /// Prompt shown while a statement is still being typed (no terminating `;`).
 const CONT_PROMPT: &str = "   ...> ";
 
-fn main() -> std::process::ExitCode {
+#[derive(Debug, Parser)]
+#[command(name = "skaidbsh", version, about = "skaidb interactive shell and admin client")]
+struct Cli {
+    /// Server host(s). Repeat or comma-separate for cluster failover, e.g.
+    /// `-H node1,node2:7000`. An entry may include its own SQL port.
+    #[arg(short = 'H', long = "host", default_value = "127.0.0.1", value_delimiter = ',')]
+    host: Vec<String>,
+
+    /// SQL (binary protocol) port, used when a host omits its own port.
+    #[arg(short = 'P', long = "port", default_value_t = 7000)]
+    port: u16,
+
+    /// REST/admin port for status, metrics, and config.
+    #[arg(long = "rest-port", default_value_t = 7080)]
+    rest_port: u16,
+
+    /// Username (SCRAM for SQL, HTTP Basic for admin).
+    #[arg(short = 'u', long, env = "SKAIDB_USER")]
+    user: Option<String>,
+
+    /// Password.
+    #[arg(short = 'p', long, env = "SKAIDB_PASSWORD")]
+    password: Option<String>,
+
+    /// Default SQL consistency: one | quorum | all.
+    #[arg(long, default_value = "quorum")]
+    consistency: String,
+
+    /// Run against an embedded engine on a local data directory instead of
+    /// connecting to a server (offline/dev). Admin commands are unavailable.
+    #[arg(long)]
+    local: Option<String>,
+
+    /// Execute one or more `;`-separated statements, print results, and exit.
+    #[arg(short = 'e', long = "execute")]
+    execute: Option<String>,
+
+    /// Execute statements read from a file, then exit.
+    #[arg(short = 'f', long = "file")]
+    file: Option<String>,
+
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Cmd {
+    /// Quick health/topology (GET /status, no auth required).
+    Status,
+    /// Print Prometheus metrics (GET /metrics).
+    Metrics,
+    /// Cluster membership operations.
+    Cluster {
+        #[command(subcommand)]
+        op: ClusterOp,
+    },
+    /// Inspect or change server configuration.
+    Config {
+        #[command(subcommand)]
+        op: ConfigOp,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ClusterOp {
+    /// Show cluster membership and topology.
+    Status,
+    /// Add a node and migrate it its share (`host:internode_port`).
+    AddNode { addr: String },
+    /// Gracefully decommission a node by id (`host:internode_port`).
+    RemoveNode { id: String },
+    /// Run a cluster-wide anti-entropy repair pass.
+    Repair,
+    /// Reclaim space former owners no longer own.
+    Reclaim,
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigOp {
+    /// Show the whole configuration (secrets masked).
+    Show,
+    /// Read one dotted `section.field` key.
+    Get { key: String },
+    /// Set one key (applies live when mutable, else persisted for restart).
+    Set { key: String, value: String },
+}
+
+fn main() -> ExitCode {
     let cli = Cli::parse();
-    let mut db = match Session::open(&cli.dir) {
-        Ok(db) => db,
+
+    // Admin subcommands always use the REST control plane.
+    if let Some(cmd) = &cli.cmd {
+        if cli.local.is_some() {
+            eprintln!("skaidbsh: admin commands need a server; --local is offline only");
+            return ExitCode::FAILURE;
+        }
+        return run_admin(&cli, cmd);
+    }
+
+    let mut shell = match Shell::connect(&cli) {
+        Ok(s) => s,
         Err(e) => {
-            eprintln!("skaidb-cli: cannot open {}: {e}", cli.dir);
-            return std::process::ExitCode::FAILURE;
+            eprintln!("skaidbsh: {e}");
+            return ExitCode::FAILURE;
         }
     };
 
-    if let Some(script) = cli.execute {
-        return match run_script(&mut db, &script) {
-            Ok(()) => std::process::ExitCode::SUCCESS,
-            Err(()) => std::process::ExitCode::FAILURE,
+    // One-shot script from `-e` or `-f`, else an interactive/piped REPL.
+    if let Some(script) = &cli.execute {
+        return shell.run_script(script);
+    }
+    if let Some(path) = &cli.file {
+        let script = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("skaidbsh: cannot read {path}: {e}");
+                return ExitCode::FAILURE;
+            }
         };
+        return shell.run_script(&script);
     }
 
     if io::stdin().is_terminal() {
-        repl_interactive(&mut db);
+        shell.repl_interactive();
     } else {
-        repl_piped(&mut db);
+        shell.repl_piped();
     }
-    std::process::ExitCode::SUCCESS
+    ExitCode::SUCCESS
 }
 
-/// Execute a `;`-separated script, stopping at the first error.
-fn run_script(db: &mut Session, script: &str) -> Result<(), ()> {
-    for stmt in split_statements(script) {
-        if let Err(e) = run_one(db, &stmt) {
-            eprintln!("error: {e}");
-            if let Some(hint) = suggest(&stmt, &e) {
-                eprintln!("hint: {hint}");
-            }
-            return Err(());
-        }
-    }
-    Ok(())
+/// Where statements execute: a remote node over the driver, or a local engine.
+enum Backend {
+    Net { client: Client, current_db: String },
+    Local(Session),
 }
 
-/// Interactive REPL with line editing, history, and arrow-key recall.
-fn repl_interactive(db: &mut Session) {
-    eprintln!("skaidb interactive shell. Type 'help' for commands, Ctrl-D to exit.");
-
-    let mut rl = match DefaultEditor::new() {
-        Ok(rl) => rl,
-        Err(e) => {
-            // Fall back to the dumb reader if the terminal can't be put in raw mode.
-            eprintln!("skaidb-cli: line editor unavailable ({e}); using basic input");
-            repl_piped(db);
-            return;
-        }
-    };
-    let history = history_path();
-    if let Some(path) = &history {
-        let _ = rl.load_history(path);
-    }
-
-    let mut buffer = String::new();
-    loop {
-        // The fresh prompt names the current database so it's always visible
-        // which one statements run against; the continuation prompt is fixed.
-        let prompt = if buffer.is_empty() {
-            format!("skaidb:{}> ", db.current_database())
-        } else {
-            CONT_PROMPT.to_string()
-        };
-        match rl.readline(&prompt) {
-            Ok(line) => {
-                let _ = rl.add_history_entry(line.as_str());
-
-                // Meta-commands work on their own line, no `;` required, but only
-                // when we are not in the middle of typing a SQL statement.
-                if buffer.is_empty() {
-                    match meta_command(line.trim()) {
-                        Meta::Help => {
-                            print_help();
-                            continue;
-                        }
-                        Meta::Quit => break,
-                        Meta::None => {}
-                    }
+impl Backend {
+    /// Execute one statement, rendering its result. Returns the error message
+    /// on failure (so the caller can print a hint).
+    fn execute(&mut self, sql: &str) -> Result<(), String> {
+        match self {
+            Backend::Net { client, current_db } => match client.execute(sql) {
+                Ok(resp) => {
+                    render::print_response(&resp);
+                    track_use(sql, current_db);
+                    Ok(())
                 }
-
-                buffer.push_str(&line);
-                buffer.push('\n');
-                drain_statements(db, &mut buffer);
-            }
-            Err(ReadlineError::Interrupted) => {
-                // Ctrl-C abandons the half-typed statement, like a shell.
-                buffer.clear();
-            }
-            Err(ReadlineError::Eof) => break,
-            Err(e) => {
-                eprintln!("read error: {e}");
-                break;
-            }
+                Err(e) => Err(e.to_string()),
+            },
+            Backend::Local(session) => match session.execute(sql) {
+                Ok(out) => {
+                    render::print_output(&out);
+                    Ok(())
+                }
+                Err(e) => Err(e.to_string()),
+            },
         }
     }
 
-    if let Some(path) = &history {
-        let _ = rl.save_history(path);
+    fn current_db(&self) -> &str {
+        match self {
+            Backend::Net { current_db, .. } => current_db,
+            Backend::Local(session) => session.current_database(),
+        }
+    }
+
+    fn set_consistency(&mut self, c: Consistency) -> bool {
+        match self {
+            Backend::Net { client, .. } => {
+                client.set_consistency(c);
+                true
+            }
+            Backend::Local(_) => false,
+        }
     }
 }
 
-/// REPL for piped / non-tty input: no prompts, no line editing.
-fn repl_piped(db: &mut Session) {
-    let stdin = io::stdin();
-    let mut buffer = String::new();
-    loop {
-        let mut line = String::new();
-        match stdin.lock().read_line(&mut line) {
-            Ok(0) => break, // EOF
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("read error: {e}");
-                break;
+/// The running shell: a backend plus the REST endpoints/credentials used by the
+/// admin helper commands.
+struct Shell {
+    backend: Backend,
+    rest_endpoints: Vec<String>,
+    user: Option<String>,
+    password: Option<String>,
+}
+
+impl Shell {
+    fn connect(cli: &Cli) -> Result<Shell, String> {
+        let backend = if let Some(dir) = &cli.local {
+            let session = Session::open(dir).map_err(|e| format!("cannot open {dir}: {e}"))?;
+            eprintln!("skaidbsh: embedded engine on {dir} (offline). Type 'help', Ctrl-D to exit.");
+            Backend::Local(session)
+        } else {
+            let endpoints = sql_endpoints(cli);
+            let user = cli.user.as_deref().unwrap_or("anonymous");
+            let pass = cli.password.as_deref().unwrap_or("");
+            let mut client = Client::connect_many(&endpoints, user, pass)
+                .map_err(|e| format!("could not connect: {e}"))?;
+            if let Some(c) = parse_consistency(&cli.consistency) {
+                client.set_consistency(c);
+            }
+            // Discover the rest of the cluster from the seed so a single --host
+            // still gives full failover: ask /status for the members' client
+            // endpoints and add any new ones to the driver's failover pool.
+            let discovered = discover_peers(&rest_endpoints(cli));
+            let new_peers = discovered.len();
+            client.add_endpoints(&discovered);
+            let total = client.endpoints().len();
+            eprintln!(
+                "skaidbsh: connected to {} ({} endpoint{}{}). Type 'help', Ctrl-D to exit.",
+                client.endpoint(),
+                total,
+                if total == 1 { "" } else { "s" },
+                if new_peers > 0 { format!(", {new_peers} discovered") } else { String::new() }
+            );
+            Backend::Net {
+                client,
+                current_db: skaidb_engine::DEFAULT_DATABASE.to_string(),
+            }
+        };
+        Ok(Shell {
+            backend,
+            rest_endpoints: rest_endpoints(cli),
+            user: cli.user.clone(),
+            password: cli.password.clone(),
+        })
+    }
+
+    fn auth(&self) -> http::Auth<'_> {
+        match (&self.user, &self.password) {
+            (Some(u), Some(p)) => Some((u.as_str(), p.as_str())),
+            _ => None,
+        }
+    }
+
+    /// Run a `;`-separated script, stopping at the first error.
+    fn run_script(&mut self, script: &str) -> ExitCode {
+        for stmt in split_statements(script) {
+            if self.run_sql(&stmt).is_err() {
+                return ExitCode::FAILURE;
             }
         }
-        buffer.push_str(&line);
-        drain_statements(db, &mut buffer);
+        ExitCode::SUCCESS
     }
-}
 
-/// Execute every complete (`;`-terminated) statement sitting in `buffer`,
-/// removing it as we go and leaving any trailing partial statement behind.
-fn drain_statements(db: &mut Session, buffer: &mut String) {
-    while let Some(idx) = find_statement_end(buffer) {
-        let stmt: String = buffer.drain(..=idx).collect();
-        let stmt = stmt.trim();
-        if !stmt.is_empty() && stmt != ";" {
-            if let Err(e) = run_one(db, stmt) {
-                eprintln!("error: {e}");
-                if let Some(hint) = suggest(stmt, &e) {
+    /// Execute one statement, printing any error and a hint.
+    fn run_sql(&mut self, sql: &str) -> Result<(), ()> {
+        match self.backend.execute(sql) {
+            Ok(()) => Ok(()),
+            Err(msg) => {
+                eprintln!("error: {msg}");
+                if let Some(hint) = suggest(sql, &msg) {
                     eprintln!("hint: {hint}");
                 }
+                Err(())
             }
         }
     }
-    // A buffer that holds only whitespace can never start a statement; clear it
-    // so the next prompt is the fresh `skaidb> ` rather than a continuation.
-    if buffer.trim().is_empty() {
-        buffer.clear();
+
+    fn repl_interactive(&mut self) {
+        let mut rl = match DefaultEditor::new() {
+            Ok(rl) => rl,
+            Err(e) => {
+                eprintln!("skaidbsh: line editor unavailable ({e}); using basic input");
+                self.repl_piped();
+                return;
+            }
+        };
+        let history = history_path();
+        if let Some(path) = &history {
+            let _ = rl.load_history(path);
+        }
+
+        let mut buffer = String::new();
+        loop {
+            let prompt = if buffer.is_empty() {
+                format!("skaidb:{}> ", self.backend.current_db())
+            } else {
+                CONT_PROMPT.to_string()
+            };
+            match rl.readline(&prompt) {
+                Ok(line) => {
+                    let _ = rl.add_history_entry(line.as_str());
+                    if buffer.is_empty() {
+                        match self.handle_meta(line.trim()) {
+                            Flow::Quit => break,
+                            Flow::Handled => continue,
+                            Flow::NotMeta => {}
+                        }
+                    }
+                    buffer.push_str(&line);
+                    buffer.push('\n');
+                    self.drain_statements(&mut buffer);
+                }
+                Err(ReadlineError::Interrupted) => buffer.clear(),
+                Err(ReadlineError::Eof) => break,
+                Err(e) => {
+                    eprintln!("read error: {e}");
+                    break;
+                }
+            }
+        }
+
+        if let Some(path) = &history {
+            let _ = rl.save_history(path);
+        }
+    }
+
+    fn repl_piped(&mut self) {
+        let stdin = io::stdin();
+        let mut buffer = String::new();
+        loop {
+            let mut line = String::new();
+            match stdin.lock().read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("read error: {e}");
+                    break;
+                }
+            }
+            // Backslash/meta commands work on their own line in piped mode too.
+            if buffer.is_empty() && is_meta(line.trim()) {
+                if let Flow::Quit = self.handle_meta(line.trim()) {
+                    break;
+                }
+                continue;
+            }
+            buffer.push_str(&line);
+            self.drain_statements(&mut buffer);
+        }
+    }
+
+    /// Execute every complete (`;`-terminated) statement in `buffer`.
+    fn drain_statements(&mut self, buffer: &mut String) {
+        while let Some(idx) = find_statement_end(buffer) {
+            let stmt: String = buffer.drain(..=idx).collect();
+            let stmt = stmt.trim();
+            if !stmt.is_empty() && stmt != ";" {
+                let _ = self.run_sql(stmt);
+            }
+        }
+        if buffer.trim().is_empty() {
+            buffer.clear();
+        }
+    }
+
+    /// Handle a meta command (help/quit or a `\`-prefixed helper). Returns
+    /// whether the line was a meta command and whether to quit.
+    fn handle_meta(&mut self, line: &str) -> Flow {
+        let line = line.trim_end_matches(';').trim();
+        let lower = line.to_ascii_lowercase();
+        match lower.as_str() {
+            "help" | "?" | "\\h" | "\\?" => {
+                print_help();
+                return Flow::Handled;
+            }
+            "quit" | "exit" | "\\q" => return Flow::Quit,
+            _ => {}
+        }
+        if !line.starts_with('\\') {
+            return Flow::NotMeta;
+        }
+
+        let mut parts = line.split_whitespace();
+        let cmd = parts.next().unwrap_or("");
+        let rest: Vec<&str> = parts.collect();
+        match cmd {
+            // SQL shortcuts.
+            "\\l" => { let _ = self.run_sql("SHOW DATABASES"); }
+            "\\dt" => { let _ = self.run_sql("SHOW TABLES"); }
+            "\\di" => { let _ = self.run_sql("SHOW INDEXES"); }
+            "\\consistency" => match rest.first().and_then(|s| parse_consistency(s)) {
+                Some(c) => {
+                    if self.backend.set_consistency(c) {
+                        println!("consistency set to {}", rest[0].to_ascii_uppercase());
+                    } else {
+                        eprintln!("consistency applies to network sessions only");
+                    }
+                }
+                None => eprintln!("usage: \\consistency one|quorum|all"),
+            },
+            // REST control-plane helpers.
+            "\\status" => self.rest_get("/status", false),
+            "\\metrics" => self.rest_get("/metrics", true),
+            "\\cluster" => self.rest_admin("/admin/status", String::new()),
+            "\\repair" => self.rest_admin("/admin/repair", String::new()),
+            "\\reclaim" => self.rest_admin("/admin/reclaim", String::new()),
+            "\\node" => match (rest.first().copied(), rest.get(1).copied()) {
+                (Some("add"), Some(addr)) => {
+                    self.rest_admin("/admin/add-node", json_kv("addr", addr))
+                }
+                (Some("remove"), Some(id)) => {
+                    self.rest_admin("/admin/remove-node", json_kv("id", id))
+                }
+                _ => eprintln!("usage: \\node add <addr> | \\node remove <id>"),
+            },
+            "\\config" => match (rest.first().copied(), rest.get(1).copied(), rest.get(2).copied()) {
+                (None, _, _) => self.rest_admin("/admin/config", String::new()),
+                (Some("get"), Some(key), _) => {
+                    self.rest_admin("/admin/config/get", json_kv("key", key))
+                }
+                (Some("set"), Some(key), Some(value)) => {
+                    self.rest_admin("/admin/config/set", json_kv2("key", key, "value", value))
+                }
+                _ => eprintln!("usage: \\config | \\config get <key> | \\config set <key> <value>"),
+            },
+            other => eprintln!("unknown command: {other} (type 'help')"),
+        }
+        Flow::Handled
+    }
+
+    /// Unauthenticated GET helper (`/status`, `/metrics`).
+    fn rest_get(&self, path: &str, raw: bool) {
+        if self.is_local() {
+            return;
+        }
+        match http::get(&self.rest_endpoints, path, None) {
+            Ok((_, body)) if raw => print!("{body}"),
+            Ok((_, body)) => http::print_body(&body),
+            Err(e) => eprintln!("error: {e}"),
+        }
+    }
+
+    /// Authenticated POST helper for `/admin/*`.
+    fn rest_admin(&self, path: &str, body: String) {
+        if self.is_local() {
+            return;
+        }
+        match http::post(&self.rest_endpoints, path, &body, self.auth()) {
+            Ok((_, resp)) => http::print_body(&resp),
+            Err(e) => eprintln!("error: {e}"),
+        }
+    }
+
+    fn is_local(&self) -> bool {
+        if matches!(self.backend, Backend::Local(_)) {
+            eprintln!("not connected to a server (running with --local)");
+            return true;
+        }
+        false
     }
 }
 
-fn run_one(db: &mut Session, sql: &str) -> Result<(), skaidb_engine::EngineError> {
-    match db.execute(sql)? {
-        QueryOutput::Rows(rs) => print_table(&rs),
-        QueryOutput::Mutation { affected } => println!("OK, {affected} row(s) affected"),
-        QueryOutput::Ddl => println!("OK"),
-    }
-    Ok(())
-}
-
-/// Meta (non-SQL) commands recognised at the start of a statement.
-enum Meta {
-    Help,
+/// Result of inspecting a line for meta commands.
+enum Flow {
+    /// The line was a meta command and has been handled.
+    Handled,
+    /// The user asked to quit.
     Quit,
-    None,
+    /// Not a meta command — treat as SQL.
+    NotMeta,
 }
 
-fn meta_command(line: &str) -> Meta {
-    match line.trim_end_matches(';').trim().to_ascii_lowercase().as_str() {
-        "help" | "?" | "\\h" | "\\?" => Meta::Help,
-        "quit" | "exit" | "\\q" => Meta::Quit,
-        _ => Meta::None,
+/// Run a one-shot admin subcommand over REST and exit accordingly.
+fn run_admin(cli: &Cli, cmd: &Cmd) -> ExitCode {
+    let endpoints = rest_endpoints(cli);
+    let auth = match (&cli.user, &cli.password) {
+        (Some(u), Some(p)) => Some((u.as_str(), p.as_str())),
+        _ => None,
+    };
+
+    let result = match cmd {
+        Cmd::Status => http::get(&endpoints, "/status", None),
+        Cmd::Metrics => http::get(&endpoints, "/metrics", None),
+        Cmd::Cluster { op } => {
+            let (path, body) = match op {
+                ClusterOp::Status => ("/admin/status", String::new()),
+                ClusterOp::Repair => ("/admin/repair", String::new()),
+                ClusterOp::Reclaim => ("/admin/reclaim", String::new()),
+                ClusterOp::AddNode { addr } => ("/admin/add-node", json_kv("addr", addr)),
+                ClusterOp::RemoveNode { id } => ("/admin/remove-node", json_kv("id", id)),
+            };
+            http::post(&endpoints, path, &body, auth)
+        }
+        Cmd::Config { op } => {
+            let (path, body) = match op {
+                ConfigOp::Show => ("/admin/config", String::new()),
+                ConfigOp::Get { key } => ("/admin/config/get", json_kv("key", key)),
+                ConfigOp::Set { key, value } => {
+                    ("/admin/config/set", json_kv2("key", key, "value", value))
+                }
+            };
+            http::post(&endpoints, path, &body, auth)
+        }
+    };
+
+    match result {
+        Ok((status, body)) => {
+            // /metrics is plain text; everything else is JSON.
+            if matches!(cmd, Cmd::Metrics) {
+                print!("{body}");
+            } else {
+                http::print_body(&body);
+            }
+            if status < 400 {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(e) => {
+            eprintln!("skaidbsh: request failed: {e}");
+            ExitCode::FAILURE
+        }
     }
+}
+
+/// SQL (binary) endpoints: each host keeps its own port, else gets `--port`.
+fn sql_endpoints(cli: &Cli) -> Vec<String> {
+    cli.host
+        .iter()
+        .map(|h| if h.contains(':') { h.clone() } else { format!("{h}:{}", cli.port) })
+        .collect()
+}
+
+/// REST endpoints: the bare host of each entry with `--rest-port`.
+fn rest_endpoints(cli: &Cli) -> Vec<String> {
+    cli.host
+        .iter()
+        .map(|h| {
+            let host = h.split(':').next().unwrap_or(h);
+            format!("{host}:{}", cli.rest_port)
+        })
+        .collect()
+}
+
+/// Ask `/status` (unauthenticated) for the cluster members' client endpoints, so
+/// connecting to one seed yields the whole failover set. Best-effort: returns an
+/// empty list for a standalone node or any error.
+fn discover_peers(rest_endpoints: &[String]) -> Vec<String> {
+    let Ok((_, body)) = http::get(rest_endpoints, "/status", None) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| {
+            v.get("endpoints")
+                .and_then(|e| e.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        })
+        .unwrap_or_default()
+}
+
+/// Build a `{"k":"v"}` JSON body.
+fn json_kv(k: &str, v: &str) -> String {
+    serde_json::json!({ k: v }).to_string()
+}
+
+/// Build a `{"k1":"v1","k2":"v2"}` JSON body.
+fn json_kv2(k1: &str, v1: &str, k2: &str, v2: &str) -> String {
+    serde_json::json!({ k1: v1, k2: v2 }).to_string()
+}
+
+fn parse_consistency(s: &str) -> Option<Consistency> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "one" => Some(Consistency::One),
+        "quorum" => Some(Consistency::Quorum),
+        "all" => Some(Consistency::All),
+        _ => None,
+    }
+}
+
+/// Track the connection's current database client-side by watching `USE`, so the
+/// prompt reflects it. (The server keeps the authoritative per-connection state.)
+fn track_use(sql: &str, current_db: &mut String) {
+    let mut words = sql.split_whitespace();
+    if !words.next().is_some_and(|w| w.eq_ignore_ascii_case("use")) {
+        return;
+    }
+    let mut next = words.next().unwrap_or("");
+    if next.eq_ignore_ascii_case("database") {
+        next = words.next().unwrap_or("");
+    }
+    let name = next.trim_end_matches(';').trim();
+    if !name.is_empty() {
+        *current_db = name.to_string();
+    }
+}
+
+/// Whether a line is a meta command (for piped mode).
+fn is_meta(line: &str) -> bool {
+    let l = line.trim_end_matches(';').trim().to_ascii_lowercase();
+    l.starts_with('\\') || matches!(l.as_str(), "help" | "?" | "quit" | "exit")
 }
 
 fn print_help() {
     println!(
         "\
-skaidb interactive shell — commands
+skaidbsh — commands
 
   Meta:
     help, ?            show this help
     quit, exit         leave the shell (or press Ctrl-D)
     Ctrl-C             discard the line you are typing
 
-  Statements (end each with ';'):
-    SELECT <cols> FROM <table> [WHERE ...] [ORDER BY ...] [LIMIT n];
-    INSERT INTO <table> (<cols>) VALUES (...);
-    UPDATE <table> SET ... [WHERE ...];
-    DELETE FROM <table> [WHERE ...];
-    CREATE TABLE <name> (PRIMARY KEY (<col> [, ...]));
-    CREATE INDEX <name> ON <table> (<path> [, ...]);
-    DROP   TABLE|INDEX <name>;
-    SHOW   TABLES;
-    SHOW   INDEXES;
-    SHOW   STATUS;          storage/runtime stats for the current database
-    BEGIN; COMMIT; ROLLBACK;
+  SQL (end each with ';'):
+    SELECT / INSERT / UPDATE / DELETE / CREATE / DROP / SHOW / USE / BEGIN ...
+    \\l                 list databases (SHOW DATABASES)
+    \\dt                list tables    (SHOW TABLES)
+    \\di                list indexes   (SHOW INDEXES)
+    \\consistency LVL   set read/write consistency: one | quorum | all
 
-  Databases (each is an isolated set of tables; the prompt shows the current one):
-    CREATE DATABASE <name>;
-    DROP   DATABASE <name>;
-    USE    <name>;          switch the current database (default: 'default')
-    SHOW   DATABASES;
-    Reach another database without switching by qualifying: db.table
-    (e.g. SELECT * FROM shop.orders;). In a cluster, databases replicate.
+  Server / cluster (network mode):
+    \\status            node health & topology (GET /status)
+    \\metrics           Prometheus metrics (GET /metrics)
+    \\cluster           cluster membership (admin)
+    \\node add <addr>   add a node       \\node remove <id>   decommission a node
+    \\repair            anti-entropy repair    \\reclaim    reclaim space
 
-  skaidb is schema-less: CREATE TABLE only declares the primary key — there are
-  no column definitions.
+  Configuration:
+    \\config                  show all settings (secrets masked)
+    \\config get <key>        read one section.field key
+    \\config set <key> <val>  change a key (live if mutable, else needs restart)
 
   Full grammar: docs/QUERY_SYNTAX.md"
     );
 }
 
-/// Suggest a fix for a failed statement, when we can recognise the mistake.
-///
-/// Returns `None` rather than guessing wildly — a misleading hint is worse than
-/// none. Recognised cases mirror the parser's own "expected …" messages.
-fn suggest(sql: &str, err: &skaidb_engine::EngineError) -> Option<String> {
-    let msg = err.to_string();
+/// Suggest a fix for a failed statement, recognising common mistakes from the
+/// error `msg`. Returns `None` rather than guessing wildly.
+fn suggest(sql: &str, msg: &str) -> Option<String> {
     let trimmed = sql.trim_start();
     let mut words = trimmed.split_whitespace();
     let first = words.next().unwrap_or("").trim_end_matches(';');
@@ -246,7 +651,6 @@ fn suggest(sql: &str, err: &skaidb_engine::EngineError) -> Option<String> {
     let first_up = first.to_ascii_uppercase();
     let second_low = second.to_ascii_lowercase();
 
-    // The whole statement could not even be tokenised.
     if msg.contains("lex error") {
         if trimmed.contains('\\') {
             return Some("stray '\\' character — skaidb does not use backslash line continuations; just keep typing until ';'.".into());
@@ -254,7 +658,6 @@ fn suggest(sql: &str, err: &skaidb_engine::EngineError) -> Option<String> {
         return Some("the statement contains a character skaidb cannot read; type 'help' to see valid syntax.".into());
     }
 
-    // First word is not a known statement keyword.
     if msg.contains("expected a statement") {
         if let Some(close) = closest_statement(&first_up) {
             return Some(format!("did you mean {close}? Type 'help' for the full list of commands."));
@@ -264,12 +667,10 @@ fn suggest(sql: &str, err: &skaidb_engine::EngineError) -> Option<String> {
         ));
     }
 
-    // SHOW with the wrong target.
     if msg.contains("after SHOW") {
         return Some("try: SHOW TABLES;  SHOW INDEXES;  SHOW STATUS;  or  SHOW DATABASES;".into());
     }
 
-    // CREATE / DROP with the wrong object kind.
     if msg.contains("expected TABLE, INDEX") {
         if matches!(second_low.as_str(), "db" | "schema") {
             return Some(format!("did you mean {first_up} DATABASE <name>?"));
@@ -279,14 +680,11 @@ fn suggest(sql: &str, err: &skaidb_engine::EngineError) -> Option<String> {
         ));
     }
 
-    // A USE / DROP DATABASE naming a database that isn't there.
     if msg.contains("does not exist") && msg.contains("database") {
         return Some("no such database — run SHOW DATABASES; to list them, or CREATE DATABASE <name>; first.".into());
     }
 
-    // CREATE TABLE without its primary-key clause: `expected LParen`.
     if msg.contains("expected LParen") && first_up == "CREATE" {
-        // The table name is the token after the TABLE keyword.
         let name = words.next().unwrap_or("").trim_end_matches(';');
         let name = if name.is_empty() { "<name>" } else { name };
         return Some(format!(
@@ -303,7 +701,6 @@ const STATEMENT_KEYWORDS: &[&str] = &[
     "COMMIT", "ROLLBACK",
 ];
 
-/// Closest statement keyword to `word` within a small edit distance, if any.
 fn closest_statement(word: &str) -> Option<&'static str> {
     if word.is_empty() {
         return None;
@@ -315,11 +712,9 @@ fn closest_statement(word: &str) -> Option<&'static str> {
             best = Some((kw, d));
         }
     }
-    // Only suggest when the typo is plausibly the same word.
     best.filter(|&(kw, d)| d <= 2.max(kw.len() / 3)).map(|(kw, _)| kw)
 }
 
-/// Levenshtein edit distance between two ASCII-ish words.
 fn edit_distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
@@ -336,7 +731,6 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-/// Location of the persistent history file, under the user's home directory.
 fn history_path() -> Option<std::path::PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(std::path::Path::new(&home).join(".skaidb_history"))
@@ -353,7 +747,6 @@ fn split_statements(script: &str) -> Vec<String> {
         match c {
             '\'' => {
                 in_string = !in_string;
-                // Doubled '' is an escaped quote; consume the second one.
                 if !in_string && chars.peek() == Some(&'\'') {
                     cur.push(c);
                     cur.push(chars.next().unwrap());
@@ -390,102 +783,73 @@ fn find_statement_end(buffer: &str) -> Option<usize> {
     None
 }
 
-/// Render a result set as a simple aligned text table.
-fn print_table(rs: &ResultSet) {
-    let mut widths: Vec<usize> = rs.columns.iter().map(|c| c.len()).collect();
-    let rendered: Vec<Vec<String>> = rs
-        .rows
-        .iter()
-        .map(|row| row.iter().map(|v| v.to_string()).collect())
-        .collect();
-    for row in &rendered {
-        for (i, cell) in row.iter().enumerate() {
-            if i < widths.len() {
-                widths[i] = widths[i].max(cell.len());
-            }
-        }
-    }
-
-    let sep: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
-    println!("{}", join_padded(&rs.columns, &widths));
-    println!("{}", sep.join("-+-"));
-    for row in &rendered {
-        println!("{}", join_padded(row, &widths));
-    }
-    println!(
-        "({} row{})",
-        rs.rows.len(),
-        if rs.rows.len() == 1 { "" } else { "s" }
-    );
-}
-
-fn join_padded<S: AsRef<str>>(cells: &[S], widths: &[usize]) -> String {
-    cells
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            format!(
-                "{:width$}",
-                c.as_ref(),
-                width = widths.get(i).copied().unwrap_or(0)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" | ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use skaidb_engine::EngineError;
 
-    fn parse_err(sql: &str) -> EngineError {
-        // Drive a real parse failure through the engine's error type.
-        EngineError::Parse(skaidb_sql::parse(sql).unwrap_err())
+    fn parse_err_msg(sql: &str) -> String {
+        skaidb_engine::EngineError::Parse(skaidb_sql::parse(sql).unwrap_err()).to_string()
     }
 
     #[test]
     fn suggests_show_tables() {
-        let e = parse_err("show dbs;");
-        let hint = suggest("show dbs;", &e).unwrap();
+        let hint = suggest("show dbs;", &parse_err_msg("show dbs;")).unwrap();
         assert!(hint.contains("SHOW TABLES"), "{hint}");
     }
 
     #[test]
     fn suggests_database_for_unknown_create_object() {
-        // `db` is not a keyword, so the parser rejects the object kind.
-        let e = parse_err("create db foo;");
-        let hint = suggest("create db foo;", &e).unwrap();
+        let hint = suggest("create db foo;", &parse_err_msg("create db foo;")).unwrap();
         assert!(hint.contains("CREATE DATABASE"), "{hint}");
     }
 
     #[test]
     fn suggests_primary_key_clause() {
-        let e = parse_err("create table test;");
-        let hint = suggest("create table test;", &e).unwrap();
+        let hint = suggest("create table test;", &parse_err_msg("create table test;")).unwrap();
         assert!(hint.contains("PRIMARY KEY"), "{hint}");
         assert!(hint.contains("test"), "{hint}");
     }
 
     #[test]
     fn suggests_closest_statement_keyword() {
-        let e = parse_err("slect 1;");
-        let hint = suggest("slect 1;", &e).unwrap();
+        let hint = suggest("slect 1;", &parse_err_msg("slect 1;")).unwrap();
         assert!(hint.contains("SELECT"), "{hint}");
     }
 
     #[test]
-    fn flags_stray_backslash() {
-        let e = parse_err("create table meh;\\");
-        let hint = suggest("create table meh;\\", &e).unwrap();
-        assert!(hint.contains('\\'), "{hint}");
+    fn tracks_use_for_prompt() {
+        let mut db = "default".to_string();
+        track_use("USE shop;", &mut db);
+        assert_eq!(db, "shop");
+        track_use("USE DATABASE analytics", &mut db);
+        assert_eq!(db, "analytics");
+        track_use("SELECT 1", &mut db);
+        assert_eq!(db, "analytics"); // unchanged by non-USE
     }
 
     #[test]
-    fn meta_help_and_quit() {
-        assert!(matches!(meta_command("help"), Meta::Help));
-        assert!(matches!(meta_command("?"), Meta::Help));
-        assert!(matches!(meta_command("exit"), Meta::Quit));
-        assert!(matches!(meta_command("select 1"), Meta::None));
+    fn endpoints_apply_default_ports() {
+        let cli = Cli {
+            host: vec!["a".into(), "b:7001".into()],
+            port: 7000,
+            rest_port: 7080,
+            user: None,
+            password: None,
+            consistency: "quorum".into(),
+            local: None,
+            execute: None,
+            file: None,
+            cmd: None,
+        };
+        assert_eq!(sql_endpoints(&cli), vec!["a:7000", "b:7001"]);
+        assert_eq!(rest_endpoints(&cli), vec!["a:7080", "b:7080"]);
+    }
+
+    #[test]
+    fn meta_detection() {
+        assert!(is_meta("help"));
+        assert!(is_meta("\\dt"));
+        assert!(is_meta("quit"));
+        assert!(!is_meta("select 1"));
     }
 }

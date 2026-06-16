@@ -1,15 +1,18 @@
 //! Shared server context and the instrumented execution path used by both the
 //! binary and REST endpoints.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
+
+use serde_json::{json, Value as Json};
 
 use crate::slowlog::SlowLog;
 
 use skaidb_auth::{Object, Privilege, RoleStore};
-use skaidb_cluster::{ClusterStats, Node};
+use skaidb_cluster::{ClusterStats, Consistency as ClusterConsistency, Node};
+use skaidb_config::Config;
 use skaidb_engine::{Database, DbStats, EngineError, QueryOutput, SessionEffect, DEFAULT_DATABASE};
-use skaidb_proto::Response;
+use skaidb_proto::{Consistency as ProtoConsistency, Response};
 use skaidb_sql::ast::Statement;
 
 use crate::audit::AuditSettings;
@@ -34,13 +37,15 @@ impl Backend {
         &self,
         current_db: &str,
         sql: &str,
+        consistency: Option<ClusterConsistency>,
     ) -> Result<SessionEffect, EngineError> {
         match self {
+            // The embedded engine is single-node; consistency does not apply.
             Backend::Local(db) => db
                 .lock()
                 .map_err(|_| EngineError::Cluster("server lock poisoned".into()))?
                 .execute_session(current_db, sql),
-            Backend::Cluster(node) => node.execute_session(current_db, sql),
+            Backend::Cluster(node) => node.execute_session_with(current_db, sql, consistency),
         }
     }
 
@@ -74,6 +79,27 @@ impl Backend {
     pub fn is_clustered(&self) -> bool {
         matches!(self, Backend::Cluster(_))
     }
+
+    /// Client (SQL) endpoints of all cluster members, as `host:quic_port`. Lets
+    /// a client that connected to one seed discover its peers for failover.
+    /// Members are tracked by internode address (`host:internode_port`); we keep
+    /// the host and apply `quic_port`, assuming a homogeneous client port across
+    /// the cluster. Empty when standalone.
+    pub fn member_client_endpoints(&self, quic_port: u16) -> Vec<String> {
+        match self {
+            Backend::Local(_) => Vec::new(),
+            Backend::Cluster(node) => {
+                let mut ids = node.member_ids();
+                ids.sort();
+                ids.into_iter()
+                    .map(|id| {
+                        let host = id.rsplit_once(':').map(|(h, _)| h).unwrap_or(&id);
+                        format!("{host}:{quic_port}")
+                    })
+                    .collect()
+            }
+        }
+    }
 }
 
 /// State shared across connection-handling threads.
@@ -81,7 +107,9 @@ impl Backend {
 pub struct Context {
     pub backend: Backend,
     pub metrics: Metrics,
-    pub audit: AuditSettings,
+    /// Live-tunable audit/observability settings. Behind a lock so `config set`
+    /// on an `observability.*` key takes effect without a restart.
+    pub audit: RwLock<AuditSettings>,
     /// Roles/grants (SPEC §8.2).
     pub roles: RoleStore,
     /// Connection authentication (SPEC §8.1).
@@ -93,10 +121,74 @@ pub struct Context {
     pub admin_lock: Mutex<()>,
     /// When the process started — drives `skaidb_uptime_seconds`.
     pub start: Instant,
-    /// Emit per-table metrics (bounded-cardinality opt-in, SPEC §10).
-    pub per_table_metrics: bool,
     /// A bounded ring of recent slow queries, for drill-down via `/admin/slow`.
     pub slow_log: SlowLog,
+    /// Authoritative current configuration, for `/admin/config` show/get/set.
+    pub config: RwLock<Config>,
+    /// Path the config was loaded from, used to persist `config set`. `None`
+    /// when the server was started from built-in defaults (no file to write).
+    pub config_path: Option<String>,
+}
+
+impl Context {
+    /// Read the live audit settings, tolerating a poisoned lock.
+    pub fn audit(&self) -> std::sync::RwLockReadGuard<'_, AuditSettings> {
+        self.audit.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A snapshot of the current configuration.
+    pub fn config_snapshot(&self) -> Config {
+        self.config.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// `config show`: the whole config with secrets masked.
+    pub fn config_show_json(&self) -> Json {
+        self.config_snapshot().to_redacted_json()
+    }
+
+    /// `config get <key>`: one dotted key, masked.
+    pub fn config_get_json(&self, key: &str) -> (u16, Json) {
+        match self.config_snapshot().get_key_redacted(key) {
+            Some(value) => (200, json!({ "key": key, "value": value })),
+            None => (404, json!({ "error": format!("unknown config key: {key}") })),
+        }
+    }
+
+    /// `config set <key> <value>`: validate, apply live if mutable, and persist
+    /// to the config file if one is known. Reports what actually happened.
+    pub fn config_set(&self, key: &str, value: &str) -> (u16, Json) {
+        let updated = match self.config_snapshot().with_key_set(key, value) {
+            Ok(u) => u,
+            Err(e) => return (400, json!({ "error": e })),
+        };
+        let applied = skaidb_config::is_runtime_mutable(key);
+        // Apply the observability subset live so it takes effect immediately.
+        if key.starts_with("observability.") {
+            *self.audit.write().unwrap_or_else(|e| e.into_inner()) =
+                AuditSettings::from(&updated.observability);
+        }
+        // Persist to disk when we know where the config lives.
+        let persisted = match &self.config_path {
+            Some(path) => {
+                if let Err(e) = std::fs::write(path, updated.to_toml_string()) {
+                    return (500, json!({ "error": format!("could not write {path}: {e}") }));
+                }
+                true
+            }
+            None => false,
+        };
+        *self.config.write().unwrap_or_else(|e| e.into_inner()) = updated;
+        (
+            200,
+            json!({
+                "ok": true,
+                "key": key,
+                "applied": applied,
+                "restart_required": !applied,
+                "persisted": persisted,
+            }),
+        )
+    }
 }
 
 /// A reference-counted [`Context`] shared by all handlers.
@@ -109,7 +201,12 @@ pub fn collect_runtime_metrics(ctx: &Shared) {
     ctx.metrics
         .set("skaidb_uptime_seconds", ctx.start.elapsed().as_secs());
 
-    if let Some(s) = ctx.backend.db_stats(ctx.per_table_metrics) {
+    let per_table = ctx
+        .config
+        .read()
+        .map(|c| c.observability.per_table_metrics)
+        .unwrap_or(false);
+    if let Some(s) = ctx.backend.db_stats(per_table) {
         let m = &ctx.metrics;
         m.set("skaidb_storage_tables", s.tables as u64);
         m.set(
@@ -198,18 +295,31 @@ pub fn execute(ctx: &Shared, sql: &str) -> Response {
 /// (stateless: any `USE` applies only for this single call).
 pub fn execute_as(ctx: &Shared, role: &str, sql: &str) -> Response {
     let mut current_db = DEFAULT_DATABASE.to_string();
-    execute_session_as(ctx, role, &mut current_db, sql)
+    // The stateless REST gateway carries no per-request consistency; use the
+    // server defaults.
+    execute_session_as(ctx, role, &mut current_db, sql, None)
+}
+
+/// Map a wire-protocol consistency level to the cluster's internal one.
+fn map_consistency(c: ProtoConsistency) -> ClusterConsistency {
+    match c {
+        ProtoConsistency::One => ClusterConsistency::One,
+        ProtoConsistency::Quorum => ClusterConsistency::Quorum,
+        ProtoConsistency::All => ClusterConsistency::All,
+    }
 }
 
 /// Execute one SQL statement on behalf of `role` within a session whose current
 /// database is `current_db`: enforce RBAC, run it, and record metrics/audit. A
-/// successful `USE` updates `current_db` in place (the connection's state). All
-/// errors become [`Response::Error`].
+/// successful `USE` updates `current_db` in place (the connection's state).
+/// `consistency` overrides the cluster default for this statement when `Some`.
+/// All errors become [`Response::Error`].
 pub fn execute_session_as(
     ctx: &Shared,
     role: &str,
     current_db: &mut String,
     sql: &str,
+    consistency: Option<ProtoConsistency>,
 ) -> Response {
     // Authorization: check the role may perform the statement before executing.
     if let Some((privilege, object)) = required_privilege(sql) {
@@ -222,7 +332,10 @@ pub fn execute_session_as(
     let start = Instant::now();
     ctx.metrics.gauge_inc("skaidb_queries_in_flight");
 
-    let response = match ctx.backend.execute_session(current_db, sql) {
+    let response = match ctx
+        .backend
+        .execute_session(current_db, sql, consistency.map(map_consistency))
+    {
         Ok(SessionEffect::Output(QueryOutput::Rows(rs))) => Response::Rows {
             columns: rs.columns,
             rows: rs.rows,
@@ -248,7 +361,7 @@ pub fn execute_session_as(
         Response::Error(m) => Some(m.as_str()),
         _ => None,
     };
-    ctx.audit.record(sql, elapsed_ms, err_msg);
+    ctx.audit().record(sql, elapsed_ms, err_msg);
 
     response
 }
@@ -295,7 +408,8 @@ fn record_metrics(
         }
     }
 
-    if ctx.audit.slow_query_ms > 0 && elapsed_ms >= ctx.audit.slow_query_ms {
+    let slow_query_ms = ctx.audit().slow_query_ms;
+    if slow_query_ms > 0 && elapsed_ms >= slow_query_ms {
         ctx.metrics.incr("skaidb_slow_queries_total");
         ctx.slow_log
             .record(&crate::audit::mask_sql(sql), elapsed_ms);

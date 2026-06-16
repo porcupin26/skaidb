@@ -241,23 +241,29 @@ fn extract_sql(body: &str) -> String {
     trimmed.to_string()
 }
 
-/// A low-privilege, unauthenticated topology snapshot — ring/epoch/members and
-/// the default consistency levels. Deliberately carries no credentials, data, or
-/// peer addresses, so it can be handed to a monitoring scraper.
+/// A low-privilege, unauthenticated topology snapshot — ring/epoch/members,
+/// the default consistency levels, and the members' client (SQL) endpoints so a
+/// client that reached one seed can discover its peers for failover. Carries no
+/// credentials or data, so it can be handed to a monitoring scraper.
 fn status_json(ctx: &Shared) -> Json {
     match ctx.backend.cluster_stats() {
-        Some(c) => json!({
-            "clustered": true,
-            "node_id": c.node_id,
-            "epoch": c.epoch,
-            "members": c.members,
-            "replication_factor": c.replication_factor,
-            "resharding": c.resharding_active,
-            "hints_pending": c.hints_pending,
-            "read_consistency": c.read_consistency,
-            "write_consistency": c.write_consistency,
-            "ready": ctx.backend.is_ready(),
-        }),
+        Some(c) => {
+            let quic_port = ctx.config.read().map(|cfg| cfg.server.quic_port).unwrap_or(0);
+            json!({
+                "clustered": true,
+                "node_id": c.node_id,
+                "epoch": c.epoch,
+                "members": c.members,
+                // Client SQL endpoints (host:quic_port) of every member.
+                "endpoints": ctx.backend.member_client_endpoints(quic_port),
+                "replication_factor": c.replication_factor,
+                "resharding": c.resharding_active,
+                "hints_pending": c.hints_pending,
+                "read_consistency": c.read_consistency,
+                "write_consistency": c.write_consistency,
+                "ready": ctx.backend.is_ready(),
+            })
+        }
         None => json!({ "clustered": false, "ready": ctx.backend.is_ready() }),
     }
 }

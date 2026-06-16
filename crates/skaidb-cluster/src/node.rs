@@ -1111,6 +1111,18 @@ impl Node {
         current_db: &str,
         sql: &str,
     ) -> EngineResult<SessionEffect> {
+        self.execute_session_with(current_db, sql, None)
+    }
+
+    /// Like [`Node::execute_session`], but overriding the cluster's configured
+    /// read/write consistency with `consistency` when it is `Some` (a per-request
+    /// level carried from the client); `None` uses the node defaults.
+    pub fn execute_session_with(
+        self: &Arc<Self>,
+        current_db: &str,
+        sql: &str,
+        consistency: Option<Consistency>,
+    ) -> EngineResult<SessionEffect> {
         let mut stmt = parse(sql)?;
         if matches!(
             stmt,
@@ -1163,6 +1175,7 @@ impl Node {
         namespace::resolve_statement(&mut stmt, current_db);
         let mut coord = Coordinator {
             node: Arc::clone(self),
+            oc: consistency,
         };
         run(stmt, &mut coord)
             .map(SessionEffect::Output)
@@ -1217,10 +1230,13 @@ impl Node {
         key: &[u8],
         op: WriteOp,
         hlc: Hlc,
+        oc: Option<Consistency>,
     ) -> EngineResult<()> {
         self.counters.writes_total.fetch_add(1, Ordering::Relaxed);
         let replicas = self.replicas_for(key);
-        let needed = self.cfg.write_consistency.required(replicas.len().max(1));
+        let needed = oc
+            .unwrap_or(self.cfg.write_consistency)
+            .required(replicas.len().max(1));
 
         // 0) Opportunistically hand off any buffered hints to recovered replicas
         //    (cheap when there are none; non-blocking).
@@ -1348,10 +1364,17 @@ impl Node {
 
     /// Point-read `key` from its replica set, resolving by last-writer-wins,
     /// requiring a read quorum of replicas to respond.
-    fn point_get(&self, table: &str, key: &[u8]) -> EngineResult<Vec<(Vec<u8>, Document)>> {
+    fn point_get(
+        &self,
+        table: &str,
+        key: &[u8],
+        oc: Option<Consistency>,
+    ) -> EngineResult<Vec<(Vec<u8>, Document)>> {
         self.counters.reads_total.fetch_add(1, Ordering::Relaxed);
         let replicas = self.replicas_for(key);
-        let needed = self.cfg.read_consistency.required(replicas.len().max(1));
+        let needed = oc
+            .unwrap_or(self.cfg.read_consistency)
+            .required(replicas.len().max(1));
         let mut responders = 0usize;
         // Best (highest-stamped) version seen: (hlc, Some(value) | None tombstone).
         let mut best: Option<(Hlc, Option<Vec<u8>>)> = None;
@@ -1496,7 +1519,11 @@ impl Node {
     /// Gather a table from all reachable members, merged by last-writer-wins.
     /// Tombstones participate in the merge so a delete on one replica correctly
     /// masks a stale `Put` gathered from another (quorum read ∩ quorum write).
-    fn cluster_scan(&self, table: &str) -> EngineResult<Vec<(Vec<u8>, Document)>> {
+    fn cluster_scan(
+        &self,
+        table: &str,
+        oc: Option<Consistency>,
+    ) -> EngineResult<Vec<(Vec<u8>, Document)>> {
         self.counters.reads_total.fetch_add(1, Ordering::Relaxed);
         // key -> (hlc, Some(encoded value) | None tombstone)
         let mut merged: BTreeMap<Vec<u8>, (Hlc, Option<Vec<u8>>)> = BTreeMap::new();
@@ -1532,7 +1559,9 @@ impl Node {
             }
         }
 
-        let needed = self.cfg.read_consistency.required(self.member_count());
+        let needed = oc
+            .unwrap_or(self.cfg.read_consistency)
+            .required(self.member_count());
         if responders < needed {
             self.counters
                 .read_quorum_failures
@@ -1575,6 +1604,7 @@ impl Node {
         index: &str,
         start: Option<Vec<u8>>,
         end: Option<Vec<u8>>,
+        oc: Option<Consistency>,
     ) -> EngineResult<Vec<(Vec<u8>, Document)>> {
         let mut keys: BTreeMap<Vec<u8>, ()> = BTreeMap::new();
 
@@ -1606,7 +1636,7 @@ impl Node {
         // Re-read each candidate key at quorum for its authoritative version.
         let mut out = Vec::new();
         for key in keys.into_keys() {
-            out.extend(self.point_get(table, &key)?);
+            out.extend(self.point_get(table, &key, oc)?);
         }
         Ok(out)
     }
@@ -1622,6 +1652,7 @@ impl Node {
         &self,
         table: &str,
         filter: &Expr,
+        oc: Option<Consistency>,
     ) -> EngineResult<Vec<(Vec<u8>, Document)>> {
         let mut keys: BTreeMap<Vec<u8>, ()> = BTreeMap::new();
 
@@ -1651,7 +1682,7 @@ impl Node {
 
         let mut out = Vec::new();
         for key in keys.into_keys() {
-            out.extend(self.point_get(table, &key)?);
+            out.extend(self.point_get(table, &key, oc)?);
         }
         Ok(out)
     }
@@ -1722,7 +1753,7 @@ impl Node {
         ranked.sort_by(|a, b| a.1.total_cmp(&b.1));
         let mut out = Vec::new();
         for (key, dist) in ranked {
-            let rows = filter_rows(filter, self.point_get(table.as_str(), &key)?)?;
+            let rows = filter_rows(filter, self.point_get(table.as_str(), &key, None)?)?;
             if let Some((_, doc)) = rows.into_iter().next() {
                 out.push((key, doc, dist));
                 if out.len() >= k {
@@ -1911,6 +1942,8 @@ fn is_ddl(stmt: &Statement) -> bool {
 /// The networked [`Cluster`] implementation driving `run()` on a coordinator.
 struct Coordinator {
     node: Arc<Node>,
+    /// Per-request consistency override; `None` uses the node's configured level.
+    oc: Option<Consistency>,
 }
 
 impl Coordinator {
@@ -1949,37 +1982,37 @@ impl Cluster for Coordinator {
         // replica set, not a full cluster scan.
         let pk = self.primary_key(table)?;
         if let Some(key) = pk_point_key(&pk, filter) {
-            let rows = self.node.point_get(table, &key)?;
+            let rows = self.node.point_get(table, &key, self.oc)?;
             return filter_rows(filter, rows);
         }
         // Indexed non-PK predicate: push the index scan to every node to gather
         // candidate keys, then re-read each at quorum — far less data than
         // shipping every node's whole shard.
         if let Some((index, start, end)) = self.plan_index_scan(table, filter)? {
-            let rows = self.node.index_lookup(table, &index, start, end)?;
+            let rows = self.node.index_lookup(table, &index, start, end, self.oc)?;
             return filter_rows(filter, rows);
         }
         // Non-indexed predicate: push the filter to each node and gather only the
         // matching candidate keys (then re-read at quorum), instead of shipping
         // every node's whole shard to the coordinator.
         if let Some(f) = filter {
-            let rows = self.node.filtered_lookup(table, f)?;
+            let rows = self.node.filtered_lookup(table, f, self.oc)?;
             return filter_rows(filter, rows);
         }
         // No predicate at all: gather the whole table, LWW-merged.
-        let rows = self.node.cluster_scan(table)?;
+        let rows = self.node.cluster_scan(table, self.oc)?;
         filter_rows(filter, rows)
     }
 
     fn put(&mut self, table: &str, key: &[u8], doc: &Document) -> EngineResult<()> {
         let hlc = self.node.clock.now();
         let bytes = Value::Document(doc.clone()).encode();
-        self.node.replicate(table, key, WriteOp::Put(bytes), hlc)
+        self.node.replicate(table, key, WriteOp::Put(bytes), hlc, self.oc)
     }
 
     fn delete(&mut self, table: &str, key: &[u8], _doc: &Document) -> EngineResult<()> {
         let hlc = self.node.clock.now();
-        self.node.replicate(table, key, WriteOp::Delete, hlc)
+        self.node.replicate(table, key, WriteOp::Delete, hlc, self.oc)
     }
 }
 

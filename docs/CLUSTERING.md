@@ -186,20 +186,20 @@ The full mechanics — pending-ranges dual-write during a join, single-sender
 migration, epoch'd membership, throttling/resume — are in
 [RESHARDING.md](RESHARDING.md).
 
-Drive them with **`skaidbctl`**, the cluster admin client (shipped alongside
-`skaidb`/`skaidb-cli`). It talks to any node's REST endpoint over an
-authenticated `POST /admin/*` control plane (RBAC: the role needs `Admin` on the
-whole cluster; membership changes are serialized server-side, one at a time):
+Drive them with **`skaidbsh`**, the unified shell/admin client (shipped
+alongside `skaidb`). It talks to any node's REST endpoint over an authenticated
+`POST /admin/*` control plane (RBAC: the role needs `Admin` on the whole cluster;
+membership changes are serialized server-side, one at a time):
 
 ```sh
-# Point it at any node's REST port (default 127.0.0.1:7080); add --user/--password
-# if the server requires auth.
-skaidbctl --addr 10.0.0.1:7080 status            # show the ring, epoch, members, RF
+# Point it at any node (REST port defaults to 7080, override with --rest-port);
+# add --user/--password if the server requires auth.
+skaidbsh --host 10.0.0.1 cluster status            # show the ring, epoch, members, RF
 
-skaidbctl --addr 10.0.0.1:7080 add-node 10.0.0.4:7100    # join: migrates its share in
-skaidbctl --addr 10.0.0.1:7080 remove-node 10.0.0.3:7100 # decommission: drains, then leaves
-skaidbctl --addr 10.0.0.1:7080 repair            # anti-entropy: converge all replicas
-skaidbctl --addr 10.0.0.1:7080 reclaim           # free space former owners no longer own
+skaidbsh --host 10.0.0.1 cluster add-node 10.0.0.4:7100    # join: migrates its share in
+skaidbsh --host 10.0.0.1 cluster remove-node 10.0.0.3:7100 # decommission: drains, then leaves
+skaidbsh --host 10.0.0.1 cluster repair            # anti-entropy: converge all replicas
+skaidbsh --host 10.0.0.1 cluster reclaim           # free space former owners no longer own
 ```
 
 `status` prints JSON like:
@@ -217,7 +217,7 @@ same operations are also available as raw HTTP (`POST /admin/status`,
 `/admin/add-node` with `{"addr":"…"}`, `/admin/remove-node` with `{"id":"…"}`,
 `/admin/repair`, `/admin/reclaim`) and as `skaidb_cluster::Node` library methods.
 
-A long migration keeps the `skaidbctl` request open until it finishes; tune the
+A long migration keeps the `skaidbsh` request open until it finishes; tune the
 push rate per node with the migration throttle (see
 [RESHARDING.md](RESHARDING.md)). Run one membership change at a time.
 

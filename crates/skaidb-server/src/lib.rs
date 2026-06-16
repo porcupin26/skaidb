@@ -14,7 +14,7 @@ pub mod rest;
 pub mod shared;
 pub mod slowlog;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use skaidb_auth::RoleStore;
@@ -66,8 +66,12 @@ fn map_consistency(c: Consistency) -> ClusterConsistency {
 }
 
 /// Open the database from `config` and serve the binary + REST endpoints,
-/// blocking until the binary accept loop ends.
-pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+/// blocking until the binary accept loop ends. `config_path` is the file the
+/// config was loaded from (if any), so `config set` can persist changes back.
+pub fn run(
+    config: Config,
+    config_path: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let db = Database::open(&config.server.data_dir)?;
 
     // Bootstrap the configured superuser role (SPEC §8.2).
@@ -130,14 +134,15 @@ pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let ctx: Shared = Arc::new(Context {
         backend,
         metrics,
-        audit: AuditSettings::from(&config.observability),
+        audit: RwLock::new(AuditSettings::from(&config.observability)),
         roles,
         authn,
         superuser_role: config.auth.superuser.clone(),
         admin_lock: Mutex::new(()),
         start: Instant::now(),
-        per_table_metrics: config.observability.per_table_metrics,
         slow_log: crate::slowlog::SlowLog::new(),
+        config: RwLock::new(config.clone()),
+        config_path,
     });
 
     println!(
@@ -229,14 +234,15 @@ mod tests {
         Arc::new(Context {
             backend: Backend::Local(Box::new(Mutex::new(Database::open(temp_dir()).unwrap()))),
             metrics: Metrics::new(),
-            audit: quiet_audit(),
+            audit: RwLock::new(quiet_audit()),
             roles,
             authn: AuthState::disabled(),
             superuser_role: "superuser".into(),
             admin_lock: Mutex::new(()),
             start: Instant::now(),
-            per_table_metrics: false,
             slow_log: crate::slowlog::SlowLog::new(),
+            config: RwLock::new(Config::default()),
+            config_path: None,
         })
     }
 
@@ -384,14 +390,15 @@ mod tests {
         Arc::new(Context {
             backend: Backend::Local(Box::new(Mutex::new(Database::open(temp_dir()).unwrap()))),
             metrics: Metrics::new(),
-            audit: quiet_audit(),
+            audit: RwLock::new(quiet_audit()),
             roles,
             authn,
             superuser_role: "admin".into(),
             admin_lock: Mutex::new(()),
             start: Instant::now(),
-            per_table_metrics: false,
             slow_log: crate::slowlog::SlowLog::new(),
+            config: RwLock::new(Config::default()),
+            config_path: None,
         })
     }
 
@@ -424,14 +431,15 @@ mod tests {
         let ctx: Shared = Arc::new(Context {
             backend: Backend::Local(Box::new(Mutex::new(Database::open(temp_dir()).unwrap()))),
             metrics: Metrics::new(),
-            audit: quiet_audit(),
+            audit: RwLock::new(quiet_audit()),
             roles,
             authn: AuthState::disabled(),
             superuser_role: "superuser".into(),
             admin_lock: Mutex::new(()),
             start: Instant::now(),
-            per_table_metrics: false,
             slow_log: crate::slowlog::SlowLog::new(),
+            config: RwLock::new(Config::default()),
+            config_path: None,
         });
 
         // Superuser sets up the table.
@@ -459,19 +467,20 @@ mod tests {
         let ctx: Shared = Arc::new(Context {
             backend: Backend::Local(Box::new(Mutex::new(Database::open(temp_dir()).unwrap()))),
             metrics: Metrics::new(),
-            audit: quiet_audit(),
+            audit: RwLock::new(quiet_audit()),
             roles,
             authn: AuthState::disabled(),
             superuser_role: "su".into(),
             admin_lock: Mutex::new(()),
             start: Instant::now(),
-            per_table_metrics: false,
             slow_log: crate::slowlog::SlowLog::new(),
+            config: RwLock::new(Config::default()),
+            config_path: None,
         });
 
         // One connection's current database, carried across statements.
         let mut db = skaidb_engine::DEFAULT_DATABASE.to_string();
-        let run = |db: &mut String, sql: &str| execute_session_as(&ctx, "su", db, sql);
+        let run = |db: &mut String, sql: &str| execute_session_as(&ctx, "su", db, sql, None);
 
         assert_eq!(run(&mut db, "CREATE DATABASE shop"), Response::Ddl);
         assert_eq!(run(&mut db, "USE shop"), Response::Ddl);
@@ -587,14 +596,15 @@ mod tests {
         Arc::new(Context {
             backend: Backend::Cluster(node),
             metrics: Metrics::new(),
-            audit: quiet_audit(),
+            audit: RwLock::new(quiet_audit()),
             roles,
             authn: AuthState::disabled(),
             superuser_role: "superuser".into(),
             admin_lock: Mutex::new(()),
             start: Instant::now(),
-            per_table_metrics: false,
             slow_log: crate::slowlog::SlowLog::new(),
+            config: RwLock::new(Config::default()),
+            config_path: None,
         })
     }
 
@@ -637,6 +647,68 @@ mod tests {
         assert!(body.contains("\"clustered\":true"), "got: {body}");
         // Unknown admin route → 404.
         assert_eq!(http_post_path(addr, "/admin/bogus", "").0, 404);
+    }
+
+    #[test]
+    fn status_advertises_member_client_endpoints() {
+        let ctx = cluster_ctx();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
+        // /status carries the members' client SQL endpoints (host:quic_port) so a
+        // client that reached one seed can discover its peers for failover.
+        let body = http_get(addr, "/status");
+        assert!(body.contains("\"endpoints\""), "got: {body}");
+        assert!(body.contains("127.0.0.1:7000"), "got: {body}");
+    }
+
+    #[test]
+    fn admin_config_show_get_set_over_rest() {
+        let ctx = temp_ctx();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
+
+        // Show: full config, with the (empty) superuser password present.
+        let (status, body) = http_post_path(addr, "/admin/config", "");
+        assert_eq!(status, 200);
+        assert!(body.contains("\"observability\""), "got: {body}");
+
+        // Get one key.
+        let (status, body) =
+            http_post_path(addr, "/admin/config/get", r#"{"key":"observability.slow_query_ms"}"#);
+        assert_eq!(status, 200);
+        assert!(body.contains("\"value\":200"), "got: {body}");
+
+        // Set a runtime-mutable key: applied live, no restart, not persisted
+        // (this ctx has no config file).
+        let (status, body) = http_post_path(
+            addr,
+            "/admin/config/set",
+            r#"{"key":"observability.slow_query_ms","value":"250"}"#,
+        );
+        assert_eq!(status, 200);
+        assert!(body.contains("\"applied\":true"), "got: {body}");
+        assert!(body.contains("\"restart_required\":false"), "got: {body}");
+        assert!(body.contains("\"persisted\":false"), "got: {body}");
+
+        // The change is visible on a subsequent get.
+        let (_, body) =
+            http_post_path(addr, "/admin/config/get", r#"{"key":"observability.slow_query_ms"}"#);
+        assert!(body.contains("\"value\":250"), "got: {body}");
+
+        // A startup-only key validates but reports restart_required.
+        let (status, body) = http_post_path(
+            addr,
+            "/admin/config/set",
+            r#"{"key":"cluster.replication_factor","value":"5"}"#,
+        );
+        assert_eq!(status, 200);
+        assert!(body.contains("\"restart_required\":true"), "got: {body}");
+
+        // An invalid value is rejected.
+        let (status, _) = http_post_path(
+            addr,
+            "/admin/config/set",
+            r#"{"key":"cluster.replication_factor","value":"lots"}"#,
+        );
+        assert_eq!(status, 400);
     }
 
     fn http_get(addr: std::net::SocketAddr, path: &str) -> String {

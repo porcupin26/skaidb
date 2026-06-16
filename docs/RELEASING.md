@@ -15,7 +15,7 @@ stages in order; a failure in any stage stops the release:
    since the last tag (see below), write it into the workspace `Cargo.toml`,
    commit it as `chore(release): vX.Y.Z [skip ci]`, and create + push the
    `vX.Y.Z` tag.
-3. **build** — a cross-compile matrix builds the `skaidb` server and `skaidb-cli`
+3. **build** — a cross-compile matrix builds the `skaidb` server and `skaidbsh`
    for every target and packages them (see the matrix below).
 4. **release** — collect every artifact, generate `SHA256SUMS`, and publish the
    GitHub Release for the tag (with auto-generated notes).
@@ -54,7 +54,7 @@ Examples: `feat: add UNION` → minor; `fix: off-by-one` → patch;
 | Windows x86_64 | `x86_64-pc-windows-msvc` | `.zip`, raw `.exe` |
 
 Plus a `SHA256SUMS` covering every file. Each archive/package bundles both the
-`skaidb` server and the `skaidb-cli` shell, the `LICENSE`, and the `README`. The
+`skaidb` server and the `skaidbsh` shell, the `LICENSE`, and the `README`. The
 `.deb`/`.rpm` install the binaries to `/usr/bin`. Packaging uses
 [`nfpm`](https://nfpm.goreleaser.com) (deb/rpm), `hdiutil` (dmg), and native
 `tar`/`Compress-Archive` for the rest.
