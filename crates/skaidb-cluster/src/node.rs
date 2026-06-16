@@ -396,35 +396,35 @@ impl Node {
         true
     }
 
-    /// `(database, CREATE-sql)` pairs reconstructing the local schema — databases,
-    /// tables, and indexes — for joiner bootstrap.
-    fn schema_ddl(&self) -> EngineResult<Vec<(String, String)>> {
+    /// Versioned schema — live objects as CREATEs, dropped ones as DROPs, each
+    /// with its HLC — for last-writer-wins reconciliation and joiner bootstrap.
+    fn schema_sync(&self) -> EngineResult<Vec<(String, String, Hlc)>> {
         Ok(self
             .local
             .read()
             .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
-            .schema_ddl())
+            .schema_sync())
     }
 
     /// Bidirectionally converge the catalog with the peer at `addr`: pull the
-    /// peer's schema and apply anything missing locally, then push the local
-    /// schema so the peer learns anything it is missing. All statements are
-    /// idempotent (`CREATE ... IF NOT EXISTS`), so this is safe to repeat and to
-    /// run concurrently with normal traffic. Best-effort: an unreachable peer or
-    /// an individual statement error is skipped rather than failing the pass.
+    /// peer's versioned schema and apply it locally, then push the local schema so
+    /// the peer converges too. Each statement carries its HLC and is applied under
+    /// last-writer-wins, so creates *and drops* propagate without a stale node
+    /// resurrecting a dropped object. Best-effort: an unreachable peer or an
+    /// individual statement error is skipped rather than failing the pass.
     fn sync_schema_with(&self, addr: &str) {
-        // Pull: apply the peer's schema locally.
+        // Pull: apply the peer's schema (creates and drops) locally, LWW.
         if let Ok(Response::Schema { entries }) = self.pool.call(addr, &Request::SchemaDdl) {
-            for (db, sql) in entries {
+            for (db, sql, hlc) in entries {
                 if let Ok(mut d) = self.local.write() {
-                    let _ = d.execute_session(&db, &sql);
+                    let _ = d.execute_session_with_hlc(&db, &sql, hlc);
                 }
             }
         }
-        // Push: send the local schema so the peer converges too.
-        if let Ok(mine) = self.schema_ddl() {
-            for (db, sql) in mine {
-                let _ = self.pool.call(addr, &Request::ApplyDdl { db, sql });
+        // Push: send the local schema (with versions) so the peer converges too.
+        if let Ok(mine) = self.schema_sync() {
+            for (db, sql, hlc) in mine {
+                let _ = self.pool.call(addr, &Request::ApplyDdl { db, sql, hlc });
             }
         }
     }
@@ -641,10 +641,10 @@ impl Node {
             }
         }
 
-        // 2) Bootstrap the joiner's schema (databases + tables + indexes) so it
-        //    can accept migrated rows.
-        for (db, ddl) in self.schema_ddl()? {
-            match self.pool.call(addr, &Request::ApplyDdl { db, sql: ddl }) {
+        // 2) Bootstrap the joiner's schema (databases + tables + indexes, with
+        //    versions) so it can accept migrated rows and converge under LWW.
+        for (db, ddl, hlc) in self.schema_sync()? {
+            match self.pool.call(addr, &Request::ApplyDdl { db, sql: ddl, hlc }) {
                 Ok(Response::Ack) => {}
                 Ok(Response::Err(e)) => {
                     return Err(EngineError::Cluster(format!("joiner DDL failed: {e}")))
@@ -1107,8 +1107,8 @@ impl Node {
             Request::ApplyDelete { table, key, hlc } => {
                 write_response(self.apply_write_local(&table, &key, &WriteOp::Delete, hlc))
             }
-            Request::ApplyDdl { db, sql } => {
-                self.with_write(|d| d.execute_session(&db, &sql).map(|_| ()))
+            Request::ApplyDdl { db, sql, hlc } => {
+                self.with_write(|d| d.execute_session_with_hlc(&db, &sql, hlc).map(|_| ()))
             }
             Request::SetMembership {
                 epoch,
@@ -1143,7 +1143,7 @@ impl Node {
                 Ok(_) => Response::Ack,
                 Err(e) => Response::Err(e.to_string()),
             },
-            Request::SchemaDdl => match self.schema_ddl() {
+            Request::SchemaDdl => match self.schema_sync() {
                 Ok(entries) => Response::Schema { entries },
                 Err(e) => Response::Err(e.to_string()),
             },
@@ -1259,11 +1259,13 @@ impl Node {
     /// reconciled by [`Node::sync_schema_with`] during [`Node::repair`], which
     /// also runs automatically on (re)join via [`Node::startup_catch_up`].
     fn broadcast_ddl(&self, current_db: &str, sql: &str) -> EngineResult<()> {
+        // Stamp the DDL once so every node records the same schema version.
+        let hlc = self.clock.now();
         let mut acks = 0usize;
         // Local first.
         match self.local.write() {
             Ok(mut db) => {
-                db.execute_session(current_db, sql)?;
+                db.execute_session_with_hlc(current_db, sql, hlc)?;
                 acks += 1;
             }
             Err(_) => return Err(EngineError::Cluster("local lock poisoned".into())),
@@ -1274,6 +1276,7 @@ impl Node {
                 &Request::ApplyDdl {
                     db: current_db.to_string(),
                     sql: sql.to_string(),
+                    hlc,
                 },
             ) {
                 acks += 1;
@@ -2658,6 +2661,7 @@ mod tests {
             &Request::ApplyDdl {
                 db: "default".into(),
                 sql: "CREATE TABLE t (PRIMARY KEY (id))".into(),
+                hlc: Hlc::new(1, 0),
             },
         )
         .unwrap();

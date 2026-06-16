@@ -155,7 +155,8 @@ fn main() -> ExitCode {
 /// Where statements execute: a remote node over the driver, or a local engine.
 enum Backend {
     Net { client: Client, current_db: String },
-    Local(Session),
+    // Boxed: the embedded engine is large, dwarfing the network variant.
+    Local(Box<Session>),
 }
 
 impl Backend {
@@ -214,7 +215,7 @@ impl Shell {
         let backend = if let Some(dir) = &cli.local {
             let session = Session::open(dir).map_err(|e| format!("cannot open {dir}: {e}"))?;
             eprintln!("skaidbsh: embedded engine on {dir} (offline). Type 'help', Ctrl-D to exit.");
-            Backend::Local(session)
+            Backend::Local(Box::new(session))
         } else {
             let endpoints = sql_endpoints(cli);
             let user = cli.user.as_deref().unwrap_or("anonymous");

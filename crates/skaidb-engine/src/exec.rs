@@ -14,10 +14,10 @@ use skaidb_sql::ast::{
 use skaidb_sql::parse;
 use std::sync::Arc;
 
-use skaidb_storage::{Engine as StorageEngine, Hlc, VersionValue, WalCommit, WalSync};
+use skaidb_storage::{Engine as StorageEngine, Hlc, HlcClock, VersionValue, WalCommit, WalSync};
 use skaidb_types::{Document, Value};
 
-use crate::catalog::{Catalog, IndexDef, TableDef, VectorIndexDef};
+use crate::catalog::{Catalog, IndexDef, SchemaVersion, TableDef, VectorIndexDef};
 use crate::error::{EngineError, Result};
 use crate::eval::{compare, eval, eval_predicate};
 use crate::namespace::{self, DEFAULT_DATABASE};
@@ -57,6 +57,12 @@ pub struct Database {
     vector_indexes: HashMap<String, Hnsw>,
     /// The open transaction's buffered writes, if a `BEGIN` is in flight.
     txn: Option<TxnBuffer>,
+    /// Clock for stamping DDL so schema changes order under last-writer-wins.
+    clock: HlcClock,
+    /// When `Some`, the HLC the current (replicated) DDL statement must use
+    /// instead of a fresh local stamp; set by [`Database::execute_session_with_hlc`]
+    /// and consumed by [`Database::ddl_stamp`].
+    ddl_hlc: Option<Hlc>,
     /// Wall-clock spent rebuilding HNSW vector indexes during the last `open`
     /// (they live only in RAM and are reconstructed from table rows), in
     /// milliseconds — surfaced as a metric so a slow open is visible.
@@ -153,8 +159,41 @@ impl Database {
             indexes,
             vector_indexes,
             txn: None,
+            clock: HlcClock::new(),
+            ddl_hlc: None,
             vector_rebuild_ms,
         })
+    }
+
+    /// Resolve the HLC for the DDL about to run: the replicated stamp if one was
+    /// supplied (so every node applies the same change at the same version),
+    /// else a fresh local stamp. Always observed so the clock stays monotonic.
+    fn ddl_stamp(&mut self) -> Hlc {
+        match self.ddl_hlc {
+            // Replicated DDL: use the coordinator's stamp verbatim so every node
+            // records the same version; still advance our clock past it.
+            Some(h) => {
+                self.clock.observe(h);
+                h
+            }
+            None => self.clock.now(),
+        }
+    }
+
+    /// Whether `hlc` is newer than the recorded version for `key` (or there is
+    /// none) — i.e. this DDL should take effect under last-writer-wins.
+    fn schema_advances(&self, key: &str, hlc: Hlc) -> bool {
+        self.catalog
+            .schema_versions
+            .get(key)
+            .is_none_or(|v| hlc > v.hlc())
+    }
+
+    /// Record the version stamp for a schema object after applying its DDL.
+    fn record_schema(&mut self, key: String, hlc: Hlc, dropped: bool) {
+        self.catalog
+            .schema_versions
+            .insert(key, SchemaVersion::new(hlc, dropped));
     }
 
     /// Create an HNSW vector index over the float array at `path` of `table`.
@@ -172,6 +211,11 @@ impl Database {
     ) -> Result<QueryOutput> {
         if !self.catalog.tables.contains_key(table) {
             return Err(EngineError::TableNotFound(table.to_string()));
+        }
+        let hlc = self.ddl_stamp();
+        let key = format!("v:{name}");
+        if !self.schema_advances(&key, hlc) {
+            return Ok(QueryOutput::Ddl);
         }
         if self.catalog.vector_indexes.contains_key(name) {
             return Err(EngineError::IndexExists(name.to_string()));
@@ -206,16 +250,23 @@ impl Database {
         }
         self.vector_indexes.insert(name.to_string(), hnsw);
         self.catalog.vector_indexes.insert(name.to_string(), def);
+        self.record_schema(key, hlc, false);
         self.save_catalog()?;
         Ok(QueryOutput::Ddl)
     }
 
     /// Drop a vector index.
     pub fn drop_vector_index(&mut self, name: &str, if_exists: bool) -> Result<QueryOutput> {
+        let hlc = self.ddl_stamp();
+        let key = format!("v:{name}");
+        if !self.schema_advances(&key, hlc) {
+            return Ok(QueryOutput::Ddl);
+        }
         if self.catalog.vector_indexes.remove(name).is_none() && !if_exists {
             return Err(EngineError::IndexNotFound(name.to_string()));
         }
         self.vector_indexes.remove(name);
+        self.record_schema(key, hlc, true);
         self.save_catalog()?;
         Ok(QueryOutput::Ddl)
     }
@@ -423,6 +474,22 @@ impl Database {
         Ok(SessionEffect::Output(out))
     }
 
+    /// Like [`Database::execute_session`], but any DDL is stamped with `hlc`
+    /// instead of a fresh local clock value — so a cluster coordinator can
+    /// replicate a schema change to every node at the same version (and a node
+    /// catching up applies it under last-writer-wins). Used for `ApplyDdl`.
+    pub fn execute_session_with_hlc(
+        &mut self,
+        current_db: &str,
+        sql: &str,
+        hlc: Hlc,
+    ) -> Result<SessionEffect> {
+        self.ddl_hlc = Some(hlc);
+        let result = self.execute_session(current_db, sql);
+        self.ddl_hlc = None;
+        result
+    }
+
     /// True if `name` is the default database or a registered database.
     pub fn has_database(&self, name: &str) -> bool {
         name == DEFAULT_DATABASE || self.catalog.databases.contains(name)
@@ -441,13 +508,21 @@ impl Database {
                 "invalid database name {name:?}: use letters, digits, '_' or '-' (max 64 chars)"
             )));
         }
-        if self.has_database(name) {
-            if if_not_exists {
-                return Ok(QueryOutput::Ddl);
-            }
+        let hlc = self.ddl_stamp();
+        let key = format!("d:{name}");
+        // Last-writer-wins: ignore a create older than the object's last change
+        // (e.g. a stale replicated create arriving after a newer drop).
+        if !self.schema_advances(&key, hlc) {
+            return Ok(QueryOutput::Ddl);
+        }
+        let exists = self.has_database(name);
+        if exists && !if_not_exists {
             return Err(EngineError::DatabaseExists(name.to_string()));
         }
-        self.catalog.databases.insert(name.to_string());
+        if !exists {
+            self.catalog.databases.insert(name.to_string());
+        }
+        self.record_schema(key, hlc, false);
         self.save_catalog()?;
         Ok(QueryOutput::Ddl)
     }
@@ -458,8 +533,18 @@ impl Database {
                 "cannot drop the default database".into(),
             ));
         }
+        let hlc = self.ddl_stamp();
+        let key = format!("d:{name}");
+        // Last-writer-wins: ignore a drop older than the object's last change.
+        if !self.schema_advances(&key, hlc) {
+            return Ok(QueryOutput::Ddl);
+        }
         if !self.catalog.databases.contains(name) {
             if if_exists {
+                // Record the tombstone even when absent, so a stale create
+                // replicated from a peer that missed this drop can't resurrect it.
+                self.record_schema(key, hlc, true);
+                self.save_catalog()?;
                 return Ok(QueryOutput::Ddl);
             }
             return Err(EngineError::DatabaseNotFound(name.to_string()));
@@ -497,6 +582,7 @@ impl Database {
             self.drop_index(&index, true)?;
         }
         self.catalog.databases.remove(name);
+        self.record_schema(key, hlc, true);
         self.save_catalog()?;
         Ok(QueryOutput::Ddl)
     }
@@ -585,36 +671,51 @@ impl Database {
         pk: Vec<String>,
         if_not_exists: bool,
     ) -> Result<QueryOutput> {
-        if self.catalog.tables.contains_key(name) {
-            if if_not_exists {
-                return Ok(QueryOutput::Ddl);
-            }
-            return Err(EngineError::TableExists(name.to_string()));
-        }
         if pk.is_empty() {
             return Err(EngineError::Constraint(
                 "primary key must have at least one column".into(),
             ));
+        }
+        let hlc = self.ddl_stamp();
+        let key = format!("t:{name}");
+        if !self.schema_advances(&key, hlc) {
+            return Ok(QueryOutput::Ddl);
+        }
+        if self.catalog.tables.contains_key(name) {
+            if if_not_exists {
+                self.record_schema(key, hlc, false);
+                self.save_catalog()?;
+                return Ok(QueryOutput::Ddl);
+            }
+            return Err(EngineError::TableExists(name.to_string()));
         }
         let engine = StorageEngine::open(table_dir(&self.dir, name))?;
         self.tables.insert(name.to_string(), engine);
         self.catalog
             .tables
             .insert(name.to_string(), TableDef { primary_key: pk });
+        self.record_schema(key, hlc, false);
         self.save_catalog()?;
         Ok(QueryOutput::Ddl)
     }
 
     fn drop_table(&mut self, name: &str, if_exists: bool) -> Result<QueryOutput> {
+        let hlc = self.ddl_stamp();
+        let key = format!("t:{name}");
+        if !self.schema_advances(&key, hlc) {
+            return Ok(QueryOutput::Ddl);
+        }
         if !self.catalog.tables.contains_key(name) {
             if if_exists {
+                self.record_schema(key, hlc, true);
+                self.save_catalog()?;
                 return Ok(QueryOutput::Ddl);
             }
             return Err(EngineError::TableNotFound(name.to_string()));
         }
         self.tables.remove(name);
         self.catalog.tables.remove(name);
-        // Drop the table's indexes too.
+        // Drop the table's indexes too, tombstoning each so the drop replicates.
         let dropped: Vec<String> = self
             .catalog
             .indexes
@@ -625,11 +726,13 @@ impl Database {
         for index_name in dropped {
             self.catalog.indexes.remove(&index_name);
             self.indexes.remove(&index_name);
+            self.record_schema(format!("i:{index_name}"), hlc, true);
             let idir = index_dir(&self.dir, &index_name);
             if idir.exists() {
                 std::fs::remove_dir_all(idir)?;
             }
         }
+        self.record_schema(key, hlc, true);
         self.save_catalog()?;
         let dir = table_dir(&self.dir, name);
         if dir.exists() {
@@ -648,8 +751,15 @@ impl Database {
         if !self.catalog.tables.contains_key(table) {
             return Err(EngineError::TableNotFound(table.to_string()));
         }
+        let hlc = self.ddl_stamp();
+        let key = format!("i:{name}");
+        if !self.schema_advances(&key, hlc) {
+            return Ok(QueryOutput::Ddl);
+        }
         if self.catalog.indexes.contains_key(name) {
             if if_not_exists {
+                self.record_schema(key, hlc, false);
+                self.save_catalog()?;
                 return Ok(QueryOutput::Ddl);
             }
             return Err(EngineError::IndexExists(name.to_string()));
@@ -668,11 +778,17 @@ impl Database {
                 paths: paths.to_vec(),
             },
         );
+        self.record_schema(key, hlc, false);
         self.save_catalog()?;
         Ok(QueryOutput::Ddl)
     }
 
     fn drop_index(&mut self, name: &str, if_exists: bool) -> Result<QueryOutput> {
+        let hlc = self.ddl_stamp();
+        let key = format!("i:{name}");
+        if !self.schema_advances(&key, hlc) {
+            return Ok(QueryOutput::Ddl);
+        }
         if self.catalog.indexes.remove(name).is_none() && !if_exists {
             return Err(EngineError::IndexNotFound(name.to_string()));
         }
@@ -681,6 +797,7 @@ impl Database {
         if idir.exists() {
             std::fs::remove_dir_all(idir)?;
         }
+        self.record_schema(key, hlc, true);
         self.save_catalog()?;
         Ok(QueryOutput::Ddl)
     }
@@ -1115,6 +1232,94 @@ impl Database {
     /// `CREATE` statements that reconstruct this node's schema (tables, then
     /// secondary indexes, then vector indexes) — sent to a joining node so it can
     /// receive migrated rows. Identifiers are assumed simple (no quoting).
+    /// Versioned schema for last-writer-wins replication: every live object as a
+    /// `CREATE … IF NOT EXISTS` and every dropped object as a `DROP … IF EXISTS`,
+    /// each paired with its DDL version stamp. A peer applies each statement via
+    /// [`Database::execute_session_with_hlc`], so creates and drops converge
+    /// across nodes and a node that missed a drop stops resurrecting the object.
+    pub fn schema_sync(&self) -> Vec<(String, String, Hlc)> {
+        let ver = |key: &str| {
+            self.catalog
+                .schema_versions
+                .get(key)
+                .map_or(Hlc::MIN, |v| v.hlc())
+        };
+        let mut out: Vec<(String, String, Hlc)> = Vec::new();
+        // Live objects as idempotent CREATEs, each with its version stamp.
+        for db in &self.catalog.databases {
+            out.push((
+                DEFAULT_DATABASE.to_string(),
+                format!("CREATE DATABASE IF NOT EXISTS {db}"),
+                ver(&format!("d:{db}")),
+            ));
+        }
+        for (name, def) in &self.catalog.tables {
+            let (db, bare) = namespace::split(name);
+            out.push((
+                db.to_string(),
+                format!(
+                    "CREATE TABLE IF NOT EXISTS {bare} (PRIMARY KEY ({}))",
+                    def.primary_key.join(", ")
+                ),
+                ver(&format!("t:{name}")),
+            ));
+        }
+        for (name, idx) in &self.catalog.indexes {
+            let (db, bare) = namespace::split(name);
+            let table = namespace::split(&idx.table).1;
+            out.push((
+                db.to_string(),
+                format!(
+                    "CREATE INDEX IF NOT EXISTS {bare} ON {table} ({})",
+                    idx.paths.join(", ")
+                ),
+                ver(&format!("i:{name}")),
+            ));
+        }
+        for (name, v) in &self.catalog.vector_indexes {
+            let (db, bare) = namespace::split(name);
+            let table = namespace::split(&v.table).1;
+            out.push((
+                db.to_string(),
+                format!(
+                    "CREATE VECTOR INDEX IF NOT EXISTS {bare} ON {table} ({}) DIM {} USING {}",
+                    v.path, v.dim, v.metric
+                ),
+                ver(&format!("v:{name}")),
+            ));
+        }
+        // Tombstones: emit a DROP for every dropped object, with its version.
+        for (key, v) in &self.catalog.schema_versions {
+            if !v.dropped {
+                continue;
+            }
+            let Some((kind, name)) = key.split_once(':') else {
+                continue;
+            };
+            let entry = match kind {
+                "d" => (
+                    DEFAULT_DATABASE.to_string(),
+                    format!("DROP DATABASE IF EXISTS {name}"),
+                ),
+                "t" => {
+                    let (db, bare) = namespace::split(name);
+                    (db.to_string(), format!("DROP TABLE IF EXISTS {bare}"))
+                }
+                "i" => {
+                    let (db, bare) = namespace::split(name);
+                    (db.to_string(), format!("DROP INDEX IF EXISTS {bare}"))
+                }
+                "v" => {
+                    let (db, bare) = namespace::split(name);
+                    (db.to_string(), format!("DROP VECTOR INDEX IF EXISTS {bare}"))
+                }
+                _ => continue,
+            };
+            out.push((entry.0, entry.1, v.hlc()));
+        }
+        out
+    }
+
     /// Returns `(database, sql)` pairs: each statement applied via
     /// [`Database::execute_session`] with the given current database recreates
     /// the object in its correct namespace, using bare (de-qualified) names so
@@ -2607,5 +2812,75 @@ fn apply_offset_limit<T>(rows: &mut Vec<T>, offset: Option<u64>, limit: Option<u
     }
     if let Some(lim) = limit {
         rows.truncate(lim as usize);
+    }
+}
+
+#[cfg(test)]
+mod schema_lww_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn tmp() -> std::path::PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "skaidb-schema-lww-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    /// A drop tombstone must beat a stale (older-HLC) recreate, but yield to a
+    /// genuinely newer one — the property that lets DROP replicate without a
+    /// lagging node resurrecting the object.
+    #[test]
+    fn drop_tombstone_blocks_stale_recreate() {
+        let mut db = Database::open(tmp()).unwrap();
+        db.execute_session("default", "CREATE TABLE t (PRIMARY KEY (id))")
+            .unwrap();
+        db.execute_session("default", "DROP TABLE t").unwrap();
+        assert!(!db.catalog.tables.contains_key("t"), "dropped");
+
+        // Stale replicated CREATE (HLC older than the drop) must NOT resurrect.
+        db.execute_session_with_hlc(
+            "default",
+            "CREATE TABLE t (PRIMARY KEY (id))",
+            Hlc::new(1, 0),
+        )
+        .unwrap();
+        assert!(
+            !db.catalog.tables.contains_key("t"),
+            "stale create must not resurrect a dropped table"
+        );
+
+        // A genuinely newer CREATE wins and recreates the table. (Far-future
+        // physical time, well past the wall-clock drop stamp.)
+        db.execute_session_with_hlc(
+            "default",
+            "CREATE TABLE t (PRIMARY KEY (id))",
+            Hlc::new(u64::MAX / 2, 0),
+        )
+        .unwrap();
+        assert!(
+            db.catalog.tables.contains_key("t"),
+            "a newer create must win over the tombstone"
+        );
+    }
+
+    /// A stale drop must not remove a table created more recently.
+    #[test]
+    fn stale_drop_does_not_remove_newer_table() {
+        let mut db = Database::open(tmp()).unwrap();
+        db.execute_session("default", "CREATE TABLE t (PRIMARY KEY (id))")
+            .unwrap();
+        // Replicated DROP with an ancient HLC: older than the create, so ignored.
+        db.execute_session_with_hlc("default", "DROP TABLE IF EXISTS t", Hlc::new(1, 0))
+            .unwrap();
+        assert!(
+            db.catalog.tables.contains_key("t"),
+            "a stale drop must not remove a newer table"
+        );
     }
 }

@@ -229,8 +229,12 @@ down replica is buffered and replayed when it returns). For a full sweep — e.g
 after a node was down a long time — run an active **repair**
 (`Node::repair`/`repair_cluster`), which reconciles every co-replica pair in both
 directions, **including the catalog**: databases, tables, and indexes are synced
-both ways (idempotent `CREATE … IF NOT EXISTS`), so a node that missed a DDL
-broadcast while it was down gets the missing schema too.
+both ways, so a node that missed a DDL broadcast while it was down gets the
+missing schema too. Schema reconciles by **last-writer-wins with tombstones** —
+every DDL is HLC-stamped and a `DROP` leaves a versioned tombstone — so a *drop*
+that happened while a node was down propagates to it on rejoin, and a lagging
+node holding the now-dropped object does **not** resurrect it (the tombstone's
+newer stamp wins). A genuinely newer re-`CREATE` still wins over an older drop.
 
 **Automatic catch-up on (re)join.** When a node starts and finds peers, it runs a
 catch-up pass in the background as soon as a peer is reachable — the same repair

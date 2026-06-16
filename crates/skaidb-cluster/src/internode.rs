@@ -61,6 +61,9 @@ pub enum Request {
         /// resolve to the same internal namespace on every node.
         db: String,
         sql: String,
+        /// DDL version stamp, so every node records the same schema version and
+        /// drops/creates converge under last-writer-wins.
+        hlc: Hlc,
     },
     /// Replace the recipient's cluster membership/ring with `members`
     /// (`(id, addr)` pairs, including the recipient) at version `epoch`. Broadcast
@@ -124,9 +127,11 @@ pub enum Response {
     VectorHits {
         hits: Vec<(Vec<u8>, f32)>,
     },
-    /// A node's full schema as `(database, ddl)` pairs (reply to `SchemaDdl`).
+    /// A node's versioned schema as `(database, ddl, hlc)` triples (reply to
+    /// `SchemaDdl`): live objects as CREATEs and dropped ones as DROPs, each
+    /// with its version stamp for last-writer-wins merge.
     Schema {
-        entries: Vec<(String, String)>,
+        entries: Vec<(String, String, Hlc)>,
     },
     Err(String),
     Pong,
@@ -215,10 +220,11 @@ impl Request {
                 }
                 o.extend_from_slice(&k.to_le_bytes());
             }
-            Request::ApplyDdl { db, sql } => {
+            Request::ApplyDdl { db, sql, hlc } => {
                 o.push(REQ_DDL);
                 put_str(&mut o, db);
                 put_str(&mut o, sql);
+                o.extend_from_slice(&hlc.to_bytes());
             }
             Request::SetMembership {
                 epoch,
@@ -291,6 +297,7 @@ impl Request {
             REQ_DDL => Request::ApplyDdl {
                 db: c.string()?,
                 sql: c.string()?,
+                hlc: c.hlc()?,
             },
             REQ_MEMBERS => {
                 let epoch = c.u64()?;
@@ -369,9 +376,10 @@ impl Response {
             Response::Schema { entries } => {
                 o.push(RES_SCHEMA);
                 o.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-                for (db, ddl) in entries {
+                for (db, ddl, hlc) in entries {
                     put_str(&mut o, db);
                     put_str(&mut o, ddl);
+                    o.extend_from_slice(&hlc.to_bytes());
                 }
             }
             Response::Err(msg) => {
@@ -433,7 +441,8 @@ impl Response {
                 for _ in 0..n {
                     let db = c.string()?;
                     let ddl = c.string()?;
-                    entries.push((db, ddl));
+                    let hlc = c.hlc()?;
+                    entries.push((db, ddl, hlc));
                 }
                 Response::Schema { entries }
             }
@@ -783,6 +792,7 @@ mod tests {
             Request::ApplyDdl {
                 db: "default".into(),
                 sql: "CREATE TABLE t (PRIMARY KEY (id))".into(),
+                hlc: Hlc::new(7, 1),
             },
             Request::IndexScan {
                 index: "t_age".into(),
@@ -851,8 +861,12 @@ mod tests {
             Response::Get { entry: None },
             Response::Schema {
                 entries: vec![
-                    ("default".into(), "CREATE DATABASE IF NOT EXISTS foo".into()),
-                    ("foo".into(), "CREATE TABLE IF NOT EXISTS t (PRIMARY KEY (id))".into()),
+                    ("default".into(), "CREATE DATABASE IF NOT EXISTS foo".into(), Hlc::new(1, 0)),
+                    (
+                        "foo".into(),
+                        "CREATE TABLE IF NOT EXISTS t (PRIMARY KEY (id))".into(),
+                        Hlc::new(2, 3),
+                    ),
                 ],
             },
             Response::Err("x".into()),

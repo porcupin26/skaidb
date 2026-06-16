@@ -7,8 +7,35 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use skaidb_storage::Hlc;
 
 use crate::error::{EngineError, Result};
+
+/// Last-writer-wins version stamp for a schema object, so DDL (including drops)
+/// can replicate across a cluster: the change with the higher HLC wins, and a
+/// `dropped` stamp is a tombstone that prevents a stale peer from resurrecting
+/// an object it still holds. Stored as plain ints so the catalog JSON needs no
+/// dependency on `Hlc`'s wire format.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SchemaVersion {
+    pub physical: u64,
+    pub logical: u32,
+    pub dropped: bool,
+}
+
+impl SchemaVersion {
+    pub fn new(hlc: Hlc, dropped: bool) -> Self {
+        SchemaVersion {
+            physical: hlc.physical,
+            logical: hlc.logical,
+            dropped,
+        }
+    }
+
+    pub fn hlc(&self) -> Hlc {
+        Hlc::new(self.physical, self.logical)
+    }
+}
 
 /// A secondary index declaration (`CREATE INDEX ... ON t(path1, path2, ...)`).
 /// `paths` is ordered: a composite index sorts by the first path, then the
@@ -51,6 +78,12 @@ pub struct Catalog {
     /// load with no databases. See [`crate::namespace`].
     #[serde(default)]
     pub databases: std::collections::BTreeSet<String>,
+    /// Per-object DDL version stamps for last-writer-wins schema replication,
+    /// keyed by a kind-prefixed name: `d:<db>`, `t:<table>`, `i:<index>`,
+    /// `v:<vector index>`. A `dropped` stamp is a tombstone. `default` so older
+    /// catalogs load with no versions and converge on the next DDL/repair.
+    #[serde(default)]
+    pub schema_versions: BTreeMap<String, SchemaVersion>,
 }
 
 impl Catalog {
