@@ -199,11 +199,12 @@ impl Backend {
     }
 }
 
-/// The running shell: a backend plus the REST endpoints/credentials used by the
-/// admin helper commands.
+/// The running shell: a backend plus the REST port/credentials used by the admin
+/// helper commands. REST targets are derived live from the driver's endpoint
+/// pool so admin commands fail over to a surviving node just like SQL does.
 struct Shell {
     backend: Backend,
-    rest_endpoints: Vec<String>,
+    rest_port: u16,
     user: Option<String>,
     password: Option<String>,
 }
@@ -244,7 +245,7 @@ impl Shell {
         };
         Ok(Shell {
             backend,
-            rest_endpoints: rest_endpoints(cli),
+            rest_port: cli.rest_port,
             user: cli.user.clone(),
             password: cli.password.clone(),
         })
@@ -255,6 +256,29 @@ impl Shell {
             (Some(u), Some(p)) => Some((u.as_str(), p.as_str())),
             _ => None,
         }
+    }
+
+    /// REST targets for admin helpers, derived from the driver's current
+    /// endpoint pool (seed + discovered peers) so a command tries the live node
+    /// first and fails over to the others — the same redundancy SQL gets. Empty
+    /// in `--local` mode.
+    fn rest_targets(&self) -> Vec<String> {
+        let Backend::Net { client, .. } = &self.backend else {
+            return Vec::new();
+        };
+        let to_rest = |e: &str| {
+            let host = e.rsplit_once(':').map(|(h, _)| h).unwrap_or(e);
+            format!("{host}:{}", self.rest_port)
+        };
+        // Currently-connected node first, then every other known endpoint.
+        let mut out = vec![to_rest(client.endpoint())];
+        for e in client.endpoints() {
+            let r = to_rest(e);
+            if !out.contains(&r) {
+                out.push(r);
+            }
+        }
+        out
     }
 
     /// Run a `;`-separated script, stopping at the first error.
@@ -439,7 +463,7 @@ impl Shell {
         if self.is_local() {
             return;
         }
-        match http::get(&self.rest_endpoints, path, None) {
+        match http::get(&self.rest_targets(), path, None) {
             Ok((_, body)) if raw => print!("{body}"),
             Ok((_, body)) => http::print_body(&body),
             Err(e) => eprintln!("error: {e}"),
@@ -451,7 +475,7 @@ impl Shell {
         if self.is_local() {
             return;
         }
-        match http::post(&self.rest_endpoints, path, &body, self.auth()) {
+        match http::post(&self.rest_targets(), path, &body, self.auth()) {
             Ok((_, resp)) => http::print_body(&resp),
             Err(e) => eprintln!("error: {e}"),
         }
