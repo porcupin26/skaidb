@@ -149,11 +149,18 @@ pub struct Node {
     /// anti-entropy ([`Node::repair`]) is the durable backstop if hints are lost.
     hints: Mutex<HashMap<NodeId, Vec<HintedWrite>>>,
     /// Highest HLC each peer has confirmed it applied (a successful replicated
-    /// write or hint replay). Compared against this node's clock frontier to
+    /// write or hint replay). Compared against [`Node::write_watermark`] to
     /// estimate how far behind a peer is — see [`Node::note_acked`] and the
     /// per-peer replication-lag metric. Peers absent from the map have no
     /// confirmed write yet (their lag is reported as unknown).
     acked: Mutex<HashMap<NodeId, Hlc>>,
+    /// Physical-time (ms) high-water mark of data writes this node has
+    /// *coordinated*. Replication lag for a peer is `watermark − acked[peer]`
+    /// (both track data writes). Unlike the HLC frontier (`clock.peek()`), this advances
+    /// *only* on real writes — never on reads, status probes, or observing a
+    /// peer's clock — so an idle cluster reports ~0 lag instead of counting up
+    /// wall-clock time since the last write.
+    write_watermark: AtomicU64,
     /// Serializes membership changes coordinated by this node (`add_member` /
     /// `remove_member`), so a runtime add-node and a peer's auto-join announce
     /// can't interleave their multi-step broadcasts on the same coordinator.
@@ -290,6 +297,7 @@ impl Node {
             pool: internode::Pool::new(auth),
             hints: Mutex::new(HashMap::new()),
             acked: Mutex::new(HashMap::new()),
+            write_watermark: AtomicU64::new(0),
             membership_lock: Mutex::new(()),
             migration_batch: AtomicUsize::new(1024),
             migration_pause_ms: AtomicU64::new(0),
@@ -398,6 +406,13 @@ impl Node {
         }
     }
 
+    /// Advance the coordinated-write high-water mark (monotonic). Called once per
+    /// write this node coordinates, so per-peer lag measures replication backlog
+    /// rather than idle wall-clock time. See [`Node::write_watermark`].
+    fn note_local_write(&self, hlc: Hlc) {
+        self.write_watermark.fetch_max(hlc.physical, Ordering::Relaxed);
+    }
+
     /// Configured seed node ids (what membership is *supposed* to be), sorted.
     fn configured_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = self.cfg.members.iter().map(|(id, _)| id.0.clone()).collect();
@@ -428,7 +443,12 @@ impl Node {
             entry.1 = true; // in_config
         }
 
-        let frontier = self.clock.peek().physical;
+        // Measure lag against the coordinated-write watermark, not the HLC
+        // frontier: the frontier also advances on reads, probes and observed
+        // peer clocks, so on an idle cluster it would race ahead of `acked` and
+        // report ever-growing phantom lag. The watermark only moves on real
+        // writes, so a fully-replicated idle cluster reports ~0.
+        let watermark = self.write_watermark.load(Ordering::Relaxed);
         let acked = self.acked.lock().expect("acked lock");
         let hints = self.hints.lock().expect("hints lock");
 
@@ -439,7 +459,7 @@ impl Node {
                 let hints_pending = hints.get(&id).map(|v| v.len()).unwrap_or(0);
                 let lag_ms = acked
                     .get(&id)
-                    .map(|h| frontier.saturating_sub(h.physical));
+                    .map(|h| watermark.saturating_sub(h.physical));
                 // One probe per peer fetches liveness *and* the peer's own
                 // membership view + data status, so we can flag cross-node
                 // disagreement (a peer that doesn't list us, or a different
@@ -1579,6 +1599,10 @@ impl Node {
     /// also runs automatically on (re)join via [`Node::startup_catch_up`].
     fn broadcast_ddl(&self, current_db: &str, sql: &str) -> EngineResult<()> {
         // Stamp the DDL once so every node records the same schema version.
+        // (DDL deliberately does not move the replication-lag watermark: DDL acks
+        // aren't tracked in `acked`, so counting DDL here would show phantom lag
+        // against the last data write. DDL is broadcast at quorum and reconciled
+        // by schema sync regardless.)
         let hlc = self.clock.now();
         let mut acks = 0usize;
         // Local first.
@@ -1626,6 +1650,7 @@ impl Node {
         oc: Option<Consistency>,
     ) -> EngineResult<()> {
         self.counters.writes_total.fetch_add(1, Ordering::Relaxed);
+        self.note_local_write(hlc);
         let replicas = self.replicas_for(key);
         let needed = oc
             .unwrap_or(self.cfg.write_consistency)
@@ -2713,6 +2738,49 @@ mod tests {
             "a quorum write was confirmed to b, so its lag is known"
         );
         assert!(na.stats().self_in_ring, "a is a normal ring member");
+    }
+
+    #[test]
+    fn idle_cluster_reports_zero_lag_despite_clock_advancing() {
+        // Regression: lag is measured against the coordinated-write watermark,
+        // not the HLC frontier. After a write is fully acked, an idle cluster
+        // whose clock keeps advancing (reads, probes, observed peer clocks) must
+        // still report ~0 lag — not an ever-growing "time since last write".
+        let (a, b) = (free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b)];
+        let na = Node::new(
+            Database::open(temp_dir("idlelag_a")).unwrap(),
+            cfg("a", &a, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("idlelag_b")).unwrap(),
+            cfg("b", &b, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        na.execute("INSERT INTO t (id, v) VALUES (1, 'x')").unwrap();
+        // Quorum across 2 members means b acked synchronously, so it is fully
+        // caught up: lag is exactly zero.
+        assert_eq!(na.peer_stats(true)[0].lag_ms, Some(0), "b is caught up");
+
+        // Simulate an idle cluster where time passes and the local clock keeps
+        // moving (a read, a status probe, observing a peer's clock all call
+        // `clock.now()`), but no new write is coordinated.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        for _ in 0..5 {
+            na.clock.now();
+        }
+        assert!(
+            na.clock.peek().physical > na.write_watermark.load(Ordering::Relaxed),
+            "clock frontier has advanced past the write watermark (the old bug's input)"
+        );
+        assert_eq!(
+            na.peer_stats(true)[0].lag_ms,
+            Some(0),
+            "no new writes: idle lag stays zero, not 'time since last write'"
+        );
     }
 
     #[test]
