@@ -56,9 +56,11 @@ query_log_enabled = true
 query_log_masked = true
 login_log_enabled = true
 error_log_level = "warn"
-# Audit log destination. Empty = stderr. Set a path to write all audit logs to
-# a file; each category below can override it with its own file (empty = use
-# log_file). Missing files are created; categories sharing a path share a handle.
+# Main log destination. Empty = stderr (journald under systemd). Set a path and
+# it becomes the catch-all log: operational/server events (startup, membership,
+# anti-entropy) plus every audit category that doesn't have its own file below.
+# Each category may override it with its own file (empty = use log_file). Missing
+# files are created; categories sharing a path share a handle.
 log_file = ""
 query_log_file = ""
 slow_query_log_file = ""

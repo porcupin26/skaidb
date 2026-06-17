@@ -34,9 +34,10 @@ prometheus_port = 9090         # dedicated metrics/health listener (/metrics, /r
 slow_query_ms = 200
 # log_format = "json"          # one JSON object per log line, for a log agent
 # per_table_metrics = true     # opt-in per-table gauges (bounded cardinality)
-# Audit logs go to /var/log/skaidb (created and owned by the package). Set to ""
-# to log to stderr (journald) instead. Each stream below can be split into its
-# own file; empty falls back to log_file.
+# Logs go to /var/log/skaidb (created and owned by the package). This is the
+# catch-all log: server/operational events plus any audit stream not split out
+# below. Set to "" to log to stderr (journald) instead. Each stream below can be
+# split into its own file; empty falls back to log_file.
 log_file = "/var/log/skaidb/skaidb.log"
 # error_log_file = "/var/log/skaidb/error.log"
 # slow_query_log_file = "/var/log/skaidb/slow.log"

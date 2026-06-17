@@ -1229,9 +1229,9 @@ impl Node {
                 continue; // standalone: nothing to reconcile
             }
             match self.repair() {
-                Ok(n) if n > 0 => eprintln!("skaidb: anti-entropy reconciled {n} rows"),
+                Ok(n) if n > 0 => skaidb_types::slog!("skaidb: anti-entropy reconciled {n} rows"),
                 Ok(_) => {}                  // already converged: stay quiet
-                Err(e) => eprintln!("skaidb: anti-entropy pass failed: {e}"),
+                Err(e) => skaidb_types::slog!("skaidb: anti-entropy pass failed: {e}"),
             }
         }
     }
@@ -1282,13 +1282,13 @@ impl Node {
                 };
                 match self.pool.call(addr, &req) {
                     Ok(Response::Ack) => {
-                        eprintln!("skaidb: announced to {addr}; admitted to the cluster");
+                        skaidb_types::slog!("skaidb: announced to {addr}; admitted to the cluster");
                         return;
                     }
                     Ok(Response::Err(e)) => {
                         // Terminal (e.g. replication-factor mismatch) — retrying
                         // won't help; the operator must fix the config.
-                        eprintln!("skaidb: announce rejected by {addr}: {e}");
+                        skaidb_types::slog!("skaidb: announce rejected by {addr}: {e}");
                         return;
                     }
                     _ => continue, // unreachable peer: try the next seed
@@ -1315,10 +1315,10 @@ impl Node {
             }
             match self.repair() {
                 Ok(n) => {
-                    eprintln!("skaidb: startup catch-up complete ({n} rows reconciled)");
+                    skaidb_types::slog!("skaidb: startup catch-up complete ({n} rows reconciled)");
                     return;
                 }
-                Err(e) => eprintln!("skaidb: startup catch-up attempt {attempt} failed: {e}"),
+                Err(e) => skaidb_types::slog!("skaidb: startup catch-up attempt {attempt} failed: {e}"),
             }
         }
     }

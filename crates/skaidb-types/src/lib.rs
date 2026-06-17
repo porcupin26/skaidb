@@ -7,8 +7,10 @@
 
 mod codec;
 mod json;
+pub mod slog;
 pub mod ternary;
 mod value;
 
+pub use slog::{init_server_log, server_log};
 pub use ternary::Ternary;
 pub use value::{Decimal, Document, Uuid, Value, ValueError, ValueType};

@@ -178,6 +178,11 @@ pub fn run(
         .unwrap_or(0);
     metrics.set("skaidb_start_time_seconds", start_unix);
 
+    // Point the operational log at `observability.log_file` before any worker
+    // (cluster background threads, listeners) spawns, so startup and membership
+    // events land in the same file as the audit log when one is configured.
+    skaidb_types::init_server_log(&config.observability.log_file);
+
     let backend = build_backend(db, &config)?;
 
     let ctx: Shared = Arc::new(Context {
@@ -194,7 +199,7 @@ pub fn run(
         config_path,
     });
 
-    println!(
+    skaidb_types::slog!(
         "skaidb mode: {}",
         if clustered {
             format!(
@@ -206,7 +211,7 @@ pub fn run(
             "standalone".to_string()
         }
     );
-    println!(
+    skaidb_types::slog!(
         "skaidb authentication: {}",
         if auth_required {
             "required (SCRAM)"
@@ -221,8 +226,8 @@ pub fn run(
     let (binary_local, binary_handle) = binary::spawn(&binary_addr, ctx.clone())?;
     let (rest_local, _rest_handle) = rest::spawn(&rest_addr, ctx.clone())?;
 
-    println!("skaidb binary endpoint listening on {binary_local}");
-    println!("skaidb REST endpoint listening on http://{rest_local}/query");
+    skaidb_types::slog!("skaidb binary endpoint listening on {binary_local}");
+    skaidb_types::slog!("skaidb REST endpoint listening on http://{rest_local}/query");
 
     // Dedicated metrics/health listener on `observability.prometheus_port`. It
     // reuses the same handler (so `/metrics`, `/health`, `/ready`, `/status` are
@@ -234,9 +239,9 @@ pub fn run(
         let prom_addr = format!("{}:{}", bind, prom_port);
         match rest::spawn(&prom_addr, ctx.clone()) {
             Ok((prom_local, _h)) => {
-                println!("skaidb metrics endpoint listening on http://{prom_local}/metrics")
+                skaidb_types::slog!("skaidb metrics endpoint listening on http://{prom_local}/metrics")
             }
-            Err(e) => eprintln!("skaidb: could not bind metrics port {prom_addr}: {e}"),
+            Err(e) => skaidb_types::slog!("skaidb: could not bind metrics port {prom_addr}: {e}"),
         }
     }
 
