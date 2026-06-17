@@ -610,9 +610,12 @@ fn run_admin(cli: &Cli, cmd: &Cmd) -> ExitCode {
 
     match result {
         Ok((status, body)) => {
-            // /metrics is plain text; everything else is JSON.
+            // /metrics is plain text; `cluster status` gets the human-readable
+            // summary; everything else is pretty-printed JSON.
             if matches!(cmd, Cmd::Metrics) {
                 print!("{body}");
+            } else if matches!(cmd, Cmd::Cluster { op: ClusterOp::Status }) {
+                cluster::render(&body);
             } else {
                 http::print_body(&body);
             }
