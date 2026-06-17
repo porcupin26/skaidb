@@ -43,11 +43,24 @@ pub enum Consistency {
 }
 
 /// How an internode connection authenticates (SPEC §8.1).
+///
+/// - `None` — no authentication (trusted/isolated network only; the default,
+///   for backward compatibility with existing clusters).
+/// - `Token` — a shared secret; peers prove knowledge of it via an HMAC-SHA256
+///   challenge-response (the token never crosses the wire).
+/// - `Cert` — mutual TLS: every node presents a certificate signed by a shared
+///   CA, and connections are encrypted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum InternodeAuth {
-    Keyfile,
-    X509,
+    #[serde(alias = "off", alias = "disabled")]
+    None,
+    /// Shared-secret challenge-response. (Accepts the legacy name `keyfile`.)
+    #[serde(alias = "keyfile")]
+    Token,
+    /// Mutual TLS with a shared CA. (Accepts the legacy name `x509`.)
+    #[serde(alias = "x509")]
+    Cert,
 }
 
 /// Source of the key-encryption key for at-rest encryption (SPEC §8.3).
@@ -109,7 +122,16 @@ pub struct AuthConfig {
     pub x509_enabled: bool,
     pub x509_ca_file: String,
     pub internode_auth: InternodeAuth,
+    /// Token mode: inline shared secret. Takes precedence over `internode_keyfile`.
+    pub internode_token: String,
+    /// Token mode: path to a file holding the shared secret (used when
+    /// `internode_token` is empty).
     pub internode_keyfile: String,
+    /// Cert mode: this node's certificate (PEM), its private key (PEM), and the
+    /// CA (PEM) that signs every node's certificate.
+    pub internode_tls_cert: String,
+    pub internode_tls_key: String,
+    pub internode_tls_ca: String,
     pub superuser: String,
     /// Password for the bootstrapped superuser. When `scram_enabled` is true and
     /// this is non-empty, the server requires authentication; otherwise
@@ -317,8 +339,12 @@ impl Default for AuthConfig {
             scram_enabled: true,
             x509_enabled: false,
             x509_ca_file: String::new(),
-            internode_auth: InternodeAuth::Keyfile,
+            internode_auth: InternodeAuth::None,
+            internode_token: String::new(),
             internode_keyfile: String::new(),
+            internode_tls_cert: String::new(),
+            internode_tls_key: String::new(),
+            internode_tls_ca: String::new(),
             superuser: "admin".to_string(),
             superuser_password: String::new(),
         }

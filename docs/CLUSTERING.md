@@ -276,21 +276,57 @@ while the node was offline, plus any row writes beyond what hinted handoff
 replayed. (A brand-new node added with `cluster add-node` is bootstrapped
 explicitly with schema + its share of the data.)
 
+**Automatic join (self-announce).** A node that starts with `seeds` pointing at
+an existing cluster but that the cluster doesn't yet know about will **announce
+itself** to a reachable seed, which runs `add_member` and broadcasts the new
+membership to every node — so you no longer have to run `cluster add-node` by
+hand, and you avoid the half-join trap (a node that pulls data via catch-up but
+was never admitted to the ring). The announce is a no-op when the seed already
+lists the node (symmetric seeds), and is **rejected if the joiner's replication
+factor doesn't match the cluster's** — fix the RF and restart rather than form a
+cluster whose coordinators disagree on each key's replica set. Joins are still
+serialized; do one at a time. `\cluster` cross-checks each peer's membership view
+and flags `membership_disagreement` when a peer you route to doesn't list you.
+
 After resharding, **reclaim** (`Node::reclaim`/`reclaim_cluster`) physically frees
 space for keys a former owner no longer holds. See
 [RESHARDING.md](RESHARDING.md#anti-entropy-keeping-replicas-converged).
 
 ## Internode security
 
-Node-to-node traffic can be authenticated with a shared keyfile:
+By default internode traffic is **unauthenticated** (`internode_auth = "none"`) —
+fine on an isolated/trusted network, but anything that can reach a node's
+internode port can read data and change membership. Two modes lock it down; every
+node must use the **same mode and material**:
+
+**Token** — a shared secret. Peers prove knowledge of it with a mutual
+HMAC-SHA256 challenge-response, so the secret never crosses the wire and each
+connection uses a fresh nonce (no replay). No encryption.
 
 ```toml
 [auth]
-internode_auth = "keyfile"
-internode_keyfile = "/etc/skaidb/internode.key"   # same file on every node
+internode_auth = "token"
+internode_token = "a-long-random-shared-secret"      # or:
+# internode_keyfile = "/etc/skaidb/cluster.token"     # file holding the secret
 ```
 
-(or `--internode-auth keyfile --internode-keyfile …`). Client auth is separate —
+**Cert** — mutual TLS. Every node presents a certificate signed by a shared CA,
+and the channel is encrypted. Node certificates must carry the SAN `DNS:skaidb`
+(how peers verify each other without per-node hostnames) and
+`extendedKeyUsage = serverAuth, clientAuth`.
+
+```toml
+[auth]
+internode_auth = "cert"
+internode_tls_cert = "/etc/skaidb/node.pem"   # this node's cert (SAN: skaidb)
+internode_tls_key  = "/etc/skaidb/node.key"
+internode_tls_ca   = "/etc/skaidb/ca.pem"     # CA that signs every node's cert
+```
+
+Both are also settable via flags/env (`--internode-auth`, `SKAIDB_INTERNODE_*`).
+A node that can't satisfy the configured mode is dropped at the handshake, before
+any RPC. **Rollout:** there's no mixed-mode window — turn the mode on with the
+same material on every node and restart them together. Client auth is separate —
 SCRAM on the binary endpoint and HTTP Basic on REST, plus RBAC; see the
 [README](../README.md).
 
@@ -301,9 +337,10 @@ SCRAM on the binary endpoint and HTTP Basic on REST, plus RBAC; see the
 - **Distinct `data_dir` per node** (and distinct ports when co-located).
 - **No membership gossip/consensus yet.** Static membership is via `seeds`;
   runtime changes are best-effort broadcasts ordered by an epoch and persisted, so
-  a restart reloads the live ring — but a node that missed a membership broadcast
-  needs it re-sent, and two *concurrent* topology changes aren't linearizable. Do
-  one membership change at a time.
+  a restart reloads the live ring. A fresh node auto-announces to a seed to get
+  admitted (above), but there's still no continuous gossip — a node that missed a
+  membership broadcast while up needs it re-sent, and two *concurrent* topology
+  changes aren't linearizable. Do one membership change at a time.
 - **Transactions are single-node.** `BEGIN/COMMIT/ROLLBACK` work against the
   embedded engine; the cluster coordinator autocommits per statement.
 - **Joins gather to the coordinator.** A single-table `WHERE` is pushed to the

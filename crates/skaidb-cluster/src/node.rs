@@ -33,6 +33,7 @@ use skaidb_types::{Document, Value};
 use crate::internode::{self, Request, Response};
 use crate::quorum::Consistency;
 use crate::ring::{NodeId, Ring};
+use crate::transport::Authenticator;
 
 type EngineResult<T> = std::result::Result<T, EngineError>;
 
@@ -48,6 +49,12 @@ pub struct NodeConfig {
     pub vnodes_per_node: u32,
     pub read_consistency: Consistency,
     pub write_consistency: Consistency,
+    /// How internode connections authenticate (none / token / cert).
+    pub auth: Arc<Authenticator>,
+    /// Announce this node to a seed on startup so the cluster admits it
+    /// automatically (auto-join). On in production; tests disable it to keep
+    /// unrelated nodes from announcing.
+    pub auto_join: bool,
 }
 
 /// The cluster's placement view: the hash ring plus peer addresses. Held behind
@@ -129,6 +136,9 @@ pub struct Node {
     /// Cluster placement, mutable so nodes can join/leave at runtime.
     topo: RwLock<Topology>,
     clock: HlcClock,
+    /// Authenticates every internode connection (none / token / mTLS). Shared
+    /// with the pool; also used to wrap inbound connections in the accept loop.
+    auth: Arc<Authenticator>,
     /// Pooled persistent connections to peers.
     pool: internode::Pool,
     /// Writes that couldn't reach a replica (it was down), buffered per replica
@@ -141,6 +151,10 @@ pub struct Node {
     /// per-peer replication-lag metric. Peers absent from the map have no
     /// confirmed write yet (their lag is reported as unknown).
     acked: Mutex<HashMap<NodeId, Hlc>>,
+    /// Serializes membership changes coordinated by this node (`add_member` /
+    /// `remove_member`), so a runtime add-node and a peer's auto-join announce
+    /// can't interleave their multi-step broadcasts on the same coordinator.
+    membership_lock: Mutex<()>,
     /// Rows pushed per migration batch before a checkpoint + throttle pause.
     migration_batch: AtomicUsize,
     /// Pause (ms) between migration batches — throttles a reshard so it doesn't
@@ -186,6 +200,15 @@ pub struct PeerStat {
     pub lag_ms: Option<u64>,
     /// Liveness from a probe, when one was requested. `None` if not probed.
     pub reachable: Option<bool>,
+    /// The peer's own membership epoch (from a probe). `None` if not probed/reachable.
+    pub reported_epoch: Option<u64>,
+    /// How many members the peer believes are in the ring (from a probe).
+    pub reported_members: Option<usize>,
+    /// Whether the peer's own member list includes *this* node — `Some(false)`
+    /// means a one-sided view (we route to it, but it doesn't know us).
+    pub lists_self: Option<bool>,
+    /// The peer's row count (data status, from a probe).
+    pub rows: Option<u64>,
 }
 
 /// A point-in-time snapshot of cluster state and counters for metrics/`/status`.
@@ -229,10 +252,15 @@ type HintedWrite = (String, Vec<u8>, WriteOp, Hlc);
 /// (anti-entropy reconciles whatever overflows).
 const MAX_HINTS_PER_REPLICA: usize = 4096;
 
-/// Startup catch-up: how many times to wait for a peer to become reachable
-/// before giving up, and how long between attempts.
+/// Startup catch-up / self-announce: how many times to wait for a peer to become
+/// reachable before giving up, and how long between attempts. The interval is
+/// shortened under test so background threads reach their exit condition (and
+/// release their node) quickly instead of lingering across other tests.
 const CATCH_UP_ATTEMPTS: usize = 15;
+#[cfg(not(test))]
 const CATCH_UP_DELAY: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const CATCH_UP_DELAY: Duration = Duration::from_millis(120);
 
 /// Per-peer connect+round-trip budget for liveness probes in `/admin/status`.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
@@ -249,14 +277,17 @@ impl Node {
             None => (cfg.members.clone(), 0),
         };
         let topo = Topology::from_members(&members, &cfg.id, cfg.vnodes_per_node, epoch);
+        let auth = cfg.auth.clone();
         Arc::new(Node {
             id: cfg.id.clone(),
             local: RwLock::new(local),
             topo: RwLock::new(topo),
             clock: HlcClock::new(),
-            pool: internode::Pool::new(),
+            auth: auth.clone(),
+            pool: internode::Pool::new(auth),
             hints: Mutex::new(HashMap::new()),
             acked: Mutex::new(HashMap::new()),
+            membership_lock: Mutex::new(()),
             migration_batch: AtomicUsize::new(1024),
             migration_pause_ms: AtomicU64::new(0),
             counters: Counters::default(),
@@ -398,6 +429,7 @@ impl Node {
         let acked = self.acked.lock().expect("acked lock");
         let hints = self.hints.lock().expect("hints lock");
 
+        let self_id = self.id.0.clone();
         addrs
             .into_iter()
             .map(|(id, (addr, in_config, in_ring))| {
@@ -405,14 +437,30 @@ impl Node {
                 let lag_ms = acked
                     .get(&id)
                     .map(|h| frontier.saturating_sub(h.physical));
-                let reachable = if probe {
-                    Some(matches!(
-                        internode::call_timeout(&addr, &Request::Ping, PROBE_TIMEOUT),
-                        Ok(Response::Pong)
-                    ))
-                } else {
-                    None
-                };
+                // One probe per peer fetches liveness *and* the peer's own
+                // membership view + data status, so we can flag cross-node
+                // disagreement (a peer that doesn't list us, or a different
+                // member count) — the failure mode static seeds can't reveal.
+                let mut reachable = None;
+                let (mut reported_epoch, mut reported_members, mut lists_self, mut rows) =
+                    (None, None, None, None);
+                if probe {
+                    match self.pool.call_timeout(&addr, &Request::NodeStatus, PROBE_TIMEOUT) {
+                        Ok(Response::NodeStatus {
+                            epoch,
+                            members,
+                            rows: r,
+                            ..
+                        }) => {
+                            reachable = Some(true);
+                            reported_epoch = Some(epoch);
+                            reported_members = Some(members.len());
+                            lists_self = Some(members.contains(&self_id));
+                            rows = Some(r);
+                        }
+                        _ => reachable = Some(false),
+                    }
+                }
                 PeerStat {
                     id: id.0,
                     addr,
@@ -421,6 +469,10 @@ impl Node {
                     hints_pending,
                     lag_ms,
                     reachable,
+                    reported_epoch,
+                    reported_members,
+                    lists_self,
+                    rows,
                 }
             })
             .collect()
@@ -737,6 +789,7 @@ impl Node {
     /// cluster. The joiner and a member quorum must be reachable; a member that
     /// missed the broadcast needs it re-sent (see [docs/RESHARDING.md]).
     pub fn add_member(&self, id: &str, addr: &str) -> EngineResult<()> {
+        let _guard = self.membership_lock.lock().expect("membership lock");
         let joiner = NodeId::new(id);
         let old_members = self.members_snapshot();
         if old_members.iter().any(|(mid, _)| *mid == joiner) {
@@ -831,6 +884,7 @@ impl Node {
     /// owners to be reachable, and assumes a quiescent cluster — as `add_member`
     /// does. See [docs/RESHARDING.md].
     pub fn remove_member(&self, id: &str) -> EngineResult<()> {
+        let _guard = self.membership_lock.lock().expect("membership lock");
         let leaving = NodeId::new(id);
         let members = self.members_snapshot();
         if !members.iter().any(|(m, _)| *m == leaving) {
@@ -1140,12 +1194,77 @@ impl Node {
                 thread::spawn(move || node.handle_internode(stream));
             }
         });
-        // Catch up on anything missed while this node was down: once a peer is
-        // reachable, reconcile schema + data from the cluster. Runs in the
-        // background so startup isn't blocked; a no-op when standalone.
+        // Announce ourselves so the cluster admits us into the live ring (so
+        // peers route writes to us), then catch up on data. Both run in the
+        // background so startup isn't blocked; both are no-ops when standalone.
+        if self.cfg.auto_join {
+            let node = Arc::clone(self);
+            thread::spawn(move || node.announce_self());
+        }
         let node = Arc::clone(self);
         thread::spawn(move || node.startup_catch_up());
         Ok(())
+    }
+
+    /// Announce this node to a seed so the cluster admits it into the live ring
+    /// (auto-join). A node that has never been admitted (epoch 0) and has other
+    /// seeds to reach asks one of them to [`Node::add_member`] it; the seed
+    /// broadcasts the new membership to every node. Idempotent: if this node is
+    /// already in the seed's ring (symmetric seeds), the seed's `add_member` is a
+    /// no-op. Skipped for a standalone / sole bootstrap node (no other seeds).
+    fn announce_self(self: Arc<Self>) {
+        if self.current_epoch() > 0 {
+            return; // already admitted via a prior membership broadcast
+        }
+        let self_id = self.id.clone();
+        let seeds: Vec<String> = self
+            .cfg
+            .members
+            .iter()
+            .filter(|(id, _)| *id != self_id)
+            .map(|(_, addr)| addr.clone())
+            .collect();
+        if seeds.is_empty() {
+            return; // standalone, or the sole bootstrap node
+        }
+        let rf = self.cfg.replication_factor as u32;
+        for _ in 0..CATCH_UP_ATTEMPTS {
+            thread::sleep(CATCH_UP_DELAY);
+            if self.current_epoch() > 0 {
+                return; // someone admitted us in the meantime
+            }
+            for addr in &seeds {
+                // Ask the seed for its view first: if it already lists us
+                // (symmetric seeds — the common case), we're known and there's
+                // nothing to do. Only announce when a reachable seed doesn't
+                // know us, so a well-formed cluster never mutates membership.
+                match self.pool.call(addr, &Request::NodeStatus) {
+                    Ok(Response::NodeStatus { members, .. }) if members.contains(&self_id.0) => {
+                        return; // already a member of this peer's ring
+                    }
+                    Ok(Response::NodeStatus { .. }) => {} // reachable but doesn't know us → announce
+                    _ => continue,                        // unreachable: try the next seed
+                }
+                let req = Request::Announce {
+                    id: self_id.0.clone(),
+                    addr: self.cfg.internode_addr.clone(),
+                    rf,
+                };
+                match self.pool.call(addr, &req) {
+                    Ok(Response::Ack) => {
+                        eprintln!("skaidb: announced to {addr}; admitted to the cluster");
+                        return;
+                    }
+                    Ok(Response::Err(e)) => {
+                        // Terminal (e.g. replication-factor mismatch) — retrying
+                        // won't help; the operator must fix the config.
+                        eprintln!("skaidb: announce rejected by {addr}: {e}");
+                        return;
+                    }
+                    _ => continue, // unreachable peer: try the next seed
+                }
+            }
+        }
     }
 
     /// Background catch-up after a (re)join: wait for a peer to come up, then run
@@ -1174,16 +1293,20 @@ impl Node {
         }
     }
 
-    fn handle_internode(&self, mut stream: TcpStream) {
-        // Disable Nagle: connections are pooled and reused for many small
-        // request/response frames, so Nagle + delayed-ACK would add ~40 ms.
-        stream.set_nodelay(true).ok();
-        while let Ok(framed) = read_frame(&mut stream) {
+    fn handle_internode(&self, stream: TcpStream) {
+        // Authenticate the connection (token challenge / mTLS handshake / none)
+        // before serving any RPC. A peer that can't satisfy the configured mode
+        // is dropped here. (`accept` also disables Nagle on the socket.)
+        let mut conn = match self.auth.accept(stream) {
+            Ok(c) => c,
+            Err(_) => return, // failed auth: drop silently
+        };
+        while let Ok(framed) = read_frame(&mut conn) {
             let response = match internode::frame_decode(&framed).and_then(|p| Request::decode(&p)) {
                 Ok(req) => self.apply_local(req),
                 Err(e) => Response::Err(e.to_string()),
             };
-            if write_frame(&mut stream, &internode::frame_encode(&response.encode())).is_err() {
+            if write_frame(&mut conn, &internode::frame_encode(&response.encode())).is_err() {
                 return;
             }
         }
@@ -1278,6 +1401,41 @@ impl Node {
                 Ok(entries) => Response::Schema { entries },
                 Err(e) => Response::Err(e.to_string()),
             },
+            Request::Announce { id, addr, rf } => self.handle_announce(&id, &addr, rf),
+            Request::NodeStatus => {
+                let (epoch, members) = {
+                    let t = self.topo.read().expect("topo lock");
+                    (t.epoch, t.members.iter().map(|(id, _)| id.0.clone()).collect())
+                };
+                let rows = self
+                    .db_stats(true)
+                    .map(|s| s.per_table.iter().map(|t| t.live_keys).sum::<u64>())
+                    .unwrap_or(0);
+                Response::NodeStatus {
+                    epoch,
+                    members,
+                    rows,
+                    hlc_ms: self.clock.peek().physical,
+                }
+            }
+        }
+    }
+
+    /// Handle a peer's [`Request::Announce`] (auto-join): admit the announcing
+    /// node into the ring and broadcast the new membership to everyone. Refuses a
+    /// replication-factor mismatch, which would otherwise create a cluster whose
+    /// coordinators disagree on each key's replica set.
+    fn handle_announce(&self, id: &str, addr: &str, rf: u32) -> Response {
+        if rf as usize != self.cfg.replication_factor {
+            return Response::Err(format!(
+                "replication-factor mismatch: joiner rf={rf}, cluster rf={}; \
+                 make them equal before joining",
+                self.cfg.replication_factor
+            ));
+        }
+        match self.add_member(id, addr) {
+            Ok(()) => Response::Ack,
+            Err(e) => Response::Err(e.to_string()),
         }
     }
 
@@ -2240,11 +2398,21 @@ mod tests {
         p
     }
 
-    /// Grab a free localhost address (small TOCTOU window, fine for tests).
+    /// Grab a free localhost address. Dedups within this test binary so the
+    /// many parallel tests can't be handed the same just-freed ephemeral port
+    /// (a TOCTOU the OS otherwise hits under load, causing cross-test crosstalk).
     fn free_addr() -> String {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = l.local_addr().unwrap();
-        format!("127.0.0.1:{}", addr.port())
+        use std::collections::HashSet;
+        static USED: Mutex<Option<HashSet<u16>>> = Mutex::new(None);
+        loop {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = l.local_addr().unwrap().port();
+            drop(l);
+            let mut guard = USED.lock().expect("free_addr lock");
+            if guard.get_or_insert_with(HashSet::new).insert(port) {
+                return format!("127.0.0.1:{port}");
+            }
+        }
     }
 
     fn member(id: &str, addr: &str) -> (NodeId, String) {
@@ -2273,7 +2441,152 @@ mod tests {
             vnodes_per_node: 64,
             read_consistency: r,
             write_consistency: w,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
         }
+    }
+
+    /// Like [`cfg`] but with an explicit replication factor and internode auth.
+    /// Auto-join stays off: the announce tests drive the `Announce` RPC
+    /// synchronously (deterministic), and the background announce path is covered
+    /// by the end-to-end smoke test.
+    fn cfg_auth(
+        id: &str,
+        addr: &str,
+        members: &[(NodeId, String)],
+        rf: usize,
+        auth: Authenticator,
+    ) -> NodeConfig {
+        NodeConfig {
+            id: NodeId::new(id),
+            internode_addr: addr.to_string(),
+            members: members.to_vec(),
+            replication_factor: rf,
+            vnodes_per_node: 64,
+            read_consistency: Consistency::Quorum,
+            write_consistency: Consistency::Quorum,
+            auth: Arc::new(auth),
+            auto_join: false,
+        }
+    }
+
+    #[test]
+    fn token_auth_allows_replication_with_matching_secret() {
+        let (a, b) = (free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b)];
+        let tok = || Authenticator::token(b"shared-cluster-secret".to_vec());
+        let na = Node::new(
+            Database::open(temp_dir("tok-a")).unwrap(),
+            cfg_auth("a", &a, &members, 2, tok()),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("tok-b")).unwrap(),
+            cfg_auth("b", &b, &members, 2, tok()),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+
+        // DDL + writes require reaching b across the authenticated channel.
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        na.execute("INSERT INTO t (id, v) VALUES (1, 'x')").unwrap();
+        let rs = rows(nb.execute("SELECT v FROM t WHERE id = 1").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::String("x".into())]]);
+    }
+
+    #[test]
+    fn token_mismatch_blocks_internode_rpc() {
+        let (a, b) = (free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b)];
+        let na = Node::new(
+            Database::open(temp_dir("tokx-a")).unwrap(),
+            cfg_auth("a", &a, &members, 2, Authenticator::token(b"secret-A".to_vec())),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("tokx-b")).unwrap(),
+            cfg_auth("b", &b, &members, 2, Authenticator::token(b"secret-B".to_vec())),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+
+        // b rejects a's handshake, so the DDL can't reach a member quorum (2/2).
+        let err = na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap_err();
+        assert!(
+            err.to_string().contains("quorum"),
+            "expected a quorum failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn announce_admits_a_node_the_cluster_was_not_configured_with() {
+        // a + b form a 2-node cluster; their seeds do NOT list c. c announces
+        // itself (the auto-join RPC, driven synchronously here so the test is
+        // deterministic) and must be admitted on every node.
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let ab = vec![member(&a, &a), member(&b, &b)];
+        let abc = vec![member(&a, &a), member(&b, &b), member(&c, &c)];
+        let none = || Authenticator::None;
+        let na = Node::new(
+            Database::open(temp_dir("aj-a")).unwrap(),
+            cfg_auth(&a, &a, &ab, 2, none()),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("aj-b")).unwrap(),
+            cfg_auth(&b, &b, &ab, 2, none()),
+        );
+        let nc = Node::new(
+            Database::open(temp_dir("aj-c")).unwrap(),
+            cfg_auth(&c, &c, &abc, 2, none()),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        nc.serve_internode().unwrap();
+
+        // `add_member` completes (broadcast + rebalance) before the Ack returns.
+        let resp = internode::call(
+            &a,
+            &Request::Announce {
+                id: c.clone(),
+                addr: c.clone(),
+                rf: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(resp, Response::Ack);
+        assert!(na.member_ids().contains(&c), "a admitted c");
+        assert!(nb.member_ids().contains(&c), "b learned c via the broadcast");
+        assert!(nc.current_epoch() > 0, "c received the live ring");
+    }
+
+    #[test]
+    fn announce_rejected_on_replication_factor_mismatch() {
+        let a = free_addr();
+        let na = Node::new(
+            Database::open(temp_dir("rfx-a")).unwrap(),
+            cfg_auth(&a, &a, &[member(&a, &a)], 2, Authenticator::None),
+        );
+        na.serve_internode().unwrap();
+
+        // A node announcing rf=3 against an rf=2 cluster must be refused.
+        let resp = internode::call(
+            &a,
+            &Request::Announce {
+                id: "127.0.0.1:1".into(),
+                addr: "127.0.0.1:1".into(),
+                rf: 3,
+            },
+        )
+        .unwrap();
+        match resp {
+            Response::Err(e) => assert!(
+                e.contains("replication-factor"),
+                "expected an RF-mismatch error, got: {e}"
+            ),
+            other => panic!("expected rejection, got {other:?}"),
+        }
+        assert!(
+            !na.member_ids().contains(&"127.0.0.1:1".to_string()),
+            "a must not admit a node with a mismatched replication factor"
+        );
     }
 
     #[test]
@@ -2663,6 +2976,8 @@ mod tests {
             vnodes_per_node: 64,
             read_consistency: one,
             write_consistency: one,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
         };
 
         let (a, b, c) = (free_addr(), free_addr(), free_addr());
@@ -2748,6 +3063,8 @@ mod tests {
             vnodes_per_node: 64,
             read_consistency: all,
             write_consistency: all,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
         };
         let (a, b, c) = (free_addr(), free_addr(), free_addr());
         let abc = vec![member("a", &a), member("b", &b), member("c", &c)];
@@ -2840,6 +3157,8 @@ mod tests {
             vnodes_per_node: 64,
             read_consistency: all,
             write_consistency: all,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
         };
         let (a, b, c) = (free_addr(), free_addr(), free_addr());
         let m = vec![member("a", &a), member("b", &b), member("c", &c)];
@@ -2904,6 +3223,8 @@ mod tests {
             vnodes_per_node: 64,
             read_consistency: q,
             write_consistency: q,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
         };
         let (a, b, c) = (free_addr(), free_addr(), free_addr());
         let m = vec![member("a", &a), member("b", &b), member("c", &c)];
@@ -2987,6 +3308,8 @@ mod tests {
             vnodes_per_node: 64,
             read_consistency: one,
             write_consistency: one,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
         };
 
         let (a, b, c) = (free_addr(), free_addr(), free_addr());
@@ -3043,6 +3366,8 @@ mod tests {
             vnodes_per_node: 64,
             read_consistency: one,
             write_consistency: one,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
         };
 
         let (a, b, c) = (free_addr(), free_addr(), free_addr());
@@ -3101,6 +3426,8 @@ mod tests {
             vnodes_per_node: 64,
             read_consistency: one,
             write_consistency: one,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
         };
         let (a, b, c) = (free_addr(), free_addr(), free_addr());
         let ab = vec![member("a", &a), member("b", &b)];
@@ -3149,6 +3476,8 @@ mod tests {
             vnodes_per_node: 64,
             read_consistency: one,
             write_consistency: one,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
         };
 
         let (a, b, c) = (free_addr(), free_addr(), free_addr());
@@ -3207,6 +3536,8 @@ mod tests {
             vnodes_per_node: 64,
             read_consistency: one,
             write_consistency: one,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
         };
 
         let (a, b, c) = (free_addr(), free_addr(), free_addr());

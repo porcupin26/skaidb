@@ -21,8 +21,16 @@ max_staleness_ms = 5000
 scram_enabled = true
 x509_enabled = false
 x509_ca_file = ""
-internode_auth = "keyfile"
+# Internode authentication: "none" (trusted network), "token" (shared secret),
+# or "cert" (mutual TLS). Every node must use the same mode and material.
+internode_auth = "none"
+# token mode: inline secret (internode_token) or a file holding it (internode_keyfile)
+internode_token = ""
 internode_keyfile = ""
+# cert mode: this node's cert + key, and the shared CA that signs all node certs
+internode_tls_cert = ""
+internode_tls_key = ""
+internode_tls_ca = ""
 superuser = "admin"
 superuser_password = ""
 

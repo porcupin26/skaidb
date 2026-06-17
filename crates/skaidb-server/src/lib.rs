@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use skaidb_auth::RoleStore;
-use skaidb_cluster::{Consistency as ClusterConsistency, Node, NodeConfig, NodeId};
-use skaidb_config::{Config, Consistency};
+use skaidb_cluster::{Authenticator, Consistency as ClusterConsistency, Node, NodeConfig, NodeId};
+use skaidb_config::{Config, Consistency, InternodeAuth};
 use skaidb_engine::Database;
 
 use crate::audit::AuditSettings;
@@ -51,10 +51,58 @@ fn build_backend(db: Database, config: &Config) -> Result<Backend, Box<dyn std::
         vnodes_per_node: config.cluster.vnodes_per_node,
         read_consistency: map_consistency(config.cluster.default_read_consistency),
         write_consistency: map_consistency(config.cluster.default_write_consistency),
+        auth: build_internode_auth(config)?,
+        auto_join: true,
     };
     let node = Node::new(db, node_cfg);
     node.serve_internode()?;
     Ok(Backend::Cluster(node))
+}
+
+/// Build the internode authenticator from `[auth]` config. Fails closed: a mode
+/// that's selected but missing its secret/cert material is an error, not a
+/// silent fallback to no auth.
+fn build_internode_auth(config: &Config) -> Result<Arc<Authenticator>, Box<dyn std::error::Error>> {
+    let a = &config.auth;
+    match a.internode_auth {
+        InternodeAuth::None => Ok(Arc::new(Authenticator::None)),
+        InternodeAuth::Token => {
+            let secret = if !a.internode_token.is_empty() {
+                a.internode_token.clone().into_bytes()
+            } else if !a.internode_keyfile.is_empty() {
+                std::fs::read(&a.internode_keyfile)
+                    .map_err(|e| format!("internode token keyfile {}: {e}", a.internode_keyfile))?
+            } else {
+                return Err(
+                    "internode_auth=token requires internode_token or internode_keyfile".into(),
+                );
+            };
+            // File-based tokens usually have a trailing newline; ignore edge whitespace.
+            let start = secret.iter().position(|b| !b.is_ascii_whitespace());
+            let end = secret.iter().rposition(|b| !b.is_ascii_whitespace());
+            let secret = match (start, end) {
+                (Some(s), Some(e)) => secret[s..=e].to_vec(),
+                _ => Vec::new(),
+            };
+            if secret.is_empty() {
+                return Err("internode token is empty".into());
+            }
+            Ok(Arc::new(Authenticator::token(secret)))
+        }
+        InternodeAuth::Cert => {
+            if a.internode_tls_cert.is_empty()
+                || a.internode_tls_key.is_empty()
+                || a.internode_tls_ca.is_empty()
+            {
+                return Err("internode_auth=cert requires internode_tls_cert, internode_tls_key, and internode_tls_ca".into());
+            }
+            Ok(Arc::new(Authenticator::cert(
+                &a.internode_tls_cert,
+                &a.internode_tls_key,
+                &a.internode_tls_ca,
+            )?))
+        }
+    }
 }
 
 fn map_consistency(c: Consistency) -> ClusterConsistency {
@@ -591,6 +639,8 @@ mod tests {
             vnodes_per_node: 64,
             read_consistency: ClusterConsistency::Quorum,
             write_consistency: ClusterConsistency::Quorum,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
         };
         let node = Node::new(Database::open(temp_dir()).unwrap(), cfg);
         Arc::new(Context {

@@ -5,10 +5,12 @@
 //! `ApplyDelete`) to a key's replica set, scatters `LocalScan` to gather a
 //! table for a read, and broadcasts `ApplyDdl`.
 
-use std::io;
+use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::sync::Arc;
 use std::time::Duration;
 
+use crate::transport::{Authenticator, Conn};
 use skaidb_proto::{read_frame, write_frame};
 use skaidb_sql::ast::{BinaryOp, Expr, UnaryOp};
 use skaidb_storage::compress::{compress, decompress, Codec};
@@ -104,6 +106,18 @@ pub enum Request {
     /// statements, so a (re)joining node can converge its catalog.
     SchemaDdl,
     Ping,
+    /// A node announcing itself to a seed so the cluster admits it (auto-join).
+    /// The receiver runs `add_member` and broadcasts the new membership to every
+    /// node, then rebalances. `rf` lets the seed reject a replication-factor
+    /// mismatch rather than form a split-replica cluster.
+    Announce {
+        id: String,
+        addr: String,
+        rf: u32,
+    },
+    /// Ask a peer for a snapshot of its own membership view and data status, for
+    /// cross-node diagnostics (so `\cluster` can flag nodes that disagree).
+    NodeStatus,
 }
 
 /// A response from a peer member.
@@ -136,6 +150,14 @@ pub enum Response {
     },
     Err(String),
     Pong,
+    /// Reply to [`Request::NodeStatus`]: the peer's membership epoch, its member
+    /// ids (its own view of the ring), a row count, and its HLC frontier (ms).
+    NodeStatus {
+        epoch: u64,
+        members: Vec<String>,
+        rows: u64,
+        hlc_ms: u64,
+    },
 }
 
 /// Errors decoding an internode message.
@@ -160,6 +182,8 @@ const REQ_RECLAIM: u8 = 12;
 const REQ_REPAIR: u8 = 13;
 const REQ_FSCAN: u8 = 14;
 const REQ_SCHEMA: u8 = 15;
+const REQ_ANNOUNCE: u8 = 16;
+const REQ_NODESTATUS: u8 = 17;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
@@ -169,6 +193,7 @@ const RES_GET: u8 = 4;
 const RES_KEYS: u8 = 5;
 const RES_VHITS: u8 = 6;
 const RES_SCHEMA: u8 = 7;
+const RES_NODESTATUS: u8 = 8;
 
 impl Request {
     pub fn encode(&self) -> Vec<u8> {
@@ -253,6 +278,13 @@ impl Request {
             Request::Repair => o.push(REQ_REPAIR),
             Request::SchemaDdl => o.push(REQ_SCHEMA),
             Request::Ping => o.push(REQ_PING),
+            Request::Announce { id, addr, rf } => {
+                o.push(REQ_ANNOUNCE);
+                put_str(&mut o, id);
+                put_str(&mut o, addr);
+                o.extend_from_slice(&rf.to_le_bytes());
+            }
+            Request::NodeStatus => o.push(REQ_NODESTATUS),
         }
         o
     }
@@ -327,6 +359,12 @@ impl Request {
             REQ_REPAIR => Request::Repair,
             REQ_SCHEMA => Request::SchemaDdl,
             REQ_PING => Request::Ping,
+            REQ_ANNOUNCE => Request::Announce {
+                id: c.string()?,
+                addr: c.string()?,
+                rf: c.u32()?,
+            },
+            REQ_NODESTATUS => Request::NodeStatus,
             _ => return Err(WireError::Malformed("unknown request op")),
         })
     }
@@ -388,6 +426,21 @@ impl Response {
                 put_str(&mut o, msg);
             }
             Response::Pong => o.push(RES_PONG),
+            Response::NodeStatus {
+                epoch,
+                members,
+                rows,
+                hlc_ms,
+            } => {
+                o.push(RES_NODESTATUS);
+                o.extend_from_slice(&epoch.to_le_bytes());
+                o.extend_from_slice(&(members.len() as u32).to_le_bytes());
+                for m in members {
+                    put_str(&mut o, m);
+                }
+                o.extend_from_slice(&rows.to_le_bytes());
+                o.extend_from_slice(&hlc_ms.to_le_bytes());
+            }
         }
         o
     }
@@ -449,6 +502,22 @@ impl Response {
             }
             RES_ERR => Response::Err(c.string()?),
             RES_PONG => Response::Pong,
+            RES_NODESTATUS => {
+                let epoch = c.u64()?;
+                let n = c.u32()? as usize;
+                let mut members = Vec::with_capacity(n);
+                for _ in 0..n {
+                    members.push(c.string()?);
+                }
+                let rows = c.u64()?;
+                let hlc_ms = c.u64()?;
+                Response::NodeStatus {
+                    epoch,
+                    members,
+                    rows,
+                    hlc_ms,
+                }
+            }
             _ => return Err(WireError::Malformed("unknown response op")),
         })
     }
@@ -498,30 +567,17 @@ pub(crate) fn frame_decode(framed: &[u8]) -> Result<Vec<u8>, WireError> {
     }
 }
 
-/// Send one request to `addr` and read the response (a fresh connection).
+/// Send one request to `addr` over a fresh, unauthenticated plain-TCP
+/// connection. Used by tests and tooling against `auth = none` nodes; the
+/// production path goes through [`Pool`], which authenticates.
 pub fn call(addr: &str, req: &Request) -> io::Result<Response> {
     let mut stream = TcpStream::connect(addr)?;
     stream.set_nodelay(true).ok();
     roundtrip(&mut stream, req)
 }
 
-/// Like [`call`], but bounds the connect and the read/write round-trip by
-/// `timeout` so an unreachable peer fails fast instead of blocking on the OS
-/// connect timeout — used for liveness probing (e.g. `\cluster` reachability).
-pub fn call_timeout(addr: &str, req: &Request, timeout: Duration) -> io::Result<Response> {
-    use std::net::ToSocketAddrs;
-    let sock = addr
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "no address"))?;
-    let mut stream = TcpStream::connect_timeout(&sock, timeout)?;
-    stream.set_nodelay(true).ok();
-    stream.set_read_timeout(Some(timeout)).ok();
-    stream.set_write_timeout(Some(timeout)).ok();
-    roundtrip(&mut stream, req)
-}
-
-fn roundtrip(stream: &mut TcpStream, req: &Request) -> io::Result<Response> {
+/// One request/response round-trip over any authenticated connection.
+fn roundtrip<S: Read + Write>(stream: &mut S, req: &Request) -> io::Result<Response> {
     write_frame(stream, &frame_encode(&req.encode()))?;
     let framed = read_frame(stream)?;
     let payload =
@@ -533,48 +589,60 @@ fn roundtrip(stream: &mut TcpStream, req: &Request) -> io::Result<Response> {
 /// Max idle connections kept per peer.
 const MAX_IDLE_PER_PEER: usize = 32;
 
-/// A pool of persistent internode connections, keyed by peer address. Reuses an
-/// idle connection when available (the server keeps connections alive across
-/// requests), avoiding a TCP handshake per replicated write.
-#[derive(Debug, Default)]
+/// A pool of persistent, authenticated internode connections, keyed by peer
+/// address. Reuses an idle connection when available (the server keeps
+/// connections alive across requests), avoiding a TCP+auth handshake per
+/// replicated write. All connections go through the shared [`Authenticator`], so
+/// a peer that can't satisfy the configured auth mode is rejected.
+#[derive(Debug)]
 pub struct Pool {
-    idle: std::sync::Mutex<std::collections::HashMap<String, Vec<TcpStream>>>,
+    auth: Arc<Authenticator>,
+    idle: std::sync::Mutex<std::collections::HashMap<String, Vec<Conn>>>,
 }
 
 impl Pool {
-    pub fn new() -> Self {
-        Pool::default()
+    pub fn new(auth: Arc<Authenticator>) -> Self {
+        Pool {
+            auth,
+            idle: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
     }
 
     /// Send `req` to `addr`, reusing a pooled connection if possible. On any I/O
     /// error the connection is dropped (not returned to the pool).
     pub fn call(&self, addr: &str, req: &Request) -> io::Result<Response> {
-        let mut stream = self.take(addr)?;
-        let resp = roundtrip(&mut stream, req)?;
-        self.put(addr, stream);
+        let mut conn = self.take(addr)?;
+        let resp = roundtrip(&mut conn, req)?;
+        self.put(addr, conn);
         Ok(resp)
     }
 
-    fn take(&self, addr: &str) -> io::Result<TcpStream> {
-        if let Some(stream) = self
+    /// Like [`Pool::call`], but on a fresh, time-bounded connection that is not
+    /// returned to the pool — for liveness probing, where an unreachable peer
+    /// must fail fast rather than block on the OS connect timeout.
+    pub fn call_timeout(&self, addr: &str, req: &Request, timeout: Duration) -> io::Result<Response> {
+        let mut conn = self.auth.connect(addr, Some(timeout))?;
+        roundtrip(&mut conn, req)
+    }
+
+    fn take(&self, addr: &str) -> io::Result<Conn> {
+        if let Some(conn) = self
             .idle
             .lock()
             .expect("pool lock")
             .get_mut(addr)
             .and_then(|v| v.pop())
         {
-            return Ok(stream);
+            return Ok(conn);
         }
-        let stream = TcpStream::connect(addr)?;
-        stream.set_nodelay(true).ok();
-        Ok(stream)
+        self.auth.connect(addr, None)
     }
 
-    fn put(&self, addr: &str, stream: TcpStream) {
+    fn put(&self, addr: &str, conn: Conn) {
         let mut idle = self.idle.lock().expect("pool lock");
         let bucket = idle.entry(addr.to_string()).or_default();
         if bucket.len() < MAX_IDLE_PER_PEER {
-            bucket.push(stream);
+            bucket.push(conn);
         }
     }
 }

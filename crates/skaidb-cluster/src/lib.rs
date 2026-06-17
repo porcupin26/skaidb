@@ -8,7 +8,9 @@ pub mod internode;
 mod node;
 mod quorum;
 mod ring;
+pub mod transport;
 
 pub use node::{ClusterStats, Node, NodeConfig, PeerStat};
+pub use transport::Authenticator;
 pub use quorum::{is_strong, merge_documents, resolve_value, Consistency, Versioned};
 pub use ring::{NodeId, Ring};

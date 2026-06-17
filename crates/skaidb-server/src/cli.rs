@@ -70,8 +70,16 @@ pub struct Cli {
     pub x509_ca_file: Option<String>,
     #[arg(long, value_enum, ignore_case = true, env = "SKAIDB_INTERNODE_AUTH")]
     pub internode_auth: Option<InternodeAuth>,
+    #[arg(long, env = "SKAIDB_INTERNODE_TOKEN")]
+    pub internode_token: Option<String>,
     #[arg(long, env = "SKAIDB_INTERNODE_KEYFILE")]
     pub internode_keyfile: Option<String>,
+    #[arg(long, env = "SKAIDB_INTERNODE_TLS_CERT")]
+    pub internode_tls_cert: Option<String>,
+    #[arg(long, env = "SKAIDB_INTERNODE_TLS_KEY")]
+    pub internode_tls_key: Option<String>,
+    #[arg(long, env = "SKAIDB_INTERNODE_TLS_CA")]
+    pub internode_tls_ca: Option<String>,
     #[arg(long, env = "SKAIDB_SUPERUSER")]
     pub superuser: Option<String>,
     #[arg(long, env = "SKAIDB_SUPERUSER_PASSWORD")]
@@ -152,7 +160,11 @@ impl Cli {
             x509_enabled => config.auth.x509_enabled,
             x509_ca_file => config.auth.x509_ca_file,
             internode_auth => config.auth.internode_auth,
+            internode_token => config.auth.internode_token,
             internode_keyfile => config.auth.internode_keyfile,
+            internode_tls_cert => config.auth.internode_tls_cert,
+            internode_tls_key => config.auth.internode_tls_key,
+            internode_tls_ca => config.auth.internode_tls_ca,
             superuser => config.auth.superuser,
             superuser_password => config.auth.superuser_password,
 

@@ -161,11 +161,27 @@ pub fn handle(ctx: &Shared, role: &str, cmd: AdminCmd) -> (u16, Json) {
                         "reachable": p.reachable,
                         "hints_pending": p.hints_pending,
                         "lag_ms": p.lag_ms,
+                        "reported_epoch": p.reported_epoch,
+                        "reported_members": p.reported_members,
+                        "lists_self": p.lists_self,
+                        "rows": p.rows,
                     })
                 })
                 .collect();
             let mut members = node.member_ids();
             members.sort();
+            // Cross-node disagreement: a reachable peer that doesn't list us, or
+            // whose member count differs from ours — the split-brain that
+            // per-node config checks can't see. (Detectable only for peers we
+            // route to; a stranger node we've never heard of stays invisible.)
+            let disagreeing: Vec<&str> = peers
+                .iter()
+                .filter(|p| {
+                    p.reachable == Some(true)
+                        && (p.lists_self == Some(false) || p.reported_members != Some(members.len()))
+                })
+                .map(|p| p.id.as_str())
+                .collect();
             (
                 200,
                 json!({
@@ -182,6 +198,7 @@ pub fn handle(ctx: &Shared, role: &str, cmd: AdminCmd) -> (u16, Json) {
                     "discrepancies": {
                         "configured_not_in_ring": configured_not_in_ring,
                         "ring_not_configured": ring_not_configured,
+                        "membership_disagreement": disagreeing,
                     },
                 }),
             )

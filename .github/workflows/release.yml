@@ -149,11 +149,19 @@ jobs:
         if: runner.os == 'Linux' && matrix.apt != ''
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
 
+      # rustls' crypto provider (ring) assembles with NASM on Windows MSVC.
+      - name: Install NASM (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
       - name: Configure cross linker
         if: matrix.linker != ''
         shell: bash
         run: |
-          echo "CARGO_TARGET_$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')_LINKER=${{ matrix.linker }}" >>"$GITHUB_ENV"
+          T=$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')
+          echo "CARGO_TARGET_${T}_LINKER=${{ matrix.linker }}" >>"$GITHUB_ENV"
+          # Point ring's C build (via the cc crate) at the cross compiler too.
+          echo "CC_$(echo '${{ matrix.target }}' | tr '-' '_')=${{ matrix.linker }}" >>"$GITHUB_ENV"
 
       - name: Build release binaries
         run: cargo build --release --target ${{ matrix.target }} -p skaidb-server -p skaidb-cli
