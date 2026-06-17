@@ -356,6 +356,10 @@ replication factor, consistency, adding/removing nodes). For the SQL surface, se
 
 - **.deb / .rpm:** install the newer package the same way — it replaces the old
   one (`sudo apt install ./skaidb_NEW_amd64.deb`, `sudo dnf install ./skaidb-NEW…rpm`).
+  If the `skaidb` service is running, the package restarts it automatically so the
+  new binary takes over (a stopped or never-enabled service is left untouched).
+  In a multi-node cluster, upgrade one host at a time so the nodes don't all
+  restart at once.
 - **Tarball / zip / source:** overwrite the binaries in place. The on-disk data
   format is forward-compatible within a release line; stop the server before
   swapping the binary.
