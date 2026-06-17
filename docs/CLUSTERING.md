@@ -268,6 +268,14 @@ that happened while a node was down propagates to it on rejoin, and a lagging
 node holding the now-dropped object does **not** resurrect it (the tombstone's
 newer stamp wins). A genuinely newer re-`CREATE` still wins over an older drop.
 
+**Continuous anti-entropy.** Beyond read-repair (on reads) and hinted handoff
+(for writes to a briefly-down replica), each node runs a full repair pass on a
+timer — `cluster.anti_entropy_interval_secs` (default **60s**, `0` disables) — so
+a node that *missed a broadcast while it was up* (e.g. a DDL that committed at
+quorum while this node was momentarily behind) converges **on its own**, with no
+operator action. Passes are staggered per-node so the cluster doesn't repair in
+lockstep.
+
 **Automatic catch-up on (re)join.** When a node starts and finds peers, it runs a
 catch-up pass in the background as soon as a peer is reachable — the same repair
 (schema + data) — so a node that was down converges on its own without an

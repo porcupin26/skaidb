@@ -106,6 +106,9 @@ pub struct ClusterConfig {
     pub vnodes_per_node: u32,
     pub default_read_consistency: Consistency,
     pub default_write_consistency: Consistency,
+    /// How often (seconds) each node runs a background anti-entropy repair pass
+    /// so missed DDL/writes converge without operator action. `0` disables it.
+    pub anti_entropy_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -320,6 +323,7 @@ impl Default for ClusterConfig {
             vnodes_per_node: 256,
             default_read_consistency: Consistency::Quorum,
             default_write_consistency: Consistency::Quorum,
+            anti_entropy_interval_secs: 60,
         }
     }
 }

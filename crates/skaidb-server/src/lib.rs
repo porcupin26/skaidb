@@ -53,6 +53,7 @@ fn build_backend(db: Database, config: &Config) -> Result<Backend, Box<dyn std::
         write_consistency: map_consistency(config.cluster.default_write_consistency),
         auth: build_internode_auth(config)?,
         auto_join: true,
+        anti_entropy_interval_secs: config.cluster.anti_entropy_interval_secs,
     };
     let node = Node::new(db, node_cfg);
     node.serve_internode()?;
@@ -641,6 +642,7 @@ mod tests {
             write_consistency: ClusterConsistency::Quorum,
             auth: Arc::new(Authenticator::None),
             auto_join: false,
+            anti_entropy_interval_secs: 0,
         };
         let node = Node::new(Database::open(temp_dir()).unwrap(), cfg);
         Arc::new(Context {

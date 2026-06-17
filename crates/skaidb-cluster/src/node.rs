@@ -55,6 +55,9 @@ pub struct NodeConfig {
     /// automatically (auto-join). On in production; tests disable it to keep
     /// unrelated nodes from announcing.
     pub auto_join: bool,
+    /// Interval (seconds) for the background anti-entropy repair loop, so missed
+    /// DDL/writes converge without operator action. `0` disables it.
+    pub anti_entropy_interval_secs: u64,
 }
 
 /// The cluster's placement view: the hash ring plus peer addresses. Held behind
@@ -1203,7 +1206,34 @@ impl Node {
         }
         let node = Arc::clone(self);
         thread::spawn(move || node.startup_catch_up());
+        // Continuous anti-entropy: periodically reconcile so a missed broadcast
+        // (e.g. a DDL that committed at quorum while this node was momentarily
+        // behind) converges on its own, without an operator running repair.
+        if self.cfg.anti_entropy_interval_secs > 0 {
+            let node = Arc::clone(self);
+            thread::spawn(move || node.anti_entropy_loop());
+        }
         Ok(())
+    }
+
+    /// Background anti-entropy: every `anti_entropy_interval_secs` run a full
+    /// repair pass. Staggered per-node so the cluster doesn't repair in lockstep.
+    fn anti_entropy_loop(self: Arc<Self>) {
+        let interval = Duration::from_secs(self.cfg.anti_entropy_interval_secs);
+        // Stagger the first pass by a node-derived fraction of the interval.
+        let stagger = fnv1a(self.id.0.as_bytes()) % self.cfg.anti_entropy_interval_secs.max(1);
+        thread::sleep(Duration::from_secs(stagger));
+        loop {
+            thread::sleep(interval);
+            if self.member_count() <= 1 {
+                continue; // standalone: nothing to reconcile
+            }
+            match self.repair() {
+                Ok(n) if n > 0 => eprintln!("skaidb: anti-entropy reconciled {n} rows"),
+                Ok(_) => {}                  // already converged: stay quiet
+                Err(e) => eprintln!("skaidb: anti-entropy pass failed: {e}"),
+            }
+        }
     }
 
     /// Announce this node to a seed so the cluster admits it into the live ring
@@ -2290,6 +2320,17 @@ fn consistency_label(c: Consistency) -> &'static str {
     }
 }
 
+/// FNV-1a 64-bit hash — used to derive a stable per-node stagger for the
+/// anti-entropy loop (not security-sensitive).
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 fn is_ddl(stmt: &Statement) -> bool {
     matches!(
         stmt,
@@ -2443,6 +2484,7 @@ mod tests {
             write_consistency: w,
             auth: Arc::new(Authenticator::None),
             auto_join: false,
+            anti_entropy_interval_secs: 0,
         }
     }
 
@@ -2467,6 +2509,7 @@ mod tests {
             write_consistency: Consistency::Quorum,
             auth: Arc::new(auth),
             auto_join: false,
+            anti_entropy_interval_secs: 0,
         }
     }
 
@@ -2978,6 +3021,7 @@ mod tests {
             write_consistency: one,
             auth: Arc::new(Authenticator::None),
             auto_join: false,
+            anti_entropy_interval_secs: 0,
         };
 
         let (a, b, c) = (free_addr(), free_addr(), free_addr());
@@ -3065,6 +3109,7 @@ mod tests {
             write_consistency: all,
             auth: Arc::new(Authenticator::None),
             auto_join: false,
+            anti_entropy_interval_secs: 0,
         };
         let (a, b, c) = (free_addr(), free_addr(), free_addr());
         let abc = vec![member("a", &a), member("b", &b), member("c", &c)];
@@ -3159,6 +3204,7 @@ mod tests {
             write_consistency: all,
             auth: Arc::new(Authenticator::None),
             auto_join: false,
+            anti_entropy_interval_secs: 0,
         };
         let (a, b, c) = (free_addr(), free_addr(), free_addr());
         let m = vec![member("a", &a), member("b", &b), member("c", &c)];
@@ -3225,6 +3271,7 @@ mod tests {
             write_consistency: q,
             auth: Arc::new(Authenticator::None),
             auto_join: false,
+            anti_entropy_interval_secs: 0,
         };
         let (a, b, c) = (free_addr(), free_addr(), free_addr());
         let m = vec![member("a", &a), member("b", &b), member("c", &c)];
@@ -3310,6 +3357,7 @@ mod tests {
             write_consistency: one,
             auth: Arc::new(Authenticator::None),
             auto_join: false,
+            anti_entropy_interval_secs: 0,
         };
 
         let (a, b, c) = (free_addr(), free_addr(), free_addr());
@@ -3368,6 +3416,7 @@ mod tests {
             write_consistency: one,
             auth: Arc::new(Authenticator::None),
             auto_join: false,
+            anti_entropy_interval_secs: 0,
         };
 
         let (a, b, c) = (free_addr(), free_addr(), free_addr());
@@ -3428,6 +3477,7 @@ mod tests {
             write_consistency: one,
             auth: Arc::new(Authenticator::None),
             auto_join: false,
+            anti_entropy_interval_secs: 0,
         };
         let (a, b, c) = (free_addr(), free_addr(), free_addr());
         let ab = vec![member("a", &a), member("b", &b)];
@@ -3478,6 +3528,7 @@ mod tests {
             write_consistency: one,
             auth: Arc::new(Authenticator::None),
             auto_join: false,
+            anti_entropy_interval_secs: 0,
         };
 
         let (a, b, c) = (free_addr(), free_addr(), free_addr());
@@ -3538,6 +3589,7 @@ mod tests {
             write_consistency: one,
             auth: Arc::new(Authenticator::None),
             auto_join: false,
+            anti_entropy_interval_secs: 0,
         };
 
         let (a, b, c) = (free_addr(), free_addr(), free_addr());

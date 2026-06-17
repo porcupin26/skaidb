@@ -54,6 +54,8 @@ pub struct Cli {
         env = "SKAIDB_DEFAULT_WRITE_CONSISTENCY"
     )]
     pub default_write_consistency: Option<Consistency>,
+    #[arg(long, env = "SKAIDB_ANTI_ENTROPY_INTERVAL_SECS")]
+    pub anti_entropy_interval_secs: Option<u64>,
 
     // ---- [agent] ----
     #[arg(long, env = "SKAIDB_SUBSET_TABLES", value_delimiter = ',')]
@@ -152,6 +154,7 @@ impl Cli {
             vnodes_per_node => config.cluster.vnodes_per_node,
             default_read_consistency => config.cluster.default_read_consistency,
             default_write_consistency => config.cluster.default_write_consistency,
+            anti_entropy_interval_secs => config.cluster.anti_entropy_interval_secs,
 
             subset_tables => config.agent.subset_tables,
             max_staleness_ms => config.agent.max_staleness_ms,

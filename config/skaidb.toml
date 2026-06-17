@@ -12,6 +12,9 @@ replication_factor = 3
 vnodes_per_node = 256
 default_read_consistency = "QUORUM"
 default_write_consistency = "QUORUM"
+# Background anti-entropy: each node repairs (schema + data) on this interval so
+# missed DDL/writes converge without operator action. 0 disables it.
+anti_entropy_interval_secs = 60
 
 [agent]
 subset_tables = []
