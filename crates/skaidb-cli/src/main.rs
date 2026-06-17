@@ -5,6 +5,7 @@
 //! operations use the REST control plane. An embedded engine is still available
 //! offline via `--local <dir>`.
 
+mod cluster;
 mod dump;
 mod http;
 mod render;
@@ -488,7 +489,10 @@ impl Shell {
             // REST control-plane helpers.
             "\\status" => self.rest_get("/status", false),
             "\\metrics" => self.rest_get("/metrics", true),
-            "\\cluster" => self.rest_admin("/admin/status", String::new()),
+            "\\cluster" => match rest.first().copied() {
+                Some("raw") => self.rest_admin("/admin/status", String::new()),
+                _ => self.rest_cluster(),
+            },
             "\\repair" => self.rest_admin("/admin/repair", String::new()),
             "\\reclaim" => self.rest_admin("/admin/reclaim", String::new()),
             "\\node" => match (rest.first().copied(), rest.get(1).copied()) {
@@ -534,6 +538,18 @@ impl Shell {
         }
         match http::post(&self.rest_targets(), path, &body, self.auth()) {
             Ok((_, resp)) => http::print_body(&resp),
+            Err(e) => eprintln!("error: {e}"),
+        }
+    }
+
+    /// `\cluster`: fetch `/admin/status` and render the human-readable summary
+    /// (verdict + per-peer table + actions) instead of the raw JSON blob.
+    fn rest_cluster(&self) {
+        if self.is_local() {
+            return;
+        }
+        match http::post(&self.rest_targets(), "/admin/status", "", self.auth()) {
+            Ok((_, resp)) => cluster::render(&resp),
             Err(e) => eprintln!("error: {e}"),
         }
     }
@@ -711,7 +727,7 @@ skaidbsh — commands
   Server / cluster (network mode):
     \\status            node health & topology (GET /status)
     \\metrics           Prometheus metrics (GET /metrics)
-    \\cluster           cluster membership (admin)
+    \\cluster           cluster health & membership (\\cluster raw for JSON)
     \\node add <addr>   add a node       \\node remove <id>   decommission a node
     \\repair            anti-entropy repair    \\reclaim    reclaim space
 
