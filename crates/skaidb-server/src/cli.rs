@@ -124,6 +124,21 @@ pub struct Cli {
     pub per_table_metrics: Option<bool>,
     #[arg(long, env = "SKAIDB_LOG_FORMAT")]
     pub log_format: Option<String>,
+    /// Default file for audit logs (empty = stderr).
+    #[arg(long, env = "SKAIDB_LOG_FILE")]
+    pub log_file: Option<String>,
+    /// Override file for the query log (empty = use --log-file).
+    #[arg(long, env = "SKAIDB_QUERY_LOG_FILE")]
+    pub query_log_file: Option<String>,
+    /// Override file for the slow-query log (empty = use --log-file).
+    #[arg(long, env = "SKAIDB_SLOW_QUERY_LOG_FILE")]
+    pub slow_query_log_file: Option<String>,
+    /// Override file for the error log (empty = use --log-file).
+    #[arg(long, env = "SKAIDB_ERROR_LOG_FILE")]
+    pub error_log_file: Option<String>,
+    /// Override file for the login/auth log (empty = use --log-file).
+    #[arg(long, env = "SKAIDB_LOGIN_LOG_FILE")]
+    pub login_log_file: Option<String>,
 }
 
 /// For each `field => target` pair, copy `self.field` onto `target` when the
@@ -189,6 +204,11 @@ impl Cli {
             error_log_level => config.observability.error_log_level,
             per_table_metrics => config.observability.per_table_metrics,
             log_format => config.observability.log_format,
+            log_file => config.observability.log_file,
+            query_log_file => config.observability.query_log_file,
+            slow_query_log_file => config.observability.slow_query_log_file,
+            error_log_file => config.observability.error_log_file,
+            login_log_file => config.observability.login_log_file,
         );
     }
 }

@@ -176,6 +176,24 @@ pub struct ObservabilityConfig {
     /// Audit/query/login log format: `"text"` (human-readable, default) or
     /// `"json"` (one JSON object per line, for a log agent to parse reliably).
     pub log_format: String,
+    /// Default destination file for audit logs. Empty (the default) writes to
+    /// the process's stderr, preserving the original behavior. A relative path
+    /// is resolved against the working directory; the file is created if absent
+    /// and appended to otherwise.
+    ///
+    /// Each log category below can override this with its own file, so
+    /// individual streams can be split out (e.g. send the error log to its own
+    /// file while everything else shares `log_file`). Adding a new log category
+    /// in the future is just another `*_log_file` override here.
+    pub log_file: String,
+    /// Override file for the query log. Empty falls back to [`log_file`].
+    pub query_log_file: String,
+    /// Override file for the slow-query log. Empty falls back to [`log_file`].
+    pub slow_query_log_file: String,
+    /// Override file for the error log. Empty falls back to [`log_file`].
+    pub error_log_file: String,
+    /// Override file for the login/auth log. Empty falls back to [`log_file`].
+    pub login_log_file: String,
 }
 
 impl Config {
@@ -253,6 +271,11 @@ pub const RUNTIME_MUTABLE_KEYS: &[&str] = &[
     "observability.error_log_level",
     "observability.per_table_metrics",
     "observability.log_format",
+    "observability.log_file",
+    "observability.query_log_file",
+    "observability.slow_query_log_file",
+    "observability.error_log_file",
+    "observability.login_log_file",
 ];
 
 /// Whether changing `key` takes effect live (see [`RUNTIME_MUTABLE_KEYS`]).
@@ -388,6 +411,11 @@ impl Default for ObservabilityConfig {
             error_log_level: "warn".to_string(),
             per_table_metrics: false,
             log_format: "text".to_string(),
+            log_file: String::new(),
+            query_log_file: String::new(),
+            slow_query_log_file: String::new(),
+            error_log_file: String::new(),
+            login_log_file: String::new(),
         }
     }
 }

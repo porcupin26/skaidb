@@ -21,6 +21,11 @@ LimitNOFILE=1048576
 StateDirectory=skaidb
 StateDirectoryMode=0750
 ReadWritePaths=/var/lib/skaidb
+# Logs directory: systemd creates/owns /var/log/skaidb for User=skaidb, where
+# the shipped config writes its audit/query/error logs (observability.log_file).
+LogsDirectory=skaidb
+LogsDirectoryMode=0750
+ReadWritePaths=/var/log/skaidb
 
 # Hardening — skaidb only needs to read its config and write its data dir.
 NoNewPrivileges=true

@@ -159,3 +159,36 @@ Set `observability.log_format = "json"` to emit **one JSON object per line**
 reliably. Query logs are masked (literals → `?`) unless `query_log_masked` is
 disabled. A bounded, masked sample of recent slow queries is available at
 `POST /admin/slow`.
+
+### Log files
+
+By default logs go to stderr. Set `observability.log_file` to a path to write
+all audit logs to a file instead (created if absent, appended otherwise):
+
+```toml
+[observability]
+log_file = "/var/log/skaidb/audit.log"
+```
+
+Each log category can be split into its own file with a per-category override;
+an empty override falls back to `log_file`, and an empty `log_file` falls back
+to stderr:
+
+| Key | Stream |
+| --- | --- |
+| `observability.query_log_file` | executed-statement log |
+| `observability.slow_query_log_file` | slow-query log |
+| `observability.error_log_file` | error log |
+| `observability.login_log_file` | login/auth log |
+
+```toml
+[observability]
+log_file = "/var/log/skaidb/audit.log"   # everything not overridden below
+error_log_file = "/var/log/skaidb/error.log"
+slow_query_log_file = "/var/log/skaidb/slow.log"
+```
+
+Categories pointed at the same path share one file handle, so their lines
+interleave safely. All of these keys are runtime-mutable (`config set`,
+`--*` flags, and `SKAIDB_*_LOG_FILE` env vars), and a path that can't be opened
+falls back to stderr with a one-line warning rather than failing startup.

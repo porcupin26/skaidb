@@ -257,14 +257,7 @@ mod tests {
     use skaidb_types::Value;
 
     fn quiet_audit() -> AuditSettings {
-        AuditSettings {
-            query_log: false,
-            query_masked: true,
-            slow_query_ms: 0,
-            login_log: false,
-            error_log: false,
-            json: false,
-        }
+        AuditSettings::quiet()
     }
 
     fn temp_dir() -> std::path::PathBuf {

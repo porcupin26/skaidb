@@ -17,6 +17,13 @@ mkdir -p /var/lib/skaidb
 chown skaidb:skaidb /var/lib/skaidb
 chmod 0750 /var/lib/skaidb
 
+# Log directory, owned by the service account. The shipped config writes audit
+# logs here (observability.log_file); under systemd LogsDirectory= also manages
+# it, but create it now so a direct run or a non-systemd host has it too.
+mkdir -p /var/log/skaidb
+chown skaidb:skaidb /var/log/skaidb
+chmod 0750 /var/log/skaidb
+
 # Config readable by the service but not world-readable (it may hold a password).
 if [ -d /etc/skaidb ]; then
     chown -R root:skaidb /etc/skaidb
