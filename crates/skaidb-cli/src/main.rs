@@ -5,6 +5,7 @@
 //! operations use the REST control plane. An embedded engine is still available
 //! offline via `--local <dir>`.
 
+mod dump;
 mod http;
 mod render;
 
@@ -16,8 +17,9 @@ use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
 use skaidb_driver::Client;
-use skaidb_engine::Session;
-use skaidb_proto::Consistency;
+use skaidb_engine::{QueryOutput, Session};
+use skaidb_proto::{Consistency, Response};
+use skaidb_types::Value;
 
 /// Prompt shown while a statement is still being typed (no terminating `;`).
 const CONT_PROMPT: &str = "   ...> ";
@@ -83,6 +85,8 @@ enum Cmd {
         #[command(subcommand)]
         op: ConfigOp,
     },
+    /// Dump schema + data to JSON or CSV (chosen tables, databases, or all).
+    Export(dump::ExportArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -112,8 +116,20 @@ enum ConfigOp {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    // Admin subcommands always use the REST control plane.
     if let Some(cmd) = &cli.cmd {
+        // Export runs SQL, so it uses a full backend (works against a server or
+        // `--local`), not the REST control plane.
+        if let Cmd::Export(args) = cmd {
+            let mut shell = match Shell::connect(&cli) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("skaidbsh: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            return dump::run(&mut shell.backend, args);
+        }
+        // Other admin subcommands always use the REST control plane.
         if cli.local.is_some() {
             eprintln!("skaidbsh: admin commands need a server; --local is offline only");
             return ExitCode::FAILURE;
@@ -153,7 +169,7 @@ fn main() -> ExitCode {
 }
 
 /// Where statements execute: a remote node over the driver, or a local engine.
-enum Backend {
+pub(crate) enum Backend {
     Net { client: Client, current_db: String },
     // Boxed: the embedded engine is large, dwarfing the network variant.
     Local(Box<Session>),
@@ -182,10 +198,50 @@ impl Backend {
         }
     }
 
-    fn current_db(&self) -> &str {
+    pub(crate) fn current_db(&self) -> &str {
         match self {
             Backend::Net { current_db, .. } => current_db,
             Backend::Local(session) => session.current_database(),
+        }
+    }
+
+    /// Run a query and return its columns + rows, without rendering (for
+    /// export/import). Non-row results yield empty vecs.
+    pub(crate) fn query(&mut self, sql: &str) -> Result<(Vec<String>, Vec<Vec<Value>>), String> {
+        match self {
+            Backend::Net { client, current_db } => {
+                let resp = client.execute(sql).map_err(|e| e.to_string())?;
+                track_use(sql, current_db);
+                match resp {
+                    Response::Rows { columns, rows } => Ok((columns, rows)),
+                    Response::Error(msg) => Err(msg),
+                    _ => Ok((Vec::new(), Vec::new())),
+                }
+            }
+            Backend::Local(session) => match session.execute(sql).map_err(|e| e.to_string())? {
+                QueryOutput::Rows(rs) => Ok((rs.columns, rs.rows)),
+                _ => Ok((Vec::new(), Vec::new())),
+            },
+        }
+    }
+
+    /// Execute a statement without rendering, returning rows affected (0 for
+    /// DDL). For bulk import and dump-schema replay.
+    pub(crate) fn exec_quiet(&mut self, sql: &str) -> Result<u64, String> {
+        match self {
+            Backend::Net { client, current_db } => {
+                let resp = client.execute(sql).map_err(|e| e.to_string())?;
+                track_use(sql, current_db);
+                match resp {
+                    Response::Mutation { affected } => Ok(affected),
+                    Response::Error(msg) => Err(msg),
+                    _ => Ok(0),
+                }
+            }
+            Backend::Local(session) => match session.execute(sql).map_err(|e| e.to_string())? {
+                QueryOutput::Mutation { affected } => Ok(affected as u64),
+                _ => Ok(0),
+            },
         }
     }
 
@@ -532,6 +588,8 @@ fn run_admin(cli: &Cli, cmd: &Cmd) -> ExitCode {
             };
             http::post(&endpoints, path, &body, auth)
         }
+        // Export is intercepted in main() (it needs a SQL backend, not REST).
+        Cmd::Export(_) => unreachable!("export is handled before run_admin"),
     };
 
     match result {
