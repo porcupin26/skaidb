@@ -135,6 +135,12 @@ pub struct Node {
     /// for replay when it comes back — *hinted handoff*. In-memory and bounded;
     /// anti-entropy ([`Node::repair`]) is the durable backstop if hints are lost.
     hints: Mutex<HashMap<NodeId, Vec<HintedWrite>>>,
+    /// Highest HLC each peer has confirmed it applied (a successful replicated
+    /// write or hint replay). Compared against this node's clock frontier to
+    /// estimate how far behind a peer is — see [`Node::note_acked`] and the
+    /// per-peer replication-lag metric. Peers absent from the map have no
+    /// confirmed write yet (their lag is reported as unknown).
+    acked: Mutex<HashMap<NodeId, Hlc>>,
     /// Rows pushed per migration batch before a checkpoint + throttle pause.
     migration_batch: AtomicUsize,
     /// Pause (ms) between migration batches — throttles a reshard so it doesn't
@@ -160,6 +166,28 @@ struct Counters {
     peer_errors: AtomicU64,
 }
 
+/// Per-peer replication state, surfaced for diagnostics and per-peer metrics.
+/// One entry per node this coordinator knows of (from the live ring and/or the
+/// configured seeds), excluding itself.
+#[derive(Debug, Clone)]
+pub struct PeerStat {
+    /// Peer node id (its `host:internode_port`).
+    pub id: String,
+    /// Internode address (from the live ring, falling back to the configured seed).
+    pub addr: String,
+    /// Present in this node's configured `seeds`.
+    pub in_config: bool,
+    /// Present in the live membership ring (actually a routing/replication target).
+    pub in_ring: bool,
+    /// Hinted writes currently buffered for this peer (exact backlog).
+    pub hints_pending: usize,
+    /// Approximate staleness: ms between this node's HLC frontier and the latest
+    /// write it has confirmed the peer applied. `None` if nothing confirmed yet.
+    pub lag_ms: Option<u64>,
+    /// Liveness from a probe, when one was requested. `None` if not probed.
+    pub reachable: Option<bool>,
+}
+
 /// A point-in-time snapshot of cluster state and counters for metrics/`/status`.
 #[derive(Debug, Clone)]
 pub struct ClusterStats {
@@ -171,6 +199,15 @@ pub struct ClusterStats {
     pub resharding_active: bool,
     /// Hinted writes currently buffered for unreachable replicas.
     pub hints_pending: usize,
+    /// Configured seed node ids (what membership *should* be), sorted.
+    pub configured: Vec<String>,
+    /// Whether this node's own id is in the live ring. `false` flags a node that
+    /// is coordinating/catching-up but was never admitted (a "half-join": it
+    /// pulls data via anti-entropy yet owns no ring tokens, so no one routes
+    /// writes to it).
+    pub self_in_ring: bool,
+    /// Per-peer replication detail (ring ∪ configured, excluding self), sorted by id.
+    pub peers: Vec<PeerStat>,
     pub write_consistency: &'static str,
     pub read_consistency: &'static str,
     pub writes_total: u64,
@@ -197,6 +234,9 @@ const MAX_HINTS_PER_REPLICA: usize = 4096;
 const CATCH_UP_ATTEMPTS: usize = 15;
 const CATCH_UP_DELAY: Duration = Duration::from_secs(2);
 
+/// Per-peer connect+round-trip budget for liveness probes in `/admin/status`.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
+
 impl Node {
     /// Create a node with the given local database and cluster config. If a
     /// persisted membership from a prior run exists (a node that joined/left
@@ -216,6 +256,7 @@ impl Node {
             clock: HlcClock::new(),
             pool: internode::Pool::new(),
             hints: Mutex::new(HashMap::new()),
+            acked: Mutex::new(HashMap::new()),
             migration_batch: AtomicUsize::new(1024),
             migration_pause_ms: AtomicU64::new(0),
             counters: Counters::default(),
@@ -255,9 +296,15 @@ impl Node {
     /// read-only `/status` endpoint.
     pub fn stats(&self) -> ClusterStats {
         let c = &self.counters;
-        let (epoch, members, resharding) = {
+        let (epoch, members, resharding, self_in_ring) = {
             let topo = self.topo.read().expect("topo lock");
-            (topo.epoch, topo.peers.len() + 1, topo.prev.is_some())
+            let self_in_ring = topo.members.iter().any(|(id, _)| *id == self.id);
+            (
+                topo.epoch,
+                topo.peers.len() + 1,
+                topo.prev.is_some(),
+                self_in_ring,
+            )
         };
         let hints_pending = self
             .hints
@@ -273,6 +320,9 @@ impl Node {
             replication_factor: self.cfg.replication_factor,
             resharding_active: resharding,
             hints_pending,
+            configured: self.configured_ids(),
+            self_in_ring,
+            peers: self.peer_stats(false),
             write_consistency: consistency_label(self.cfg.write_consistency),
             read_consistency: consistency_label(self.cfg.read_consistency),
             writes_total: c.writes_total.load(Ordering::Relaxed),
@@ -301,6 +351,86 @@ impl Node {
             .iter()
             .map(|(id, _)| id.0.clone())
             .collect()
+    }
+
+    /// Record that `peer` has confirmed a write stamped `hlc` (a successful
+    /// replicated write or hint replay). Monotonic — only advances. Feeds the
+    /// per-peer replication-lag estimate.
+    fn note_acked(&self, peer: &NodeId, hlc: Hlc) {
+        let mut acked = self.acked.lock().expect("acked lock");
+        let slot = acked.entry(peer.clone()).or_insert(Hlc::MIN);
+        if hlc > *slot {
+            *slot = hlc;
+        }
+    }
+
+    /// Configured seed node ids (what membership is *supposed* to be), sorted.
+    fn configured_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.cfg.members.iter().map(|(id, _)| id.0.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    /// Per-peer replication detail: the union of the live ring's peers and the
+    /// configured seeds (excluding self), each flagged with whether it is in the
+    /// config, in the live ring, its hint backlog, and an estimated lag. When
+    /// `probe` is set, each peer is pinged (short timeout) for liveness — used by
+    /// the operator-facing `/admin/status`, skipped on the cheap metrics path.
+    fn peer_stats(&self, probe: bool) -> Vec<PeerStat> {
+        // Candidate set: ring peers (id -> addr) plus configured seeds, minus self.
+        let mut addrs: BTreeMap<NodeId, (String, bool, bool)> = BTreeMap::new();
+        {
+            let topo = self.topo.read().expect("topo lock");
+            for (id, addr) in &topo.peers {
+                addrs.insert(id.clone(), (addr.clone(), false, true));
+            }
+        }
+        for (id, addr) in &self.cfg.members {
+            if *id == self.id {
+                continue;
+            }
+            let entry = addrs.entry(id.clone()).or_insert((addr.clone(), false, false));
+            entry.1 = true; // in_config
+        }
+
+        let frontier = self.clock.peek().physical;
+        let acked = self.acked.lock().expect("acked lock");
+        let hints = self.hints.lock().expect("hints lock");
+
+        addrs
+            .into_iter()
+            .map(|(id, (addr, in_config, in_ring))| {
+                let hints_pending = hints.get(&id).map(|v| v.len()).unwrap_or(0);
+                let lag_ms = acked
+                    .get(&id)
+                    .map(|h| frontier.saturating_sub(h.physical));
+                let reachable = if probe {
+                    Some(matches!(
+                        internode::call_timeout(&addr, &Request::Ping, PROBE_TIMEOUT),
+                        Ok(Response::Pong)
+                    ))
+                } else {
+                    None
+                };
+                PeerStat {
+                    id: id.0,
+                    addr,
+                    in_config,
+                    in_ring,
+                    hints_pending,
+                    lag_ms,
+                    reachable,
+                }
+            })
+            .collect()
+    }
+
+    /// An operator-facing snapshot that probes each peer for liveness. Heavier
+    /// than [`Node::stats`] (one ping per peer), so it backs the explicit
+    /// `/admin/status` call rather than the metrics scrape.
+    pub fn peer_stats_probed(&self) -> Vec<PeerStat> {
+        self.peer_stats(true)
     }
 
     /// Persist the current membership + epoch so it survives a restart.
@@ -980,6 +1110,7 @@ impl Node {
             for (table, key, op, hlc) in writes {
                 if matches!(self.send_write(&addr, &table, &key, &op, hlc), Ok(true)) {
                     delivered += 1;
+                    self.note_acked(&replica, hlc);
                 } else {
                     remaining.push((table, key, op, hlc));
                 }
@@ -1353,6 +1484,7 @@ impl Node {
                 async_peers.push((replica.clone(), addr));
             } else if matches!(self.send_write(&addr, table, key, &op, hlc), Ok(true)) {
                 acks += 1;
+                self.note_acked(replica, hlc);
             } else {
                 // Replica down: buffer the write for hinted handoff.
                 self.store_hint(replica, table, key, &op, hlc);
@@ -1373,7 +1505,9 @@ impl Node {
             let (table, key, op) = (table.to_string(), key.to_vec(), op.clone());
             thread::spawn(move || {
                 for (replica, addr) in async_peers {
-                    if !matches!(node.send_write(&addr, &table, &key, &op, hlc), Ok(true)) {
+                    if matches!(node.send_write(&addr, &table, &key, &op, hlc), Ok(true)) {
+                        node.note_acked(&replica, hlc);
+                    } else {
                         node.store_hint(&replica, &table, &key, &op, hlc);
                     }
                 }
@@ -2190,6 +2324,87 @@ mod tests {
         nc.execute("DELETE FROM t WHERE id = 2").unwrap();
         let rs = rows(na.execute("SELECT id FROM t ORDER BY id").unwrap());
         assert_eq!(rs.rows, vec![vec![Value::Int(1)], vec![Value::Int(3)]]);
+    }
+
+    #[test]
+    fn peer_stats_report_config_ring_reachability_and_lag() {
+        let (a, b) = (free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b)];
+        let na = Node::new(
+            Database::open(temp_dir("psa")).unwrap(),
+            cfg("a", &a, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("psb")).unwrap(),
+            cfg("b", &b, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        na.execute("INSERT INTO t (id, v) VALUES (1, 'x')").unwrap();
+
+        let peers = na.peer_stats(true);
+        assert_eq!(peers.len(), 1, "exactly one peer (b), self excluded");
+        let p = &peers[0];
+        assert_eq!(p.id, "b");
+        assert!(p.in_config, "b is a configured seed");
+        assert!(p.in_ring, "b is in the live ring");
+        assert_eq!(p.reachable, Some(true), "b is serving, probe succeeds");
+        assert_eq!(p.hints_pending, 0, "all writes reached b");
+        assert!(
+            p.lag_ms.is_some(),
+            "a quorum write was confirmed to b, so its lag is known"
+        );
+        assert!(na.stats().self_in_ring, "a is a normal ring member");
+    }
+
+    #[test]
+    fn self_in_ring_false_for_half_joined_node() {
+        // A node whose own id is absent from its membership (it points only at
+        // peers) — it would catch up data but was never admitted to the ring.
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let peers_only = vec![member("b", &b), member("c", &c)];
+        let na = Node::new(
+            Database::open(temp_dir("halfjoin")).unwrap(),
+            cfg("a", &a, &peers_only, Consistency::Quorum, Consistency::Quorum),
+        );
+        assert!(
+            !na.stats().self_in_ring,
+            "a is coordinating but not in its own ring (half-join)"
+        );
+    }
+
+    #[test]
+    fn peer_stats_flag_unreachable_peer_and_hint_backlog() {
+        // Three configured members; a coordinates, c is up, b is never served.
+        // DDL still reaches quorum (a+c of 3), but replica writes to b fail.
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let na = Node::new(
+            Database::open(temp_dir("psda")).unwrap(),
+            cfg("a", &a, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nc = Node::new(
+            Database::open(temp_dir("psdc")).unwrap(),
+            cfg("c", &c, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        na.serve_internode().unwrap();
+        nc.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        na.execute("INSERT INTO t (id, v) VALUES (1, 'x')").unwrap();
+        // An undeliverable replica write may be buffered on a background thread.
+        thread::sleep(Duration::from_millis(200));
+
+        let peers = na.peer_stats(true);
+        let pb = peers.iter().find(|p| p.id == "b").expect("b listed");
+        assert_eq!(pb.reachable, Some(false), "b is down, probe fails fast");
+        assert!(pb.hints_pending >= 1, "the write to b was buffered as a hint");
+        assert_eq!(pb.lag_ms, None, "no write ever confirmed to b => lag unknown");
+
+        let pc = peers.iter().find(|p| p.id == "c").expect("c listed");
+        assert_eq!(pc.reachable, Some(true), "c is serving");
     }
 
     #[test]

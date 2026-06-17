@@ -80,6 +80,13 @@ impl HlcClock {
         next
     }
 
+    /// The clock's current frontier: the greatest timestamp it has generated or
+    /// observed, without advancing it. Used as this node's "latest known write"
+    /// reference point when measuring how far a peer is behind.
+    pub fn peek(&self) -> Hlc {
+        *self.last.lock().expect("hlc mutex poisoned")
+    }
+
     /// Merge a remote timestamp (e.g. received from a peer) so this clock stays
     /// ahead of causally-prior events, then return a fresh local timestamp.
     pub fn observe(&self, remote: Hlc) -> Hlc {

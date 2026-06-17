@@ -545,6 +545,17 @@ const KNOWN_METRICS: &[(&str, MetricType, &str)] = &[
         MetricType::Counter,
         "Internode RPCs that errored or timed out.",
     ),
+    (
+        "skaidb_cluster_hints_pending_peer",
+        MetricType::Gauge,
+        "Hinted-handoff writes currently buffered, per peer (exact backlog).",
+    ),
+    (
+        "skaidb_cluster_replication_lag_ms",
+        MetricType::Gauge,
+        "Approx. ms between this node's HLC frontier and the latest write it has \
+         confirmed a peer applied (0/absent until a write is confirmed).",
+    ),
 ];
 
 #[cfg(test)]

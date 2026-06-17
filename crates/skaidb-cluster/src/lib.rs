@@ -9,6 +9,6 @@ mod node;
 mod quorum;
 mod ring;
 
-pub use node::{ClusterStats, Node, NodeConfig};
+pub use node::{ClusterStats, Node, NodeConfig, PeerStat};
 pub use quorum::{is_strong, merge_documents, resolve_value, Consistency, Versioned};
 pub use ring::{NodeId, Ring};

@@ -206,8 +206,40 @@ skaidbsh --host 10.0.0.1 cluster reclaim           # free space former owners no
 
 ```json
 { "clustered": true, "node_id": "10.0.0.1:7100", "epoch": 3,
-  "replication_factor": 3, "members": ["10.0.0.1:7100", "10.0.0.2:7100", "10.0.0.4:7100"] }
+  "replication_factor": 3,
+  "configured": ["10.0.0.1:7100", "10.0.0.2:7100", "10.0.0.3:7100"],
+  "self_in_ring": true,
+  "members": ["10.0.0.1:7100", "10.0.0.2:7100", "10.0.0.4:7100"],
+  "peers": [
+    { "id": "10.0.0.2:7100", "in_config": true, "in_ring": true,
+      "reachable": true, "hints_pending": 0, "lag_ms": 4 },
+    { "id": "10.0.0.4:7100", "in_config": false, "in_ring": true,
+      "reachable": true, "hints_pending": 0, "lag_ms": 7 }
+  ],
+  "discrepancies": {
+    "configured_not_in_ring": ["10.0.0.3:7100"],
+    "ring_not_configured": ["10.0.0.4:7100"]
+  } }
 ```
+
+**Configured vs. actual.** `configured` is what `seeds` says membership *should*
+be; `members` is the **live ring** the coordinator actually routes and replicates
+to. They diverge in normal operation: `cluster add-node` admits a node that was
+never in anyone's `seeds` (it shows up under `ring_not_configured`), and a seed
+that has not (yet) been admitted to the ring shows up under
+`configured_not_in_ring`. The latter is exactly the trap to watch for: a node
+started with `seeds` pointing at the cluster will **pull data via background
+catch-up** (it sees peers, so anti-entropy runs) **without ever joining the
+ring** — it serves stale-but-converging reads while no one routes writes to it.
+Such a node appears in `configured_not_in_ring` until you run `cluster add-node`
+for it. If the joining node's own `seeds` omit itself (it lists only peers),
+peers never learn of it at all — there is no gossip — so the tell is on the node
+itself: its `self_in_ring` is `false`, meaning it is coordinating/catching-up but
+owns no ring tokens. The unauthenticated `GET /status` carries the same
+`configured` / `self_in_ring` / `configured_not_in_ring` / `ring_not_configured`
+fields (without the per-peer liveness probe); `\cluster` adds `reachable`,
+`hints_pending`, and `lag_ms` per peer (see [METRICS.md](METRICS.md) for the
+matching Prometheus gauges).
 
 Under the hood these call the coordinator: `add-node` broadcasts the new ring,
 bootstraps the joiner's schema, and streams it the keys it now owns (dual-writing

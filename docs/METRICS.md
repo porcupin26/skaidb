@@ -133,12 +133,23 @@ coordinator at scrape time.
 | `skaidb_cluster_read_repairs_total` | counter | — | Read-repair writes pushed to lagging replicas. |
 | `skaidb_cluster_hints_stored_total` | counter | — | Hinted-handoff writes buffered for unreachable replicas. |
 | `skaidb_cluster_hints_replayed_total` | counter | — | Hinted-handoff writes successfully replayed. |
-| `skaidb_cluster_hints_pending` | gauge | — | Hints currently buffered. |
+| `skaidb_cluster_hints_pending` | gauge | — | Hints currently buffered (all peers). |
+| `skaidb_cluster_hints_pending_peer` | gauge | `peer` | Hints buffered **per peer** — exact replication backlog for that node. |
+| `skaidb_cluster_replication_lag_ms` | gauge | `peer` | Approx. ms between this node's HLC frontier and the latest write it has confirmed `peer` applied. |
 | `skaidb_cluster_peer_requests_total` | counter | — | Internode RPCs issued by the coordinator. |
 | `skaidb_cluster_peer_errors_total` | counter | — | Internode RPCs that errored or timed out. |
 
 These anti-entropy and quorum signals are correctness-critical — read-repair,
 hinted handoff, and quorum failures were previously invisible.
+
+**Reading replication health per peer.** `skaidb_cluster_hints_pending_peer` is
+the *exact* backlog — writes this node has buffered for a peer it couldn't reach.
+`skaidb_cluster_replication_lag_ms` is an *estimate*: it only advances a peer's
+baseline when a write is confirmed to it, so it climbs while a peer is
+unreachable and falls once hinted handoff/anti-entropy catch it up. A peer with
+no confirmed write yet (freshly added, or down since startup) is **absent** from
+`replication_lag_ms` — rely on `hints_pending_peer` and the `reachable` flag in
+`\cluster` for those. Both are emitted per current peer (ring ∪ configured seeds).
 
 ## Logs
 

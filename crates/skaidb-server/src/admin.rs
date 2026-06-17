@@ -136,6 +136,34 @@ pub fn handle(ctx: &Shared, role: &str, cmd: AdminCmd) -> (u16, Json) {
 
     match cmd {
         AdminCmd::Status => {
+            let stats = node.stats();
+            // Probe peers for liveness (this is an explicit operator action, so the
+            // extra round-trips are acceptable; the metrics scrape doesn't probe).
+            let peers = node.peer_stats_probed();
+            let configured_not_in_ring: Vec<&str> = peers
+                .iter()
+                .filter(|p| p.in_config && !p.in_ring)
+                .map(|p| p.id.as_str())
+                .collect();
+            let ring_not_configured: Vec<&str> = peers
+                .iter()
+                .filter(|p| p.in_ring && !p.in_config)
+                .map(|p| p.id.as_str())
+                .collect();
+            let peers_json: Vec<Json> = peers
+                .iter()
+                .map(|p| {
+                    json!({
+                        "id": p.id,
+                        "addr": p.addr,
+                        "in_config": p.in_config,
+                        "in_ring": p.in_ring,
+                        "reachable": p.reachable,
+                        "hints_pending": p.hints_pending,
+                        "lag_ms": p.lag_ms,
+                    })
+                })
+                .collect();
             let mut members = node.member_ids();
             members.sort();
             (
@@ -145,7 +173,16 @@ pub fn handle(ctx: &Shared, role: &str, cmd: AdminCmd) -> (u16, Json) {
                     "node_id": node.id(),
                     "epoch": node.membership_epoch(),
                     "replication_factor": node.replication_factor(),
+                    "resharding": stats.resharding_active,
+                    // What membership is configured (seeds) vs. what is live (ring).
+                    "configured": stats.configured,
+                    "self_in_ring": stats.self_in_ring,
                     "members": members,
+                    "peers": peers_json,
+                    "discrepancies": {
+                        "configured_not_in_ring": configured_not_in_ring,
+                        "ring_not_configured": ring_not_configured,
+                    },
                 }),
             )
         }

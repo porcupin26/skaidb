@@ -275,6 +275,22 @@ pub fn collect_runtime_metrics(ctx: &Shared) {
         m.set("skaidb_cluster_hints_replayed_total", c.hints_replayed);
         m.set("skaidb_cluster_peer_requests_total", c.peer_requests);
         m.set("skaidb_cluster_peer_errors_total", c.peer_errors);
+        // Per-peer replication health: exact hint backlog, and a lag estimate
+        // (only for peers a write has been confirmed to — absence is itself a
+        // signal that the peer has never acked).
+        for p in &c.peers {
+            let peer = escape_label(&p.id);
+            m.set(
+                &format!("skaidb_cluster_hints_pending_peer{{peer=\"{peer}\"}}"),
+                p.hints_pending as u64,
+            );
+            if let Some(lag) = p.lag_ms {
+                m.set(
+                    &format!("skaidb_cluster_replication_lag_ms{{peer=\"{peer}\"}}"),
+                    lag,
+                );
+            }
+        }
     }
 }
 

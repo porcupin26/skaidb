@@ -249,6 +249,22 @@ fn status_json(ctx: &Shared) -> Json {
     match ctx.backend.cluster_stats() {
         Some(c) => {
             let quic_port = ctx.config.read().map(|cfg| cfg.server.quic_port).unwrap_or(0);
+            // Configured-vs-live discrepancies (no liveness probe here — that's the
+            // authenticated /admin/status). Surfaces a node that half-joined (it is
+            // catching up data but was never admitted to the ring) or a configured
+            // seed that never joined.
+            let configured_not_in_ring: Vec<&str> = c
+                .peers
+                .iter()
+                .filter(|p| p.in_config && !p.in_ring)
+                .map(|p| p.id.as_str())
+                .collect();
+            let ring_not_configured: Vec<&str> = c
+                .peers
+                .iter()
+                .filter(|p| p.in_ring && !p.in_config)
+                .map(|p| p.id.as_str())
+                .collect();
             json!({
                 "clustered": true,
                 "node_id": c.node_id,
@@ -259,6 +275,11 @@ fn status_json(ctx: &Shared) -> Json {
                 "replication_factor": c.replication_factor,
                 "resharding": c.resharding_active,
                 "hints_pending": c.hints_pending,
+                // Membership as configured (seeds) vs. as actually live (the ring).
+                "configured": c.configured,
+                "self_in_ring": c.self_in_ring,
+                "configured_not_in_ring": configured_not_in_ring,
+                "ring_not_configured": ring_not_configured,
                 "read_consistency": c.read_consistency,
                 "write_consistency": c.write_consistency,
                 "ready": ctx.backend.is_ready(),

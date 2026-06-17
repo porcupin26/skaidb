@@ -7,6 +7,7 @@
 
 use std::io;
 use std::net::TcpStream;
+use std::time::Duration;
 
 use skaidb_proto::{read_frame, write_frame};
 use skaidb_sql::ast::{BinaryOp, Expr, UnaryOp};
@@ -501,6 +502,22 @@ pub(crate) fn frame_decode(framed: &[u8]) -> Result<Vec<u8>, WireError> {
 pub fn call(addr: &str, req: &Request) -> io::Result<Response> {
     let mut stream = TcpStream::connect(addr)?;
     stream.set_nodelay(true).ok();
+    roundtrip(&mut stream, req)
+}
+
+/// Like [`call`], but bounds the connect and the read/write round-trip by
+/// `timeout` so an unreachable peer fails fast instead of blocking on the OS
+/// connect timeout — used for liveness probing (e.g. `\cluster` reachability).
+pub fn call_timeout(addr: &str, req: &Request, timeout: Duration) -> io::Result<Response> {
+    use std::net::ToSocketAddrs;
+    let sock = addr
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "no address"))?;
+    let mut stream = TcpStream::connect_timeout(&sock, timeout)?;
+    stream.set_nodelay(true).ok();
+    stream.set_read_timeout(Some(timeout)).ok();
+    stream.set_write_timeout(Some(timeout)).ok();
     roundtrip(&mut stream, req)
 }
 
