@@ -475,14 +475,14 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "skaidb-auth"
-version = "0.16.2"
+version = "0.16.3"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "skaidb-cli"
-version = "0.16.2"
+version = "0.16.3"
 dependencies = [
  "clap",
  "rustyline",
@@ -496,7 +496,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-cluster"
-version = "0.16.2"
+version = "0.16.3"
 dependencies = [
  "rustls",
  "rustls-pemfile",
@@ -511,7 +511,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-config"
-version = "0.16.2"
+version = "0.16.3"
 dependencies = [
  "clap",
  "serde",
@@ -522,7 +522,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-driver"
-version = "0.16.2"
+version = "0.16.3"
 dependencies = [
  "skaidb-auth",
  "skaidb-proto",
@@ -532,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-engine"
-version = "0.16.2"
+version = "0.16.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -544,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-proto"
-version = "0.16.2"
+version = "0.16.3"
 dependencies = [
  "skaidb-types",
  "thiserror",
@@ -552,7 +552,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-server"
-version = "0.16.2"
+version = "0.16.3"
 dependencies = [
  "clap",
  "serde_json",
@@ -568,7 +568,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-sql"
-version = "0.16.2"
+version = "0.16.3"
 dependencies = [
  "skaidb-types",
  "thiserror",
@@ -576,7 +576,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-storage"
-version = "0.16.2"
+version = "0.16.3"
 dependencies = [
  "brotli",
  "lz4_flex",
@@ -586,7 +586,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-types"
-version = "0.16.2"
+version = "0.16.3"
 dependencies = [
  "serde",
  "serde_json",
