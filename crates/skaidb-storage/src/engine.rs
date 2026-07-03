@@ -20,10 +20,12 @@ use crate::error::{Result, StorageError};
 use crate::hlc::{Hlc, HlcClock};
 use crate::memtable::{Memtable, VersionValue};
 use crate::sstable::{SsTable, SstEntry};
-use crate::wal::{Wal, WalCommit, WalOp, WalRecord, WalSync};
+use crate::wal::{Wal, WalCommit, WalOp, WalSync};
 
-/// The latest version of each key, keyed by storage key (used by merged reads).
-type MergedRows = std::collections::BTreeMap<Vec<u8>, (Hlc, VersionValue)>;
+/// One key's winning `(key, stamp, version)` as produced by the k-way merge.
+type MergeItem = (Vec<u8>, Hlc, VersionValue);
+/// A key-ordered source feeding the k-way merge (memtable or one SSTable).
+type MergeSource<'a> = Box<dyn Iterator<Item = Result<MergeItem>> + 'a>;
 
 /// A live key/value pair together with its version stamp.
 pub type VersionedRow = (Vec<u8>, Vec<u8>, Hlc);
@@ -193,19 +195,15 @@ impl Engine {
 
     /// Append a record to the WAL and apply it to the memtable, returning the
     /// commit point — **without** fsync. Callers make it durable separately
-    /// (immediately, or batched outside a lock for group commit).
-    fn append_buffered(
-        &mut self,
-        key: &[u8],
-        hlc: Hlc,
-        op: WalOp,
-        value: VersionValue,
-    ) -> Result<WalCommit> {
-        let commit = self.wal.append(&WalRecord {
-            hlc,
-            key: key.to_vec(),
-            op,
-        })?;
+    /// (immediately, or batched outside a lock for group commit). The value is
+    /// encoded into the WAL frame from a borrow and moved into the memtable —
+    /// no intermediate copies.
+    fn append_buffered(&mut self, key: &[u8], hlc: Hlc, value: VersionValue) -> Result<WalCommit> {
+        let wal_value = match &value {
+            VersionValue::Put(bytes) => Some(bytes.as_slice()),
+            VersionValue::Delete => None,
+        };
+        let commit = self.wal.append_op(hlc, key, wal_value)?;
         self.mem.insert(key.to_vec(), hlc, value);
         // Every write supersedes any cached SSTable result for this key. This is
         // what keeps the read cache correct across flush/compaction.
@@ -217,12 +215,7 @@ impl Engine {
     /// Write `value` under `key`, returning the version stamp assigned.
     pub fn put(&mut self, key: &[u8], value: Vec<u8>) -> Result<Hlc> {
         let hlc = self.clock.now();
-        let commit = self.append_buffered(
-            key,
-            hlc,
-            WalOp::Put(value.clone()),
-            VersionValue::Put(value),
-        )?;
+        let commit = self.append_buffered(key, hlc, VersionValue::Put(value))?;
         self.wal.commit_sync(commit)?;
         Ok(hlc)
     }
@@ -230,9 +223,26 @@ impl Engine {
     /// Delete `key` (writes a tombstone), returning the version stamp assigned.
     pub fn delete(&mut self, key: &[u8]) -> Result<Hlc> {
         let hlc = self.clock.now();
-        let commit = self.append_buffered(key, hlc, WalOp::Delete, VersionValue::Delete)?;
+        let commit = self.append_buffered(key, hlc, VersionValue::Delete)?;
         self.wal.commit_sync(commit)?;
         Ok(hlc)
+    }
+
+    /// Like [`Engine::put`] but **without** the fsync: returns the commit
+    /// point so a caller writing many rows in one statement can make them all
+    /// durable with a single [`WalSync::sync_through`] (group commit) instead
+    /// of one fsync per row. Pair with [`Engine::wal_sync_handle`].
+    pub fn put_deferred(&mut self, key: &[u8], value: Vec<u8>) -> Result<(Hlc, WalCommit)> {
+        let hlc = self.clock.now();
+        let commit = self.append_buffered(key, hlc, VersionValue::Put(value))?;
+        Ok((hlc, commit))
+    }
+
+    /// Deferred-durability [`Engine::delete`]; see [`Engine::put_deferred`].
+    pub fn delete_deferred(&mut self, key: &[u8]) -> Result<(Hlc, WalCommit)> {
+        let hlc = self.clock.now();
+        let commit = self.append_buffered(key, hlc, VersionValue::Delete)?;
+        Ok((hlc, commit))
     }
 
     /// Apply a write at a caller-supplied stamp (replication: a replica stores
@@ -258,18 +268,13 @@ impl Engine {
         hlc: Hlc,
     ) -> Result<WalCommit> {
         self.clock.observe(hlc);
-        self.append_buffered(
-            key,
-            hlc,
-            WalOp::Put(value.clone()),
-            VersionValue::Put(value),
-        )
+        self.append_buffered(key, hlc, VersionValue::Put(value))
     }
 
     /// Buffered replicated delete (no fsync); see [`Engine::append_put_buffered`].
     pub fn append_delete_buffered(&mut self, key: &[u8], hlc: Hlc) -> Result<WalCommit> {
         self.clock.observe(hlc);
-        self.append_buffered(key, hlc, WalOp::Delete, VersionValue::Delete)
+        self.append_buffered(key, hlc, VersionValue::Delete)
     }
 
     /// Durability coordinator handle, to `sync_through` a buffered commit after
@@ -342,27 +347,30 @@ impl Engine {
     /// Full scan of the latest live key/value pairs across all sources, in key
     /// order.
     pub fn scan(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        Ok(self
-            .merged()?
-            .into_iter()
-            .filter_map(|(k, (_, v))| match v {
-                VersionValue::Put(bytes) => Some((k, bytes)),
-                VersionValue::Delete => None,
-            })
-            .collect())
+        self.scan_iter().collect()
+    }
+
+    /// Streaming [`Engine::scan`]: yields rows one at a time via a k-way merge
+    /// of the memtable and SSTable block iterators — O(sources × block) memory
+    /// instead of materializing the table, and early-stop friendly.
+    pub fn scan_iter(&self) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + '_ {
+        self.merged_iter().filter_map(|item| match item {
+            Ok((k, _, VersionValue::Put(bytes))) => Some(Ok((k, bytes))),
+            Ok((_, _, VersionValue::Delete)) => None,
+            Err(e) => Some(Err(e)),
+        })
     }
 
     /// Like [`Engine::scan`] but also returns each row's version stamp, so a
     /// coordinator can resolve replicas by last-writer-wins (SPEC §5).
     pub fn scan_versioned(&self) -> Result<Vec<VersionedRow>> {
-        Ok(self
-            .merged()?
-            .into_iter()
-            .filter_map(|(k, (hlc, v))| match v {
-                VersionValue::Put(bytes) => Some((k, bytes, hlc)),
-                VersionValue::Delete => None,
+        self.merged_iter()
+            .filter_map(|item| match item {
+                Ok((k, hlc, VersionValue::Put(bytes))) => Some(Ok((k, bytes, hlc))),
+                Ok((_, _, VersionValue::Delete)) => None,
+                Err(e) => Some(Err(e)),
             })
-            .collect())
+            .collect()
     }
 
     /// Like [`Engine::scan_versioned`] but **includes tombstones** (as
@@ -370,28 +378,28 @@ impl Engine {
     /// must see deletes to resolve them by last-writer-wins — otherwise a stale
     /// `Put` on one replica could mask a newer delete on another.
     pub fn scan_versioned_with_tombstones(&self) -> Result<Vec<VersionedTombstoneRow>> {
-        Ok(self
-            .merged()?
-            .into_iter()
-            .map(|(k, (hlc, v))| match v {
+        self.scan_versioned_with_tombstones_iter().collect()
+    }
+
+    /// Streaming [`Engine::scan_versioned_with_tombstones`].
+    pub fn scan_versioned_with_tombstones_iter(
+        &self,
+    ) -> impl Iterator<Item = Result<VersionedTombstoneRow>> + '_ {
+        self.merged_iter().map(|item| {
+            item.map(|(k, hlc, v)| match v {
                 VersionValue::Put(bytes) => (k, hlc, Some(bytes)),
                 VersionValue::Delete => (k, hlc, None),
             })
-            .collect())
+        })
     }
 
     /// Scan only the live keys that start with `prefix`, in key order. Used by
     /// secondary indexes, whose entries are prefixed by the indexed value.
+    /// Delegates to [`Engine::scan_range`], so cost is proportional to the
+    /// matching key range — not the table.
     pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        Ok(self
-            .merged()?
-            .into_iter()
-            .filter(|(k, _)| k.starts_with(prefix))
-            .filter_map(|(k, (_, v))| match v {
-                VersionValue::Put(bytes) => Some((k, bytes)),
-                VersionValue::Delete => None,
-            })
-            .collect())
+        let end = prefix_upper_bound(prefix);
+        self.scan_range(Some(prefix), end.as_deref())
     }
 
     /// Scan live keys in the half-open byte range `[start, end)`, in key order.
@@ -403,58 +411,38 @@ impl Engine {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        use std::collections::BTreeMap;
-        let mut merged: BTreeMap<Vec<u8>, (Hlc, VersionValue)> = BTreeMap::new();
-        let mut consider = |key: Vec<u8>, hlc: Hlc, value: VersionValue| {
-            merged
-                .entry(key)
-                .and_modify(|cur| {
-                    if hlc > cur.0 {
-                        *cur = (hlc, value.clone());
-                    }
-                })
-                .or_insert((hlc, value));
-        };
-        for (key, hlc, value) in self.mem.range_latest(start, end) {
-            consider(key, hlc, value);
-        }
+        let mut sources: Vec<MergeSource<'_>> = Vec::with_capacity(1 + self.sstable_count());
+        sources.push(Box::new(self.mem.range_latest(start, end).into_iter().map(Ok)));
         for sst in self.sstables_newest_first() {
-            for e in sst.range(start, end)? {
-                consider(e.key, e.hlc, e.value);
-            }
+            let entries = sst.range(start, end)?;
+            sources.push(Box::new(
+                entries.into_iter().map(|e| Ok((e.key, e.hlc, e.value))),
+            ));
         }
-        Ok(merged
-            .into_iter()
-            .filter_map(|(k, (_, v))| match v {
-                VersionValue::Put(bytes) => Some((k, bytes)),
-                VersionValue::Delete => None,
+        KWayMerge::new(sources)
+            .filter_map(|item| match item {
+                Ok((k, _, VersionValue::Put(bytes))) => Some(Ok((k, bytes))),
+                Ok((_, _, VersionValue::Delete)) => None,
+                Err(e) => Some(Err(e)),
             })
-            .collect())
+            .collect()
     }
 
-    /// Merge all sources into the latest version per key (newest stamp wins).
-    fn merged(&self) -> Result<MergedRows> {
-        use std::collections::BTreeMap;
-        let mut merged: MergedRows = BTreeMap::new();
-        let mut consider = |key: Vec<u8>, hlc: Hlc, value: VersionValue| {
-            merged
-                .entry(key)
-                .and_modify(|cur| {
-                    if hlc > cur.0 {
-                        *cur = (hlc, value.clone());
-                    }
-                })
-                .or_insert((hlc, value));
-        };
-        for (key, hlc, value) in self.mem.iter_latest_entries() {
-            consider(key, hlc, value);
-        }
+    /// Stream the latest version per key (newest stamp wins) across the
+    /// memtable and all SSTables, in key order.
+    fn merged_iter(&self) -> KWayMerge<'_> {
+        let mut sources: Vec<MergeSource<'_>> = Vec::with_capacity(1 + self.sstable_count());
+        sources.push(Box::new(
+            self.mem
+                .iter_latest_lazy()
+                .map(|(k, hlc, v)| Ok((k.to_vec(), hlc, v.clone()))),
+        ));
         for sst in self.sstables_newest_first() {
-            for e in sst.entries()? {
-                consider(e.key, e.hlc, e.value);
-            }
+            sources.push(Box::new(
+                sst.iter().map(|r| r.map(|e| (e.key, e.hlc, e.value))),
+            ));
         }
-        Ok(merged)
+        KWayMerge::new(sources)
     }
 
     /// Force the active memtable to flush to an SSTable (no-op if empty).
@@ -462,15 +450,16 @@ impl Engine {
         if self.mem.is_empty() {
             return Ok(());
         }
-        let entries: Vec<SstEntry> = self
-            .mem
-            .iter_latest_entries()
-            .into_iter()
-            .map(|(key, hlc, value)| SstEntry { key, hlc, value })
-            .collect();
-
+        let path = self.next_table_path();
         let codec = self.opts.compression;
-        let (sst, _path) = self.write_table(&entries, codec)?;
+        let entries = self.mem.iter_latest_lazy().map(|(key, hlc, value)| {
+            Ok(SstEntry {
+                key: key.to_vec(),
+                hlc,
+                value: value.clone(),
+            })
+        });
+        let sst = SsTable::write_stream(&path, entries, self.mem.version_count(), codec)?;
         self.l0.insert(0, sst);
 
         self.mem = Memtable::new();
@@ -497,23 +486,27 @@ impl Engine {
     /// dropped. Crash-safe: the new table is written and the manifest repointed
     /// before any old file is removed.
     pub fn retain(&mut self, keep: impl Fn(&[u8]) -> bool) -> Result<usize> {
-        let all = self.scan_versioned_with_tombstones()?;
-        let dropped = all.iter().filter(|(k, _, _)| !keep(k)).count();
-        if dropped == 0 {
-            return Ok(0);
-        }
-        let entries: Vec<SstEntry> = all
-            .into_iter()
-            .filter(|(k, _, _)| keep(k))
-            .map(|(key, hlc, value)| SstEntry {
+        // Stream the merged view, keeping only survivors in memory.
+        let mut dropped = 0usize;
+        let mut entries: Vec<SstEntry> = Vec::new();
+        for row in self.scan_versioned_with_tombstones_iter() {
+            let (key, hlc, value) = row?;
+            if !keep(&key) {
+                dropped += 1;
+                continue;
+            }
+            entries.push(SstEntry {
                 key,
                 hlc,
                 value: match value {
                     Some(bytes) => VersionValue::Put(bytes),
                     None => VersionValue::Delete,
                 },
-            })
-            .collect();
+            });
+        }
+        if dropped == 0 {
+            return Ok(0);
+        }
 
         let old_paths: Vec<PathBuf> = self
             .l0
@@ -526,7 +519,14 @@ impl Engine {
         let new_table = if entries.is_empty() {
             None
         } else {
-            Some(self.write_table(&entries, self.opts.bottom_compression)?.0)
+            let path = self.next_table_path();
+            let count = entries.len();
+            Some(SsTable::write_stream(
+                &path,
+                entries.into_iter().map(Ok),
+                count,
+                self.opts.bottom_compression,
+            )?)
         };
 
         self.l0.clear();
@@ -585,13 +585,14 @@ impl Engine {
         }
     }
 
-    /// Live-key and tombstone counts via a full merged scan (O(rows)).
+    /// Live-key and tombstone counts via a full merged scan (O(rows) time,
+    /// O(block) memory — the scan streams).
     pub fn key_stats(&self) -> Result<KeyStats> {
         let mut stats = KeyStats::default();
-        for (_, _, value) in self.scan_versioned_with_tombstones()? {
-            match value {
-                Some(_) => stats.live_keys += 1,
-                None => stats.tombstones += 1,
+        for item in self.merged_iter() {
+            match item?.2 {
+                VersionValue::Put(_) => stats.live_keys += 1,
+                VersionValue::Delete => stats.tombstones += 1,
             }
         }
         Ok(stats)
@@ -618,12 +619,11 @@ impl Engine {
         }
     }
 
-    fn write_table(&mut self, entries: &[SstEntry], codec: Codec) -> Result<(SsTable, PathBuf)> {
+    /// Reserve the next SSTable sequence number and return its path.
+    fn next_table_path(&mut self) -> PathBuf {
         let seq = self.next_seq;
         self.next_seq += 1;
-        let path = self.dir.join("sst").join(format!("{seq:020}.sst"));
-        let sst = SsTable::write(&path, entries, codec)?;
-        Ok((sst, path))
+        self.dir.join("sst").join(format!("{seq:020}.sst"))
     }
 
     /// Compact when level 0 has accumulated too many tables, cascading deeper.
@@ -633,16 +633,15 @@ impl Engine {
         }
 
         // Merge all L0 tables and the existing L1 (if any) into a new L1 run.
+        let path = self.next_table_path();
+        let deepest = self.levels.len() <= 1;
+        let codec = self.codec_for(deepest);
         let mut sources: Vec<&SsTable> = self.l0.iter().collect();
         if let Some(l1) = self.levels.first() {
             sources.push(l1);
         }
-        let deepest = self.levels.len() <= 1;
-        let merged = merge_tables(&sources, deepest)?;
         let old_paths = collect_paths(&self.l0, self.levels.first());
-
-        let codec = self.codec_for(deepest);
-        let (new_l1, _) = self.write_table(&merged, codec)?;
+        let new_l1 = merge_write(&path, &sources, deepest, codec)?;
         self.compactions += 1;
         self.compaction_bytes += new_l1.disk_len();
         self.l0.clear();
@@ -662,18 +661,18 @@ impl Engine {
             }
             let has_next = level + 1 < self.levels.len();
             let deepest = !has_next;
+            let path = self.next_table_path();
+            let codec = self.codec_for(deepest);
             let mut sources: Vec<&SsTable> = vec![&self.levels[level]];
             if has_next {
                 sources.push(&self.levels[level + 1]);
             }
-            let merged = merge_tables(&sources, deepest)?;
             let mut old_paths = vec![self.levels[level].path().to_path_buf()];
             if has_next {
                 old_paths.push(self.levels[level + 1].path().to_path_buf());
             }
 
-            let codec = self.codec_for(deepest);
-            let (new_run, _) = self.write_table(&merged, codec)?;
+            let new_run = merge_write(&path, &sources, deepest, codec)?;
             self.compactions += 1;
             self.compaction_bytes += new_run.disk_len();
             if has_next {
@@ -699,10 +698,20 @@ impl Engine {
         for (i, sst) in self.levels.iter().enumerate() {
             lines.push_str(&format!("{} {}\n", i + 1, file_name(sst.path())));
         }
-        let manifest = self.dir.join("sst").join("MANIFEST");
-        let tmp = self.dir.join("sst").join("MANIFEST.tmp");
-        std::fs::write(&tmp, lines)?;
+        let sst_dir = self.dir.join("sst");
+        let manifest = sst_dir.join("MANIFEST");
+        let tmp = sst_dir.join("MANIFEST.tmp");
+        // fsync the tmp file before the rename and the directory after, so a
+        // crash can't leave the manifest pointing at unwritten data or lose
+        // the rename itself.
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(lines.as_bytes())?;
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp, &manifest)?;
+        std::fs::File::open(&sst_dir)?.sync_all()?;
         Ok(())
     }
 }
@@ -721,29 +730,104 @@ fn file_name(path: &Path) -> String {
         .to_string()
 }
 
-/// Merge `sources` (ordered newest → oldest) into a deduplicated, key-sorted
-/// run keeping the highest-stamped version of each key. When `drop_tombstones`
-/// is set (merging into the deepest level), delete markers are discarded.
-fn merge_tables(sources: &[&SsTable], drop_tombstones: bool) -> Result<Vec<SstEntry>> {
-    use std::collections::BTreeMap;
-    let mut merged: BTreeMap<Vec<u8>, (Hlc, VersionValue)> = BTreeMap::new();
-    for sst in sources {
-        for e in sst.entries()? {
-            merged
-                .entry(e.key)
-                .and_modify(|cur| {
-                    if e.hlc > cur.0 {
-                        *cur = (e.hlc, e.value.clone());
-                    }
-                })
-                .or_insert((e.hlc, e.value));
-        }
+/// A k-way merge over key-ordered sources, each yielding unique keys. Sources
+/// are ordered newest → oldest; for a key held by several sources the highest
+/// stamp wins, and on equal stamps the earlier (newer) source wins — the same
+/// resolution the old map-based merge applied. Streams: holds one buffered
+/// item per source, never the whole dataset.
+struct KWayMerge<'a> {
+    iters: Vec<MergeSource<'a>>,
+    /// One buffered head per source (`None` = needs refill or exhausted).
+    heads: Vec<Option<MergeItem>>,
+}
+
+impl<'a> KWayMerge<'a> {
+    fn new(iters: Vec<MergeSource<'a>>) -> KWayMerge<'a> {
+        let heads = iters.iter().map(|_| None).collect();
+        KWayMerge { iters, heads }
     }
-    Ok(merged
-        .into_iter()
-        .filter(|(_, (_, v))| !(drop_tombstones && matches!(v, VersionValue::Delete)))
-        .map(|(key, (hlc, value))| SstEntry { key, hlc, value })
-        .collect())
+}
+
+impl Iterator for KWayMerge<'_> {
+    type Item = Result<MergeItem>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for (iter, head) in self.iters.iter_mut().zip(self.heads.iter_mut()) {
+            if head.is_none() {
+                match iter.next() {
+                    Some(Ok(item)) => *head = Some(item),
+                    Some(Err(e)) => return Some(Err(e)),
+                    None => {}
+                }
+            }
+        }
+        // Winner: smallest key; among equal keys the highest stamp, with the
+        // earlier (newer) source breaking stamp ties.
+        let mut win: Option<usize> = None;
+        for i in 0..self.heads.len() {
+            let Some((key, hlc, _)) = self.heads[i].as_ref() else {
+                continue;
+            };
+            win = Some(match win {
+                None => i,
+                Some(w) => {
+                    let (wkey, whlc, _) = self.heads[w].as_ref().expect("winner head");
+                    if key < wkey || (key == wkey && hlc > whlc) {
+                        i
+                    } else {
+                        w
+                    }
+                }
+            });
+        }
+        let item = self.heads[win?].take().expect("winner head");
+        // Discard superseded versions of the same key in the other sources.
+        for head in &mut self.heads {
+            if head.as_ref().is_some_and(|(k, _, _)| *k == item.0) {
+                *head = None;
+            }
+        }
+        Some(Ok(item))
+    }
+}
+
+/// Merge `sources` (ordered newest → oldest) into a new key-sorted table at
+/// `path`, keeping the highest-stamped version of each key. When
+/// `drop_tombstones` is set (merging into the deepest level), delete markers
+/// are discarded. Fully streaming: block-in, block-out.
+fn merge_write(
+    path: &Path,
+    sources: &[&SsTable],
+    drop_tombstones: bool,
+    codec: Codec,
+) -> Result<SsTable> {
+    let approx: u64 = sources.iter().map(|s| s.len()).sum();
+    let iters: Vec<MergeSource<'_>> = sources
+        .iter()
+        .map(|sst| {
+            Box::new(sst.iter().map(|r| r.map(|e| (e.key, e.hlc, e.value)))) as MergeSource<'_>
+        })
+        .collect();
+    let entries = KWayMerge::new(iters).filter_map(|item| match item {
+        Ok((_, _, VersionValue::Delete)) if drop_tombstones => None,
+        Ok((key, hlc, value)) => Some(Ok(SstEntry { key, hlc, value })),
+        Err(e) => Some(Err(e)),
+    });
+    SsTable::write_stream(path, entries, approx as usize, codec)
+}
+
+/// Smallest byte string greater than every key starting with `prefix`, or
+/// `None` (unbounded) when the prefix is empty or all `0xFF`.
+fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(&last) = end.last() {
+        if last < 0xFF {
+            *end.last_mut().expect("non-empty") = last + 1;
+            return Some(end);
+        }
+        end.pop();
+    }
+    None
 }
 
 fn collect_paths(l0: &[SsTable], l1: Option<&SsTable>) -> Vec<PathBuf> {

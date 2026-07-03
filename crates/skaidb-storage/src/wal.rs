@@ -59,22 +59,6 @@ pub struct WalCommit {
 }
 
 impl WalRecord {
-    fn encode_payload(&self) -> Vec<u8> {
-        let mut p = Vec::new();
-        match &self.op {
-            WalOp::Put(_) => p.push(OP_PUT),
-            WalOp::Delete => p.push(OP_DELETE),
-        }
-        p.extend_from_slice(&self.hlc.to_bytes());
-        p.extend_from_slice(&(self.key.len() as u32).to_le_bytes());
-        p.extend_from_slice(&self.key);
-        if let WalOp::Put(val) = &self.op {
-            p.extend_from_slice(&(val.len() as u32).to_le_bytes());
-            p.extend_from_slice(val);
-        }
-        p
-    }
-
     fn decode_payload(p: &[u8], offset: u64) -> Result<WalRecord> {
         let corrupt = |detail| StorageError::Corruption { offset, detail };
         let mut cur = 0usize;
@@ -202,11 +186,29 @@ impl Wal {
     /// Appends must be serialized by the caller (the engine's write lock); the
     /// returned [`WalCommit`] is made durable later via [`WalSync::sync_through`].
     pub fn append(&self, record: &WalRecord) -> Result<WalCommit> {
-        let payload = record.encode_payload();
-        let mut frame = Vec::with_capacity(payload.len() + 8);
-        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        frame.extend_from_slice(&payload);
-        frame.extend_from_slice(&crc32(&payload).to_le_bytes());
+        let value = match &record.op {
+            WalOp::Put(val) => Some(val.as_slice()),
+            WalOp::Delete => None,
+        };
+        self.append_op(record.hlc, &record.key, value)
+    }
+
+    /// Append a mutation encoded directly from its borrowed parts (`Some` value
+    /// = put, `None` = delete), building the frame in one pre-sized buffer —
+    /// key and value bytes are copied exactly once.
+    pub fn append_op(&self, hlc: Hlc, key: &[u8], value: Option<&[u8]>) -> Result<WalCommit> {
+        let payload_len = 1 + 12 + 4 + key.len() + value.map_or(0, |v| 4 + v.len());
+        let mut frame = Vec::with_capacity(4 + payload_len + 4);
+        frame.extend_from_slice(&(payload_len as u32).to_le_bytes());
+        frame.push(if value.is_some() { OP_PUT } else { OP_DELETE });
+        frame.extend_from_slice(&hlc.to_bytes());
+        frame.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        frame.extend_from_slice(key);
+        if let Some(val) = value {
+            frame.extend_from_slice(&(val.len() as u32).to_le_bytes());
+            frame.extend_from_slice(val);
+        }
+        frame.extend_from_slice(&crc32(&frame[4..]).to_le_bytes());
 
         let offset = self.sync.write_offset.load(Ordering::SeqCst);
         write_all_at(&self.sync.file, &frame, offset)?;

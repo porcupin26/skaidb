@@ -130,7 +130,7 @@ pub fn compare(l: &Value, r: &Value) -> Option<Ordering> {
 }
 
 /// Numeric projection for cross-type numeric comparison/arithmetic.
-fn as_number(v: &Value) -> Option<f64> {
+pub(crate) fn as_number(v: &Value) -> Option<f64> {
     match v {
         Value::Int(i) => Some(*i as f64),
         Value::Float(f) => Some(*f),

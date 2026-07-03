@@ -11,20 +11,25 @@ use crate::slowlog::SlowLog;
 use skaidb_auth::{Object, Privilege, RoleStore};
 use skaidb_cluster::{ClusterStats, Consistency as ClusterConsistency, Node};
 use skaidb_config::Config;
-use skaidb_engine::{Database, DbStats, EngineError, QueryOutput, SessionEffect, DEFAULT_DATABASE};
+use skaidb_engine::{
+    statement_is_read_only, Database, DbStats, EngineError, QueryOutput, SessionEffect,
+    DEFAULT_DATABASE,
+};
 use skaidb_proto::{Consistency as ProtoConsistency, Response};
-use skaidb_sql::ast::Statement;
+use skaidb_sql::{ast::Statement, ParseError};
 
 use crate::audit::AuditSettings;
 use crate::authn::AuthState;
-use crate::metrics::Metrics;
+use crate::metrics::{ErrorClass, Metrics, QueryType, TxKind};
 
 /// Where statements actually execute: a local single-node engine, or the
-/// cluster coordinator that replicates across nodes.
+/// cluster coordinator that replicates across nodes. The local engine sits
+/// behind an `RwLock` so read-only statements share a read lock (concurrent
+/// SELECTs) while writes stay exclusive.
 #[derive(Debug)]
 pub enum Backend {
     // Boxed so the enum isn't dominated by the large embedded `Database`.
-    Local(Box<Mutex<Database>>),
+    Local(Box<RwLock<Database>>),
     Cluster(Arc<Node>),
 }
 
@@ -33,18 +38,38 @@ impl Backend {
     /// resolving names against it and replicating database/table DDL across the
     /// cluster. `USE` returns [`SessionEffect::UseDatabase`] for the caller to
     /// apply to the connection's current-database state.
+    ///
+    /// `parsed` is the one-and-only parse of `sql` (done by the caller, which
+    /// also uses it for the privilege check): the local engine executes the
+    /// pre-parsed statement directly, while the cluster path forwards the raw
+    /// SQL over the wire.
     fn execute_session(
         &self,
         current_db: &str,
         sql: &str,
+        parsed: Result<Statement, ParseError>,
         consistency: Option<ClusterConsistency>,
     ) -> Result<SessionEffect, EngineError> {
         match self {
             // The embedded engine is single-node; consistency does not apply.
-            Backend::Local(db) => db
-                .lock()
-                .map_err(|_| EngineError::Cluster("server lock poisoned".into()))?
-                .execute_session(current_db, sql),
+            Backend::Local(db) => {
+                // SQL that fails to parse errors here with the same
+                // `EngineError::Parse` the engine itself would have raised.
+                let stmt = parsed?;
+                // Read-only statements (SELECT / SHOW …) execute under a shared
+                // lock so concurrent readers run in parallel instead of
+                // serializing; anything else takes the exclusive path.
+                if statement_is_read_only(&stmt) {
+                    return db
+                        .read()
+                        .map_err(|_| EngineError::Cluster("server lock poisoned".into()))?
+                        .execute_session_read_statement(current_db, stmt)
+                        .map(SessionEffect::Output);
+                }
+                db.write()
+                    .map_err(|_| EngineError::Cluster("server lock poisoned".into()))?
+                    .execute_session_statement(current_db, stmt)
+            }
             Backend::Cluster(node) => node.execute_session_with(current_db, sql, consistency),
         }
     }
@@ -53,7 +78,7 @@ impl Backend {
     /// storage lock is currently unavailable (poisoned).
     pub fn db_stats(&self, per_table: bool) -> Option<DbStats> {
         match self {
-            Backend::Local(db) => db.lock().ok().map(|d| d.stats(per_table)),
+            Backend::Local(db) => db.read().ok().map(|d| d.stats(per_table)),
             Backend::Cluster(node) => node.db_stats(per_table),
         }
     }
@@ -70,7 +95,7 @@ impl Backend {
     /// lockable (not poisoned). Distinct from process liveness.
     pub fn is_ready(&self) -> bool {
         match self {
-            Backend::Local(db) => db.lock().is_ok(),
+            Backend::Local(db) => db.read().is_ok(),
             Backend::Cluster(node) => node.db_stats(false).is_some(),
         }
     }
@@ -337,20 +362,25 @@ pub fn execute_session_as(
     sql: &str,
     consistency: Option<ProtoConsistency>,
 ) -> Response {
+    // Parse once; the same result drives the privilege check, the lock-mode
+    // choice, and (on the local backend) execution itself. SQL that fails to
+    // parse skips the check — the backend then reports the parse error.
+    let parsed = skaidb_sql::parse(sql);
+
     // Authorization: check the role may perform the statement before executing.
-    if let Some((privilege, object)) = required_privilege(sql) {
+    if let Some((privilege, object)) = parsed.as_ref().ok().and_then(required_privilege) {
         if !ctx.roles.has_privilege(role, privilege, &object) {
-            ctx.metrics.incr("skaidb_authz_denied_total");
+            ctx.metrics.incr_authz_denied();
             return Response::Error(format!("permission denied: {privilege:?} on {object:?}"));
         }
     }
 
     let start = Instant::now();
-    ctx.metrics.gauge_inc("skaidb_queries_in_flight");
+    ctx.metrics.inc_queries_in_flight();
 
     let response = match ctx
         .backend
-        .execute_session(current_db, sql, consistency.map(map_consistency))
+        .execute_session(current_db, sql, parsed, consistency.map(map_consistency))
     {
         Ok(SessionEffect::Output(QueryOutput::Rows(rs))) => Response::Rows {
             columns: rs.columns,
@@ -368,7 +398,7 @@ pub fn execute_session_as(
         Err(e) => Response::Error(e.to_string()),
     };
 
-    ctx.metrics.gauge_dec("skaidb_queries_in_flight");
+    ctx.metrics.dec_queries_in_flight();
     let elapsed = start.elapsed();
     let elapsed_ms = elapsed.as_millis() as u64;
     record_metrics(ctx, sql, elapsed.as_secs_f64(), elapsed_ms, &response);
@@ -390,43 +420,34 @@ fn record_metrics(
     response: &Response,
 ) {
     let kind = statement_type(sql);
-    ctx.metrics
-        .incr(&format!("skaidb_queries_total{{type=\"{kind}\"}}"));
-    ctx.metrics.observe(
-        &format!("skaidb_query_duration_seconds{{type=\"{kind}\"}}"),
-        elapsed_secs,
-    );
+    ctx.metrics.incr_query(kind);
+    ctx.metrics.observe_query_duration(kind, elapsed_secs);
 
     match response {
         Response::Rows { columns, rows } => {
-            ctx.metrics
-                .add("skaidb_rows_returned_total", rows.len() as u64);
+            ctx.metrics.add_rows_returned(rows.len() as u64);
             // Cells returned ≈ result width; a cheap proxy for result volume that
             // avoids re-serializing every row here (exact bytes are accounted at
             // the wire writer).
             let cells = (rows.len() * columns.len().max(1)) as u64;
-            ctx.metrics.add("skaidb_rows_scanned_total", cells);
+            ctx.metrics.add_rows_scanned(cells);
         }
         Response::Error(msg) => {
-            ctx.metrics.incr(&format!(
-                "skaidb_query_errors_total{{class=\"{}\"}}",
-                error_class(msg)
-            ));
+            ctx.metrics.incr_query_error(error_class(msg));
         }
         _ => {}
     }
 
     // Transaction control statements, split by kind.
-    if kind == "tx" {
+    if kind == QueryType::Tx {
         if let Some(tx) = tx_kind(sql) {
-            ctx.metrics
-                .incr(&format!("skaidb_transactions_total{{kind=\"{tx}\"}}"));
+            ctx.metrics.incr_transaction(tx);
         }
     }
 
     let slow_query_ms = ctx.audit().slow_query_ms;
     if slow_query_ms > 0 && elapsed_ms >= slow_query_ms {
-        ctx.metrics.incr("skaidb_slow_queries_total");
+        ctx.metrics.incr_slow_query();
         ctx.slow_log
             .record(&crate::audit::mask_sql(sql), elapsed_ms);
     }
@@ -434,58 +455,63 @@ fn record_metrics(
 
 /// Bucket an error message into a small, bounded set of classes so
 /// `skaidb_query_errors_total` is actionable without unbounded label values.
-fn error_class(msg: &str) -> &'static str {
+fn error_class(msg: &str) -> ErrorClass {
     let m = msg.to_ascii_lowercase();
     if m.contains("permission denied") {
-        "permission"
+        ErrorClass::Permission
     } else if m.contains("quorum") || m.contains("timeout") || m.contains("timed out") {
-        "timeout"
+        ErrorClass::Timeout
     } else if m.contains("parse")
         || m.contains("expected")
         || m.contains("syntax")
         || m.contains("unexpected")
     {
-        "parse"
+        ErrorClass::Parse
     } else if m.contains("constraint")
         || m.contains("primary key")
         || m.contains("already exists")
         || m.contains("does not exist")
         || m.contains("not found")
     {
-        "constraint"
+        ErrorClass::Constraint
     } else if m.contains("corrupt") || m.contains("io ") || m.contains("storage") {
-        "storage"
+        ErrorClass::Storage
     } else {
-        "other"
+        ErrorClass::Other
     }
 }
 
 /// The transaction-control kind for `skaidb_transactions_total`.
-fn tx_kind(sql: &str) -> Option<&'static str> {
-    let word = sql.split_whitespace().next()?.to_ascii_uppercase();
-    match word.as_str() {
-        "BEGIN" => Some("begin"),
-        "COMMIT" => Some("commit"),
-        "ROLLBACK" => Some("rollback"),
-        _ => None,
+fn tx_kind(sql: &str) -> Option<TxKind> {
+    let word = sql.split_whitespace().next()?;
+    if word.eq_ignore_ascii_case("BEGIN") {
+        Some(TxKind::Begin)
+    } else if word.eq_ignore_ascii_case("COMMIT") {
+        Some(TxKind::Commit)
+    } else if word.eq_ignore_ascii_case("ROLLBACK") {
+        Some(TxKind::Rollback)
+    } else {
+        None
     }
 }
 
-/// The privilege and object a statement requires (SPEC §8.2). Returns `None`
-/// when the SQL does not parse — the engine then reports the parse error.
-fn required_privilege(sql: &str) -> Option<(Privilege, Object)> {
-    Some(match skaidb_sql::parse(sql).ok()? {
-        Statement::Select(s) => (Privilege::Select, Object::Table(s.from)),
-        Statement::Insert(i) => (Privilege::Insert, Object::Table(i.table)),
-        Statement::Update(u) => (Privilege::Update, Object::Table(u.table)),
-        Statement::Delete(d) => (Privilege::Delete, Object::Table(d.table)),
+/// The privilege and object a statement requires (SPEC §8.2). Takes the
+/// already-parsed statement so the request's single parse is reused; callers
+/// skip the check entirely for SQL that does not parse — the engine then
+/// reports the parse error.
+fn required_privilege(stmt: &Statement) -> Option<(Privilege, Object)> {
+    Some(match stmt {
+        Statement::Select(s) => (Privilege::Select, Object::Table(s.from.clone())),
+        Statement::Insert(i) => (Privilege::Insert, Object::Table(i.table.clone())),
+        Statement::Update(u) => (Privilege::Update, Object::Table(u.table.clone())),
+        Statement::Delete(d) => (Privilege::Delete, Object::Table(d.table.clone())),
         Statement::CreateTable(_) => (Privilege::Create, Object::Global),
-        Statement::CreateIndex(ci) => (Privilege::Create, Object::Table(ci.table)),
-        Statement::CreateVectorIndex(ci) => (Privilege::Create, Object::Table(ci.table)),
-        Statement::DropTable { name, .. } => (Privilege::Drop, Object::Table(name)),
+        Statement::CreateIndex(ci) => (Privilege::Create, Object::Table(ci.table.clone())),
+        Statement::CreateVectorIndex(ci) => (Privilege::Create, Object::Table(ci.table.clone())),
+        Statement::DropTable { name, .. } => (Privilege::Drop, Object::Table(name.clone())),
         Statement::DropIndex { .. } => (Privilege::Drop, Object::Global),
         Statement::DropVectorIndex { .. } => (Privilege::Drop, Object::Global),
-        Statement::AlterTable(a) => (Privilege::Create, Object::Table(a.name)),
+        Statement::AlterTable(a) => (Privilege::Create, Object::Table(a.name.clone())),
         // Transaction control affects writes; gate it like a global write.
         Statement::Begin | Statement::Commit | Statement::Rollback => {
             (Privilege::Insert, Object::Global)
@@ -506,22 +532,30 @@ fn required_privilege(sql: &str) -> Option<(Privilege, Object)> {
 }
 
 /// Classify a statement by its leading keyword (for the `type` metric label).
-fn statement_type(sql: &str) -> &'static str {
+/// Case-insensitive without allocating — this runs on every statement.
+fn statement_type(sql: &str) -> QueryType {
     let word = sql
         .trim_start()
         .split(|c: char| c.is_whitespace() || c == '(')
         .next()
-        .unwrap_or("")
-        .to_ascii_uppercase();
-    match word.as_str() {
-        "SELECT" => "select",
-        "INSERT" => "insert",
-        "UPDATE" => "update",
-        "DELETE" => "delete",
-        "CREATE" | "DROP" | "ALTER" => "ddl",
-        "BEGIN" | "COMMIT" | "ROLLBACK" => "tx",
-        _ => "other",
-    }
+        .unwrap_or("");
+    const KEYWORDS: &[(&str, QueryType)] = &[
+        ("SELECT", QueryType::Select),
+        ("INSERT", QueryType::Insert),
+        ("UPDATE", QueryType::Update),
+        ("DELETE", QueryType::Delete),
+        ("CREATE", QueryType::Ddl),
+        ("DROP", QueryType::Ddl),
+        ("ALTER", QueryType::Ddl),
+        ("BEGIN", QueryType::Tx),
+        ("COMMIT", QueryType::Tx),
+        ("ROLLBACK", QueryType::Tx),
+    ];
+    KEYWORDS
+        .iter()
+        .find(|(kw, _)| word.eq_ignore_ascii_case(kw))
+        .map(|&(_, t)| t)
+        .unwrap_or(QueryType::Other)
 }
 
 #[cfg(test)]
@@ -530,9 +564,9 @@ mod tests {
 
     #[test]
     fn classifies_statements() {
-        assert_eq!(statement_type("  select * from t"), "select");
-        assert_eq!(statement_type("INSERT INTO t ..."), "insert");
-        assert_eq!(statement_type("CREATE TABLE t ..."), "ddl");
-        assert_eq!(statement_type("EXPLAIN ..."), "other");
+        assert_eq!(statement_type("  select * from t"), QueryType::Select);
+        assert_eq!(statement_type("INSERT INTO t ..."), QueryType::Insert);
+        assert_eq!(statement_type("CREATE TABLE t ..."), QueryType::Ddl);
+        assert_eq!(statement_type("EXPLAIN ..."), QueryType::Other);
     }
 }

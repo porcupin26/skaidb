@@ -30,6 +30,26 @@ impl Value {
         out
     }
 
+    /// Serialize losslessly (the [`Value::encode`] format), appending to `out`
+    /// — no intermediate allocation. Distinct from [`Value::encode_into`],
+    /// which appends the order-preserving *key* encoding.
+    pub fn encode_value_into(&self, out: &mut Vec<u8>) {
+        self.encode_value(out);
+    }
+
+    /// Encode a borrowed document exactly as `Value::Document(doc).encode()`
+    /// would, without cloning the document into a `Value` first.
+    pub fn encode_document(doc: &Document) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(tag::DOCUMENT);
+        out.extend_from_slice(&(doc.0.len() as u32).to_le_bytes());
+        for (k, v) in &doc.0 {
+            write_bytes(&mut out, k.as_bytes());
+            v.encode_value(&mut out);
+        }
+        out
+    }
+
     /// Deserialize a value previously produced by [`Value::encode`].
     pub fn decode(bytes: &[u8]) -> Result<Value, ValueError> {
         let mut cur = Cursor { bytes, pos: 0 };

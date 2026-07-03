@@ -43,6 +43,10 @@ rustyline = "18"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
 
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 

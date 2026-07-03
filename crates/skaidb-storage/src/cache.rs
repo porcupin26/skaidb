@@ -12,8 +12,9 @@
 //! key removes the entry, the cache can never hold a stale version — flush and
 //! compaction preserve the latest stored value, so untouched entries stay valid.
 //!
-//! Eviction is FIFO with a fixed capacity; the cache is `Send + Sync` (a single
-//! `Mutex`) so it can be shared across reader threads behind the engine.
+//! Eviction is FIFO with a fixed capacity; the cache is `Send + Sync` and
+//! **sharded** — keys hash to one of up to 16 independently locked shards, so
+//! concurrent readers don't serialize on a single mutex.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,10 +36,14 @@ pub struct CacheStats {
     pub entries: usize,
 }
 
+/// Upper bound on lock shards; small caches use fewer so the total entry
+/// bound stays exact.
+const MAX_SHARDS: usize = 16;
+
 #[derive(Debug)]
 pub struct ReadCache {
-    capacity: usize,
-    inner: Mutex<Inner>,
+    /// One FIFO map per shard; empty when the cache is disabled (capacity 0).
+    shards: Vec<Mutex<Inner>>,
     hits: AtomicU64,
     misses: AtomicU64,
     evictions: AtomicU64,
@@ -46,6 +51,8 @@ pub struct ReadCache {
 
 #[derive(Debug, Default)]
 struct Inner {
+    /// This shard's entry budget (the total capacity split across shards).
+    capacity: usize,
     map: HashMap<Vec<u8>, CachedRead>,
     /// Insertion order, for FIFO eviction. May contain keys already removed by
     /// `invalidate`; those are skipped (they're no longer in `map`).
@@ -55,22 +62,49 @@ struct Inner {
 impl ReadCache {
     /// Create a cache holding at most `capacity` entries (0 disables it).
     pub fn new(capacity: usize) -> ReadCache {
+        let n_shards = capacity.min(MAX_SHARDS);
+        let shards = (0..n_shards)
+            .map(|i| {
+                // Split the budget evenly; the first shards absorb the remainder
+                // so per-shard capacities sum exactly to `capacity`.
+                let cap = capacity / n_shards + usize::from(i < capacity % n_shards);
+                Mutex::new(Inner {
+                    capacity: cap,
+                    ..Inner::default()
+                })
+            })
+            .collect();
         ReadCache {
-            capacity,
-            inner: Mutex::new(Inner::default()),
+            shards,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
         }
     }
 
+    fn shard(&self, key: &[u8]) -> &Mutex<Inner> {
+        // FNV-1a; cheap and good enough to spread keys across shards.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in key {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        &self.shards[(h % self.shards.len() as u64) as usize]
+    }
+
     /// Look up a key. `Some(_)` is a cache hit (carrying the cached result, which
     /// may itself be `None` for a known-absent key); the outer `None` is a miss.
     pub fn get(&self, key: &[u8]) -> Option<CachedRead> {
-        if self.capacity == 0 {
+        if self.shards.is_empty() {
             return None;
         }
-        let found = self.inner.lock().expect("read cache").map.get(key).cloned();
+        let found = self
+            .shard(key)
+            .lock()
+            .expect("read cache")
+            .map
+            .get(key)
+            .cloned();
         if found.is_some() {
             self.hits.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -85,22 +119,26 @@ impl ReadCache {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
-            entries: self.inner.lock().expect("read cache").map.len(),
+            entries: self
+                .shards
+                .iter()
+                .map(|s| s.lock().expect("read cache").map.len())
+                .sum(),
         }
     }
 
     /// Record the resolved result for `key`.
     pub fn insert(&self, key: &[u8], value: CachedRead) {
-        if self.capacity == 0 {
+        if self.shards.is_empty() {
             return;
         }
-        let mut guard = self.inner.lock().expect("read cache");
+        let mut guard = self.shard(key).lock().expect("read cache");
         let inner = &mut *guard;
         if inner.map.insert(key.to_vec(), value).is_none() {
             inner.fifo.push_back(key.to_vec());
         }
         // Evict oldest live entries until within capacity (skip stale fifo keys).
-        while inner.map.len() > self.capacity {
+        while inner.map.len() > inner.capacity {
             match inner.fifo.pop_front() {
                 Some(old) => {
                     if inner.map.remove(&old).is_some() {
@@ -111,7 +149,7 @@ impl ReadCache {
             }
         }
         // Trim stale fifo heads so it can't grow without bound under churn.
-        while inner.fifo.len() > self.capacity {
+        while inner.fifo.len() > inner.capacity {
             match inner.fifo.front() {
                 Some(front) if !inner.map.contains_key(front) => {
                     inner.fifo.pop_front();
@@ -123,15 +161,18 @@ impl ReadCache {
 
     /// Drop any cached result for `key`. Called on every write to the key.
     pub fn invalidate(&self, key: &[u8]) {
-        if self.capacity == 0 {
+        if self.shards.is_empty() {
             return;
         }
-        self.inner.lock().expect("read cache").map.remove(key);
+        self.shard(key).lock().expect("read cache").map.remove(key);
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.inner.lock().expect("read cache").map.len()
+        self.shards
+            .iter()
+            .map(|s| s.lock().expect("read cache").map.len())
+            .sum()
     }
 }
 
@@ -179,8 +220,12 @@ mod tests {
             c.invalidate(&i.to_le_bytes()); // immediately invalidate
         }
         assert_eq!(c.len(), 0);
-        let inner = c.inner.lock().unwrap();
-        assert!(inner.fifo.len() <= 4, "fifo must not grow unbounded under churn");
+        let fifo_total: usize = c
+            .shards
+            .iter()
+            .map(|s| s.lock().unwrap().fifo.len())
+            .sum();
+        assert!(fifo_total <= 4, "fifo must not grow unbounded under churn");
     }
 
     #[test]

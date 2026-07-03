@@ -82,16 +82,25 @@ impl Memtable {
     /// Latest version per distinct key (including tombstones), with its stamp,
     /// in key order. Used to flush the memtable into an SSTable.
     pub fn iter_latest_entries(&self) -> Vec<(Vec<u8>, Hlc, VersionValue)> {
-        let mut out = Vec::new();
+        self.iter_latest_lazy()
+            .map(|(k, hlc, v)| (k.to_vec(), hlc, v.clone()))
+            .collect()
+    }
+
+    /// Lazily yield the latest version per distinct key (including tombstones)
+    /// with its stamp, in key order, borrowing from the table — no per-key
+    /// allocation until the caller copies what it keeps.
+    pub fn iter_latest_lazy(&self) -> impl Iterator<Item = (&[u8], Hlc, &VersionValue)> + '_ {
         let mut current: Option<&[u8]> = None;
-        for ((k, std::cmp::Reverse(stamp)), value) in &self.map {
-            if current == Some(k.as_slice()) {
-                continue;
-            }
-            current = Some(k.as_slice());
-            out.push((k.clone(), *stamp, value.clone()));
-        }
-        out
+        self.map
+            .iter()
+            .filter_map(move |((k, Reverse(stamp)), value)| {
+                if current == Some(k.as_slice()) {
+                    return None; // already yielded the newest version of this key
+                }
+                current = Some(k.as_slice());
+                Some((k.as_slice(), *stamp, value))
+            })
     }
 
     /// Latest version per distinct key (including tombstones), with its stamp,

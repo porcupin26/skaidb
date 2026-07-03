@@ -12,6 +12,7 @@ use std::thread::{self, JoinHandle};
 use serde_json::{json, Value as Json};
 use skaidb_proto::Response;
 
+use crate::metrics::Endpoint;
 use crate::shared::{collect_runtime_metrics, execute_as, Shared};
 
 /// Bind the REST endpoint and serve it on a background thread.
@@ -27,13 +28,9 @@ pub fn serve(listener: TcpListener, ctx: Shared) {
     for stream in listener.incoming().flatten() {
         let ctx = ctx.clone();
         thread::spawn(move || {
-            ctx.metrics
-                .incr("skaidb_connections_total{endpoint=\"rest\"}");
-            ctx.metrics
-                .gauge_inc("skaidb_connections_active{endpoint=\"rest\"}");
+            ctx.metrics.connection_opened(Endpoint::Rest);
             let _ = handle_connection(stream, ctx.clone());
-            ctx.metrics
-                .gauge_dec("skaidb_connections_active{endpoint=\"rest\"}");
+            ctx.metrics.connection_closed(Endpoint::Rest);
         });
     }
 }
@@ -118,11 +115,12 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) -> io::Result<()> {
     let sql = extract_sql(&req.body);
     let response = execute_as(&ctx, &role, &sql);
     let (status, payload) = response_to_json(response);
-    ctx.metrics.add(
-        "skaidb_bytes_returned_total{endpoint=\"rest\"}",
-        payload.to_string().len() as u64,
-    );
-    write_response(&mut stream, status, &payload)
+    // Serialize the payload exactly once: the same string feeds both the
+    // bytes-returned metric and the wire.
+    let body = payload.to_string();
+    ctx.metrics
+        .add_bytes_returned(Endpoint::Rest, body.len() as u64);
+    write_json_body(&mut stream, status, &body)
 }
 
 /// A parsed HTTP request (just the parts the gateway needs).
@@ -134,8 +132,12 @@ struct HttpRequest {
 }
 
 /// Parse the request line, headers, and body. Returns `None` on a clean EOF.
+///
+/// The gateway serves one request per connection (`Connection: close`), so a
+/// per-call `BufReader` is already per-connection; borrowing the stream avoids
+/// the `try_clone` (dup) syscall entirely.
 fn read_request(stream: &mut TcpStream) -> io::Result<Option<HttpRequest>> {
-    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut reader = BufReader::new(&mut *stream);
 
     let mut request_line = String::new();
     if reader.read_line(&mut request_line)? == 0 {
@@ -305,8 +307,13 @@ fn response_to_json(response: Response) -> (u16, Json) {
 }
 
 fn write_response(stream: &mut TcpStream, status: u16, body: &Json) -> io::Result<()> {
+    write_json_body(stream, status, &body.to_string())
+}
+
+/// Write an already-serialized JSON body (callers that also meter the body
+/// size pass the one serialization here instead of re-serializing).
+fn write_json_body(stream: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
     let reason = http_reason(status);
-    let body = body.to_string();
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()

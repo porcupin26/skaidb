@@ -13,7 +13,10 @@ mod session;
 pub mod vector;
 
 pub use error::EngineError;
-pub use exec::{filter_rows, run, Cluster, Database, DbStats, IndexScanRange, TableStats};
+pub use exec::{
+    filter_rows, run, statement_is_read_only, Cluster, Database, DbStats, IndexScanRange,
+    TableStats,
+};
 pub use namespace::DEFAULT_DATABASE;
 pub use result::{QueryOutput, ResultSet, SessionEffect};
 pub use session::Session;
@@ -787,6 +790,54 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(rs.rows, vec![vec![Value::String("b".into())]]);
+    }
+
+    // ---- read-only execution path ----
+
+    #[test]
+    fn execute_read_serves_selects_through_shared_access() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        db.execute("CREATE INDEX t_v ON t(v)").unwrap();
+        db.execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30)")
+            .unwrap();
+
+        // Concurrent readers share the database behind an RwLock read guard —
+        // the whole point of the `&self` read path.
+        let db = std::sync::RwLock::new(db);
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    let d = db.read().unwrap();
+                    let rs = rows(d.execute_read("SELECT id FROM t WHERE v >= 20 ORDER BY id").unwrap());
+                    assert_eq!(rs.rows, vec![vec![Value::Int(2)], vec![Value::Int(3)]]);
+                    let rs = rows(d.execute_read("SHOW TABLES").unwrap());
+                    assert_eq!(rs.rows.len(), 1);
+                });
+            }
+        });
+
+        // Anything that mutates is rejected on the read-only path.
+        let d = db.read().unwrap();
+        assert!(d.execute_read("INSERT INTO t (id) VALUES (9)").is_err());
+        assert!(d.execute_read("DROP TABLE t").is_err());
+        assert!(d.execute_read("BEGIN").is_err());
+    }
+
+    #[test]
+    fn execute_read_sees_open_transaction_overlay() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        db.execute("INSERT INTO t (id) VALUES (1)").unwrap();
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO t (id) VALUES (2)").unwrap();
+        db.execute("DELETE FROM t WHERE id = 1").unwrap();
+        // A read-your-writes SELECT works through `&db` too.
+        let rs = rows(db.execute_read("SELECT id FROM t ORDER BY id").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::Int(2)]]);
+        db.execute("ROLLBACK").unwrap();
+        let rs = rows(db.execute_read("SELECT id FROM t").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::Int(1)]]);
     }
 
     // ---- transactions ----

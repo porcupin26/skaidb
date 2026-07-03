@@ -45,7 +45,9 @@ impl Parser {
     }
 
     fn advance(&mut self) -> Token {
-        let t = self.tokens[self.pos].clone();
+        // Tokens are consumed strictly left-to-right (the parser never looks
+        // back), so the consumed slot can be hollowed out instead of cloned.
+        let t = std::mem::replace(&mut self.tokens[self.pos], Token::Eof);
         if self.pos < self.tokens.len() - 1 {
             self.pos += 1;
         }
@@ -438,7 +440,9 @@ impl Parser {
 
         self.expect_keyword(Keyword::From)?;
         let from = self.parse_table_name()?;
-        let from_alias = self.parse_table_alias(bare_table(&from));
+        let from_alias = self
+            .parse_table_alias()
+            .unwrap_or_else(|| bare_table(&from).to_string());
 
         let mut joins = Vec::new();
         while let Some(kind) = self.peek_join_kind() {
@@ -485,17 +489,17 @@ impl Parser {
     }
 
     /// An optional table alias after a table reference: `[AS] <ident>`. Returns
-    /// `default` (the table name) when none is present.
-    fn parse_table_alias(&mut self, default: &str) -> String {
+    /// `None` when absent so the caller only allocates the default when needed.
+    fn parse_table_alias(&mut self) -> Option<String> {
         if self.eat_keyword(Keyword::As) {
-            return self.expect_ident().unwrap_or_else(|_| default.to_string());
+            return self.expect_ident().ok();
         }
         if let Token::Ident(_) = self.peek() {
             if let Ok(a) = self.expect_ident() {
-                return a;
+                return Some(a);
             }
         }
-        default.to_string()
+        None
     }
 
     /// If the next token begins a join clause, the join flavor it introduces.
@@ -528,7 +532,9 @@ impl Parser {
             _ => return Err(self.unexpected("JOIN".into())),
         }
         let table = self.parse_table_name()?;
-        let alias = self.parse_table_alias(bare_table(&table));
+        let alias = self
+            .parse_table_alias()
+            .unwrap_or_else(|| bare_table(&table).to_string());
         let on = if self.eat_keyword(Keyword::On) {
             Some(self.parse_expr()?)
         } else {
@@ -617,13 +623,14 @@ impl Parser {
     /// Table and database identifiers never contain `.`, so the join is
     /// unambiguous.
     fn parse_table_name(&mut self) -> Result<String, ParseError> {
-        let first = self.expect_ident()?;
+        let mut first = self.expect_ident()?;
         if self.eat(&Token::Dot) {
             let table = self.expect_ident()?;
-            Ok(format!("{first}.{table}"))
-        } else {
-            Ok(first)
+            first.reserve(1 + table.len());
+            first.push('.');
+            first.push_str(&table);
         }
+        Ok(first)
     }
 
     /// Parse a dotted path `a.b.c` into the string `"a.b.c"`.
@@ -742,19 +749,21 @@ impl Parser {
     }
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
-        match self.peek().clone() {
+        match self.peek() {
             Token::Int(i) => {
+                let i = *i;
                 self.advance();
                 Ok(Expr::Literal(Value::Int(i)))
             }
             Token::Float(f) => {
+                let f = *f;
                 self.advance();
                 Ok(Expr::Literal(Value::Float(f)))
             }
-            Token::Str(s) => {
-                self.advance();
-                Ok(Expr::Literal(Value::String(s)))
-            }
+            Token::Str(_) => match self.advance() {
+                Token::Str(s) => Ok(Expr::Literal(Value::String(s))),
+                _ => unreachable!(),
+            },
             Token::Keyword(Keyword::True) => {
                 self.advance();
                 Ok(Expr::Literal(Value::Bool(true)))
@@ -781,7 +790,7 @@ impl Parser {
                 if !self.eat(&Token::RBracket) {
                     loop {
                         let e = self.parse_expr()?;
-                        items.push(const_value(&e).ok_or_else(|| {
+                        items.push(const_value(e).ok_or_else(|| {
                             ParseError::Other("array elements must be constant literals".into())
                         })?);
                         if !self.eat(&Token::Comma) {
@@ -792,9 +801,9 @@ impl Parser {
                 }
                 Ok(Expr::Literal(Value::Array(items)))
             }
-            Token::Keyword(kw) if agg_func(kw).is_some() => {
+            Token::Keyword(kw) if agg_func(*kw).is_some() => {
+                let func = agg_func(*kw).unwrap();
                 self.advance();
-                let func = agg_func(kw).unwrap();
                 self.expect(&Token::LParen)?;
                 let arg = if self.eat(&Token::Star) {
                     AggArg::Star
@@ -834,13 +843,13 @@ fn agg_func(kw: Keyword) -> Option<AggFunc> {
 
 /// Fold a parse-time-constant expression — a literal, or a negated numeric
 /// literal — into a `Value`, for array-literal elements.
-fn const_value(e: &Expr) -> Option<Value> {
+fn const_value(e: Expr) -> Option<Value> {
     match e {
-        Expr::Literal(v) => Some(v.clone()),
+        Expr::Literal(v) => Some(v),
         Expr::Unary {
             op: UnaryOp::Neg,
             expr,
-        } => match expr.as_ref() {
+        } => match *expr {
             Expr::Literal(Value::Int(i)) => Some(Value::Int(-i)),
             Expr::Literal(Value::Float(f)) => Some(Value::Float(-f)),
             _ => None,

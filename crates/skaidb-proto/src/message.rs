@@ -106,7 +106,13 @@ impl Response {
                 for row in rows {
                     out.extend_from_slice(&(row.len() as u32).to_le_bytes());
                     for v in row {
-                        write_bytes(&mut out, &v.encode());
+                        // Encode in place behind a backfilled length prefix —
+                        // no per-cell temporary buffer.
+                        let len_pos = out.len();
+                        out.extend_from_slice(&[0u8; 4]);
+                        v.encode_value_into(&mut out);
+                        let len = (out.len() - len_pos - 4) as u32;
+                        out[len_pos..len_pos + 4].copy_from_slice(&len.to_le_bytes());
                     }
                 }
             }

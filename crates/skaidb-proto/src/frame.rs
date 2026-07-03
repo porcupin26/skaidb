@@ -4,12 +4,19 @@
 //! many payload bytes. This is the raw-TCP fast path; QUIC is the eventual WAN
 //! default.
 
-use std::io::{self, Read, Write};
+use std::io::{self, IoSlice, Read, Write};
 
 /// Maximum accepted frame payload (64 MiB) — guards against bogus lengths.
 pub const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
 
-/// Write `payload` as one length-prefixed frame and flush.
+/// Payloads up to this size are coalesced with the length prefix into one
+/// buffer (one write syscall, one TCP segment); larger ones use a vectored
+/// write to avoid copying the payload.
+const COALESCE_LIMIT: usize = 8 * 1024;
+
+/// Write `payload` as one length-prefixed frame and flush. The prefix and
+/// payload go out in a single write, so with `TCP_NODELAY` the prefix is never
+/// flushed as its own tiny segment.
 pub fn write_frame(w: &mut impl Write, payload: &[u8]) -> io::Result<()> {
     if payload.len() as u64 > MAX_FRAME_LEN as u64 {
         return Err(io::Error::new(
@@ -17,9 +24,37 @@ pub fn write_frame(w: &mut impl Write, payload: &[u8]) -> io::Result<()> {
             "frame too large",
         ));
     }
-    w.write_all(&(payload.len() as u32).to_be_bytes())?;
-    w.write_all(payload)?;
+    let len = (payload.len() as u32).to_be_bytes();
+    if payload.len() <= COALESCE_LIMIT {
+        let mut buf = Vec::with_capacity(4 + payload.len());
+        buf.extend_from_slice(&len);
+        buf.extend_from_slice(payload);
+        w.write_all(&buf)?;
+    } else {
+        write_all_vectored(w, &len, payload)?;
+    }
     w.flush()
+}
+
+/// `write_all` over two buffers via vectored I/O (one syscall per iteration on
+/// sockets; writers without real vectored support just take an extra loop).
+fn write_all_vectored(w: &mut impl Write, mut head: &[u8], mut body: &[u8]) -> io::Result<()> {
+    while !head.is_empty() || !body.is_empty() {
+        let n = w.write_vectored(&[IoSlice::new(head), IoSlice::new(body)])?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write whole frame",
+            ));
+        }
+        if n >= head.len() {
+            body = &body[n - head.len()..];
+            head = &[];
+        } else {
+            head = &head[n..];
+        }
+    }
+    Ok(())
 }
 
 /// Read one length-prefixed frame. Returns the payload bytes.

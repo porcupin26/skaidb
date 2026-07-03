@@ -16,26 +16,25 @@ pub struct Bloom {
 }
 
 impl Bloom {
-    /// Build a filter over `keys` targeting roughly `fp_rate` false positives.
-    pub fn build(keys: &[Vec<u8>], fp_rate: f64) -> Bloom {
-        let n = keys.len().max(1) as f64;
+    /// An empty filter sized for `expected_keys` insertions at `fp_rate`. Keys
+    /// are added incrementally with [`Bloom::add`]; inserting fewer keys than
+    /// expected only lowers the false-positive rate.
+    pub fn with_capacity(expected_keys: usize, fp_rate: f64) -> Bloom {
+        let n = expected_keys.max(1) as f64;
         let ln2 = std::f64::consts::LN_2;
         let m = (-(n * fp_rate.ln()) / (ln2 * ln2)).ceil().max(8.0) as u64;
         let m = m.div_ceil(8) * 8; // round up to whole bytes
         let k = (((m as f64 / n) * ln2).round() as u32).clamp(1, 30);
 
-        let mut bloom = Bloom {
+        Bloom {
             bits: vec![0u8; (m / 8) as usize],
             m,
             k,
-        };
-        for key in keys {
-            bloom.add(key);
         }
-        bloom
     }
 
-    fn add(&mut self, key: &[u8]) {
+    /// Record `key` in the filter.
+    pub fn add(&mut self, key: &[u8]) {
         let (h1, h2) = hashes(key);
         for i in 0..self.k {
             let bit = combined(h1, h2, i) % self.m;
@@ -114,10 +113,19 @@ mod tests {
         (0..n).map(|i| format!("key-{i}").into_bytes()).collect()
     }
 
+    /// Build a filter over `keys` targeting roughly `fp_rate` false positives.
+    fn build(keys: &[Vec<u8>], fp_rate: f64) -> Bloom {
+        let mut bloom = Bloom::with_capacity(keys.len(), fp_rate);
+        for key in keys {
+            bloom.add(key);
+        }
+        bloom
+    }
+
     #[test]
     fn no_false_negatives() {
         let ks = keys(1000);
-        let bloom = Bloom::build(&ks, 0.01);
+        let bloom = build(&ks, 0.01);
         for k in &ks {
             assert!(bloom.contains(k), "must contain inserted key");
         }
@@ -126,7 +134,7 @@ mod tests {
     #[test]
     fn false_positive_rate_is_reasonable() {
         let ks = keys(1000);
-        let bloom = Bloom::build(&ks, 0.01);
+        let bloom = build(&ks, 0.01);
         let mut fp = 0;
         let trials = 10_000;
         for i in 0..trials {
@@ -141,7 +149,7 @@ mod tests {
 
     #[test]
     fn encode_decode_roundtrip() {
-        let bloom = Bloom::build(&keys(100), 0.01);
+        let bloom = build(&keys(100), 0.01);
         let decoded = Bloom::decode(&bloom.encode()).unwrap();
         assert_eq!(bloom, decoded);
     }

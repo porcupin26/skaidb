@@ -90,7 +90,7 @@ fn field(body: &str, key: &str) -> Option<String> {
 pub fn handle(ctx: &Shared, role: &str, cmd: AdminCmd) -> (u16, Json) {
     // Every admin op (including status) requires cluster-wide Admin.
     if !ctx.roles.has_privilege(role, Privilege::Admin, &Object::Global) {
-        ctx.metrics.incr("skaidb_authz_denied_total");
+        ctx.metrics.incr_authz_denied();
         return (403, json!({ "error": "permission denied: Admin on Global" }));
     }
 

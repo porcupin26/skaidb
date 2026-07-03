@@ -107,72 +107,83 @@ pub enum Keyword {
     Indexes,
 }
 
+/// Length of the longest keyword ("TRANSACTION").
+const MAX_KEYWORD_LEN: usize = 11;
+
 impl Keyword {
     fn from_str(s: &str) -> Option<Keyword> {
         use Keyword::*;
-        let kw = match s.to_ascii_uppercase().as_str() {
-            "SELECT" => Select,
-            "FROM" => From,
-            "WHERE" => Where,
-            "INSERT" => Insert,
-            "INTO" => Into,
-            "VALUES" => Values,
-            "UPDATE" => Update,
-            "SET" => Set,
-            "DELETE" => Delete,
-            "CREATE" => Create,
-            "DROP" => Drop,
-            "TABLE" => Table,
-            "INDEX" => Index,
-            "ON" => On,
-            "PRIMARY" => Primary,
-            "KEY" => Key,
-            "ORDER" => Order,
-            "BY" => By,
-            "ASC" => Asc,
-            "DESC" => Desc,
-            "LIMIT" => Limit,
-            "OFFSET" => Offset,
-            "AND" => And,
-            "OR" => Or,
-            "NOT" => Not,
-            "NULL" => Null,
-            "IS" => Is,
-            "TRUE" => True,
-            "FALSE" => False,
-            "IF" => If,
-            "EXISTS" => Exists,
-            "GROUP" => Group,
-            "AS" => As,
-            "COUNT" => Count,
-            "SUM" => Sum,
-            "AVG" => Avg,
-            "MIN" => Min,
-            "MAX" => Max,
-            "VECTOR" => Vector,
-            "USING" => Using,
-            "DIM" => Dim,
-            "ALTER" => Alter,
-            "RENAME" => Rename,
-            "TO" => To,
-            "COLUMN" => Column,
-            "DISTINCT" => Distinct,
-            "HAVING" => Having,
-            "UNION" => Union,
-            "ALL" => All,
-            "BEGIN" => Begin,
-            "COMMIT" => Commit,
-            "ROLLBACK" => Rollback,
-            "TRANSACTION" => Transaction,
-            "JOIN" => Join,
-            "INNER" => Inner,
-            "LEFT" => Left,
-            "RIGHT" => Right,
-            "OUTER" => Outer,
-            "CROSS" => Cross,
-            "SHOW" => Show,
-            "TABLES" => Tables,
-            "INDEXES" => Indexes,
+        // Uppercase into a stack buffer so matching never allocates.
+        if s.len() > MAX_KEYWORD_LEN {
+            return None;
+        }
+        let mut buf = [0u8; MAX_KEYWORD_LEN];
+        for (out, b) in buf.iter_mut().zip(s.bytes()) {
+            *out = b.to_ascii_uppercase();
+        }
+        let kw = match &buf[..s.len()] {
+            b"SELECT" => Select,
+            b"FROM" => From,
+            b"WHERE" => Where,
+            b"INSERT" => Insert,
+            b"INTO" => Into,
+            b"VALUES" => Values,
+            b"UPDATE" => Update,
+            b"SET" => Set,
+            b"DELETE" => Delete,
+            b"CREATE" => Create,
+            b"DROP" => Drop,
+            b"TABLE" => Table,
+            b"INDEX" => Index,
+            b"ON" => On,
+            b"PRIMARY" => Primary,
+            b"KEY" => Key,
+            b"ORDER" => Order,
+            b"BY" => By,
+            b"ASC" => Asc,
+            b"DESC" => Desc,
+            b"LIMIT" => Limit,
+            b"OFFSET" => Offset,
+            b"AND" => And,
+            b"OR" => Or,
+            b"NOT" => Not,
+            b"NULL" => Null,
+            b"IS" => Is,
+            b"TRUE" => True,
+            b"FALSE" => False,
+            b"IF" => If,
+            b"EXISTS" => Exists,
+            b"GROUP" => Group,
+            b"AS" => As,
+            b"COUNT" => Count,
+            b"SUM" => Sum,
+            b"AVG" => Avg,
+            b"MIN" => Min,
+            b"MAX" => Max,
+            b"VECTOR" => Vector,
+            b"USING" => Using,
+            b"DIM" => Dim,
+            b"ALTER" => Alter,
+            b"RENAME" => Rename,
+            b"TO" => To,
+            b"COLUMN" => Column,
+            b"DISTINCT" => Distinct,
+            b"HAVING" => Having,
+            b"UNION" => Union,
+            b"ALL" => All,
+            b"BEGIN" => Begin,
+            b"COMMIT" => Commit,
+            b"ROLLBACK" => Rollback,
+            b"TRANSACTION" => Transaction,
+            b"JOIN" => Join,
+            b"INNER" => Inner,
+            b"LEFT" => Left,
+            b"RIGHT" => Right,
+            b"OUTER" => Outer,
+            b"CROSS" => Cross,
+            b"SHOW" => Show,
+            b"TABLES" => Tables,
+            b"INDEXES" => Indexes,
             _ => return None,
         };
         Some(kw)
@@ -191,74 +202,77 @@ pub enum LexError {
 }
 
 /// Tokenize `input` into a token stream terminated by [`Token::Eof`].
+///
+/// Operates on the raw bytes with an index cursor; slicing at ASCII delimiters
+/// is always UTF-8 safe, and multi-byte characters are decoded only where the
+/// grammar allows them (whitespace, identifiers, string/quoted-ident bodies).
 pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
-    let chars: Vec<char> = input.chars().collect();
+    let bytes = input.as_bytes();
     let mut i = 0;
     let mut tokens = Vec::new();
 
-    while i < chars.len() {
-        let c = chars[i];
-        match c {
-            c if c.is_whitespace() => i += 1,
-            '-' if i + 1 < chars.len() && chars[i + 1] == '-' => {
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\t'..=b'\r' | b' ' => i += 1,
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
                 // Line comment to end of line.
-                while i < chars.len() && chars[i] != '\n' {
+                while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
                 }
             }
-            ',' => {
+            b',' => {
                 tokens.push(Token::Comma);
                 i += 1;
             }
-            '.' => {
+            b'.' => {
                 tokens.push(Token::Dot);
                 i += 1;
             }
-            '(' => {
+            b'(' => {
                 tokens.push(Token::LParen);
                 i += 1;
             }
-            ')' => {
+            b')' => {
                 tokens.push(Token::RParen);
                 i += 1;
             }
-            '[' => {
+            b'[' => {
                 tokens.push(Token::LBracket);
                 i += 1;
             }
-            ']' => {
+            b']' => {
                 tokens.push(Token::RBracket);
                 i += 1;
             }
-            '*' => {
+            b'*' => {
                 tokens.push(Token::Star);
                 i += 1;
             }
-            '+' => {
+            b'+' => {
                 tokens.push(Token::Plus);
                 i += 1;
             }
-            '-' => {
+            b'-' => {
                 tokens.push(Token::Minus);
                 i += 1;
             }
-            '/' => {
+            b'/' => {
                 tokens.push(Token::Slash);
                 i += 1;
             }
-            ';' => {
+            b';' => {
                 tokens.push(Token::Semicolon);
                 i += 1;
             }
-            '=' => {
+            b'=' => {
                 tokens.push(Token::Eq);
                 i += 1;
             }
-            '<' => {
-                if i + 1 < chars.len() && chars[i + 1] == '=' {
+            b'<' => {
+                if bytes.get(i + 1) == Some(&b'=') {
                     tokens.push(Token::LtEq);
                     i += 2;
-                } else if i + 1 < chars.len() && chars[i + 1] == '>' {
+                } else if bytes.get(i + 1) == Some(&b'>') {
                     tokens.push(Token::NotEq);
                     i += 2;
                 } else {
@@ -266,8 +280,8 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     i += 1;
                 }
             }
-            '>' => {
-                if i + 1 < chars.len() && chars[i + 1] == '=' {
+            b'>' => {
+                if bytes.get(i + 1) == Some(&b'=') {
                     tokens.push(Token::GtEq);
                     i += 2;
                 } else {
@@ -275,34 +289,48 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     i += 1;
                 }
             }
-            '!' if i + 1 < chars.len() && chars[i + 1] == '=' => {
+            b'!' if bytes.get(i + 1) == Some(&b'=') => {
                 tokens.push(Token::NotEq);
                 i += 2;
             }
-            '\'' => {
-                let (s, next) = lex_string(&chars, i)?;
+            b'\'' => {
+                let (s, next) = lex_string(input, i)?;
                 tokens.push(Token::Str(s));
                 i = next;
             }
-            '"' => {
-                let (s, next) = lex_quoted_ident(&chars, i)?;
+            b'"' => {
+                let (s, next) = lex_quoted_ident(input, i)?;
                 tokens.push(Token::Ident(s));
                 i = next;
             }
-            c if c.is_ascii_digit() => {
-                let (tok, next) = lex_number(&chars, i)?;
+            b if b.is_ascii_digit() => {
+                let (tok, next) = lex_number(input, i)?;
                 tokens.push(tok);
                 i = next;
             }
-            c if c.is_alphabetic() || c == '_' => {
-                let (word, next) = lex_word(&chars, i);
-                match Keyword::from_str(&word) {
+            b if b.is_ascii_alphabetic() || b == b'_' => {
+                let next = lex_word_end(input, i);
+                let word = &input[i..next];
+                match Keyword::from_str(word) {
                     Some(kw) => tokens.push(Token::Keyword(kw)),
-                    None => tokens.push(Token::Ident(word)),
+                    None => tokens.push(Token::Ident(word.to_string())),
                 }
                 i = next;
             }
-            other => return Err(LexError::UnexpectedChar(other)),
+            b if b < 0x80 => return Err(LexError::UnexpectedChar(b as char)),
+            _ => {
+                // Non-ASCII: decode the full character to classify it.
+                let c = input[i..].chars().next().unwrap();
+                if c.is_whitespace() {
+                    i += c.len_utf8();
+                } else if c.is_alphabetic() {
+                    let next = lex_word_end(input, i);
+                    tokens.push(Token::Ident(input[i..next].to_string()));
+                    i = next;
+                } else {
+                    return Err(LexError::UnexpectedChar(c));
+                }
+            }
         }
     }
 
@@ -310,73 +338,114 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
     Ok(tokens)
 }
 
-fn lex_string(chars: &[char], start: usize) -> Result<(String, usize), LexError> {
+fn lex_string(input: &str, start: usize) -> Result<(String, usize), LexError> {
+    let bytes = input.as_bytes();
     let mut i = start + 1; // skip opening quote
-    let mut out = String::new();
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '\'' {
-            if i + 1 < chars.len() && chars[i + 1] == '\'' {
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            if bytes.get(i + 1) == Some(&b'\'') {
+                // Slow path: the literal contains `''` escapes.
+                return lex_string_escaped(input, start + 1, i);
+            }
+            return Ok((input[start + 1..i].to_string(), i + 1));
+        }
+        i += 1;
+    }
+    Err(LexError::UnterminatedString)
+}
+
+/// Continue lexing a string literal whose first `''` escape is at `escape`;
+/// the content starts at `content_start` (just past the opening quote).
+fn lex_string_escaped(
+    input: &str,
+    content_start: usize,
+    escape: usize,
+) -> Result<(String, usize), LexError> {
+    let bytes = input.as_bytes();
+    let mut out = String::from(&input[content_start..escape]);
+    out.push('\'');
+    let mut i = escape + 2;
+    let mut seg = i; // start of the current unescaped segment
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            out.push_str(&input[seg..i]);
+            if bytes.get(i + 1) == Some(&b'\'') {
                 out.push('\''); // escaped quote
                 i += 2;
+                seg = i;
             } else {
                 return Ok((out, i + 1));
             }
         } else {
-            out.push(c);
             i += 1;
         }
     }
     Err(LexError::UnterminatedString)
 }
 
-fn lex_quoted_ident(chars: &[char], start: usize) -> Result<(String, usize), LexError> {
+fn lex_quoted_ident(input: &str, start: usize) -> Result<(String, usize), LexError> {
+    let bytes = input.as_bytes();
     let mut i = start + 1;
-    let mut out = String::new();
-    while i < chars.len() {
-        if chars[i] == '"' {
-            return Ok((out, i + 1));
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            return Ok((input[start + 1..i].to_string(), i + 1));
         }
-        out.push(chars[i]);
         i += 1;
     }
     Err(LexError::UnterminatedString)
 }
 
-fn lex_number(chars: &[char], start: usize) -> Result<(Token, usize), LexError> {
+fn lex_number(input: &str, start: usize) -> Result<(Token, usize), LexError> {
+    let bytes = input.as_bytes();
     let mut i = start;
     let mut seen_dot = false;
-    while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
-        if chars[i] == '.' {
+    while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+        if bytes[i] == b'.' {
             // A dot followed by a non-digit is field access, not a decimal point.
-            if seen_dot || i + 1 >= chars.len() || !chars[i + 1].is_ascii_digit() {
+            if seen_dot || i + 1 >= bytes.len() || !bytes[i + 1].is_ascii_digit() {
                 break;
             }
             seen_dot = true;
         }
         i += 1;
     }
-    let text: String = chars[start..i].iter().collect();
+    let text = &input[start..i];
     let token = if seen_dot {
         Token::Float(
             text.parse()
-                .map_err(|_| LexError::InvalidNumber(text.clone()))?,
+                .map_err(|_| LexError::InvalidNumber(text.to_string()))?,
         )
     } else {
         Token::Int(
             text.parse()
-                .map_err(|_| LexError::InvalidNumber(text.clone()))?,
+                .map_err(|_| LexError::InvalidNumber(text.to_string()))?,
         )
     };
     Ok((token, i))
 }
 
-fn lex_word(chars: &[char], start: usize) -> (String, usize) {
+/// Byte index just past the identifier/keyword word starting at `start`.
+fn lex_word_end(input: &str, start: usize) -> usize {
+    let bytes = input.as_bytes();
     let mut i = start;
-    while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
-        i += 1;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b < 0x80 {
+            if b.is_ascii_alphanumeric() || b == b'_' {
+                i += 1;
+            } else {
+                break;
+            }
+        } else {
+            let c = input[i..].chars().next().unwrap();
+            if c.is_alphanumeric() {
+                i += c.len_utf8();
+            } else {
+                break;
+            }
+        }
     }
-    (chars[start..i].iter().collect(), i)
+    i
 }
 
 #[cfg(test)]

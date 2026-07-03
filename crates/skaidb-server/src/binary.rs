@@ -1,6 +1,6 @@
 //! Binary (raw-TCP fast-path) endpoint (SPEC §11).
 
-use std::io;
+use std::io::{self, BufReader};
 use std::net::{TcpListener, TcpStream};
 use std::thread::{self, JoinHandle};
 
@@ -10,6 +10,7 @@ use skaidb_proto::{
 };
 
 use crate::authn::AuthResult;
+use crate::metrics::Endpoint;
 use crate::shared::{execute_session_as, Shared};
 
 /// Bind the binary endpoint and serve it on a background thread.
@@ -28,23 +29,32 @@ pub fn serve(listener: TcpListener, ctx: Shared) {
     for stream in listener.incoming().flatten() {
         let ctx = ctx.clone();
         thread::spawn(move || {
-            ctx.metrics
-                .incr("skaidb_connections_total{endpoint=\"binary\"}");
-            ctx.metrics
-                .gauge_inc("skaidb_connections_active{endpoint=\"binary\"}");
+            ctx.metrics.connection_opened(Endpoint::Binary);
             handle_connection(stream, ctx.clone());
-            ctx.metrics
-                .gauge_dec("skaidb_connections_active{endpoint=\"binary\"}");
+            ctx.metrics.connection_closed(Endpoint::Binary);
         });
     }
 }
 
 /// Serve requests on one connection until the peer disconnects.
-fn handle_connection(mut stream: TcpStream, ctx: Shared) {
+fn handle_connection(stream: TcpStream, ctx: Shared) {
     stream.set_nodelay(true).ok();
 
-    // SCRAM handshake first; the resolved role authorizes every later statement.
-    let role = match authenticate(&mut stream, &ctx) {
+    // Split the socket once per connection: the read side goes behind a
+    // `BufReader` so each frame costs one read syscall instead of two
+    // (length prefix + payload). The write side stays unbuffered —
+    // `write_frame` already coalesces header and payload into a single
+    // write, so flush semantics are unchanged.
+    let mut writer = match stream.try_clone() {
+        Ok(w) => w,
+        Err(_) => return,
+    };
+    let mut reader = BufReader::new(stream);
+
+    // SCRAM handshake first; the resolved role authorizes every later
+    // statement. The handshake shares this connection's `BufReader`, so bytes
+    // it buffered ahead are still available to the request loop below.
+    let role = match authenticate(&mut reader, &mut writer, &ctx) {
         Ok(role) => role,
         Err(()) => return, // denied or framing error → drop the connection
     };
@@ -54,7 +64,7 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) {
     let mut current_db = skaidb_engine::DEFAULT_DATABASE.to_string();
 
     loop {
-        let payload = match read_frame(&mut stream) {
+        let payload = match read_frame(&mut reader) {
             Ok(p) => p,
             Err(_) => return, // disconnect or framing error
         };
@@ -65,19 +75,21 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) {
             Err(e) => Response::Error(format!("protocol error: {e}")),
         };
         let encoded = response.encode();
-        ctx.metrics.add(
-            "skaidb_bytes_returned_total{endpoint=\"binary\"}",
-            encoded.len() as u64,
-        );
-        if write_frame(&mut stream, &encoded).is_err() {
+        ctx.metrics
+            .add_bytes_returned(Endpoint::Binary, encoded.len() as u64);
+        if write_frame(&mut writer, &encoded).is_err() {
             return;
         }
     }
 }
 
 /// Run the server side of the SCRAM handshake, returning the authorized role.
-fn authenticate(stream: &mut TcpStream, ctx: &Shared) -> Result<String, ()> {
-    let start = AuthStart::decode(&read_frame(stream).map_err(|_| ())?).map_err(|_| ())?;
+fn authenticate(
+    reader: &mut BufReader<TcpStream>,
+    writer: &mut TcpStream,
+    ctx: &Shared,
+) -> Result<String, ()> {
+    let start = AuthStart::decode(&read_frame(reader).map_err(|_| ())?).map_err(|_| ())?;
 
     let (salt, iterations) = ctx.authn.salt_for(&start.username);
     let server_nonce = ctx.authn.server_nonce(&start.client_nonce);
@@ -86,9 +98,9 @@ fn authenticate(stream: &mut TcpStream, ctx: &Shared) -> Result<String, ()> {
         iterations,
         server_nonce: server_nonce.clone(),
     };
-    write_frame(stream, &challenge.encode()).map_err(|_| ())?;
+    write_frame(writer, &challenge.encode()).map_err(|_| ())?;
 
-    let finish = AuthFinish::decode(&read_frame(stream).map_err(|_| ())?).map_err(|_| ())?;
+    let finish = AuthFinish::decode(&read_frame(reader).map_err(|_| ())?).map_err(|_| ())?;
     let am = auth_message(
         &start.username,
         &start.client_nonce,
@@ -107,14 +119,14 @@ fn authenticate(stream: &mut TcpStream, ctx: &Shared) -> Result<String, ()> {
             role,
             server_signature,
         } => {
-            write_frame(stream, &AuthOutcome::Ok { server_signature }.encode()).map_err(|_| ())?;
-            ctx.metrics.incr("skaidb_logins_total");
+            write_frame(writer, &AuthOutcome::Ok { server_signature }.encode()).map_err(|_| ())?;
+            ctx.metrics.incr_login();
             ctx.audit().log_login(&start.username, Some(&role), true);
             Ok(role)
         }
         AuthResult::Denied(reason) => {
-            let _ = write_frame(stream, &AuthOutcome::Denied { reason }.encode());
-            ctx.metrics.incr("skaidb_login_failures_total");
+            let _ = write_frame(writer, &AuthOutcome::Denied { reason }.encode());
+            ctx.metrics.incr_login_failure();
             ctx.audit().log_login(&start.username, None, false);
             Err(())
         }

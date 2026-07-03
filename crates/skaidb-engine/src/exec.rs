@@ -296,24 +296,34 @@ impl Database {
             .ok_or_else(|| EngineError::TableNotFound(def.table.clone()))?;
 
         // The HNSW only knows keys; resolve each candidate to its row to apply
-        // the filter (filtered nearest-neighbor search).
-        let hits = hnsw.search(query, k, |key| match table_engine.get(key) {
-            Ok(Some(bytes)) => match (filter, Value::decode(&bytes)) {
-                (Some(_), Ok(Value::Document(doc))) => matches_filter(filter, &doc).unwrap_or(false),
-                (None, Ok(Value::Document(_))) => true,
+        // the filter (filtered nearest-neighbor search). Decoded docs are kept
+        // so each candidate is read and decoded once, and survivors are served
+        // from the same map instead of a second storage read.
+        let decoded: std::cell::RefCell<HashMap<Vec<u8>, Option<Document>>> =
+            std::cell::RefCell::new(HashMap::new());
+        let hits = hnsw.search(query, k, |key| {
+            let mut cache = decoded.borrow_mut();
+            let doc = cache.entry(key.to_vec()).or_insert_with(|| {
+                match table_engine.get(key) {
+                    Ok(Some(bytes)) => match Value::decode(&bytes) {
+                        Ok(Value::Document(doc)) => Some(doc),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            });
+            match (filter, doc.as_ref()) {
+                (Some(_), Some(doc)) => matches_filter(filter, doc).unwrap_or(false),
+                (None, Some(_)) => true,
                 _ => false,
-            },
-            _ => false,
+            }
         });
 
+        let mut cache = decoded.into_inner();
         let mut out = Vec::with_capacity(hits.len());
         for (key, dist) in hits {
-            if let Some(bytes) = table_engine.get(&key)? {
-                if let Value::Document(doc) = Value::decode(&bytes)
-                    .map_err(|e| EngineError::Constraint(format!("corrupt row: {e}")))?
-                {
-                    out.push((key, doc, dist));
-                }
+            if let Some(Some(doc)) = cache.remove(&key) {
+                out.push((key, doc, dist));
             }
         }
         Ok(out)
@@ -390,6 +400,36 @@ impl Database {
         self.execute_statement(parse(sql)?)
     }
 
+    /// Parse and execute a single **read-only** statement (`SELECT` / `SHOW …`)
+    /// through `&self`, so callers holding the database behind an `RwLock` can
+    /// serve reads under a shared lock and run them concurrently. A statement
+    /// that is not read-only (see [`statement_is_read_only`]) is rejected —
+    /// route it through [`Database::execute`] instead.
+    pub fn execute_read(&self, sql: &str) -> Result<QueryOutput> {
+        self.execute_read_statement(parse(sql)?)
+    }
+
+    /// Execute an already-parsed read-only statement; see
+    /// [`Database::execute_read`]. A `SELECT` inside an open transaction still
+    /// works here: it reads through the buffered overlay, which needs only
+    /// shared access.
+    pub fn execute_read_statement(&self, stmt: Statement) -> Result<QueryOutput> {
+        match stmt {
+            Statement::Select(sel) => {
+                run_select(&sel, &LocalRead { db: self }).map(QueryOutput::Rows)
+            }
+            Statement::ShowTables => Ok(QueryOutput::Rows(self.show_tables())),
+            Statement::ShowIndexes => Ok(QueryOutput::Rows(self.show_indexes())),
+            Statement::ShowStatus => Ok(QueryOutput::Rows(self.show_status())),
+            Statement::ShowDatabases => Err(EngineError::Unsupported(
+                "database statements require a multi-database session".into(),
+            )),
+            _ => Err(EngineError::Unsupported(
+                "statement is not read-only; use the exclusive execution path".into(),
+            )),
+        }
+    }
+
     /// Execute an already-parsed statement. This lets the multi-database
     /// [`Session`](crate::Session) dispatch a statement it has classified
     /// without re-parsing it.
@@ -428,8 +468,14 @@ impl Database {
             // exact same logic serves the local engine and the cluster
             // coordinator (which replaces LocalCluster with a networked one).
             dml => {
-                let mut local = LocalCluster { db: self };
-                run(dml, &mut local)
+                let mut local = LocalCluster::new(self);
+                let out = run(dml, &mut local);
+                // Applied rows must become durable whether or not the
+                // statement finished cleanly (matches per-row fsync behavior).
+                let synced = local.flush_pending();
+                let out = out?;
+                synced?;
+                Ok(out)
             }
         }
     }
@@ -448,7 +494,17 @@ impl Database {
         current_db: &str,
         sql: &str,
     ) -> Result<SessionEffect> {
-        let mut stmt = parse(sql)?;
+        self.execute_session_statement(current_db, parse(sql)?)
+    }
+
+    /// [`Database::execute_session`] over an already-parsed statement, so a
+    /// caller that parsed the SQL once (e.g. for privilege checks) doesn't pay
+    /// for a second parse.
+    pub fn execute_session_statement(
+        &mut self,
+        current_db: &str,
+        mut stmt: Statement,
+    ) -> Result<SessionEffect> {
         let out = match stmt {
             Statement::CreateDatabase {
                 name,
@@ -472,6 +528,38 @@ impl Database {
             }
         };
         Ok(SessionEffect::Output(out))
+    }
+
+    /// Database-aware read-only entry point: like [`Database::execute_session`]
+    /// but through `&self`, for statements that only read (see
+    /// [`statement_is_read_only`]). Table names resolve against `current_db`
+    /// and `SHOW` output is filtered to it; anything that mutates is rejected.
+    /// Callers behind an `RwLock` use this under a shared lock so concurrent
+    /// readers don't serialize.
+    pub fn execute_session_read(&self, current_db: &str, sql: &str) -> Result<QueryOutput> {
+        self.execute_session_read_statement(current_db, parse(sql)?)
+    }
+
+    /// [`Database::execute_session_read`] over an already-parsed statement.
+    pub fn execute_session_read_statement(
+        &self,
+        current_db: &str,
+        mut stmt: Statement,
+    ) -> Result<QueryOutput> {
+        match stmt {
+            Statement::ShowDatabases => Ok(QueryOutput::Rows(self.show_databases(current_db))),
+            Statement::ShowTables => Ok(QueryOutput::Rows(self.show_tables_in(current_db))),
+            Statement::ShowIndexes => Ok(QueryOutput::Rows(self.show_indexes_in(current_db))),
+            Statement::ShowStatus => Ok(QueryOutput::Rows(self.show_status())),
+            Statement::Select(_) => {
+                namespace::resolve_statement(&mut stmt, current_db);
+                self.execute_read_statement(stmt)
+                    .map_err(|e| namespace::humanize_error(e, current_db))
+            }
+            _ => Err(EngineError::Unsupported(
+                "statement is not read-only; use the exclusive execution path".into(),
+            )),
+        }
     }
 
     /// Like [`Database::execute_session`], but any DDL is stamped with `hlc`
@@ -976,20 +1064,27 @@ impl Database {
         let Some(txn) = self.txn.take() else {
             return Err(EngineError::Constraint("no transaction in progress".into()));
         };
-        let mut local = LocalCluster { db: self };
-        for ((table, key), op) in txn.writes {
-            match op {
-                Some(doc) => local.put(&table, &key, &doc)?,
-                None => {
-                    // Read the committed doc so index entries are removed correctly.
-                    let doc = local
-                        .db
-                        .committed_doc(&table, &key)?
-                        .unwrap_or_default();
-                    local.delete(&table, &key, &doc)?;
+        let mut local = LocalCluster::new(self);
+        let apply = || -> Result<()> {
+            for ((table, key), op) in txn.writes {
+                match op {
+                    Some(doc) => local.put(&table, &key, &doc)?,
+                    None => {
+                        // Read the committed doc so index entries are removed correctly.
+                        let doc = local
+                            .db
+                            .committed_doc(&table, &key)?
+                            .unwrap_or_default();
+                        local.delete(&table, &key, &doc)?;
+                    }
                 }
             }
-        }
+            Ok(())
+        };
+        let applied = apply();
+        let synced = local.flush_pending();
+        applied?;
+        synced?;
         Ok(QueryOutput::Ddl)
     }
 
@@ -1016,39 +1111,87 @@ impl Database {
     }
 
     /// Gather rows for `table` matching `filter` with the open transaction's
-    /// buffered writes merged over committed storage (read-your-writes). Used
-    /// only while a transaction is active, so it always full-scans (no index
-    /// acceleration) for simplicity.
+    /// buffered writes merged over committed storage (read-your-writes).
+    /// Committed rows come through the index planner (bounded when the filter
+    /// permits); the overlay is exact per-key, so merging it afterwards keeps
+    /// full-scan semantics: an overlay write always wins over the committed
+    /// version of its key.
     fn gather_with_overlay(
         &self,
         table: &str,
         filter: &Option<Expr>,
     ) -> Result<Vec<(Vec<u8>, Document)>> {
         let txn = self.txn.as_ref().expect("transaction active");
-        let mut map: BTreeMap<Vec<u8>, Document> = self.scan_docs(table)?.into_iter().collect();
+        let mut map: BTreeMap<Vec<u8>, Document> =
+            self.gather_rows_keyed(table, filter)?.into_iter().collect();
         for ((t, k), op) in &txn.writes {
             if t != table {
                 continue;
             }
             match op {
                 Some(doc) => {
-                    map.insert(k.clone(), doc.clone());
+                    // The overlay version masks the committed one — keep it
+                    // only if it (still) matches the filter.
+                    if matches_filter(filter, doc)? {
+                        map.insert(k.clone(), doc.clone());
+                    } else {
+                        map.remove(k);
+                    }
                 }
                 None => {
                     map.remove(k);
                 }
             }
         }
-        let mut out = Vec::new();
-        for (k, doc) in map {
-            if matches_filter(filter, &doc)? {
-                out.push((k, doc));
-            }
-        }
-        Ok(out)
+        Ok(map.into_iter().collect())
     }
 
     // ---- row gathering (with optional index acceleration) ----
+
+    /// `(key, doc)` rows of `table` matching `filter`, reading through the open
+    /// transaction's buffered overlay when one is active (read-your-writes).
+    /// The shared body of [`Cluster::matching_rows`] for the embedded engine —
+    /// `&self` so a `SELECT` needs only shared access.
+    fn local_matching_rows(
+        &self,
+        table: &str,
+        filter: &Option<Expr>,
+    ) -> Result<Vec<(Vec<u8>, Document)>> {
+        if self.txn.is_some() {
+            return self.gather_with_overlay(table, filter);
+        }
+        self.gather_rows_keyed(table, filter)
+    }
+
+    /// Ordered/limited variant of [`Database::local_matching_rows`]; see
+    /// [`Cluster::matching_rows_ordered`]. In a transaction, reads go through
+    /// the buffered overlay (unindexed, never presorted).
+    fn local_matching_rows_ordered(
+        &self,
+        table: &str,
+        filter: &Option<Expr>,
+        order: Option<&str>,
+        fetch_limit: Option<usize>,
+    ) -> Result<OrderedRows> {
+        if self.txn.is_some() {
+            return Ok((self.gather_with_overlay(table, filter)?, false));
+        }
+        self.gather_rows_planned(table, filter, order, fetch_limit)
+    }
+
+    /// Live-row count of `table` straight from storage key statistics — no row
+    /// decode. Unavailable while a transaction is open (its overlay could
+    /// change the count).
+    fn local_count_rows(&self, table: &str) -> Result<Option<usize>> {
+        if self.txn.is_some() {
+            return Ok(None);
+        }
+        let engine = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+        Ok(Some(engine.key_stats()?.live_keys))
+    }
 
     /// Collect `(key, doc)` for the rows of `table` matching `filter`, using a
     /// secondary index when the filter permits (equality or range on an indexed
@@ -1074,11 +1217,31 @@ impl Database {
         fetch_limit: Option<usize>,
     ) -> Result<OrderedRows> {
         let Some((index_name, start, end, sorted)) = self.plan_index(table, filter, order) else {
-            // No usable index: full table scan + filter, unordered.
+            // No usable index: stream the table scan (decode one row at a
+            // time) and, when no ordering is required, stop as soon as the
+            // fetch limit is satisfied — a plain `LIMIT n` touches n matching
+            // rows, not the whole table.
+            let engine = self
+                .tables
+                .get(table)
+                .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
             let mut out = Vec::new();
-            for (key, doc) in self.scan_docs(table)? {
+            for item in engine.scan_iter() {
+                let (key, bytes) = item?;
+                let doc = match Value::decode(&bytes) {
+                    Ok(Value::Document(doc)) => doc,
+                    Ok(_) => {
+                        return Err(EngineError::Constraint(
+                            "stored row is not a document".into(),
+                        ))
+                    }
+                    Err(e) => return Err(EngineError::Constraint(format!("corrupt row: {e}"))),
+                };
                 if matches_filter(filter, &doc)? {
                     out.push((key, doc));
+                    if order.is_none() && fetch_limit.is_some_and(|lim| out.len() >= lim) {
+                        break;
+                    }
                 }
             }
             return Ok((out, false));
@@ -1103,8 +1266,11 @@ impl Database {
             {
                 if matches_filter(filter, &doc)? {
                     out.push((row_key, doc));
-                    // Rows already arrive in `order`, so a fetch limit lets us stop.
-                    if sorted && fetch_limit.is_some_and(|lim| out.len() >= lim) {
+                    // Stop early when the rows already arrive in `order`, or
+                    // when the query never asked for one.
+                    if (sorted || order.is_none())
+                        && fetch_limit.is_some_and(|lim| out.len() >= lim)
+                    {
                         break;
                     }
                 }
@@ -1162,6 +1328,23 @@ impl Database {
         Ok(())
     }
 
+    /// [`Database::index_put`] without the fsync: returns the index WAL's sync
+    /// handle and commit point so a multi-row statement group-commits once.
+    fn index_put_deferred(
+        &mut self,
+        name: &str,
+        paths: &[String],
+        doc: &Document,
+        row_key: &[u8],
+    ) -> Result<Option<(Arc<WalSync>, WalCommit)>> {
+        let values = index_values(doc, paths);
+        if let Some(engine) = self.indexes.get_mut(name) {
+            let (_, commit) = engine.put_deferred(&index_entry_key(&values, row_key), row_key.to_vec())?;
+            return Ok(Some((engine.wal_sync_handle(), commit)));
+        }
+        Ok(None)
+    }
+
     /// Remove the index entry for `doc`'s values at `paths` pointing to `row_key`.
     fn index_del(
         &mut self,
@@ -1175,6 +1358,23 @@ impl Database {
             engine.delete(&index_entry_key(&values, row_key))?;
         }
         Ok(())
+    }
+
+    /// Deferred-durability [`Database::index_del`]; see
+    /// [`Database::index_put_deferred`].
+    fn index_del_deferred(
+        &mut self,
+        name: &str,
+        paths: &[String],
+        doc: &Document,
+        row_key: &[u8],
+    ) -> Result<Option<(Arc<WalSync>, WalCommit)>> {
+        let values = index_values(doc, paths);
+        if let Some(engine) = self.indexes.get_mut(name) {
+            let (_, commit) = engine.delete_deferred(&index_entry_key(&values, row_key))?;
+            return Ok(Some((engine.wal_sync_handle(), commit)));
+        }
+        Ok(None)
     }
 
     // ---- distribution support (used by the cluster coordinator) ----
@@ -1745,12 +1945,16 @@ impl Database {
 /// Storage seam for the SQL executor (SPEC §4–6). Implemented by [`LocalCluster`]
 /// for the embedded engine and by the cluster coordinator for replicated,
 /// quorum-based reads and writes — so [`run`] is identical in both worlds.
+///
+/// Read methods take `&self` so a `SELECT` can execute with shared access to
+/// the underlying storage (concurrent readers); only the write methods need
+/// `&mut self`.
 pub trait Cluster {
     /// Primary-key columns of `table`.
     fn primary_key(&self, table: &str) -> Result<Vec<String>>;
     /// `(key, doc)` for rows of `table` matching `filter`.
     fn matching_rows(
-        &mut self,
+        &self,
         table: &str,
         filter: &Option<Expr>,
     ) -> Result<Vec<(Vec<u8>, Document)>>;
@@ -1760,7 +1964,7 @@ pub trait Cluster {
     /// after `fetch_limit` matching rows. Returns the rows and whether they are
     /// actually sorted by `order`. The default ignores the hints.
     fn matching_rows_ordered(
-        &mut self,
+        &self,
         table: &str,
         filter: &Option<Expr>,
         _order: Option<&str>,
@@ -1768,10 +1972,32 @@ pub trait Cluster {
     ) -> Result<OrderedRows> {
         Ok((self.matching_rows(table, filter)?, false))
     }
+    /// Fast count of `table`'s live rows, when the implementation can serve it
+    /// without materializing or decoding rows (`None` = unavailable; the
+    /// caller falls back to a full gather). Only consulted for unfiltered
+    /// `COUNT(*)`.
+    fn count_rows(&self, _table: &str) -> Result<Option<usize>> {
+        Ok(None)
+    }
     /// Write `doc` under `key` in `table` (and maintain indexes/replicas).
     fn put(&mut self, table: &str, key: &[u8], doc: &Document) -> Result<()>;
     /// Delete `key` from `table`; `doc` is the row being removed (for indexes).
     fn delete(&mut self, table: &str, key: &[u8], doc: &Document) -> Result<()>;
+}
+
+/// Whether `stmt` only reads — i.e. it can run through the shared-access entry
+/// points ([`Database::execute_read`] / [`Database::execute_session_read`])
+/// without exclusive access. DML, DDL, and transaction control are not
+/// read-only. Lets a caller holding an `RwLock<Database>` pick the lock mode.
+pub fn statement_is_read_only(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::Select(_)
+            | Statement::ShowTables
+            | Statement::ShowIndexes
+            | Statement::ShowStatus
+            | Statement::ShowDatabases
+    )
 }
 
 /// Execute one DML/SELECT statement against any [`Cluster`].
@@ -1781,7 +2007,9 @@ pub trait Cluster {
 pub fn run(stmt: Statement, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
     match stmt {
         Statement::Insert(ins) => run_insert(ins, cluster),
-        Statement::Select(sel) => run_select(&sel, cluster).map(QueryOutput::Rows),
+        // SELECT only reads: reborrow shared so the executor's read-only
+        // requirements are checked by the compiler.
+        Statement::Select(sel) => run_select(&sel, &*cluster).map(QueryOutput::Rows),
         Statement::Update(upd) => run_update(upd, cluster),
         Statement::Delete(del) => run_delete(del, cluster),
         _ => Err(EngineError::Unsupported(
@@ -1809,7 +2037,7 @@ fn run_insert(ins: Insert, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
     Ok(QueryOutput::Mutation { affected })
 }
 
-fn run_select(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSet> {
+fn run_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> {
     // Compound query (`UNION [ALL]`): project each core without ordering/limiting,
     // combine the row sets, then apply the whole-query DISTINCT / ORDER BY / LIMIT.
     if !sel.set_ops.is_empty() {
@@ -1847,18 +2075,42 @@ fn is_grouped(sel: &Select) -> bool {
 }
 
 /// Single-table query using the index planner for ordered/top-N gathers.
-fn run_simple_select(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSet> {
+fn run_simple_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> {
     let grouped = is_grouped(sel);
+    // Unfiltered `SELECT COUNT(*)`: serve straight from storage key statistics
+    // without decoding a single row.
+    if grouped && sel.filter.is_none() && sel.group_by.is_empty() && sel.having.is_none() {
+        if let [SelectItem::Expr {
+            expr:
+                expr @ Expr::Aggregate {
+                    func: AggFunc::Count,
+                    arg: AggArg::Star,
+                },
+            alias,
+        }] = sel.items.as_slice()
+        {
+            if let Some(n) = cluster.count_rows(&sel.from)? {
+                let col = alias.clone().unwrap_or_else(|| expr_name(expr));
+                let mut rows = vec![vec![Value::Int(n as i64)]];
+                apply_offset_limit(&mut rows, sel.offset, sel.limit);
+                return Ok(ResultSet::new(vec![col], rows));
+            }
+        }
+    }
     // An index can satisfy a single ascending `ORDER BY <column>` directly.
     let order_col = if grouped {
         None
     } else {
         index_order_column(&sel.order_by)
     };
-    // Push a fetch limit only when the rows will come back in the requested order
-    // (so truncating the prefix is correct) and the result isn't deduplicated.
+    // Push a fetch limit when truncating the gather is correct: either the
+    // rows come back already in the requested order, or the query asks for no
+    // order at all. DISTINCT and grouping need every row.
     let fetch_limit = match (&order_col, sel.limit, sel.distinct) {
         (Some(_), Some(limit), false) => {
+            Some(sel.offset.unwrap_or(0).saturating_add(limit) as usize)
+        }
+        (None, Some(limit), false) if !grouped && sel.order_by.is_empty() => {
             Some(sel.offset.unwrap_or(0).saturating_add(limit) as usize)
         }
         _ => None,
@@ -1878,7 +2130,7 @@ fn run_simple_select(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSe
 /// Project a query core (its own projection/grouping/having/distinct) to a
 /// `ResultSet`, but **without** applying ORDER BY / LIMIT — those belong to the
 /// enclosing compound query. Join-aware.
-fn project_core(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSet> {
+fn project_core(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> {
     let docs: Vec<Document> = if sel.joins.is_empty() {
         cluster
             .matching_rows(&sel.from, &sel.filter)?
@@ -1952,12 +2204,85 @@ fn join_keep(on: &Option<Expr>, cand: &JoinTuple) -> Result<bool> {
     }
 }
 
+/// Find an `ON` conjunct of the form `<left column> = <ra>.<column>` (either
+/// operand order): the equi-join key that lets [`gather_join_docs`] build a
+/// hash table instead of running the O(left × right) nested loop. Returns the
+/// left path (evaluated against the merged left tuple) and the right path
+/// stripped of its `ra.` prefix (evaluated against the right document).
+fn equi_key_paths(on: &Option<Expr>, ra: &str) -> Option<(String, String)> {
+    fn conjuncts<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+        if let Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } = e
+        {
+            conjuncts(left, out);
+            conjuncts(right, out);
+        } else {
+            out.push(e);
+        }
+    }
+    let mut cs = Vec::new();
+    conjuncts(on.as_ref()?, &mut cs);
+    for c in cs {
+        let Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } = c
+        else {
+            continue;
+        };
+        let (Expr::Column(a), Expr::Column(b)) = (left.as_ref(), right.as_ref()) else {
+            continue;
+        };
+        for (x, y) in [(a, b), (b, a)] {
+            let Some(stripped) = y.strip_prefix(ra).and_then(|s| s.strip_prefix('.')) else {
+                continue;
+            };
+            let x_head = x.split('.').next().unwrap_or(x);
+            if x_head != ra {
+                return Some((x.clone(), stripped.to_string()));
+            }
+        }
+    }
+    None
+}
+
+/// Hash-bucket key under which two values can possibly compare equal by
+/// [`compare`]'s coercion rules: numerics collapse to their f64 projection
+/// (so `1 = 1.0` lands in one bucket), everything else to its type-tagged key
+/// encoding. `None` (NULL or NaN) equals nothing. Collisions are harmless —
+/// every candidate pair is re-verified against the full `ON` expression;
+/// only equal values landing in different buckets would be a bug, which the
+/// f64 collapse rules out.
+fn join_hash_key(v: &Value) -> Option<Vec<u8>> {
+    if v.is_null() {
+        return None;
+    }
+    if let Some(n) = crate::eval::as_number(v) {
+        if n.is_nan() {
+            return None;
+        }
+        let n = if n == 0.0 { 0.0f64 } else { n }; // collapse -0.0 into +0.0
+        let mut k = Vec::with_capacity(9);
+        k.push(0);
+        k.extend_from_slice(&n.to_bits().to_le_bytes());
+        return Some(k);
+    }
+    let mut k = Vec::with_capacity(16);
+    k.push(1);
+    v.encode_into(&mut k);
+    Some(k)
+}
+
 /// Nested-loop evaluation of `FROM` + its joins into flattened result documents
 /// (then filtered by the query `WHERE`). Each table's rows are gathered through
 /// the [`Cluster`] seam, so joins work embedded and cluster-wide alike. Note: in
 /// a cluster this pulls each joined table to the coordinator — there is no join
 /// pushdown — so it suits modest tables / lookups.
-fn gather_join_docs(sel: &Select, cluster: &mut dyn Cluster) -> Result<Vec<Document>> {
+fn gather_join_docs(sel: &Select, cluster: &dyn Cluster) -> Result<Vec<Document>> {
     let base = cluster.matching_rows(&sel.from, &None)?;
     let mut tuples: Vec<JoinTuple> = base
         .into_iter()
@@ -1971,14 +2296,58 @@ fn gather_join_docs(sel: &Select, cluster: &mut dyn Cluster) -> Result<Vec<Docum
         let mut next: Vec<JoinTuple> = Vec::new();
         match join.kind {
             JoinKind::Inner | JoinKind::Left | JoinKind::Cross => {
+                // Equi-join: bucket the right side by its key once, then probe
+                // per left tuple — O(left + right + matches) instead of the
+                // O(left × right) nested loop. Bucket collisions and residual
+                // `ON` conjuncts are handled by re-verifying each candidate.
+                let equi = equi_key_paths(&join.on, ra);
+                let buckets: Option<HashMap<Vec<u8>, Vec<usize>>> =
+                    equi.as_ref().map(|(_, rpath)| {
+                        let mut b: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+                        for (i, (_, rd)) in right.iter().enumerate() {
+                            // A right row with a NULL/absent key can never
+                            // satisfy the equality — leave it unbucketed.
+                            if let Some(k) = rd.get_path(rpath).and_then(join_hash_key) {
+                                b.entry(k).or_default().push(i);
+                            }
+                        }
+                        b
+                    });
                 for t in &tuples {
                     let mut matched = false;
-                    for (_, rd) in &right {
-                        let mut cand = t.clone();
-                        cand.push((ra.clone(), Some(rd.clone())));
-                        if join_keep(&join.on, &cand)? {
-                            next.push(cand);
-                            matched = true;
+                    let probe: Option<&[usize]> = match (&equi, &buckets) {
+                        (Some((lpath, _)), Some(b)) => {
+                            match merge_tuple(t).get_path(lpath).and_then(join_hash_key) {
+                                Some(k) => Some(b.get(&k).map(Vec::as_slice).unwrap_or(&[])),
+                                // NULL left key: the merged candidate could in
+                                // principle still resolve the path through the
+                                // right side, so keep exact semantics with a
+                                // per-tuple nested loop.
+                                None => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    match probe {
+                        Some(idxs) => {
+                            for &i in idxs {
+                                let mut cand = t.clone();
+                                cand.push((ra.clone(), Some(right[i].1.clone())));
+                                if join_keep(&join.on, &cand)? {
+                                    next.push(cand);
+                                    matched = true;
+                                }
+                            }
+                        }
+                        None => {
+                            for (_, rd) in &right {
+                                let mut cand = t.clone();
+                                cand.push((ra.clone(), Some(rd.clone())));
+                                if join_keep(&join.on, &cand)? {
+                                    next.push(cand);
+                                    matched = true;
+                                }
+                            }
                         }
                     }
                     // LEFT JOIN: emit the left row with a null right side if nothing matched.
@@ -2027,7 +2396,16 @@ fn gather_join_docs(sel: &Select, cluster: &mut dyn Cluster) -> Result<Vec<Docum
 /// Dedup rows in place, preserving first-seen order (for `DISTINCT` / `UNION`).
 fn dedup_rows(rows: &mut Vec<Vec<Value>>) {
     let mut seen = BTreeSet::new();
-    rows.retain(|row| seen.insert(Value::Array(row.clone()).encode_key()));
+    rows.retain(|row| {
+        // Concatenated per-value key encodings are self-delimiting (the same
+        // property composite index keys rely on), so no need to clone the row
+        // into a `Value::Array` just to encode it.
+        let mut key = Vec::new();
+        for v in row {
+            v.encode_into(&mut key);
+        }
+        seen.insert(key)
+    });
 }
 
 /// Apply the whole-query DISTINCT, ORDER BY, and OFFSET/LIMIT to a combined
@@ -2061,10 +2439,12 @@ fn sort_result_rows(rs: &mut ResultSet, order_by: &[OrderKey]) -> Result<()> {
         keyed.push((k, i));
     }
     keyed.sort_by(|a, b| order_compare(&a.0, &b.0, order_by));
-    let original = rs.rows.clone();
-    for (new_pos, (_, old_idx)) in keyed.into_iter().enumerate() {
-        rs.rows[new_pos] = original[old_idx].clone();
-    }
+    // Reorder by moving rows into place — no clones.
+    let mut old = std::mem::take(&mut rs.rows);
+    rs.rows = keyed
+        .into_iter()
+        .map(|(_, old_idx)| std::mem::take(&mut old[old_idx]))
+        .collect();
     Ok(())
 }
 
@@ -2108,8 +2488,48 @@ fn run_delete(del: Delete, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
 }
 
 /// The embedded, single-node implementation of [`Cluster`].
+///
+/// Writes are appended with **deferred durability**: each put/delete lands in
+/// the WAL and memtable immediately, but the fsync is postponed and issued
+/// once per touched engine when the statement finishes ([`LocalCluster::
+/// flush_pending`]) — a multi-row `INSERT` costs one fsync, not one per row.
 struct LocalCluster<'a> {
     db: &'a mut Database,
+    /// Per-statement memo of each table's secondary indexes, so a multi-row
+    /// statement doesn't rescan (and re-clone) the catalog per row.
+    index_memo: HashMap<String, Vec<(String, Vec<String>)>>,
+    /// Latest deferred WAL commit per engine touched (`t:`/`i:`-prefixed
+    /// name); syncing the latest commit makes all earlier ones durable.
+    pending: HashMap<String, (Arc<WalSync>, WalCommit)>,
+}
+
+impl<'a> LocalCluster<'a> {
+    fn new(db: &'a mut Database) -> LocalCluster<'a> {
+        LocalCluster {
+            db,
+            index_memo: HashMap::new(),
+            pending: HashMap::new(),
+        }
+    }
+
+    /// Group-commit every deferred write. Must be called when the statement
+    /// finishes (success or error — applied rows must become durable either
+    /// way, matching the previous per-row fsync behavior).
+    fn flush_pending(&mut self) -> Result<()> {
+        for (_, (sync, commit)) in self.pending.drain() {
+            sync.sync_through(commit)?;
+        }
+        Ok(())
+    }
+
+    /// The memoized `(name, paths)` list of `table`'s secondary indexes.
+    fn table_indexes(&mut self, table: &str) -> &[(String, Vec<String>)] {
+        if !self.index_memo.contains_key(table) {
+            let list = self.db.indexes_on(table);
+            self.index_memo.insert(table.to_string(), list);
+        }
+        &self.index_memo[table]
+    }
 }
 
 impl Cluster for LocalCluster<'_> {
@@ -2118,28 +2538,25 @@ impl Cluster for LocalCluster<'_> {
     }
 
     fn matching_rows(
-        &mut self,
+        &self,
         table: &str,
         filter: &Option<Expr>,
     ) -> Result<Vec<(Vec<u8>, Document)>> {
-        if self.db.txn.is_some() {
-            return self.db.gather_with_overlay(table, filter);
-        }
-        self.db.gather_rows_keyed(table, filter)
+        self.db.local_matching_rows(table, filter)
     }
 
     fn matching_rows_ordered(
-        &mut self,
+        &self,
         table: &str,
         filter: &Option<Expr>,
         order: Option<&str>,
         fetch_limit: Option<usize>,
     ) -> Result<OrderedRows> {
-        // In a transaction, read through the buffered overlay (unindexed).
-        if self.db.txn.is_some() {
-            return Ok((self.db.gather_with_overlay(table, filter)?, false));
-        }
-        self.db.gather_rows_planned(table, filter, order, fetch_limit)
+        self.db.local_matching_rows_ordered(table, filter, order, fetch_limit)
+    }
+
+    fn count_rows(&self, table: &str) -> Result<Option<usize>> {
+        self.db.local_count_rows(table)
     }
 
     fn put(&mut self, table: &str, key: &[u8], doc: &Document) -> Result<()> {
@@ -2149,11 +2566,15 @@ impl Cluster for LocalCluster<'_> {
                 .insert((table.to_string(), key.to_vec()), Some(doc.clone()));
             return Ok(());
         }
-        self.db
-            .table_engine_mut(table)?
-            .put(key, Value::Document(doc.clone()).encode())?;
-        for (name, path) in self.db.indexes_on(table) {
-            self.db.index_put(&name, &path, doc, key)?;
+        self.table_indexes(table);
+        let engine = self.db.table_engine_mut(table)?;
+        let (_, commit) = engine.put_deferred(key, Value::encode_document(doc))?;
+        self.pending
+            .insert(format!("t:{table}"), (engine.wal_sync_handle(), commit));
+        for (name, paths) in &self.index_memo[table] {
+            if let Some(sync) = self.db.index_put_deferred(name, paths, doc, key)? {
+                self.pending.insert(format!("i:{name}"), sync);
+            }
         }
         self.db.maintain_vectors_put(table, doc, key);
         Ok(())
@@ -2164,12 +2585,65 @@ impl Cluster for LocalCluster<'_> {
             txn.writes.insert((table.to_string(), key.to_vec()), None);
             return Ok(());
         }
-        self.db.table_engine_mut(table)?.delete(key)?;
-        for (name, path) in self.db.indexes_on(table) {
-            self.db.index_del(&name, &path, doc, key)?;
+        self.table_indexes(table);
+        let engine = self.db.table_engine_mut(table)?;
+        let (_, commit) = engine.delete_deferred(key)?;
+        self.pending
+            .insert(format!("t:{table}"), (engine.wal_sync_handle(), commit));
+        for (name, paths) in &self.index_memo[table] {
+            if let Some(sync) = self.db.index_del_deferred(name, paths, doc, key)? {
+                self.pending.insert(format!("i:{name}"), sync);
+            }
         }
         self.db.maintain_vectors_del(table, key);
         Ok(())
+    }
+}
+
+/// A read-only [`Cluster`] over a shared `&Database` — the seam behind
+/// [`Database::execute_read_statement`]. SELECT execution never calls the
+/// write methods, so they only guard against misuse.
+struct LocalRead<'a> {
+    db: &'a Database,
+}
+
+impl Cluster for LocalRead<'_> {
+    fn primary_key(&self, table: &str) -> Result<Vec<String>> {
+        Ok(self.db.table_def(table)?.primary_key.clone())
+    }
+
+    fn matching_rows(
+        &self,
+        table: &str,
+        filter: &Option<Expr>,
+    ) -> Result<Vec<(Vec<u8>, Document)>> {
+        self.db.local_matching_rows(table, filter)
+    }
+
+    fn matching_rows_ordered(
+        &self,
+        table: &str,
+        filter: &Option<Expr>,
+        order: Option<&str>,
+        fetch_limit: Option<usize>,
+    ) -> Result<OrderedRows> {
+        self.db.local_matching_rows_ordered(table, filter, order, fetch_limit)
+    }
+
+    fn count_rows(&self, table: &str) -> Result<Option<usize>> {
+        self.db.local_count_rows(table)
+    }
+
+    fn put(&mut self, _table: &str, _key: &[u8], _doc: &Document) -> Result<()> {
+        Err(EngineError::Unsupported(
+            "write statement reached the read-only executor".into(),
+        ))
+    }
+
+    fn delete(&mut self, _table: &str, _key: &[u8], _doc: &Document) -> Result<()> {
+        Err(EngineError::Unsupported(
+            "write statement reached the read-only executor".into(),
+        ))
     }
 }
 
@@ -2522,7 +2996,15 @@ fn select_rows(
     // `UNION` core, where they belong to the whole query). `presorted` means the
     // gather already returned rows in `ORDER BY` order (via an index).
     if finalize && !presorted {
-        sort_docs(&mut docs, &sel.order_by)?;
+        // Without DISTINCT only the first offset+limit sorted rows survive, so
+        // a bounded selection beats sorting the whole set.
+        let top_k = if sel.distinct {
+            None
+        } else {
+            sel.limit
+                .map(|lim| (sel.offset.unwrap_or(0).saturating_add(lim)) as usize)
+        };
+        sort_docs(&mut docs, &sel.order_by, top_k)?;
     }
     // Without DISTINCT we can trim to the page before projecting (cheap top-N);
     // with DISTINCT the dedup must happen first, so we page after projection.
@@ -2765,7 +3247,11 @@ fn number(v: &Value) -> Option<f64> {
     }
 }
 
-fn sort_docs(docs: &mut [Document], order_by: &[OrderKey]) -> Result<()> {
+/// Sort `docs` by `order_by`; with `top_k` set, keep only the first `k` rows
+/// of the sorted order — an O(n) selection plus an O(k log k) sort instead of
+/// sorting everything, for `ORDER BY … LIMIT` queries. Ties break by original
+/// position, so the result matches what a full stable sort would keep.
+fn sort_docs(docs: &mut Vec<Document>, order_by: &[OrderKey], top_k: Option<usize>) -> Result<()> {
     if order_by.is_empty() {
         return Ok(());
     }
@@ -2778,12 +3264,25 @@ fn sort_docs(docs: &mut [Document], order_by: &[OrderKey]) -> Result<()> {
         }
         keyed.push((k, i));
     }
-    keyed.sort_by(|a, b| order_compare(&a.0, &b.0, order_by));
-
-    let original: Vec<Document> = docs.to_vec();
-    for (new_pos, (_, old_idx)) in keyed.into_iter().enumerate() {
-        docs[new_pos] = original[old_idx].clone();
+    let cmp = |a: &(Vec<Value>, usize), b: &(Vec<Value>, usize)| {
+        order_compare(&a.0, &b.0, order_by).then(a.1.cmp(&b.1))
+    };
+    if let Some(k) = top_k.filter(|k| *k < keyed.len()) {
+        if k == 0 {
+            docs.clear();
+            return Ok(());
+        }
+        keyed.select_nth_unstable_by(k - 1, cmp);
+        keyed.truncate(k);
     }
+    keyed.sort_unstable_by(cmp);
+
+    // Reorder by moving the docs into place — no clones.
+    let mut old = std::mem::take(docs);
+    *docs = keyed
+        .into_iter()
+        .map(|(_, i)| std::mem::take(&mut old[i]))
+        .collect();
     Ok(())
 }
 

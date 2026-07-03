@@ -30,48 +30,79 @@ use skaidb_proto::{read_frame, write_frame};
 /// generate node certs with `DNS:skaidb`.)
 const TLS_SERVER_NAME: &str = "skaidb";
 
-/// An authenticated internode connection: plain TCP, or TLS over TCP.
-pub enum Conn {
+/// An authenticated internode connection: plain TCP, or TLS over TCP. Reads go
+/// through an internal buffer so a length-prefixed frame read doesn't hit the
+/// stream twice per message (once for the length, once for the payload); writes
+/// pass straight through (`write_frame` already coalesces header + payload).
+pub struct Conn {
+    stream: BufReader<Stream>,
+}
+
+/// The underlying byte stream of a [`Conn`].
+enum Stream {
     Plain(TcpStream),
     ClientTls(Box<StreamOwned<ClientConnection, TcpStream>>),
     ServerTls(Box<StreamOwned<ServerConnection, TcpStream>>),
 }
 
+impl Conn {
+    fn new(stream: Stream) -> Conn {
+        Conn {
+            stream: BufReader::new(stream),
+        }
+    }
+}
+
 impl fmt::Debug for Conn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let kind = match self {
-            Conn::Plain(_) => "Plain",
-            Conn::ClientTls(_) => "ClientTls",
-            Conn::ServerTls(_) => "ServerTls",
+        let kind = match self.stream.get_ref() {
+            Stream::Plain(_) => "Plain",
+            Stream::ClientTls(_) => "ClientTls",
+            Stream::ServerTls(_) => "ServerTls",
         };
         f.debug_tuple("Conn").field(&kind).finish()
     }
 }
 
-impl Read for Conn {
+impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
-            Conn::Plain(s) => s.read(buf),
-            Conn::ClientTls(s) => s.read(buf),
-            Conn::ServerTls(s) => s.read(buf),
+            Stream::Plain(s) => s.read(buf),
+            Stream::ClientTls(s) => s.read(buf),
+            Stream::ServerTls(s) => s.read(buf),
         }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Stream::Plain(s) => s.write(buf),
+            Stream::ClientTls(s) => s.write(buf),
+            Stream::ServerTls(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Stream::Plain(s) => s.flush(),
+            Stream::ClientTls(s) => s.flush(),
+            Stream::ServerTls(s) => s.flush(),
+        }
+    }
+}
+
+impl Read for Conn {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stream.read(buf)
     }
 }
 
 impl Write for Conn {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            Conn::Plain(s) => s.write(buf),
-            Conn::ClientTls(s) => s.write(buf),
-            Conn::ServerTls(s) => s.write(buf),
-        }
+        self.stream.get_mut().write(buf)
     }
     fn flush(&mut self) -> io::Result<()> {
-        match self {
-            Conn::Plain(s) => s.flush(),
-            Conn::ClientTls(s) => s.flush(),
-            Conn::ServerTls(s) => s.flush(),
-        }
+        self.stream.get_mut().flush()
     }
 }
 
@@ -158,9 +189,9 @@ impl Authenticator {
         tcp.set_nodelay(true).ok();
 
         match self {
-            Authenticator::None => Ok(Conn::Plain(tcp)),
+            Authenticator::None => Ok(Conn::new(Stream::Plain(tcp))),
             Authenticator::Token(secret) => {
-                let mut conn = Conn::Plain(tcp);
+                let mut conn = Conn::new(Stream::Plain(tcp));
                 token_handshake_client(&mut conn, secret)?;
                 Ok(conn)
             }
@@ -172,7 +203,9 @@ impl Authenticator {
                 while conn.is_handshaking() {
                     conn.complete_io(&mut tcp)?;
                 }
-                Ok(Conn::ClientTls(Box::new(StreamOwned::new(conn, tcp))))
+                Ok(Conn::new(Stream::ClientTls(Box::new(StreamOwned::new(
+                    conn, tcp,
+                )))))
             }
         }
     }
@@ -181,9 +214,9 @@ impl Authenticator {
     pub fn accept(&self, tcp: TcpStream) -> io::Result<Conn> {
         tcp.set_nodelay(true).ok();
         match self {
-            Authenticator::None => Ok(Conn::Plain(tcp)),
+            Authenticator::None => Ok(Conn::new(Stream::Plain(tcp))),
             Authenticator::Token(secret) => {
-                let mut conn = Conn::Plain(tcp);
+                let mut conn = Conn::new(Stream::Plain(tcp));
                 token_handshake_server(&mut conn, secret)?;
                 Ok(conn)
             }
@@ -193,7 +226,9 @@ impl Authenticator {
                 while conn.is_handshaking() {
                     conn.complete_io(&mut tcp)?;
                 }
-                Ok(Conn::ServerTls(Box::new(StreamOwned::new(conn, tcp))))
+                Ok(Conn::new(Stream::ServerTls(Box::new(StreamOwned::new(
+                    conn, tcp,
+                )))))
             }
         }
     }

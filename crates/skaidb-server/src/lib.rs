@@ -3,7 +3,8 @@
 //!
 //! The binary endpoint is the raw-TCP fast path from `scp.txt`; QUIC is the
 //! eventual WAN default. Both endpoints execute SQL against one [`Database`]
-//! guarded by a mutex (thread-per-connection model).
+//! guarded by a reader-writer lock (thread-per-connection model; concurrent
+//! readers, exclusive writers).
 
 pub mod admin;
 pub mod audit;
@@ -31,7 +32,7 @@ use crate::shared::{Backend, Context, Shared};
 /// configured, otherwise a standalone local engine.
 fn build_backend(db: Database, config: &Config) -> Result<Backend, Box<dyn std::error::Error>> {
     if config.cluster.seeds.is_empty() {
-        return Ok(Backend::Local(Box::new(Mutex::new(db))));
+        return Ok(Backend::Local(Box::new(RwLock::new(db))));
     }
     let internode_addr = format!(
         "{}:{}",
@@ -279,7 +280,7 @@ mod tests {
         let mut roles = RoleStore::new();
         roles.create_superuser("superuser");
         Arc::new(Context {
-            backend: Backend::Local(Box::new(Mutex::new(Database::open(temp_dir()).unwrap()))),
+            backend: Backend::Local(Box::new(RwLock::new(Database::open(temp_dir()).unwrap()))),
             metrics: Metrics::new(),
             audit: RwLock::new(quiet_audit()),
             roles,
@@ -435,7 +436,7 @@ mod tests {
         let mut authn = AuthState::required();
         authn.add_user("ada", "pencil", "admin");
         Arc::new(Context {
-            backend: Backend::Local(Box::new(Mutex::new(Database::open(temp_dir()).unwrap()))),
+            backend: Backend::Local(Box::new(RwLock::new(Database::open(temp_dir()).unwrap()))),
             metrics: Metrics::new(),
             audit: RwLock::new(quiet_audit()),
             roles,
@@ -476,7 +477,7 @@ mod tests {
             .grant("reader", Privilege::Select, Object::Table("t".into()))
             .unwrap();
         let ctx: Shared = Arc::new(Context {
-            backend: Backend::Local(Box::new(Mutex::new(Database::open(temp_dir()).unwrap()))),
+            backend: Backend::Local(Box::new(RwLock::new(Database::open(temp_dir()).unwrap()))),
             metrics: Metrics::new(),
             audit: RwLock::new(quiet_audit()),
             roles,
@@ -512,7 +513,7 @@ mod tests {
         let mut roles = RoleStore::new();
         roles.create_superuser("su");
         let ctx: Shared = Arc::new(Context {
-            backend: Backend::Local(Box::new(Mutex::new(Database::open(temp_dir()).unwrap()))),
+            backend: Backend::Local(Box::new(RwLock::new(Database::open(temp_dir()).unwrap()))),
             metrics: Metrics::new(),
             audit: RwLock::new(quiet_audit()),
             roles,

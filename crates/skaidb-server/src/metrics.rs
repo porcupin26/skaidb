@@ -15,8 +15,21 @@
 //! line. Rendering a gauge as a counter (the old behaviour for `skaidb_up`)
 //! made `rate()`/`increase()` semantically wrong and tripped strict scrapers;
 //! the type is now tracked per base metric.
+//!
+//! # Hot path vs. cold path
+//!
+//! The per-query/per-connection series are a small closed set, so they live in
+//! pre-allocated [`AtomicU64`] cells addressed by enum ([`QueryType`],
+//! [`ErrorClass`], [`TxKind`], [`Endpoint`]). Recording one of them is a
+//! handful of relaxed atomic ops — **no mutex, no heap allocation** — so
+//! concurrent connection threads never serialize on the registry. The
+//! string-keyed API (`incr`/`add`/`set`/`observe`) remains for the cold paths:
+//! startup info gauges, scrape-time storage/cluster snapshots (including
+//! open-ended per-table/per-peer labels), and rare admin ops. Rendering merges
+//! both worlds and may allocate freely — scrapes are cold.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::Mutex;
 
 /// The Prometheus metric type of a base metric name.
@@ -69,10 +82,337 @@ impl Default for Hist {
     }
 }
 
-/// A registry of counters, gauges, and histograms.
+// ---------------------------------------------------------------------------
+// Hot-path label enums
+// ---------------------------------------------------------------------------
+
+/// The `type` label of `skaidb_queries_total`/`skaidb_query_duration_seconds`,
+/// classifying a statement by its leading keyword.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryType {
+    Select,
+    Insert,
+    Update,
+    Delete,
+    Ddl,
+    Tx,
+    Other,
+}
+
+impl QueryType {
+    /// Every variant, in cell-array order (`variant as usize` indexes it).
+    const ALL: [QueryType; 7] = [
+        QueryType::Select,
+        QueryType::Insert,
+        QueryType::Update,
+        QueryType::Delete,
+        QueryType::Ddl,
+        QueryType::Tx,
+        QueryType::Other,
+    ];
+
+    /// Full counter series key, e.g. `skaidb_queries_total{type="select"}`.
+    fn counter_series(self) -> &'static str {
+        match self {
+            QueryType::Select => "skaidb_queries_total{type=\"select\"}",
+            QueryType::Insert => "skaidb_queries_total{type=\"insert\"}",
+            QueryType::Update => "skaidb_queries_total{type=\"update\"}",
+            QueryType::Delete => "skaidb_queries_total{type=\"delete\"}",
+            QueryType::Ddl => "skaidb_queries_total{type=\"ddl\"}",
+            QueryType::Tx => "skaidb_queries_total{type=\"tx\"}",
+            QueryType::Other => "skaidb_queries_total{type=\"other\"}",
+        }
+    }
+
+    /// Full histogram series key, e.g. `skaidb_query_duration_seconds{type="select"}`.
+    fn duration_series(self) -> &'static str {
+        match self {
+            QueryType::Select => "skaidb_query_duration_seconds{type=\"select\"}",
+            QueryType::Insert => "skaidb_query_duration_seconds{type=\"insert\"}",
+            QueryType::Update => "skaidb_query_duration_seconds{type=\"update\"}",
+            QueryType::Delete => "skaidb_query_duration_seconds{type=\"delete\"}",
+            QueryType::Ddl => "skaidb_query_duration_seconds{type=\"ddl\"}",
+            QueryType::Tx => "skaidb_query_duration_seconds{type=\"tx\"}",
+            QueryType::Other => "skaidb_query_duration_seconds{type=\"other\"}",
+        }
+    }
+}
+
+/// The `class` label of `skaidb_query_errors_total` — a small, bounded set so
+/// the metric is actionable without unbounded label values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    Permission,
+    Timeout,
+    Parse,
+    Constraint,
+    Storage,
+    Other,
+}
+
+impl ErrorClass {
+    /// Every variant, in cell-array order (`variant as usize` indexes it).
+    const ALL: [ErrorClass; 6] = [
+        ErrorClass::Permission,
+        ErrorClass::Timeout,
+        ErrorClass::Parse,
+        ErrorClass::Constraint,
+        ErrorClass::Storage,
+        ErrorClass::Other,
+    ];
+
+    /// Full series key, e.g. `skaidb_query_errors_total{class="parse"}`.
+    fn series(self) -> &'static str {
+        match self {
+            ErrorClass::Permission => "skaidb_query_errors_total{class=\"permission\"}",
+            ErrorClass::Timeout => "skaidb_query_errors_total{class=\"timeout\"}",
+            ErrorClass::Parse => "skaidb_query_errors_total{class=\"parse\"}",
+            ErrorClass::Constraint => "skaidb_query_errors_total{class=\"constraint\"}",
+            ErrorClass::Storage => "skaidb_query_errors_total{class=\"storage\"}",
+            ErrorClass::Other => "skaidb_query_errors_total{class=\"other\"}",
+        }
+    }
+}
+
+/// The `kind` label of `skaidb_transactions_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxKind {
+    Begin,
+    Commit,
+    Rollback,
+}
+
+impl TxKind {
+    /// Every variant, in cell-array order (`variant as usize` indexes it).
+    const ALL: [TxKind; 3] = [TxKind::Begin, TxKind::Commit, TxKind::Rollback];
+
+    /// Full series key, e.g. `skaidb_transactions_total{kind="begin"}`.
+    fn series(self) -> &'static str {
+        match self {
+            TxKind::Begin => "skaidb_transactions_total{kind=\"begin\"}",
+            TxKind::Commit => "skaidb_transactions_total{kind=\"commit\"}",
+            TxKind::Rollback => "skaidb_transactions_total{kind=\"rollback\"}",
+        }
+    }
+}
+
+/// The `endpoint` label of the connection/bytes series.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Endpoint {
+    Binary,
+    Rest,
+}
+
+impl Endpoint {
+    /// Every variant, in cell-array order (`variant as usize` indexes it).
+    const ALL: [Endpoint; 2] = [Endpoint::Binary, Endpoint::Rest];
+
+    fn connections_total_series(self) -> &'static str {
+        match self {
+            Endpoint::Binary => "skaidb_connections_total{endpoint=\"binary\"}",
+            Endpoint::Rest => "skaidb_connections_total{endpoint=\"rest\"}",
+        }
+    }
+
+    fn connections_active_series(self) -> &'static str {
+        match self {
+            Endpoint::Binary => "skaidb_connections_active{endpoint=\"binary\"}",
+            Endpoint::Rest => "skaidb_connections_active{endpoint=\"rest\"}",
+        }
+    }
+
+    fn bytes_returned_series(self) -> &'static str {
+        match self {
+            Endpoint::Binary => "skaidb_bytes_returned_total{endpoint=\"binary\"}",
+            Endpoint::Rest => "skaidb_bytes_returned_total{endpoint=\"rest\"}",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hot-path storage
+// ---------------------------------------------------------------------------
+
+/// One lock-free counter/gauge cell. `touched` mirrors the map semantics of
+/// the string-keyed API: a series appears in the exposition only after its
+/// first operation (even a zero-delta `add`).
 #[derive(Debug, Default)]
+struct Cell {
+    value: AtomicU64,
+    touched: AtomicBool,
+}
+
+impl Cell {
+    /// Add `n` (counters, and positive gauge deltas).
+    fn add(&self, n: u64) {
+        self.value.fetch_add(n, Relaxed);
+        self.touched.store(true, Relaxed);
+    }
+
+    /// Subtract `n`, saturating at zero (gauge decrements never wrap).
+    fn sub_saturating(&self, n: u64) {
+        let _ = self
+            .value
+            .fetch_update(Relaxed, Relaxed, |cur| Some(cur.saturating_sub(n)));
+        self.touched.store(true, Relaxed);
+    }
+
+    /// Current value, or `None` if the series was never touched.
+    fn read(&self) -> Option<u64> {
+        self.touched
+            .load(Relaxed)
+            .then(|| self.value.load(Relaxed))
+    }
+}
+
+/// One lock-free histogram cell. Buckets store *per-bucket* counts (one
+/// `fetch_add` per observation); the cumulative `le` form is computed at
+/// render time. The sum is kept as `f64` bits in an `AtomicU64` since std has
+/// no atomic float.
+#[derive(Debug, Default)]
+struct HistCell {
+    buckets: [AtomicU64; BUCKETS.len()],
+    sum_bits: AtomicU64,
+    count: AtomicU64,
+}
+
+impl HistCell {
+    fn observe(&self, value: f64) {
+        if let Some(i) = BUCKETS.iter().position(|&bound| value <= bound) {
+            self.buckets[i].fetch_add(1, Relaxed);
+        }
+        let _ = self.sum_bits.fetch_update(Relaxed, Relaxed, |bits| {
+            Some((f64::from_bits(bits) + value).to_bits())
+        });
+        self.count.fetch_add(1, Relaxed);
+    }
+
+    /// Cumulative snapshot, or `None` if nothing was ever observed.
+    fn snapshot(&self) -> Option<Hist> {
+        let count = self.count.load(Relaxed);
+        if count == 0 {
+            return None;
+        }
+        let mut cumulative = 0u64;
+        let buckets = self
+            .buckets
+            .iter()
+            .map(|b| {
+                cumulative += b.load(Relaxed);
+                cumulative
+            })
+            .collect();
+        Some(Hist {
+            buckets,
+            sum: f64::from_bits(self.sum_bits.load(Relaxed)),
+            count,
+        })
+    }
+}
+
+/// Pre-allocated cells for every hot series (the fixed set written on the
+/// query/connection paths). Indexed by the label enums' discriminants.
+#[derive(Debug, Default)]
+struct HotMetrics {
+    queries_total: [Cell; QueryType::ALL.len()],
+    query_duration: [HistCell; QueryType::ALL.len()],
+    query_errors_total: [Cell; ErrorClass::ALL.len()],
+    transactions_total: [Cell; TxKind::ALL.len()],
+    rows_returned_total: Cell,
+    rows_scanned_total: Cell,
+    slow_queries_total: Cell,
+    authz_denied_total: Cell,
+    logins_total: Cell,
+    login_failures_total: Cell,
+    bytes_returned_total: [Cell; Endpoint::ALL.len()],
+    connections_total: [Cell; Endpoint::ALL.len()],
+    connections_active: [Cell; Endpoint::ALL.len()],
+    queries_in_flight: Cell,
+}
+
+impl HotMetrics {
+    /// Every hot counter cell with its full series key (render/`get` helper).
+    fn counters(&self) -> Vec<(&'static str, &Cell)> {
+        let mut out = Vec::new();
+        for t in QueryType::ALL {
+            out.push((t.counter_series(), &self.queries_total[t as usize]));
+        }
+        for c in ErrorClass::ALL {
+            out.push((c.series(), &self.query_errors_total[c as usize]));
+        }
+        for k in TxKind::ALL {
+            out.push((k.series(), &self.transactions_total[k as usize]));
+        }
+        out.push(("skaidb_rows_returned_total", &self.rows_returned_total));
+        out.push(("skaidb_rows_scanned_total", &self.rows_scanned_total));
+        out.push(("skaidb_slow_queries_total", &self.slow_queries_total));
+        out.push(("skaidb_authz_denied_total", &self.authz_denied_total));
+        out.push(("skaidb_logins_total", &self.logins_total));
+        out.push(("skaidb_login_failures_total", &self.login_failures_total));
+        for e in Endpoint::ALL {
+            out.push((
+                e.bytes_returned_series(),
+                &self.bytes_returned_total[e as usize],
+            ));
+            out.push((
+                e.connections_total_series(),
+                &self.connections_total[e as usize],
+            ));
+        }
+        out
+    }
+
+    /// Every hot gauge cell with its full series key (render/`get` helper).
+    fn gauges(&self) -> Vec<(&'static str, &Cell)> {
+        let mut out = Vec::new();
+        for e in Endpoint::ALL {
+            out.push((
+                e.connections_active_series(),
+                &self.connections_active[e as usize],
+            ));
+        }
+        out.push(("skaidb_queries_in_flight", &self.queries_in_flight));
+        out
+    }
+
+    /// Fold the touched hot scalar cells into a string-keyed snapshot.
+    /// Counters accumulate on top of any same-named dynamic series; gauges
+    /// overwrite (set semantics).
+    fn merge_scalars(&self, out: &mut BTreeMap<String, u64>) {
+        for (series, cell) in self.counters() {
+            if let Some(v) = cell.read() {
+                *out.entry(series.to_string()).or_insert(0) += v;
+            }
+        }
+        for (series, cell) in self.gauges() {
+            if let Some(v) = cell.read() {
+                out.insert(series.to_string(), v);
+            }
+        }
+    }
+
+    /// Fold the touched hot histogram cells into a string-keyed snapshot.
+    fn merge_hists(&self, out: &mut BTreeMap<String, Hist>) {
+        for t in QueryType::ALL {
+            if let Some(snap) = self.query_duration[t as usize].snapshot() {
+                let h = out.entry(t.duration_series().to_string()).or_default();
+                for (b, add) in h.buckets.iter_mut().zip(&snap.buckets) {
+                    *b += add;
+                }
+                h.sum += snap.sum;
+                h.count += snap.count;
+            }
+        }
+    }
+}
+
+/// A registry of counters, gauges, and histograms.
+#[derive(Debug)]
 pub struct Metrics {
+    /// Lock-free cells for the fixed hot-path series.
+    hot: HotMetrics,
     /// Counter and gauge values, keyed by full series (name + labels).
+    /// Cold-path only: startup info, scrape-time snapshots, admin ops.
     series: Mutex<BTreeMap<String, u64>>,
     /// Histogram accumulators, keyed by full series (name + labels, no `le`).
     hist: Mutex<BTreeMap<String, Hist>>,
@@ -82,7 +422,12 @@ pub struct Metrics {
 
 impl Metrics {
     pub fn new() -> Self {
-        let m = Metrics::default();
+        let m = Metrics {
+            hot: HotMetrics::default(),
+            series: Mutex::default(),
+            hist: Mutex::default(),
+            meta: Mutex::default(),
+        };
         // Register the well-known metrics with their correct type + help so the
         // exposition is meaningful even before the first observation.
         for (base, kind, help) in KNOWN_METRICS {
@@ -110,6 +455,87 @@ impl Metrics {
             help: String::new(),
         });
     }
+
+    // -- hot-path API (lock-free, allocation-free) ---------------------------
+
+    /// Count one executed statement (`skaidb_queries_total{type=…}`).
+    pub fn incr_query(&self, kind: QueryType) {
+        self.hot.queries_total[kind as usize].add(1);
+    }
+
+    /// Record one statement latency (`skaidb_query_duration_seconds{type=…}`).
+    pub fn observe_query_duration(&self, kind: QueryType, seconds: f64) {
+        self.hot.query_duration[kind as usize].observe(seconds);
+    }
+
+    /// Count one failed statement (`skaidb_query_errors_total{class=…}`).
+    pub fn incr_query_error(&self, class: ErrorClass) {
+        self.hot.query_errors_total[class as usize].add(1);
+    }
+
+    /// Count one transaction-control statement (`skaidb_transactions_total{kind=…}`).
+    pub fn incr_transaction(&self, kind: TxKind) {
+        self.hot.transactions_total[kind as usize].add(1);
+    }
+
+    /// Add to `skaidb_rows_returned_total`.
+    pub fn add_rows_returned(&self, n: u64) {
+        self.hot.rows_returned_total.add(n);
+    }
+
+    /// Add to `skaidb_rows_scanned_total`.
+    pub fn add_rows_scanned(&self, n: u64) {
+        self.hot.rows_scanned_total.add(n);
+    }
+
+    /// Add to `skaidb_bytes_returned_total{endpoint=…}`.
+    pub fn add_bytes_returned(&self, endpoint: Endpoint, n: u64) {
+        self.hot.bytes_returned_total[endpoint as usize].add(n);
+    }
+
+    /// Count one statement slower than `slow_query_ms` (`skaidb_slow_queries_total`).
+    pub fn incr_slow_query(&self) {
+        self.hot.slow_queries_total.add(1);
+    }
+
+    /// Count one RBAC denial (`skaidb_authz_denied_total`).
+    pub fn incr_authz_denied(&self) {
+        self.hot.authz_denied_total.add(1);
+    }
+
+    /// Count one successful authentication (`skaidb_logins_total`).
+    pub fn incr_login(&self) {
+        self.hot.logins_total.add(1);
+    }
+
+    /// Count one rejected authentication (`skaidb_login_failures_total`).
+    pub fn incr_login_failure(&self) {
+        self.hot.login_failures_total.add(1);
+    }
+
+    /// Account an accepted connection: bumps `skaidb_connections_total` and
+    /// `skaidb_connections_active` for `endpoint`.
+    pub fn connection_opened(&self, endpoint: Endpoint) {
+        self.hot.connections_total[endpoint as usize].add(1);
+        self.hot.connections_active[endpoint as usize].add(1);
+    }
+
+    /// Account a closed connection: drops `skaidb_connections_active`.
+    pub fn connection_closed(&self, endpoint: Endpoint) {
+        self.hot.connections_active[endpoint as usize].sub_saturating(1);
+    }
+
+    /// A statement started executing (`skaidb_queries_in_flight` +1).
+    pub fn inc_queries_in_flight(&self) {
+        self.hot.queries_in_flight.add(1);
+    }
+
+    /// A statement finished executing (`skaidb_queries_in_flight` -1).
+    pub fn dec_queries_in_flight(&self) {
+        self.hot.queries_in_flight.sub_saturating(1);
+    }
+
+    // -- string-keyed API (cold paths: startup, scrape snapshots, admin) -----
 
     /// Increment a counter series by one (creating it at zero first).
     pub fn incr(&self, series: &str) {
@@ -166,21 +592,39 @@ impl Metrics {
         h.count += 1;
     }
 
-    /// Current value of a counter/gauge series (0 if unset). Mainly for tests.
+    /// Current value of a counter/gauge series (0 if unset), merging the hot
+    /// cells with the string-keyed map. Mainly for tests.
     pub fn get(&self, series: &str) -> u64 {
-        *self
+        let mut value = *self
             .series
             .lock()
             .expect("metrics lock")
             .get(series)
-            .unwrap_or(&0)
+            .unwrap_or(&0);
+        for (name, cell) in self.hot.counters() {
+            if name == series {
+                if let Some(v) = cell.read() {
+                    value += v;
+                }
+            }
+        }
+        for (name, cell) in self.hot.gauges() {
+            if name == series {
+                if let Some(v) = cell.read() {
+                    value = v;
+                }
+            }
+        }
+        value
     }
 
     /// Render the Prometheus text exposition format. Each base metric emits a
     /// `# HELP` and `# TYPE` line (with the correct type) followed by its series.
     pub fn render(&self) -> String {
-        let series = self.series.lock().expect("metrics lock");
-        let hist = self.hist.lock().expect("metrics hist");
+        let mut series = self.series.lock().expect("metrics lock").clone();
+        self.hot.merge_scalars(&mut series);
+        let mut hist = self.hist.lock().expect("metrics hist").clone();
+        self.hot.merge_hists(&mut hist);
         let meta = self.meta.lock().expect("metrics meta");
 
         let mut out = String::new();
@@ -237,6 +681,12 @@ impl Metrics {
             }
         }
         out
+    }
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Metrics::new()
     }
 }
 
@@ -580,6 +1030,30 @@ mod tests {
     }
 
     #[test]
+    fn hot_counters_render_like_string_counters() {
+        let m = Metrics::new();
+        m.incr_query(QueryType::Select);
+        m.incr_query(QueryType::Select);
+        m.incr_query(QueryType::Insert);
+        m.incr_query_error(ErrorClass::Parse);
+        m.incr_transaction(TxKind::Begin);
+        m.add_rows_returned(3);
+        m.add_bytes_returned(Endpoint::Rest, 128);
+
+        assert_eq!(m.get("skaidb_queries_total{type=\"select\"}"), 2);
+        let text = m.render();
+        assert!(text.contains("skaidb_queries_total{type=\"select\"} 2"));
+        assert!(text.contains("skaidb_queries_total{type=\"insert\"} 1"));
+        assert!(text.contains("skaidb_query_errors_total{class=\"parse\"} 1"));
+        assert!(text.contains("skaidb_transactions_total{kind=\"begin\"} 1"));
+        assert!(text.contains("skaidb_rows_returned_total 3"));
+        assert!(text.contains("skaidb_bytes_returned_total{endpoint=\"rest\"} 128"));
+        // Untouched hot series stay out of the exposition.
+        assert!(!text.contains("skaidb_queries_total{type=\"delete\"}"));
+        assert!(!text.contains("skaidb_logins_total"));
+    }
+
+    #[test]
     fn up_is_a_gauge_not_a_counter() {
         let m = Metrics::new();
         m.set("skaidb_up", 1);
@@ -599,6 +1073,28 @@ mod tests {
         m.gauge_dec("skaidb_connections_active{endpoint=\"rest\"}");
         m.gauge_dec("skaidb_connections_active{endpoint=\"rest\"}");
         assert_eq!(m.get("skaidb_connections_active{endpoint=\"rest\"}"), 0);
+    }
+
+    #[test]
+    fn hot_gauges_saturate_and_render() {
+        let m = Metrics::new();
+        m.connection_opened(Endpoint::Rest);
+        m.connection_opened(Endpoint::Rest);
+        m.connection_closed(Endpoint::Rest);
+        assert_eq!(m.get("skaidb_connections_active{endpoint=\"rest\"}"), 1);
+        assert_eq!(m.get("skaidb_connections_total{endpoint=\"rest\"}"), 2);
+        // Saturates at zero, never wraps.
+        m.connection_closed(Endpoint::Rest);
+        m.connection_closed(Endpoint::Rest);
+        assert_eq!(m.get("skaidb_connections_active{endpoint=\"rest\"}"), 0);
+        let text = m.render();
+        assert!(text.contains("skaidb_connections_active{endpoint=\"rest\"} 0"));
+        assert!(text.contains("skaidb_connections_total{endpoint=\"rest\"} 2"));
+
+        m.inc_queries_in_flight();
+        m.dec_queries_in_flight();
+        m.dec_queries_in_flight();
+        assert_eq!(m.get("skaidb_queries_in_flight"), 0);
     }
 
     #[test]
@@ -629,5 +1125,33 @@ mod tests {
             .contains("skaidb_query_duration_seconds_bucket{type=\"select\",le=\"+Inf\"} 2"));
         assert!(text.contains("skaidb_query_duration_seconds_count{type=\"select\"} 2"));
         assert!(text.contains("skaidb_query_duration_seconds_sum{type=\"select\"}"));
+    }
+
+    #[test]
+    fn hot_histogram_renders_identically() {
+        let m = Metrics::new();
+        m.observe_query_duration(QueryType::Select, 0.003);
+        m.observe_query_duration(QueryType::Select, 0.2);
+        let text = m.render();
+        assert!(text.contains("# TYPE skaidb_query_duration_seconds histogram"));
+        // 0.003 <= 0.005 bucket, both <= 0.25 bucket (cumulative form).
+        assert!(
+            text.contains("skaidb_query_duration_seconds_bucket{type=\"select\",le=\"0.005\"} 1"),
+            "got: {text}"
+        );
+        assert!(
+            text.contains("skaidb_query_duration_seconds_bucket{type=\"select\",le=\"0.25\"} 2"),
+            "got: {text}"
+        );
+        assert!(text
+            .contains("skaidb_query_duration_seconds_bucket{type=\"select\",le=\"+Inf\"} 2"));
+        assert!(text.contains("skaidb_query_duration_seconds_count{type=\"select\"} 2"));
+        assert!(text.contains("skaidb_query_duration_seconds_sum{type=\"select\"} 0.203"));
+        // An observation past the last bound lands only in +Inf/_count.
+        m.observe_query_duration(QueryType::Select, 60.0);
+        let text = m.render();
+        assert!(text.contains("skaidb_query_duration_seconds_bucket{type=\"select\",le=\"10\"} 2"));
+        assert!(text
+            .contains("skaidb_query_duration_seconds_bucket{type=\"select\",le=\"+Inf\"} 3"));
     }
 }

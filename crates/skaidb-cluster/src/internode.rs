@@ -2,8 +2,9 @@
 //!
 //! Members talk to each other over the same length-prefixed framing as the
 //! client protocol. A coordinator replicates row writes (`ApplyPut`/
-//! `ApplyDelete`) to a key's replica set, scatters `LocalScan` to gather a
-//! table for a read, and broadcasts `ApplyDdl`.
+//! `ApplyDelete`, or `ApplyBatch` for many rows at once) to a key's replica
+//! set, scatters `LocalScan` to gather a table for a read, and broadcasts
+//! `ApplyDdl`.
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -30,6 +31,17 @@ pub enum Request {
         table: String,
         key: Vec<u8>,
         hlc: Hlc,
+    },
+    /// Apply a batch of row writes to one table in a single round-trip: the
+    /// receiver applies every row under one lock acquisition and issues one
+    /// WAL fsync for the whole batch (versus one per `ApplyPut`/`ApplyDelete`).
+    /// Rows are `(key, value, hlc, is_put)` — the [`Response::Scan`] row shape;
+    /// `is_put == false` marks a tombstone (delete, empty value). Used by
+    /// migration, drain, hint replay and anti-entropy. Acked with
+    /// [`Response::Ack`] only if every row applied.
+    ApplyBatch {
+        table: String,
+        rows: Vec<(Vec<u8>, Vec<u8>, Hlc, bool)>,
     },
     LocalScan {
         table: String,
@@ -160,6 +172,10 @@ pub enum Response {
     },
 }
 
+/// A versioned row on the wire: `(key, value, hlc, is_put)` — the shape shared
+/// by [`Response::Scan`] and [`Request::ApplyBatch`].
+type WireRow = (Vec<u8>, Vec<u8>, Hlc, bool);
+
 /// Errors decoding an internode message.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum WireError {
@@ -184,6 +200,7 @@ const REQ_FSCAN: u8 = 14;
 const REQ_SCHEMA: u8 = 15;
 const REQ_ANNOUNCE: u8 = 16;
 const REQ_NODESTATUS: u8 = 17;
+const REQ_BATCH: u8 = 18;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
@@ -216,6 +233,11 @@ impl Request {
                 put_str(&mut o, table);
                 put_bytes(&mut o, key);
                 o.extend_from_slice(&hlc.to_bytes());
+            }
+            Request::ApplyBatch { table, rows } => {
+                o.push(REQ_BATCH);
+                put_str(&mut o, table);
+                put_rows(&mut o, rows);
             }
             Request::LocalScan { table } => {
                 o.push(REQ_SCAN);
@@ -303,6 +325,10 @@ impl Request {
                 key: c.bytes()?,
                 hlc: c.hlc()?,
             },
+            REQ_BATCH => Request::ApplyBatch {
+                table: c.string()?,
+                rows: c.rows()?,
+            },
             REQ_SCAN => Request::LocalScan { table: c.string()? },
             REQ_FSCAN => Request::FilteredScan {
                 table: c.string()?,
@@ -377,13 +403,7 @@ impl Response {
             Response::Ack => o.push(RES_ACK),
             Response::Scan { rows } => {
                 o.push(RES_SCAN);
-                o.extend_from_slice(&(rows.len() as u32).to_le_bytes());
-                for (k, v, hlc, is_put) in rows {
-                    put_bytes(&mut o, k);
-                    put_bytes(&mut o, v);
-                    o.extend_from_slice(&hlc.to_bytes());
-                    o.push(u8::from(*is_put));
-                }
+                put_rows(&mut o, rows);
             }
             Response::Get { entry } => {
                 o.push(RES_GET);
@@ -449,18 +469,7 @@ impl Response {
         let mut c = Cur::new(buf);
         Ok(match c.u8()? {
             RES_ACK => Response::Ack,
-            RES_SCAN => {
-                let n = c.u32()? as usize;
-                let mut rows = Vec::with_capacity(n);
-                for _ in 0..n {
-                    let key = c.bytes()?;
-                    let value = c.bytes()?;
-                    let hlc = c.hlc()?;
-                    let is_put = c.u8()? != 0;
-                    rows.push((key, value, hlc, is_put));
-                }
-                Response::Scan { rows }
-            }
+            RES_SCAN => Response::Scan { rows: c.rows()? },
             RES_GET => {
                 let entry = if c.u8()? == 1 {
                     let value = c.bytes()?;
@@ -731,6 +740,17 @@ fn binary_from(b: u8) -> Result<BinaryOp, WireError> {
     })
 }
 
+/// A length-prefixed list of versioned [`WireRow`]s.
+fn put_rows(o: &mut Vec<u8>, rows: &[WireRow]) {
+    o.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+    for (k, v, hlc, is_put) in rows {
+        put_bytes(o, k);
+        put_bytes(o, v);
+        o.extend_from_slice(&hlc.to_bytes());
+        o.push(u8::from(*is_put));
+    }
+}
+
 /// A length-prefixed list of `(id, addr)` member pairs.
 fn put_members(o: &mut Vec<u8>, members: &[(String, String)]) {
     o.extend_from_slice(&(members.len() as u32).to_le_bytes());
@@ -827,6 +847,19 @@ impl<'a> Cur<'a> {
             _ => return Err(WireError::Malformed("unsupported filter expr")),
         })
     }
+    /// Reverse of [`put_rows`].
+    fn rows(&mut self) -> Result<Vec<WireRow>, WireError> {
+        let n = self.u32()? as usize;
+        let mut rows = Vec::with_capacity(n);
+        for _ in 0..n {
+            let key = self.bytes()?;
+            let value = self.bytes()?;
+            let hlc = self.hlc()?;
+            let is_put = self.u8()? != 0;
+            rows.push((key, value, hlc, is_put));
+        }
+        Ok(rows)
+    }
     fn members(&mut self) -> Result<Vec<(String, String)>, WireError> {
         let n = self.u32()? as usize;
         let mut out = Vec::with_capacity(n);
@@ -860,6 +893,17 @@ mod tests {
                 table: "t".into(),
                 key: vec![9],
                 hlc: Hlc::new(11, 0),
+            },
+            Request::ApplyBatch {
+                table: "t".into(),
+                rows: vec![
+                    (vec![1], vec![2, 3], Hlc::new(12, 0), true),
+                    (vec![4], vec![], Hlc::new(13, 1), false), // tombstone
+                ],
+            },
+            Request::ApplyBatch {
+                table: "t".into(),
+                rows: vec![],
             },
             Request::LocalScan { table: "t".into() },
             Request::FilteredScan {
