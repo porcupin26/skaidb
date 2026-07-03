@@ -150,6 +150,27 @@ less than every other system.
   to `ONE` would make reads node-local and faster, at the cost of read-your-writes
   across coordinators.
 
+## v0.16.2 performance optimization pass
+
+A full-stack performance audit (`docs/PERFORMANCE_AUDIT.md`) identified 12 major bottlenecks, all fixed in v0.16.2 (commit `a0bd866`):
+
+- **Storage:** streaming k-way merge replaces full-DB materialization; range-bounded `scan_prefix`; decompressed-block cache; single-buffer WAL frames; sharded read cache.
+- **Engine:** concurrent `&self` reads under RwLock; streaming scans with early-stop `LIMIT`; `COUNT(*)` fast path; hash equi-joins; top-k selection; one-fsync-per-multi-row-statement group-commit.
+- **Cluster:** parallel replica fan-out (latency = max RTT, not sum); batched `ApplyBatch` internode RPC (one fsync per batch instead of per row).
+- **Server:** parse once per request (was 2–3×); lock-free atomic metrics; buffered socket reads.
+- **SQL:** byte-cursor lexer with near-zero allocation.
+
+**C4 (3-node quorum) baseline (v0.16.0) vs. optimized (v0.16.2):**
+
+| Workload | v0.16.0 | v0.16.2 | improvement |
+|----------|--------:|--------:|-------------|
+| write 1c | 136 | **203** | +49% |
+| write 16c | 1,071 | **1,495** | +40% |
+| read 16c | 1,848 | **2,302** | +25% |
+| mixed 16c | 1,353 | **2,184** | +61% |
+
+Biggest gains in concurrent writes and mixed workloads (group-commit fsync coalescing + parallel fan-out impact). Single-connection writes benefited from the index planner's overlay merge and parse-once threading. The 3-node cluster was upgraded in-place on 2026-07-03 and re-run using the canonical Rust client (`cargo run --release --example bench -p skaidb-driver`), with the same 3-node quorum config as the baseline.
+
 ## Reproducing
 
 skaidb's load generator is in-tree:
