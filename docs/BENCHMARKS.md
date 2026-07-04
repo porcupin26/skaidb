@@ -5,9 +5,9 @@ A throughput/latency comparison of **skaidb** against four production databases 
 identical containers with matched durability semantics, across four
 cluster/consistency configurations.
 
-Latest full-matrix run: **2026-07-03**, skaidb **v0.16.3** (all other systems at
-the versions above). Earlier published figures for v0.16.0 appear in the
-[optimization-pass section](#v016x-performance-optimization-pass) below.
+Latest full-matrix run: **2026-07-03**, skaidb **v0.16.4** (the coordination-path
+optimization pass described [below](#v016x-performance-optimization-passes); all
+other systems at the versions above).
 
 > Numbers are for *relative* comparison on small nodes, not absolute peak
 > throughput. All five systems are driven by the same client model and the same
@@ -53,28 +53,28 @@ is its own committed/acked operation.
 
 | Workload | skaidb | MongoDB 7 | MongoDB 8 | PostgreSQL | MariaDB |
 |----------|-------:|----------:|----------:|-----------:|--------:|
-| write 1c  |   137 |   125 |   145 | **219** | 146 |
-| write 16c | 1,315 |   878 |   789 | **1,907** | 968 |
-| read 16c  | **3,058** | 2,508 | 2,340 | 2,789 | 2,386 |
-| mixed 16c | 1,741 | 1,100 | 1,132 | **2,042** | 1,503 |
+| write 1c  |   149 |   105 |   139 | **216** | 153 |
+| write 16c | 1,369 |   897 |   849 | **1,924** | 979 |
+| read 16c  | **3,064** | 2,503 | 2,231 | 2,605 | 2,449 |
+| mixed 16c | 1,848 | 1,196 | 1,145 | **2,175** | 1,464 |
 
 ## C2 — 2 nodes, writes wait for the **primary only** (async replication)
 
 | Workload | skaidb | MongoDB 7 | MongoDB 8 | PostgreSQL | MariaDB |
 |----------|-------:|----------:|----------:|-----------:|--------:|
-| write 1c  |   132 |   224 |   219 | **271** | 164 |
-| write 16c | 1,255 | 1,831 | 1,225 | **2,305** | 1,091 |
-| read 16c  | **2,982** | 2,426 | 2,091 | 2,676 | 2,585 |
-| mixed 16c | 1,753 | 1,996 | 1,562 | **2,459** | 1,603 |
+| write 1c  |   141 |   239 |   216 | **261** | 150 |
+| write 16c | 1,348 | 1,725 | 1,275 | **2,270** | 1,071 |
+| read 16c  | **3,234** | 2,418 | 2,131 | 2,714 | 2,058 |
+| mixed 16c | 1,809 | 1,965 | 1,554 | **2,249** | 1,514 |
 
 ## C3 — 3 nodes, writes wait for **all 3**
 
 | Workload | skaidb | MongoDB 7 | MongoDB 8 | PostgreSQL | MariaDB* |
 |----------|-------:|----------:|----------:|-----------:|---------:|
-| write 1c  |   146 |   111 |   117 | **196** |  146* |
-| write 16c | 1,259 |   807 |   685 | **1,651** | 885* |
-| read 16c  | 1,737 | 2,456 | 2,455 | **2,715** | 2,229* |
-| mixed 16c | 1,583 | 1,077 | 1,009 | **2,024** | 1,344* |
+| write 1c  |   149 |   120 |   120 | **184** | 147* |
+| write 16c | 1,290 |   802 |   696 | **1,357** | 915* |
+| read 16c  | 2,486 | 2,408 | 2,393 | **2,664** | 2,601* |
+| mixed 16c | 1,734 | 1,136 |   904 | **1,770** | 1,410* |
 
 `*` MariaDB acks after 1 replica (see note ¹), so its C3 ≈ 2-of-3, not all-3.
 
@@ -82,10 +82,10 @@ is its own committed/acked operation.
 
 | Workload | skaidb | MongoDB 7 | MongoDB 8 | PostgreSQL | MariaDB |
 |----------|-------:|----------:|----------:|-----------:|--------:|
-| write 1c  |   134 |   134 |   126 | **197** | 121 |
-| write 16c | 1,246 |   861 |   836 | **1,728** | 897 |
-| read 16c  | 1,783 | 2,399 | **2,476** | 1,682 | 2,431 |
-| mixed 16c | 1,598 | 1,232 | 1,132 | **1,649** | 1,424 |
+| write 1c  |   149 |   127 |   138 | **183** | 134 |
+| write 16c | 1,328 |   886 |   791 | **1,684** | 886 |
+| read 16c  | **3,000** | 2,256 | 2,255 | 1,958 | 2,066 |
+| mixed 16c | 1,856 | 1,201 | 1,098 | **1,999** | 1,364 |
 
 ## skaidb: reads and writes on **all nodes** (leaderless)
 
@@ -99,15 +99,15 @@ across all 3 nodes** (round-robin), in the C4 (3-node quorum) config:
 
 | Workload | single coordinator | all 3 nodes (fan-out) |
 |----------|-------------------:|----------------------:|
-| write 16c | 1,246 | **1,251** |
-| read 16c  | 1,783 | **2,298** |
-| mixed 16c | 1,598 | **1,661** |
+| write 16c | **1,328** | 1,174 |
+| read 16c  | 3,000 | **3,156** |
+| mixed 16c | **1,856** | 1,748 |
 
-Fan-out is a little faster on writes and mixed and markedly faster on reads
-(+29%): with several host cores available, spreading read coordination over
-three nodes uses more of them than funnelling every request through one. The
-larger point is **availability and client locality** — connect to any node,
-tolerate losing one.
+Since the v0.16.4 coordination-path rework a single coordinator no longer
+bottlenecks on threading, so fan-out only wins on pure reads (spreading the
+local-read work); on writes the extra cross-node coordination slightly
+outweighs it. The larger point of fan-out remains **availability and client
+locality** — connect to any node, tolerate losing one.
 
 ## Memory footprint (idle, per node, of 512 MB)
 
@@ -116,44 +116,42 @@ minutes after the benchmark run:
 
 | | skaidb | MongoDB 7 | MongoDB 8 | PostgreSQL | MariaDB |
 |--|------:|----------:|----------:|-----------:|--------:|
-| node RAM used | **24 MB** | 91 MB | 97 MB | 41 MB | 51 MB |
+| node RAM used | **25 MB** | 91 MB | 97 MB | 41 MB | 51 MB |
 
-(The skaidb server process itself is ~7 MB RSS; the rest is the container's
+(The skaidb server process itself is ~6 MB RSS; the rest is the container's
 base system.)
 
 ## What the matrix shows
 
-**PostgreSQL leads writes and mixed everywhere.** It tops every `write 1c`,
-`write 16c`, and `mixed 16c` row in the matrix (up to 2,305 concurrent writes/s
-at C2), and the C3 read row as well.
+**skaidb owns the read rows.** Its point reads lead every config except C3
+(where PostgreSQL edges it by 7%): 3,064 ops/s at C1, 3,234 at C2, and 3,000
+at C4 — 53% ahead of PostgreSQL's 1,958 in the headline 3-node-quorum config,
+despite skaidb doing a cross-node quorum confirmation per read while the
+others read purely locally from the primary.
 
-**skaidb owns the 2-node read rows.** Its C1/C2 point reads (3,058 / 2,982
-ops/s) are the best read figures in the whole matrix — with two nodes, the
-quorum read's peer confirmation is a single cheap hop, and v0.16.3's concurrent
-read path keeps 16 connections busy. At 3 nodes the extra coordination hop costs
-it the lead (1,737–1,783), where **MongoDB** takes the read rows (2,399–2,476).
+**PostgreSQL still leads writes and mixed, but the gap has closed sharply.**
+It tops every `write` and `mixed` row. At C3 the margins are now 5% on
+concurrent writes (1,357 vs 1,290) and 2% on mixed (1,770 vs 1,734) —
+effectively ties on this hardware; at C4 they are 27% and 8%. PostgreSQL's
+remaining edge is a commit path that is at the network-latency floor
+(single-digit-connection writes) and decades of group-commit tuning under
+concurrency (C2's async 2,270 writes/s).
 
-**skaidb is the strongest non-PostgreSQL writer.** Its group-commit WAL
-coalesces fsyncs under concurrency: `write 16c` of 1,246–1,315 beats both
-MongoDBs and MariaDB in every config, second only to PostgreSQL. Notably its
-write throughput barely moves between C1 and C2 (1,315 vs 1,255) — the
-replication ack is parallel and cheap, so relaxing durability buys little,
-whereas MongoDB 7 jumps 878 → 1,831 and PostgreSQL 1,907 → 2,305.
+**skaidb is the strongest non-PostgreSQL writer in every durable config.** Its
+group-commit WAL and pipelined replication put `write 16c` at 1,290–1,369
+across C1/C3/C4 — ahead of both MongoDBs and MariaDB everywhere. Its write
+throughput barely moves with the consistency level (C2's `ONE` 1,348 ≈ C1's
+both-nodes 1,369): the replica round-trip is fully overlapped with the local
+fsync, so relaxing durability buys almost nothing — whereas MongoDB 7 jumps
+897 → 1,725 and PostgreSQL 1,924 → 2,270 when freed from the sync ack.
 
-**Relaxing write durability speeds writes (C1 → C2)** for the primary-based
-engines — PostgreSQL 1,907 → 2,305, MongoDB 7 878 → 1,831, MariaDB 968 → 1,091
-concurrent writes/s — and single-connection writes even more (MongoDB 7
-125 → 224, PostgreSQL 219 → 271).
+**Waiting for all 3 (C3) vs quorum (C4)** now costs skaidb almost nothing
+(1,290 vs 1,328 concurrent writes): the second peer's append+fsync happens in
+parallel with the first's. MongoDB pays the most for C3 (mongo8: 696 vs 791).
 
-**Waiting for all 3 is the most expensive write config (C3); quorum recovers
-some of it (C4).** MongoDB's concurrent writes drop to their matrix lows at C3
-(807 / 685) and recover at C4 (861 / 836); PostgreSQL goes 1,651 → 1,728.
-skaidb is nearly flat (1,259 → 1,246) — its parallel replica fan-out already
-bounds the wait at the slowest replica, so all-3 vs 2-of-3 changes little.
-
-**skaidb does all of this on 24 MB of node RAM** (~7 MB process RSS) — a
-fraction of MongoDB's ~95 MB, and well under PostgreSQL's 41 MB and MariaDB's
-51 MB, on nodes with only 512 MB to spend.
+**skaidb does all of this on 25 MB of node RAM** (~6 MB process RSS) — a
+fraction of MongoDB's ~95 MB and half of PostgreSQL's 41 MB, on nodes with
+only 512 MB to spend.
 
 ## Caveats
 
@@ -166,41 +164,54 @@ fraction of MongoDB's ~95 MB, and well under PostgreSQL's 41 MB and MariaDB's
   differences between systems or between runs as a tie.
 - **MariaDB** can't express "wait for all replicas" with semi-sync (acks after 1),
   so its C3 column is effectively its C4 mode.
-- skaidb reads are **quorum reads** (the coordinator contacts a peer to satisfy
-  `default_read_consistency = QUORUM`), so each read costs a cross-node hop; the
-  other systems read locally from the primary. Setting skaidb's read consistency
-  to `ONE` would make reads node-local and faster, at the cost of read-your-writes
-  across coordinators.
+- skaidb reads are **quorum reads** (the coordinator confirms with a peer to
+  satisfy `default_read_consistency = QUORUM`), so each read still costs a
+  cross-node round-trip; the other systems read locally from the primary.
+  Setting skaidb's read consistency to `ONE` would make reads node-local and
+  faster still, at the cost of read-your-writes across coordinators.
 
-## v0.16.x performance optimization pass
+## v0.16.x performance optimization passes
 
-A full-stack performance audit (`docs/PERFORMANCE_AUDIT.md`) identified 12 major
-bottlenecks, fixed in v0.16.2 (commit `a0bd866`):
+**v0.16.2** (commit `a0bd866`): a full-stack audit (`docs/PERFORMANCE_AUDIT.md`)
+fixed 12 bottlenecks — streaming k-way merge scans, decompressed-block cache,
+sharded read cache, concurrent `&self` reads under RwLock, `COUNT(*)` fast
+path, hash equi-joins, group-commit WAL, parallel replica fan-out, batched
+internode `ApplyBatch` RPC, lock-free metrics, byte-cursor lexer.
 
-- **Storage:** streaming k-way merge replaces full-DB materialization; range-bounded `scan_prefix`; decompressed-block cache; single-buffer WAL frames; sharded read cache.
-- **Engine:** concurrent `&self` reads under RwLock; streaming scans with early-stop `LIMIT`; `COUNT(*)` fast path; hash equi-joins; top-k selection; one-fsync-per-multi-row-statement group-commit.
-- **Cluster:** parallel replica fan-out (latency = max RTT, not sum); batched `ApplyBatch` internode RPC (one fsync per batch instead of per row).
-- **Server:** parse once per request (was 2–3×); lock-free atomic metrics; buffered socket reads.
-- **SQL:** byte-cursor lexer with near-zero allocation.
+**v0.16.4**: a coordination-path pass driven by syscall profiling on the bench
+nodes (an `strace -c` of the coordinator showed the per-write cost was thread
+machinery — `clone3` + stack setup + futex parks — not I/O; the fdatasync
+itself is ~50–170 µs on these containers):
 
-Measured on the canonical 1 vCPU / 512 MB bench containers, v0.16.0 baseline
-vs. v0.16.3 (2026-07-03 full-matrix rerun; same nodes, same client):
+- **Thread-free pipelined replication.** The coordinator no longer spawns a
+  thread per peer per write. It puts each quorum peer's RPC on the wire, runs
+  its local WAL fsync while the peers append+fsync, then collects the acks —
+  all on the request thread (`Pool::call_begin`/`Pending::finish`).
+- **Quorum-count read fan-out.** A quorum read now consults exactly the quorum
+  (local replica + `needed-1` peers, pipelined the same way) instead of every
+  replica — at RF=3 that halves cluster-wide read work. Unconsulted replicas
+  converge via read-repair on ALL reads and anti-entropy, as before.
+- **Statement-level replication batching.** A multi-row `INSERT` is now one
+  `ApplyBatch` round-trip per peer and one fsync per node for the whole
+  statement, instead of one replication round per row.
+- **Parse-once request path** now covers cluster mode (the coordinator reuses
+  the statement parsed for the privilege check).
+- **`[storage]` config actually applies.** `memtable_size_mb` (and the new
+  `read_cache_entries`) now reach the storage engine; previously they were
+  parsed but never wired, so every node silently ran hard-coded defaults.
 
-| Workload | C1 v0.16.0 | C1 v0.16.3 | Δ | C4 v0.16.0 | C4 v0.16.3 | Δ |
-|----------|-----------:|-----------:|---|-----------:|-----------:|---|
-| write 1c  |   121 |   137 | +13% | 136 | 134 | ≈ |
-| write 16c |   982 | **1,315** | +34% | 1,071 | **1,246** | +16% |
-| read 16c  | 1,665 | **3,058** | +84% | 1,848 | 1,783 | ≈ |
-| mixed 16c | 1,347 | **1,741** | +29% | 1,353 | **1,598** | +18% |
+Measured on the canonical 1 vCPU / 512 MB bench containers, all on 2026-07-03
+(same nodes, same client, C4 = 3-node quorum):
 
-The concurrent-read path (RwLock `&self` reads) and streaming scans show up
-strongest where coordination is cheapest — 2-node reads nearly double. Group
-commit and parallel fan-out lift concurrent writes and mixed workloads in every
-config; 3-node quorum reads are unchanged because the cross-node read hop, not
-the local read path, dominates there.
+| Workload | v0.16.0 | v0.16.3 | v0.16.4 | v0.16.4 vs v0.16.0 |
+|----------|--------:|--------:|--------:|-------------------:|
+| write 1c  |   136 |   134 |   149 | +10% |
+| write 16c | 1,071 | 1,246 | **1,328** | +24% |
+| read 16c  | 1,848 | 1,783 | **3,000** | +62% |
+| mixed 16c | 1,353 | 1,598 | **1,856** | +37% |
 
-> An earlier version of this section reported a v0.16.2 C4 rerun with larger
-> gains (25–61%); those figures were measured on the development test cluster
+> An earlier version of this section reported a v0.16.2 C4 rerun with 25–61%
+> gains; those figures were measured on the development test cluster
 > (1 vCPU / 1 GB nodes spread across two Proxmox hosts) and are superseded by
 > the same-hardware numbers above.
 
