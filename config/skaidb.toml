@@ -46,6 +46,8 @@ at_rest_keyfile = ""
 
 [storage]
 memtable_size_mb = 256
+# RAM read cache (entries) for point reads that miss the memtable; 0 disables.
+read_cache_entries = 16384
 compaction_strategy = "lazy_leveled"
 use_io_uring = true
 

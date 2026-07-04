@@ -156,6 +156,10 @@ pub struct EncryptionConfig {
 #[serde(default)]
 pub struct StorageConfig {
     pub memtable_size_mb: u64,
+    /// Entry capacity of the RAM read cache for point reads that miss the
+    /// memtable (0 disables it). Larger values trade RAM for hit rate on
+    /// datasets bigger than the memtable.
+    pub read_cache_entries: u64,
     pub compaction_strategy: String,
     pub use_io_uring: bool,
 }
@@ -394,6 +398,7 @@ impl Default for StorageConfig {
     fn default() -> Self {
         StorageConfig {
             memtable_size_mb: 256,
+            read_cache_entries: 16_384,
             compaction_strategy: "lazy_leveled".to_string(),
             use_io_uring: true,
         }

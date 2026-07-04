@@ -626,6 +626,21 @@ impl Pool {
         Ok(resp)
     }
 
+    /// First half of [`Pool::call`]: send `req` on a pooled connection and
+    /// return the in-flight call, so the caller can overlap its own work
+    /// (a WAL fsync, a local read) with the peer's processing — without
+    /// spawning a thread. Internode frames are small, so the send lands in
+    /// the socket buffer without blocking on the peer.
+    pub fn call_begin(&self, addr: &str, req: &Request) -> io::Result<Pending<'_>> {
+        let mut conn = self.take(addr)?;
+        write_frame(&mut conn, &frame_encode(&req.encode()))?;
+        Ok(Pending {
+            pool: self,
+            addr: addr.to_string(),
+            conn: Some(conn),
+        })
+    }
+
     /// Like [`Pool::call`], but on a fresh, time-bounded connection that is not
     /// returned to the pool — for liveness probing, where an unreachable peer
     /// must fail fast rather than block on the OS connect timeout.
@@ -653,6 +668,31 @@ impl Pool {
         if bucket.len() < MAX_IDLE_PER_PEER {
             bucket.push(conn);
         }
+    }
+}
+
+/// A request sent via [`Pool::call_begin`] whose response hasn't been read
+/// yet. Dropping it without [`Pending::finish`] discards the connection (a
+/// response is still in flight on it, so it can't be pooled for reuse).
+#[derive(Debug)]
+pub struct Pending<'p> {
+    pool: &'p Pool,
+    addr: String,
+    conn: Option<Conn>,
+}
+
+impl Pending<'_> {
+    /// Second half of the round-trip: block on the peer's response and return
+    /// the connection to the pool.
+    pub fn finish(mut self) -> io::Result<Response> {
+        let mut conn = self.conn.take().expect("Pending::finish called twice");
+        let framed = read_frame(&mut conn)?;
+        let payload = frame_decode(&framed)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let resp = Response::decode(&payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        self.pool.put(&self.addr, conn);
+        Ok(resp)
     }
 }
 

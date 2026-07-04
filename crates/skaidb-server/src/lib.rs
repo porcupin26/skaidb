@@ -122,7 +122,15 @@ pub fn run(
     config: Config,
     config_path: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let db = Database::open(&config.server.data_dir)?;
+    // Apply the `[storage]` tuning to every table/index engine the database
+    // opens (memtable flush threshold and read-cache capacity; the remaining
+    // engine knobs keep their built-in defaults).
+    let storage_opts = skaidb_engine::EngineOptions {
+        flush_threshold_bytes: (config.storage.memtable_size_mb.max(1) as usize) * 1024 * 1024,
+        read_cache_capacity: config.storage.read_cache_entries as usize,
+        ..Default::default()
+    };
+    let db = Database::open_with_options(&config.server.data_dir, storage_opts)?;
 
     // Bootstrap the configured superuser role (SPEC §8.2).
     let mut roles = RoleStore::new();

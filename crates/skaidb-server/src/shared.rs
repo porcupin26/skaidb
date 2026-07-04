@@ -70,7 +70,9 @@ impl Backend {
                     .map_err(|_| EngineError::Cluster("server lock poisoned".into()))?
                     .execute_session_statement(current_db, stmt)
             }
-            Backend::Cluster(node) => node.execute_session_with(current_db, sql, consistency),
+            Backend::Cluster(node) => {
+                node.execute_session_parsed(current_db, sql, parsed?, consistency)
+            }
         }
     }
 

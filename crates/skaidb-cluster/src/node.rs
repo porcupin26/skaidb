@@ -30,7 +30,7 @@ use skaidb_sql::parse;
 use skaidb_storage::{Hlc, HlcClock, WalCommit, WalSync};
 use skaidb_types::{Document, Value};
 
-use crate::internode::{self, Request, Response};
+use crate::internode::{self, Pending, Request, Response};
 use crate::quorum::Consistency;
 use crate::ring::{NodeId, Ring};
 use crate::transport::Authenticator;
@@ -288,6 +288,13 @@ enum BgTask {
         op: WriteOp,
         hlc: Hlc,
     },
+    /// Replicate a statement's batch to the replicas beyond the quorum (the
+    /// async tail), hinting every row for any replica that is unreachable.
+    ReplicateBatch {
+        peers: Vec<(NodeId, String)>,
+        table: String,
+        rows: Vec<BatchRow>,
+    },
 }
 
 /// Cap on buffered hints per replica, so a long outage can't grow unboundedly
@@ -372,6 +379,17 @@ impl Node {
                         self.note_acked(&replica, hlc);
                     } else {
                         self.store_hint(&replica, &table, &key, &op, hlc);
+                    }
+                }
+            }
+            BgTask::ReplicateBatch { peers, table, rows } => {
+                for (replica, addr) in peers {
+                    if self.send_batch(&addr, &table, &rows) {
+                        if let Some((_, _, hlc, _)) = rows.last() {
+                            self.note_acked(&replica, *hlc);
+                        }
+                    } else {
+                        self.hint_batch(&replica, &table, &rows);
                     }
                 }
             }
@@ -1617,7 +1635,21 @@ impl Node {
         sql: &str,
         consistency: Option<Consistency>,
     ) -> EngineResult<SessionEffect> {
-        let mut stmt = parse(sql)?;
+        self.execute_session_parsed(current_db, sql, parse(sql)?, consistency)
+    }
+
+    /// Like [`Node::execute_session_with`], but taking the statement already
+    /// parsed by the caller (which parsed it for its privilege check), so the
+    /// request path parses exactly once. `sql` is still needed verbatim for
+    /// DDL broadcast and catalog reads.
+    pub fn execute_session_parsed(
+        self: &Arc<Self>,
+        current_db: &str,
+        sql: &str,
+        stmt: Statement,
+        consistency: Option<Consistency>,
+    ) -> EngineResult<SessionEffect> {
+        let mut stmt = stmt;
         if matches!(
             stmt,
             Statement::Begin | Statement::Commit | Statement::Rollback
@@ -1767,10 +1799,15 @@ impl Node {
             None
         };
 
-        // 2) Scatter to enough peers to satisfy the quorum concurrently, while
-        //    this thread runs the local fsync. A failed peer is hinted and the
-        //    next untried replica takes its place (retry waves below), so the
-        //    set contacted synchronously matches the old sequential loop.
+        // 2) Pipelined scatter: put each quorum peer's write on the wire (a
+        //    small frame into the socket buffer — doesn't block on the peer),
+        //    run the local fsync on this thread while the peers append+fsync,
+        //    then collect the acks. No thread is spawned: on small nodes the
+        //    per-write spawn/park/join cycle (clone3 + stack setup + futex
+        //    wakeups) used to cost more than the fsync itself. A failed peer
+        //    is hinted and the next untried replica takes its place (retry
+        //    waves below), so the set contacted synchronously matches the old
+        //    sequential loop.
         let peers: Vec<(NodeId, String)> = replicas
             .iter()
             .filter(|r| **r != self.id)
@@ -1779,27 +1816,17 @@ impl Node {
         let sync_target = needed.saturating_sub(usize::from(buffered.is_some()));
         let first = sync_target.min(peers.len());
         let (oks, local_ok) = {
-            let op = &op;
-            thread::scope(|s| {
-                let handles: Vec<_> = peers[..first]
-                    .iter()
-                    .map(|(_, addr)| {
-                        s.spawn(move || {
-                            matches!(self.send_write(addr, table, key, op, hlc), Ok(true))
-                        })
-                    })
-                    .collect();
-                // Overlap: fsync the local buffered write while the sends fly.
-                let local_ok = match &buffered {
-                    Some((commit, handle)) => handle.sync_through(*commit).is_ok(),
-                    None => false,
-                };
-                let oks: Vec<bool> = handles
-                    .into_iter()
-                    .map(|h| h.join().expect("replica send panicked"))
-                    .collect();
-                (oks, local_ok)
-            })
+            let pending: Vec<Option<Pending<'_>>> = peers[..first]
+                .iter()
+                .map(|(_, addr)| self.send_write_begin(addr, table, key, &op, hlc))
+                .collect();
+            // Overlap: fsync the local buffered write while the sends fly.
+            let local_ok = match &buffered {
+                Some((commit, handle)) => handle.sync_through(*commit).is_ok(),
+                None => false,
+            };
+            let oks: Vec<bool> = pending.into_iter().map(|p| self.finish_ack(p)).collect();
+            (oks, local_ok)
         };
         let mut acks = usize::from(local_ok);
         for ((replica, _), ok) in peers[..first].iter().zip(oks) {
@@ -1865,6 +1892,138 @@ impl Node {
         }
     }
 
+    /// Replicate a whole statement's puts. Rows are grouped by replica set;
+    /// each group is applied locally under one write-lock acquisition with
+    /// **one** fsync, overlapped with a single [`Request::ApplyBatch`]
+    /// round-trip per quorum peer — instead of one replication round (and one
+    /// fsync on every replica) per row. Per-group consistency semantics match
+    /// [`Node::replicate`]: the statement acks once every group reaches its
+    /// quorum; replicas beyond the quorum get the batch in the background.
+    fn replicate_batch(
+        self: &Arc<Self>,
+        table: &str,
+        rows: Vec<(Vec<u8>, Vec<u8>, Hlc)>,
+        oc: Option<Consistency>,
+    ) -> EngineResult<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.counters
+            .writes_total
+            .fetch_add(rows.len() as u64, Ordering::Relaxed);
+        if let Some((_, _, hlc)) = rows.last() {
+            self.note_local_write(*hlc);
+        }
+        if self.hints_pending() && !self.hint_flush_queued.swap(true, Ordering::AcqRel) {
+            let _ = self.bg.send(BgTask::FlushHints);
+        }
+        // Group rows by replica set. With members == RF every key maps to the
+        // same set (one group, one batch); larger clusters get one batch per
+        // distinct set.
+        let mut groups: Vec<(Vec<NodeId>, Vec<BatchRow>)> = Vec::new();
+        for (key, value, hlc) in rows {
+            let replicas = self.replicas_for(&key);
+            let row: BatchRow = (key, value, hlc, true);
+            match groups.iter_mut().find(|(r, _)| *r == replicas) {
+                Some((_, group)) => group.push(row),
+                None => groups.push((replicas, vec![row])),
+            }
+        }
+        for (replicas, group) in groups {
+            self.replicate_group(table, &replicas, group, oc)?;
+        }
+        Ok(())
+    }
+
+    /// Replicate one replica-set group of a statement batch (see
+    /// [`Node::replicate_batch`]).
+    fn replicate_group(
+        self: &Arc<Self>,
+        table: &str,
+        replicas: &[NodeId],
+        rows: Vec<BatchRow>,
+        oc: Option<Consistency>,
+    ) -> EngineResult<()> {
+        let needed = oc
+            .unwrap_or(self.cfg.write_consistency)
+            .required(replicas.len().max(1));
+        let last_hlc = rows.last().map(|(_, _, h, _)| *h).expect("group is non-empty");
+        let buffered = if replicas.contains(&self.id) {
+            self.apply_batch_buffered(table, &rows)?
+        } else {
+            None
+        };
+        let peers: Vec<(NodeId, String)> = replicas
+            .iter()
+            .filter(|r| **r != self.id)
+            .filter_map(|r| self.peer_addr(r).map(|addr| (r.clone(), addr)))
+            .collect();
+        let sync_target = needed.saturating_sub(usize::from(buffered.is_some()));
+        let first = sync_target.min(peers.len());
+        // Pipelined, thread-free scatter as in `replicate`: sends on the
+        // wire, local fsync overlapped, then collect.
+        let pending: Vec<Option<Pending<'_>>> = peers[..first]
+            .iter()
+            .map(|(_, addr)| self.send_batch_begin(addr, table, &rows))
+            .collect();
+        let local_ok = match &buffered {
+            Some((commit, handle)) => handle.sync_through(*commit).is_ok(),
+            None => false,
+        };
+        let mut acks = usize::from(local_ok);
+        for ((replica, addr), p) in peers[..first].iter().zip(pending) {
+            if self.finish_batch_ack(p, addr, table, &rows) {
+                acks += 1;
+                self.note_acked(replica, last_hlc);
+            } else {
+                self.hint_batch(replica, table, &rows);
+            }
+        }
+        // Retry waves: while short of the quorum, try the next untried
+        // replicas in place of the ones that failed.
+        let mut next = first;
+        while acks < needed && next < peers.len() {
+            let take = (needed - acks).min(peers.len() - next);
+            let wave = &peers[next..next + take];
+            next += take;
+            let rows_ref = &rows;
+            let oks = scatter(wave, |(_, addr)| self.send_batch(addr, table, rows_ref));
+            for ((replica, _), ok) in wave.iter().zip(oks) {
+                if ok {
+                    acks += 1;
+                    self.note_acked(replica, last_hlc);
+                } else {
+                    self.hint_batch(replica, table, &rows);
+                }
+            }
+        }
+        // Replicas beyond the quorum get the whole batch in the background.
+        if next < peers.len() {
+            let task = BgTask::ReplicateBatch {
+                peers: peers[next..].to_vec(),
+                table: table.to_string(),
+                rows: rows.clone(),
+            };
+            if let Err(mpsc::SendError(BgTask::ReplicateBatch { peers, table, rows })) =
+                self.bg.send(task)
+            {
+                for (replica, _) in peers {
+                    self.hint_batch(&replica, &table, &rows);
+                }
+            }
+        }
+        if acks >= needed {
+            Ok(())
+        } else {
+            self.counters
+                .write_quorum_failures
+                .fetch_add(1, Ordering::Relaxed);
+            Err(EngineError::Cluster(format!(
+                "write quorum not met: {acks}/{needed} acks"
+            )))
+        }
+    }
+
     /// Apply a write to the local memtable + WAL buffer (no fsync) under the
     /// write lock, returning the commit point and durability handle so the caller
     /// can fsync after releasing the lock — and, in [`Node::replicate`],
@@ -1915,25 +2074,33 @@ impl Node {
     /// table — one WAL — and commit points are monotonic, so syncing through
     /// the last row's commit makes every row durable.
     fn apply_batch_local(&self, table: &str, rows: &[BatchRow]) -> EngineResult<()> {
-        let last = {
-            let mut db = self
-                .local
-                .write()
-                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
-            let mut last = None;
-            for (key, value, hlc, is_put) in rows {
-                last = Some(if *is_put {
-                    db.apply_put_buffered(table, key, value.clone(), *hlc)?
-                } else {
-                    db.apply_delete_buffered(table, key, *hlc)?
-                });
-            }
-            last
-        };
-        if let Some((commit, handle)) = last {
+        if let Some((commit, handle)) = self.apply_batch_buffered(table, rows)? {
             handle.sync_through(commit)?;
         }
         Ok(())
+    }
+
+    /// The buffered half of [`Node::apply_batch_local`]: append + apply every
+    /// row under one write-lock acquisition, returning the last row's commit
+    /// point so the caller can overlap the single fsync with peer round-trips.
+    fn apply_batch_buffered(
+        &self,
+        table: &str,
+        rows: &[BatchRow],
+    ) -> EngineResult<Option<(WalCommit, Arc<WalSync>)>> {
+        let mut db = self
+            .local
+            .write()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
+        let mut last = None;
+        for (key, value, hlc, is_put) in rows {
+            last = Some(if *is_put {
+                db.apply_put_buffered(table, key, value.clone(), *hlc)?
+            } else {
+                db.apply_delete_buffered(table, key, *hlc)?
+            });
+        }
+        Ok(last)
     }
 
     /// Point-read `key` from its replica set, resolving by last-writer-wins,
@@ -1956,11 +2123,14 @@ impl Node {
         // its address (`None` = the local replica), for read-repair.
         let mut seen: Vec<(Option<String>, Option<Hlc>)> = Vec::new();
 
-        // Local replica first (no network), then all peer replicas concurrently
-        // (scatter/gather), so the read waits ~one RTT instead of the sum of
-        // every replica's RTT. Results merge in replica order (deterministic).
+        // Quorum-count fan-out: the local replica counts as one responder, so
+        // only `needed - 1` peers are consulted (not every replica) — at RF=3
+        // that's one peer read per key instead of two, halving cluster-wide
+        // read work. The peer sends are pipelined: put each LocalGet on the
+        // wire, do the local read while the peers work, then collect — all on
+        // this thread (no spawn/join). If a contacted peer is unreachable,
+        // the next untried replicas take its place (shortfall waves below).
         let mut merge = |addr_opt: Option<String>, entry: Option<(Vec<u8>, Hlc, bool)>| {
-            responders += 1;
             let entry_hlc = entry.as_ref().map(|(_, h, _)| *h);
             if let Some((value, hlc, is_put)) = entry {
                 if best.as_ref().is_none_or(|(h, _)| hlc > *h) {
@@ -1969,37 +2139,69 @@ impl Node {
             }
             seen.push((addr_opt, entry_hlc));
         };
-        if replicas.contains(&self.id) {
-            let entry = match self.local.read() {
-                Ok(db) => db.local_get_versioned(table, key)?,
-                Err(_) => return Err(EngineError::Cluster("local lock poisoned".into())),
-            };
-            merge(None, entry);
-        }
+        let is_local_replica = replicas.contains(&self.id);
         let peers: Vec<(NodeId, String)> = replicas
             .iter()
             .filter(|r| **r != self.id)
             .filter_map(|r| self.peer_addr(r).map(|addr| (r.clone(), addr)))
             .collect();
-        let results = scatter(&peers, |(_, addr)| {
-            self.counters.peer_requests.fetch_add(1, Ordering::Relaxed);
-            match self.pool.call(
-                addr,
-                &Request::LocalGet {
-                    table: table.to_string(),
-                    key: key.to_vec(),
-                },
-            ) {
-                Ok(Response::Get { entry }) => Some(entry),
-                _ => {
+        let req = Request::LocalGet {
+            table: table.to_string(),
+            key: key.to_vec(),
+        };
+        let first = needed
+            .saturating_sub(usize::from(is_local_replica))
+            .min(peers.len());
+        let pending: Vec<Option<Pending<'_>>> = peers[..first]
+            .iter()
+            .map(|(_, addr)| {
+                self.counters.peer_requests.fetch_add(1, Ordering::Relaxed);
+                match self.pool.call_begin(addr, &req) {
+                    Ok(p) => Some(p),
+                    Err(_) => {
+                        self.counters.peer_errors.fetch_add(1, Ordering::Relaxed);
+                        None
+                    }
+                }
+            })
+            .collect();
+        // Overlap: read the local replica while the peer reads fly.
+        if is_local_replica {
+            let entry = match self.local.read() {
+                Ok(db) => db.local_get_versioned(table, key)?,
+                Err(_) => return Err(EngineError::Cluster("local lock poisoned".into())),
+            };
+            responders += 1;
+            merge(None, entry);
+        }
+        for ((_, addr), p) in peers[..first].iter().zip(pending) {
+            match p.map(Pending::finish) {
+                Some(Ok(Response::Get { entry })) => {
+                    responders += 1;
+                    merge(Some(addr.clone()), entry);
+                }
+                Some(Ok(_)) | None => {}
+                Some(Err(_)) => {
                     self.counters.peer_errors.fetch_add(1, Ordering::Relaxed);
-                    None // unreachable peer: not a responder
                 }
             }
-        });
-        for ((_, addr), got) in peers.iter().zip(results) {
-            if let Some(entry) = got {
-                merge(Some(addr.clone()), entry);
+        }
+        // Shortfall waves: while short of the quorum, consult the next
+        // untried replicas in place of the unreachable ones.
+        let mut next = first;
+        while responders < needed && next < peers.len() {
+            let (_, addr) = &peers[next];
+            next += 1;
+            self.counters.peer_requests.fetch_add(1, Ordering::Relaxed);
+            match self.pool.call(addr, &req) {
+                Ok(Response::Get { entry }) => {
+                    responders += 1;
+                    merge(Some(addr.clone()), entry);
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    self.counters.peer_errors.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
 
@@ -2099,6 +2301,117 @@ impl Node {
                 self.counters.peer_errors.fetch_add(1, Ordering::Relaxed);
                 Err(e)
             }
+        }
+    }
+
+    /// First half of [`Node::send_write`]: put the replicated write on the
+    /// wire and return the in-flight call, so the caller can overlap its own
+    /// fsync with the peer's append+fsync. `None` means the send itself
+    /// failed (peer unreachable) — the caller treats it like a nack.
+    fn send_write_begin(
+        &self,
+        addr: &str,
+        table: &str,
+        key: &[u8],
+        op: &WriteOp,
+        hlc: Hlc,
+    ) -> Option<Pending<'_>> {
+        let req = match op {
+            WriteOp::Put(bytes) => Request::ApplyPut {
+                table: table.to_string(),
+                key: key.to_vec(),
+                value: bytes.clone(),
+                hlc,
+            },
+            WriteOp::Delete => Request::ApplyDelete {
+                table: table.to_string(),
+                key: key.to_vec(),
+                hlc,
+            },
+        };
+        self.counters.peer_requests.fetch_add(1, Ordering::Relaxed);
+        match self.pool.call_begin(addr, &req) {
+            Ok(pending) => Some(pending),
+            Err(_) => {
+                self.counters.peer_errors.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    /// Second half: collect a peer's response; `true` iff it acked.
+    fn finish_ack(&self, pending: Option<Pending<'_>>) -> bool {
+        match pending.map(Pending::finish) {
+            Some(Ok(resp)) => matches!(resp, Response::Ack),
+            Some(Err(_)) => {
+                self.counters.peer_errors.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// First half of [`Node::send_batch`]: put the whole batch on the wire
+    /// and return the in-flight call so the caller can overlap its own fsync
+    /// with the peer's batch apply. `None` means the send itself failed.
+    fn send_batch_begin(&self, addr: &str, table: &str, rows: &[BatchRow]) -> Option<Pending<'_>> {
+        self.counters.peer_requests.fetch_add(1, Ordering::Relaxed);
+        match self.pool.call_begin(
+            addr,
+            &Request::ApplyBatch {
+                table: table.to_string(),
+                rows: rows.to_vec(),
+            },
+        ) {
+            Ok(pending) => Some(pending),
+            Err(_) => {
+                self.counters.peer_errors.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    /// Second half: collect a peer's batch response; `true` iff every row is
+    /// durable on it. A peer that predates the batch RPC (rolling upgrade)
+    /// rejects the unknown op, in which case the rows are re-sent per-row.
+    fn finish_batch_ack(
+        &self,
+        pending: Option<Pending<'_>>,
+        addr: &str,
+        table: &str,
+        rows: &[BatchRow],
+    ) -> bool {
+        match pending.map(Pending::finish) {
+            Some(Ok(Response::Ack)) => true,
+            Some(Ok(Response::Err(e))) if e.contains("unknown request op") => {
+                rows.iter().all(|(key, value, hlc, is_put)| {
+                    let op = if *is_put {
+                        WriteOp::Put(value.clone())
+                    } else {
+                        WriteOp::Delete
+                    };
+                    matches!(self.send_write(addr, table, key, &op, *hlc), Ok(true))
+                })
+            }
+            Some(Ok(_)) => false,
+            Some(Err(_)) => {
+                self.counters.peer_errors.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Buffer every row of a batch as a hint for `replica` (it was down or
+    /// short of the quorum), for later hinted handoff.
+    fn hint_batch(&self, replica: &NodeId, table: &str, rows: &[BatchRow]) {
+        for (key, value, hlc, is_put) in rows {
+            let op = if *is_put {
+                WriteOp::Put(value.clone())
+            } else {
+                WriteOp::Delete
+            };
+            self.store_hint(replica, table, key, &op, *hlc);
         }
     }
 
@@ -2684,6 +2997,24 @@ impl Cluster for Coordinator {
         let hlc = self.node.clock.now();
         let bytes = Value::Document(doc.clone()).encode();
         self.node.replicate(table, key, WriteOp::Put(bytes), hlc, self.oc)
+    }
+
+    fn put_batch(&mut self, table: &str, rows: &[(Vec<u8>, Document)]) -> EngineResult<()> {
+        // A single row gets the per-row path (same cost, no grouping pass).
+        if let [(key, doc)] = rows {
+            return self.put(table, key, doc);
+        }
+        let batch: Vec<(Vec<u8>, Vec<u8>, Hlc)> = rows
+            .iter()
+            .map(|(key, doc)| {
+                (
+                    key.clone(),
+                    Value::Document(doc.clone()).encode(),
+                    self.node.clock.now(),
+                )
+            })
+            .collect();
+        self.node.replicate_batch(table, batch, self.oc)
     }
 
     fn delete(&mut self, table: &str, key: &[u8], _doc: &Document) -> EngineResult<()> {
@@ -3630,15 +3961,29 @@ mod tests {
             )
         };
 
-        // (a) read-repair: write id=1 to a and b only; c is missing it.
+        // (a) read-repair: write id=1 to a and b only; c is missing it. A
+        // quorum read consults only a quorum of replicas (not all of them),
+        // so it may not touch c; a read at ALL consults — and repairs —
+        // every replica.
         let (k1, v1) = row(1, 100);
         inject(&a, &k1, &v1, Hlc::new(1000, 0));
         inject(&b, &k1, &v1, Hlc::new(1000, 0));
         assert!(!has(&c, &k1), "c starts without id=1");
-        // A quorum read through a touches all replicas and repairs c.
         let rs = rows(na.execute("SELECT v FROM t WHERE id = 1").unwrap());
         assert_eq!(rs.rows, vec![vec![Value::Int(100)]]);
-        assert!(has(&c, &k1), "read-repair pushed id=1 to c");
+        let out = na
+            .execute_session_with(
+                DEFAULT_DATABASE,
+                "SELECT v FROM t WHERE id = 1",
+                Some(Consistency::All),
+            )
+            .unwrap();
+        let rs = match out {
+            SessionEffect::Output(o) => rows(o),
+            SessionEffect::UseDatabase(_) => unreachable!(),
+        };
+        assert_eq!(rs.rows, vec![vec![Value::Int(100)]]);
+        assert!(has(&c, &k1), "ALL read repaired c");
 
         // (b) anti-entropy push: write id=2 to a only; repair fans it out.
         let (k2, v2) = row(2, 200);

@@ -14,7 +14,9 @@ use skaidb_sql::ast::{
 use skaidb_sql::parse;
 use std::sync::Arc;
 
-use skaidb_storage::{Engine as StorageEngine, Hlc, HlcClock, VersionValue, WalCommit, WalSync};
+use skaidb_storage::{
+    Engine as StorageEngine, EngineOptions, Hlc, HlcClock, VersionValue, WalCommit, WalSync,
+};
 use skaidb_types::{Document, Value};
 
 use crate::catalog::{Catalog, IndexDef, SchemaVersion, TableDef, VectorIndexDef};
@@ -48,6 +50,9 @@ type IndexPlan = (String, Option<Vec<u8>>, Option<Vec<u8>>, bool);
 #[derive(Debug)]
 pub struct Database {
     dir: PathBuf,
+    /// Storage tuning (flush threshold, read-cache size, codecs) applied to
+    /// every table/index engine this database opens or creates.
+    storage_opts: EngineOptions,
     catalog: Catalog,
     tables: HashMap<String, StorageEngine>,
     /// Secondary index storage by index name; entries map an indexed value to a
@@ -116,21 +121,29 @@ struct TxnBuffer {
 }
 
 impl Database {
-    /// Open (creating if needed) a database rooted at `dir`.
+    /// Open (creating if needed) a database rooted at `dir`, with default
+    /// storage tuning.
     pub fn open(dir: impl AsRef<Path>) -> Result<Database> {
+        Database::open_with_options(dir, EngineOptions::default())
+    }
+
+    /// Open (creating if needed) a database rooted at `dir`, applying `opts`
+    /// (flush threshold, read-cache size, codecs) to every table and index
+    /// engine — both the ones loaded now and any created later.
+    pub fn open_with_options(dir: impl AsRef<Path>, opts: EngineOptions) -> Result<Database> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
         let catalog = Catalog::load(dir.join("catalog.json"))?;
 
         let mut tables = HashMap::new();
         for name in catalog.tables.keys() {
-            let engine = StorageEngine::open(table_dir(&dir, name))?;
+            let engine = StorageEngine::open_with_options(table_dir(&dir, name), opts)?;
             tables.insert(name.clone(), engine);
         }
 
         let mut indexes = HashMap::new();
         for name in catalog.indexes.keys() {
-            let engine = StorageEngine::open(index_dir(&dir, name))?;
+            let engine = StorageEngine::open_with_options(index_dir(&dir, name), opts)?;
             indexes.insert(name.clone(), engine);
         }
 
@@ -154,6 +167,7 @@ impl Database {
 
         Ok(Database {
             dir,
+            storage_opts: opts,
             catalog,
             tables,
             indexes,
@@ -777,7 +791,7 @@ impl Database {
             }
             return Err(EngineError::TableExists(name.to_string()));
         }
-        let engine = StorageEngine::open(table_dir(&self.dir, name))?;
+        let engine = StorageEngine::open_with_options(table_dir(&self.dir, name), self.storage_opts)?;
         self.tables.insert(name.to_string(), engine);
         self.catalog
             .tables
@@ -853,7 +867,7 @@ impl Database {
             return Err(EngineError::IndexExists(name.to_string()));
         }
         // Create the index store and backfill it from the existing rows.
-        let mut index_engine = StorageEngine::open(index_dir(&self.dir, name))?;
+        let mut index_engine = StorageEngine::open_with_options(index_dir(&self.dir, name), self.storage_opts)?;
         for (row_key, doc) in self.scan_docs(table)? {
             let values = index_values(&doc, paths);
             index_engine.put(&index_entry_key(&values, &row_key), row_key.clone())?;
@@ -917,7 +931,7 @@ impl Database {
             std::fs::rename(&old_dir, &new_dir)?;
         }
         self.tables
-            .insert(new.to_string(), StorageEngine::open(new_dir)?);
+            .insert(new.to_string(), StorageEngine::open_with_options(new_dir, self.storage_opts)?);
 
         let def = self.catalog.tables.remove(old).expect("table present");
         self.catalog.tables.insert(new.to_string(), def);
@@ -1018,7 +1032,7 @@ impl Database {
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
         }
-        let mut engine = StorageEngine::open(dir)?;
+        let mut engine = StorageEngine::open_with_options(dir, self.storage_opts)?;
         for (row_key, doc) in self.scan_docs(&idx_table)? {
             let values = index_values(&doc, &idx_paths);
             engine.put(&index_entry_key(&values, &row_key), row_key.clone())?;
@@ -1981,6 +1995,15 @@ pub trait Cluster {
     }
     /// Write `doc` under `key` in `table` (and maintain indexes/replicas).
     fn put(&mut self, table: &str, key: &[u8], doc: &Document) -> Result<()>;
+    /// Write a whole statement's rows in one call. Implementations may batch
+    /// the WAL fsync and the replication round-trips (one per replica set
+    /// instead of one per row); the default is the per-row loop.
+    fn put_batch(&mut self, table: &str, rows: &[(Vec<u8>, Document)]) -> Result<()> {
+        for (key, doc) in rows {
+            self.put(table, key, doc)?;
+        }
+        Ok(())
+    }
     /// Delete `key` from `table`; `doc` is the row being removed (for indexes).
     fn delete(&mut self, table: &str, key: &[u8], doc: &Document) -> Result<()>;
 }
@@ -2031,9 +2054,7 @@ fn run_insert(ins: Insert, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
         rows.push((key, doc));
     }
     let affected = rows.len();
-    for (key, doc) in &rows {
-        cluster.put(&ins.table, key, doc)?;
-    }
+    cluster.put_batch(&ins.table, &rows)?;
     Ok(QueryOutput::Mutation { affected })
 }
 
