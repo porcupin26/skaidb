@@ -36,10 +36,15 @@ const TLS_SERVER_NAME: &str = "skaidb";
 /// pass straight through (`write_frame` already coalesces header + payload).
 pub struct Conn {
     stream: BufReader<Stream>,
+    /// Reusable frame buffers for the RPC layer (see `internode::conn_send` /
+    /// `conn_recv`): inbound payloads land in `rbuf`, outbound frames are
+    /// built in `wbuf`. Steady-state, a message costs no allocation.
+    rbuf: Vec<u8>,
+    wbuf: Vec<u8>,
 }
 
 /// The underlying byte stream of a [`Conn`].
-enum Stream {
+pub(crate) enum Stream {
     Plain(TcpStream),
     ClientTls(Box<StreamOwned<ClientConnection, TcpStream>>),
     ServerTls(Box<StreamOwned<ServerConnection, TcpStream>>),
@@ -49,7 +54,20 @@ impl Conn {
     fn new(stream: Stream) -> Conn {
         Conn {
             stream: BufReader::new(stream),
+            rbuf: Vec::new(),
+            wbuf: Vec::new(),
         }
+    }
+
+    /// The buffered read side plus the reusable inbound-payload buffer, split
+    /// so the RPC layer can read a frame into the buffer it owns.
+    pub(crate) fn read_half(&mut self) -> (&mut BufReader<Stream>, &mut Vec<u8>) {
+        (&mut self.stream, &mut self.rbuf)
+    }
+
+    /// The unbuffered write side plus the reusable outbound-frame buffer.
+    pub(crate) fn write_half(&mut self) -> (&mut Stream, &mut Vec<u8>) {
+        (self.stream.get_mut(), &mut self.wbuf)
     }
 }
 

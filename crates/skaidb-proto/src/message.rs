@@ -95,12 +95,19 @@ impl Request {
 impl Response {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
+        self.encode_into(&mut out);
+        out
+    }
+
+    /// Encode appending to `out`, so a per-connection buffer can be reused
+    /// across responses instead of allocating one per message.
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
         match self {
             Response::Rows { columns, rows } => {
                 out.push(RESP_ROWS);
                 out.extend_from_slice(&(columns.len() as u32).to_le_bytes());
                 for col in columns {
-                    write_bytes(&mut out, col.as_bytes());
+                    write_bytes(out, col.as_bytes());
                 }
                 out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
                 for row in rows {
@@ -110,7 +117,7 @@ impl Response {
                         // no per-cell temporary buffer.
                         let len_pos = out.len();
                         out.extend_from_slice(&[0u8; 4]);
-                        v.encode_value_into(&mut out);
+                        v.encode_value_into(out);
                         let len = (out.len() - len_pos - 4) as u32;
                         out[len_pos..len_pos + 4].copy_from_slice(&len.to_le_bytes());
                     }
@@ -123,10 +130,9 @@ impl Response {
             Response::Ddl => out.push(RESP_DDL),
             Response::Error(msg) => {
                 out.push(RESP_ERROR);
-                write_bytes(&mut out, msg.as_bytes());
+                write_bytes(out, msg.as_bytes());
             }
         }
-        out
     }
 
     pub fn decode(buf: &[u8]) -> Result<Response, ProtoError> {

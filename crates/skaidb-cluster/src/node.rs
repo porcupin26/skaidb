@@ -24,7 +24,6 @@ use skaidb_engine::{
     filter_rows, namespace, run, Cluster, Database, DbStats, EngineError, IndexScanRange,
     QueryOutput, SessionEffect, DEFAULT_DATABASE,
 };
-use skaidb_proto::{read_frame, write_frame};
 use skaidb_sql::ast::{BinaryOp, Expr, Statement};
 use skaidb_sql::parse;
 use skaidb_storage::{Hlc, HlcClock, WalCommit, WalSync};
@@ -1538,12 +1537,18 @@ impl Node {
             Ok(c) => c,
             Err(_) => return, // failed auth: drop silently
         };
-        while let Ok(framed) = read_frame(&mut conn) {
-            let response = match internode::frame_decode(&framed).and_then(|p| Request::decode(&p)) {
-                Ok(req) => self.apply_local(req),
-                Err(e) => Response::Err(e.to_string()),
+        loop {
+            // Frame buffers live on the Conn and are reused across requests,
+            // so steady-state a request/response pair allocates nothing in
+            // the framing layer.
+            let response = match internode::conn_recv_request(&mut conn) {
+                Ok(Ok(req)) => self.apply_local(req),
+                // Undecodable but fully-read frame: answer and keep serving
+                // (a newer peer's unknown op lands here — rolling upgrades).
+                Ok(Err(e)) => Response::Err(e.to_string()),
+                Err(_) => return, // disconnect or framing error
             };
-            if write_frame(&mut conn, &internode::frame_encode(&response.encode())).is_err() {
+            if internode::conn_send(&mut conn, |o| response.encode_into(o)).is_err() {
                 return;
             }
         }

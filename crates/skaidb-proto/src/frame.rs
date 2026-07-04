@@ -59,6 +59,17 @@ fn write_all_vectored(w: &mut impl Write, mut head: &[u8], mut body: &[u8]) -> i
 
 /// Read one length-prefixed frame. Returns the payload bytes.
 pub fn read_frame(r: &mut impl Read) -> io::Result<Vec<u8>> {
+    let mut payload = Vec::new();
+    read_frame_into(r, &mut payload)?;
+    Ok(payload)
+}
+
+/// Like [`read_frame`], but into a caller-owned buffer whose capacity is
+/// reused across frames: on a long-lived connection the per-message
+/// allocation (and the zero-fill of a fresh buffer) happens only when a frame
+/// exceeds the high-water mark. The buffer is left holding exactly the
+/// payload.
+pub fn read_frame_into(r: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<()> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;
     let len = u32::from_be_bytes(len_buf);
@@ -68,9 +79,37 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Vec<u8>> {
             "frame too large",
         ));
     }
-    let mut payload = vec![0u8; len as usize];
-    r.read_exact(&mut payload)?;
-    Ok(payload)
+    let len = len as usize;
+    if buf.len() < len {
+        buf.resize(len, 0);
+    }
+    buf.truncate(len);
+    r.read_exact(buf)?;
+    Ok(())
+}
+
+/// Start building a frame in place: clear `buf` and reserve the 4-byte length
+/// prefix. Encode the payload directly after it, then send with
+/// [`finish_frame`] — one buffer, no payload copy.
+pub fn begin_frame(buf: &mut Vec<u8>) {
+    buf.clear();
+    buf.extend_from_slice(&[0u8; 4]);
+}
+
+/// Finish a frame begun with [`begin_frame`]: patch the length prefix and
+/// write the whole frame (prefix + payload) in one call, then flush.
+pub fn finish_frame(w: &mut impl Write, buf: &mut [u8]) -> io::Result<()> {
+    let payload_len = buf.len() - 4;
+    if payload_len as u64 > MAX_FRAME_LEN as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "frame too large",
+        ));
+    }
+    let len = (payload_len as u32).to_be_bytes();
+    buf[..4].copy_from_slice(&len);
+    w.write_all(buf)?;
+    w.flush()
 }
 
 #[cfg(test)]

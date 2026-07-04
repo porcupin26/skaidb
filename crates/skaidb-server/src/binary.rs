@@ -5,8 +5,8 @@ use std::net::{TcpListener, TcpStream};
 use std::thread::{self, JoinHandle};
 
 use skaidb_proto::{
-    auth_message, read_frame, write_frame, AuthChallenge, AuthFinish, AuthOutcome, AuthStart,
-    Request, Response,
+    auth_message, begin_frame, finish_frame, read_frame, read_frame_into, write_frame,
+    AuthChallenge, AuthFinish, AuthOutcome, AuthStart, Request, Response,
 };
 
 use crate::authn::AuthResult;
@@ -63,21 +63,25 @@ fn handle_connection(stream: TcpStream, ctx: Shared) {
     // of this connection; it starts at `default`.
     let mut current_db = skaidb_engine::DEFAULT_DATABASE.to_string();
 
+    // Request and response buffers are reused across the connection's life,
+    // so steady-state a request costs no allocation in the framing layer.
+    let mut inbuf = Vec::new();
+    let mut outbuf = Vec::new();
     loop {
-        let payload = match read_frame(&mut reader) {
-            Ok(p) => p,
-            Err(_) => return, // disconnect or framing error
-        };
-        let response = match Request::decode(&payload) {
+        if read_frame_into(&mut reader, &mut inbuf).is_err() {
+            return; // disconnect or framing error
+        }
+        let response = match Request::decode(&inbuf) {
             Ok(req) => {
                 execute_session_as(&ctx, &role, &mut current_db, &req.sql, Some(req.consistency))
             }
             Err(e) => Response::Error(format!("protocol error: {e}")),
         };
-        let encoded = response.encode();
+        begin_frame(&mut outbuf);
+        response.encode_into(&mut outbuf);
         ctx.metrics
-            .add_bytes_returned(Endpoint::Binary, encoded.len() as u64);
-        if write_frame(&mut writer, &encoded).is_err() {
+            .add_bytes_returned(Endpoint::Binary, (outbuf.len() - 4) as u64);
+        if finish_frame(&mut writer, &mut outbuf).is_err() {
             return;
         }
     }

@@ -6,7 +6,7 @@
 //! set, scatters `LocalScan` to gather a table for a read, and broadcasts
 //! `ApplyDdl`.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Duration;
@@ -215,6 +215,13 @@ const RES_NODESTATUS: u8 = 8;
 impl Request {
     pub fn encode(&self) -> Vec<u8> {
         let mut o = Vec::new();
+        self.encode_into(&mut o);
+        o
+    }
+
+    /// Encode appending to `o`, so the RPC layer can build messages in a
+    /// reused per-connection buffer instead of allocating one per call.
+    pub fn encode_into(&self, o: &mut Vec<u8>) {
         match self {
             Request::ApplyPut {
                 table,
@@ -223,45 +230,45 @@ impl Request {
                 hlc,
             } => {
                 o.push(REQ_PUT);
-                put_str(&mut o, table);
-                put_bytes(&mut o, key);
-                put_bytes(&mut o, value);
+                put_str(o, table);
+                put_bytes(o, key);
+                put_bytes(o, value);
                 o.extend_from_slice(&hlc.to_bytes());
             }
             Request::ApplyDelete { table, key, hlc } => {
                 o.push(REQ_DEL);
-                put_str(&mut o, table);
-                put_bytes(&mut o, key);
+                put_str(o, table);
+                put_bytes(o, key);
                 o.extend_from_slice(&hlc.to_bytes());
             }
             Request::ApplyBatch { table, rows } => {
                 o.push(REQ_BATCH);
-                put_str(&mut o, table);
-                put_rows(&mut o, rows);
+                put_str(o, table);
+                put_rows(o, rows);
             }
             Request::LocalScan { table } => {
                 o.push(REQ_SCAN);
-                put_str(&mut o, table);
+                put_str(o, table);
             }
             Request::FilteredScan { table, filter } => {
                 o.push(REQ_FSCAN);
-                put_str(&mut o, table);
-                put_expr(&mut o, filter);
+                put_str(o, table);
+                put_expr(o, filter);
             }
             Request::LocalGet { table, key } => {
                 o.push(REQ_GET);
-                put_str(&mut o, table);
-                put_bytes(&mut o, key);
+                put_str(o, table);
+                put_bytes(o, key);
             }
             Request::IndexScan { index, start, end } => {
                 o.push(REQ_INDEX);
-                put_str(&mut o, index);
-                put_opt_bytes(&mut o, start.as_deref());
-                put_opt_bytes(&mut o, end.as_deref());
+                put_str(o, index);
+                put_opt_bytes(o, start.as_deref());
+                put_opt_bytes(o, end.as_deref());
             }
             Request::VectorSearch { index, query, k } => {
                 o.push(REQ_VECTOR);
-                put_str(&mut o, index);
+                put_str(o, index);
                 o.extend_from_slice(&(query.len() as u32).to_le_bytes());
                 for x in query {
                     o.extend_from_slice(&x.to_le_bytes());
@@ -270,8 +277,8 @@ impl Request {
             }
             Request::ApplyDdl { db, sql, hlc } => {
                 o.push(REQ_DDL);
-                put_str(&mut o, db);
-                put_str(&mut o, sql);
+                put_str(o, db);
+                put_str(o, sql);
                 o.extend_from_slice(&hlc.to_bytes());
             }
             Request::SetMembership {
@@ -281,19 +288,19 @@ impl Request {
             } => {
                 o.push(REQ_MEMBERS);
                 o.extend_from_slice(&epoch.to_le_bytes());
-                put_members(&mut o, members);
-                put_members(&mut o, prev_members);
+                put_members(o, members);
+                put_members(o, prev_members);
             }
             Request::Rebalance { joiner } => {
                 o.push(REQ_REBAL);
-                put_str(&mut o, joiner);
+                put_str(o, joiner);
             }
             Request::Drain { members } => {
                 o.push(REQ_DRAIN);
                 o.extend_from_slice(&(members.len() as u32).to_le_bytes());
                 for (id, addr) in members {
-                    put_str(&mut o, id);
-                    put_str(&mut o, addr);
+                    put_str(o, id);
+                    put_str(o, addr);
                 }
             }
             Request::Reclaim => o.push(REQ_RECLAIM),
@@ -302,13 +309,12 @@ impl Request {
             Request::Ping => o.push(REQ_PING),
             Request::Announce { id, addr, rf } => {
                 o.push(REQ_ANNOUNCE);
-                put_str(&mut o, id);
-                put_str(&mut o, addr);
+                put_str(o, id);
+                put_str(o, addr);
                 o.extend_from_slice(&rf.to_le_bytes());
             }
             Request::NodeStatus => o.push(REQ_NODESTATUS),
         }
-        o
     }
 
     pub fn decode(buf: &[u8]) -> Result<Request, WireError> {
@@ -399,18 +405,24 @@ impl Request {
 impl Response {
     pub fn encode(&self) -> Vec<u8> {
         let mut o = Vec::new();
+        self.encode_into(&mut o);
+        o
+    }
+
+    /// Encode appending to `o` (see [`Request::encode_into`]).
+    pub fn encode_into(&self, o: &mut Vec<u8>) {
         match self {
             Response::Ack => o.push(RES_ACK),
             Response::Scan { rows } => {
                 o.push(RES_SCAN);
-                put_rows(&mut o, rows);
+                put_rows(o, rows);
             }
             Response::Get { entry } => {
                 o.push(RES_GET);
                 match entry {
                     Some((value, hlc, is_put)) => {
                         o.push(1);
-                        put_bytes(&mut o, value);
+                        put_bytes(o, value);
                         o.extend_from_slice(&hlc.to_bytes());
                         o.push(u8::from(*is_put));
                     }
@@ -421,14 +433,14 @@ impl Response {
                 o.push(RES_KEYS);
                 o.extend_from_slice(&(keys.len() as u32).to_le_bytes());
                 for k in keys {
-                    put_bytes(&mut o, k);
+                    put_bytes(o, k);
                 }
             }
             Response::VectorHits { hits } => {
                 o.push(RES_VHITS);
                 o.extend_from_slice(&(hits.len() as u32).to_le_bytes());
                 for (key, dist) in hits {
-                    put_bytes(&mut o, key);
+                    put_bytes(o, key);
                     o.extend_from_slice(&dist.to_le_bytes());
                 }
             }
@@ -436,14 +448,14 @@ impl Response {
                 o.push(RES_SCHEMA);
                 o.extend_from_slice(&(entries.len() as u32).to_le_bytes());
                 for (db, ddl, hlc) in entries {
-                    put_str(&mut o, db);
-                    put_str(&mut o, ddl);
+                    put_str(o, db);
+                    put_str(o, ddl);
                     o.extend_from_slice(&hlc.to_bytes());
                 }
             }
             Response::Err(msg) => {
                 o.push(RES_ERR);
-                put_str(&mut o, msg);
+                put_str(o, msg);
             }
             Response::Pong => o.push(RES_PONG),
             Response::NodeStatus {
@@ -456,13 +468,12 @@ impl Response {
                 o.extend_from_slice(&epoch.to_le_bytes());
                 o.extend_from_slice(&(members.len() as u32).to_le_bytes());
                 for m in members {
-                    put_str(&mut o, m);
+                    put_str(o, m);
                 }
                 o.extend_from_slice(&rows.to_le_bytes());
                 o.extend_from_slice(&hlc_ms.to_le_bytes());
             }
         }
-        o
     }
 
     pub fn decode(buf: &[u8]) -> Result<Response, WireError> {
@@ -582,22 +593,93 @@ pub(crate) fn frame_decode(framed: &[u8]) -> Result<Vec<u8>, WireError> {
 pub fn call(addr: &str, req: &Request) -> io::Result<Response> {
     let mut stream = TcpStream::connect(addr)?;
     stream.set_nodelay(true).ok();
-    roundtrip(&mut stream, req)
-}
-
-/// One request/response round-trip over any authenticated connection.
-fn roundtrip<S: Read + Write>(stream: &mut S, req: &Request) -> io::Result<Response> {
-    write_frame(stream, &frame_encode(&req.encode()))?;
-    read_response(stream)
-}
-
-/// Read and decode one response frame.
-fn read_response<S: Read>(stream: &mut S) -> io::Result<Response> {
-    let framed = read_frame(stream)?;
+    write_frame(&mut stream, &frame_encode(&req.encode()))?;
+    let framed = read_frame(&mut stream)?;
     let payload =
         frame_decode(&framed).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     Response::decode(&payload)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+}
+
+fn wire_io_err(e: WireError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+}
+
+/// Serialize one message and write it as a single length-prefixed,
+/// envelope-tagged frame, building it in the connection's reusable write
+/// buffer: steady-state a message costs no allocation, no payload copy, and
+/// one write. The payload is encoded directly after the frame header; only
+/// when it turns out large enough to compress (and actually shrinks) is the
+/// envelope rebuilt around the compressed bytes.
+pub(crate) fn conn_send(conn: &mut Conn, encode: impl FnOnce(&mut Vec<u8>)) -> io::Result<()> {
+    let (stream, wbuf) = conn.write_half();
+    wbuf.clear();
+    // 4-byte length prefix + 1-byte codec tag, patched below.
+    wbuf.extend_from_slice(&[0u8; 5]);
+    encode(wbuf);
+    let payload_len = wbuf.len() - 5;
+    let mut codec = Codec::None;
+    if payload_len >= COMPRESS_THRESHOLD {
+        let comp = compress(Codec::Lz4, &wbuf[5..]);
+        if comp.len() + 5 < payload_len {
+            wbuf.truncate(5);
+            wbuf.extend_from_slice(&(payload_len as u32).to_le_bytes());
+            wbuf.extend_from_slice(&comp);
+            codec = Codec::Lz4;
+        }
+    }
+    if (wbuf.len() - 4) as u64 > skaidb_proto::MAX_FRAME_LEN as u64 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "frame too large"));
+    }
+    let framed_len = ((wbuf.len() - 4) as u32).to_be_bytes();
+    wbuf[..4].copy_from_slice(&framed_len);
+    wbuf[4] = codec.to_u8();
+    stream.write_all(wbuf)?;
+    stream.flush()
+}
+
+/// Read one framed message into the connection's reusable read buffer and
+/// decode it, borrowing the payload in place when it is uncompressed (the
+/// common case for acks and point ops — no copy, no allocation).
+///
+/// The outer error is an I/O failure (disconnect, oversized frame): the
+/// stream is unusable. The inner error is a decode failure on a fully-read
+/// frame: the stream is still framed correctly, so a server can answer with
+/// an error and keep serving.
+fn conn_recv<T>(
+    conn: &mut Conn,
+    decode: impl FnOnce(&[u8]) -> Result<T, WireError>,
+) -> io::Result<Result<T, WireError>> {
+    let (stream, rbuf) = conn.read_half();
+    skaidb_proto::read_frame_into(stream, rbuf)?;
+    let Some((&tag, rest)) = rbuf.split_first() else {
+        return Ok(Err(WireError::Malformed("empty frame")));
+    };
+    Ok(match Codec::from_u8(tag) {
+        Some(Codec::None) => decode(rest),
+        Some(codec) => match rest.get(..4) {
+            Some(len_bytes) => {
+                let ulen = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+                match decompress(codec, &rest[4..], ulen) {
+                    Ok(payload) => decode(&payload),
+                    Err(_) => Err(WireError::Malformed("decompress")),
+                }
+            }
+            None => Err(WireError::Malformed("short compressed frame")),
+        },
+        None => Err(WireError::Malformed("unknown wire codec")),
+    })
+}
+
+/// Read and decode one [`Response`] from a pooled/authenticated connection.
+fn conn_recv_response(conn: &mut Conn) -> io::Result<Response> {
+    conn_recv(conn, Response::decode)?.map_err(wire_io_err)
+}
+
+/// Read and decode one [`Request`] (the internode server side). See
+/// [`conn_recv`] for the two error layers.
+pub(crate) fn conn_recv_request(conn: &mut Conn) -> io::Result<Result<Request, WireError>> {
+    conn_recv(conn, Request::decode)
 }
 
 /// Max idle connections kept per peer.
@@ -626,7 +708,8 @@ impl Pool {
     /// error the connection is dropped (not returned to the pool).
     pub fn call(&self, addr: &str, req: &Request) -> io::Result<Response> {
         let mut conn = self.take(addr)?;
-        let resp = roundtrip(&mut conn, req)?;
+        conn_send(&mut conn, |o| req.encode_into(o))?;
+        let resp = conn_recv_response(&mut conn)?;
         self.put(addr, conn);
         Ok(resp)
     }
@@ -638,7 +721,7 @@ impl Pool {
     /// the socket buffer without blocking on the peer.
     pub fn call_begin(&self, addr: &str, req: &Request) -> io::Result<Pending<'_>> {
         let mut conn = self.take(addr)?;
-        write_frame(&mut conn, &frame_encode(&req.encode()))?;
+        conn_send(&mut conn, |o| req.encode_into(o))?;
         Ok(Pending {
             pool: self,
             addr: addr.to_string(),
@@ -651,7 +734,8 @@ impl Pool {
     /// must fail fast rather than block on the OS connect timeout.
     pub fn call_timeout(&self, addr: &str, req: &Request, timeout: Duration) -> io::Result<Response> {
         let mut conn = self.auth.connect(addr, Some(timeout))?;
-        roundtrip(&mut conn, req)
+        conn_send(&mut conn, |o| req.encode_into(o))?;
+        conn_recv_response(&mut conn)
     }
 
     fn take(&self, addr: &str) -> io::Result<Conn> {
@@ -669,9 +753,17 @@ impl Pool {
 
     fn put(&self, addr: &str, conn: Conn) {
         let mut idle = self.idle.lock().expect("pool lock");
-        let bucket = idle.entry(addr.to_string()).or_default();
-        if bucket.len() < MAX_IDLE_PER_PEER {
-            bucket.push(conn);
+        // Look up before inserting so the hot path (bucket exists) doesn't
+        // allocate a key `String` per returned connection.
+        match idle.get_mut(addr) {
+            Some(bucket) => {
+                if bucket.len() < MAX_IDLE_PER_PEER {
+                    bucket.push(conn);
+                }
+            }
+            None => {
+                idle.insert(addr.to_string(), vec![conn]);
+            }
         }
     }
 }
@@ -691,7 +783,7 @@ impl Pending<'_> {
     /// the connection to the pool.
     pub fn finish(mut self) -> io::Result<Response> {
         let mut conn = self.conn.take().expect("Pending::finish called twice");
-        let resp = read_response(&mut conn)?;
+        let resp = conn_recv_response(&mut conn)?;
         self.pool.put(&self.addr, conn);
         Ok(resp)
     }

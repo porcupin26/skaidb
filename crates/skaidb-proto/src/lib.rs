@@ -9,6 +9,6 @@ pub mod frame;
 pub mod handshake;
 pub mod message;
 
-pub use frame::{read_frame, write_frame, MAX_FRAME_LEN};
+pub use frame::{begin_frame, finish_frame, read_frame, read_frame_into, write_frame, MAX_FRAME_LEN};
 pub use handshake::{auth_message, AuthChallenge, AuthFinish, AuthOutcome, AuthStart};
 pub use message::{Consistency, ProtoError, Request, Response};
