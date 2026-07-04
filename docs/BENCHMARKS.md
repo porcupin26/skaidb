@@ -286,10 +286,50 @@ and busier cores.
 The remaining concurrent-write gap to PostgreSQL on this hardware (~25% at
 C4) is per-statement service time spread across SQL parsing (~8% of
 coordinator CPU), WAL append + memtable (~24%), and executor setup — there is
-no single plumbing lever left. The structural next step would be prepared
-statements / a parameterized-statement cache at the protocol level, which
-removes the parse and most of the per-statement setup rather than shaving
-them.
+no single plumbing lever left. The structural next step was prepared
+statements at the protocol level — measured below (v0.16.8).
+
+**v0.16.8**: **prepared statements**, end to end — `?` placeholders in the
+grammar, `Prepare`/`Execute`/`Close` opcodes in the binary protocol
+(per-connection statement cache, parse once / bind per call), and
+`prepare()`/`execute_prepared()` in the Rust driver. Statements are bound
+server-side (typed values, no SQL-injection surface) and the per-request SQL
+parse disappears.
+
+Both skaidb and PostgreSQL were benchmarked text vs prepared **same-day, same
+C4 config, alternating runs** (PostgreSQL via `PREPARE`/`EXECUTE` in the same
+client — both systems get the same fairness):
+
+| C4 workload | skaidb text | skaidb prepared | postgres text | postgres prepared |
+|-------------|------------:|----------------:|--------------:|------------------:|
+| write 1c    |   148 |   148 |   216 |   214 |
+| write 16c   | 1,294 | 1,309 | 1,686 | **1,771** |
+| read 16c    | 2,951 | **3,214** | 2,790 | 2,808 |
+| mixed 16c   | 1,784 | **1,853** | 2,000 | **2,110** |
+
+What it shows, honestly:
+
+- **skaidb reads gain ~9%** (3,214 ops/s — extending the same-day read lead
+  over PostgreSQL to +14% when both use prepared statements) and **mixed
+  gains ~4%** with visibly tighter p99s. Point reads are the workload where
+  the parse was the largest share of service time.
+- **skaidb writes are flat.** A durable quorum write's service time is
+  fsync + replication + WAL/memtable work; the ~40µs parse was never a
+  measurable part of it on this hardware (the same lesson as the v0.16.7
+  pass, now confirmed from the other direction).
+- **PostgreSQL gains ~5% on writes and mixed** from its own prepared path, so
+  fully-prepared-vs-fully-prepared slightly *widens* its concurrent-write
+  lead (1,771 vs 1,309). Its per-statement planner overhead is larger than
+  skaidb's parser, so it has more to save.
+- Beyond throughput, prepared statements are a correctness/safety feature:
+  typed server-side bindings replace client-side string interpolation as the
+  injection boundary, and clients spend less CPU formatting SQL.
+
+Methodology note: an earlier read of this experiment showed prepared mixed
+*losing* 12% — an artifact of leg ordering (the prepared leg always ran last,
+behind extra table-churn legs). Alternating text/prepared runs back-to-back
+reversed the sign. On this fleet, position-in-sequence effects are the same
+size as single-digit deltas; only alternating same-day A/Bs are trusted.
 
 ## Reproducing
 
