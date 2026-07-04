@@ -7,7 +7,10 @@ cluster/consistency configurations.
 
 Latest full-matrix run: **2026-07-03**, skaidb **v0.16.5** (the coordination-path
 optimization pass described [below](#v016x-performance-optimization-passes); all
-other systems at the versions above).
+other systems at the versions above). The **v0.16.6** async-tail replication
+batching was A/B-measured against v0.16.5 on the same fleet on **2026-07-04**
+(same-day, alternating binaries); its deltas are listed in the optimization-pass
+section rather than re-rolled into the matrix.
 
 > Numbers are for *relative* comparison on small nodes, not absolute peak
 > throughput. All five systems are driven by the same client model and the same
@@ -95,19 +98,20 @@ each back from a *different* node returns consistent results, and a full scan
 from any node sees all writes.
 
 Driving all 16 connections at a **single coordinator** node vs **fanning them
-across all 3 nodes** (round-robin), in the C4 (3-node quorum) config:
+across all 3 nodes** (round-robin), in the C4 (3-node quorum) config
+(v0.16.6, measured 2026-07-04):
 
 | Workload | single coordinator | all 3 nodes (fan-out) |
 |----------|-------------------:|----------------------:|
-| write 16c | **1,328** | 1,174 |
-| read 16c  | 3,000 | **3,156** |
-| mixed 16c | **1,856** | 1,748 |
+| write 16c | 1,337 | 1,338 |
+| read 16c  | 3,181 | 3,178 |
+| mixed 16c | 1,891 | 1,879 |
 
-Since the v0.16.5 coordination-path rework a single coordinator no longer
-bottlenecks on threading, so fan-out only wins on pure reads (spreading the
-local-read work); on writes the extra cross-node coordination slightly
-outweighs it. The larger point of fan-out remains **availability and client
-locality** — connect to any node, tolerate losing one.
+Since the v0.16.5/v0.16.6 coordination-path reworks a single coordinator is no
+longer the bottleneck at this connection count — fan-out and single-coordinator
+are a statistical tie on every workload. The point of fan-out is
+**availability and client locality** — connect to any node, tolerate losing
+one — not throughput.
 
 ## Memory footprint (idle, per node, of 512 MB)
 
@@ -214,6 +218,43 @@ Measured on the canonical 1 vCPU / 512 MB bench containers, all on 2026-07-03
 > gains; those figures were measured on the development test cluster
 > (1 vCPU / 1 GB nodes spread across two Proxmox hosts) and are superseded by
 > the same-hardware numbers above.
+
+**v0.16.6**: replication batching on the **async tail**, plus a measured dead
+end on the sync path:
+
+- **Batched async-tail replication.** The coordinator's background worker now
+  drains its whole task queue per wakeup and regroups the rows by peer and
+  table, so a burst of asynchronous tail replication — the beyond-quorum
+  replica at C4, *every* replica in C2's `ONE` mode — reaches each peer as a
+  few `ApplyBatch` frames (one frame parse, one lock acquisition, one WAL
+  fsync per batch on the peer) instead of one blocking round-trip per write.
+- **Tried and reverted: sync-path replication group commit.** Coalescing
+  concurrent sessions' quorum-path writes into shared per-peer `ApplyBatch`
+  flushes (PostgreSQL-style cross-session group commit, including a bounded
+  4-deep flush pipeline per peer) **cost ~9%** concurrent-write throughput
+  (C4 write 16c: 1,325 → ~1,200 in same-day A/B). The coordinator is
+  CPU-bound on these 1-vCPU nodes — C2, which never waits on a peer, hits the
+  same ~1,350 writes/s ceiling as C1/C4 — so batching the internode frames
+  saved CPU on the *peer* (which had headroom) while the queue/wake machinery
+  added CPU on the *coordinator* (which had none). Reverted; the analysis is
+  recorded next to the scatter path in `node.rs`.
+
+Same-day A/B, v0.16.5 vs v0.16.6 binaries alternated on the same fleet
+(2026-07-04; two runs each, averaged; unlisted workloads were unchanged
+within noise):
+
+| Config / workload | v0.16.5 | v0.16.6 | Δ |
+|-------------------|--------:|--------:|--:|
+| C2 write 16c      | 1,274 | **1,365** | +7% |
+| C2 mixed 16c      | 1,844 | **1,934** | +5% |
+| C4 mixed 16c      | 1,742 | **1,881** | +8% |
+| C4 write 16c      | 1,310 | 1,330 | +2% |
+| fan-out write 16c | 1,305 | 1,337 | +2% |
+
+The C2 gains are the direct effect (in `ONE` mode all replication is tail
+replication); the C4 mixed gain comes from the freed background-worker CPU —
+each C4 write ships one beyond-quorum tail copy, and batching those frees
+coordinator cycles that the interleaved reads then use.
 
 ## Reproducing
 
