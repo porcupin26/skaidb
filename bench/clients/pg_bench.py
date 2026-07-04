@@ -2,7 +2,11 @@
 """Load generator for a PostgreSQL primary (comparison benchmark for skaidb).
 
 Usage:
-    pg_bench.py <host> <write|read|mixed> <ops> <threads> [preload]
+    pg_bench.py <host> <write|read|mixed|writep|readp|mixedp> <ops> <threads> [preload]
+
+The `*p` modes use server-side prepared statements (PREPARE once per
+connection, EXECUTE per op) — the fair counterpart to skaidb's prepared
+workloads; the plain modes send full SQL text per op (psycopg2 default).
 
 Env:
     PG_PORT (5432), PG_DB (bench), PG_USER (skaidb), PG_PASS (changeme)
@@ -40,7 +44,7 @@ c = conn()
 cur = c.cursor()
 cur.execute("CREATE TABLE IF NOT EXISTS bench (id bigint PRIMARY KEY, v text)")
 cur.execute("TRUNCATE bench")
-if mode != "write":
+if mode not in ("write", "writep"):
     cur.executemany(
         "INSERT INTO bench (id,v) VALUES (%s,%s)",
         [(i, f"payload-{i}") for i in range(preload)],
@@ -52,16 +56,29 @@ per = ops // threads
 lat, err, lock = [], [0], threading.Lock()
 
 
+prepared = mode.endswith("p")
+base = mode[:-1] if prepared else mode
+
+
 def worker(t):
     c = conn()
     cur = c.cursor()
+    if prepared:
+        cur.execute("PREPARE ins (bigint, text) AS INSERT INTO bench (id,v) VALUES ($1,$2)")
+        cur.execute("PREPARE sel (bigint) AS SELECT v FROM bench WHERE id=$1")
+        read_sql, write_sql = "EXECUTE sel (%s)", "EXECUTE ins (%s,%s)"
+    else:
+        read_sql, write_sql = (
+            "SELECT v FROM bench WHERE id=%s",
+            "INSERT INTO bench (id,v) VALUES (%s,%s)",
+        )
     lats, e, rng = [], 0, random.Random(t)
     for i in range(per):
-        if mode == "read" or (mode == "mixed" and rng.random() < 0.5):
+        if base == "read" or (base == "mixed" and rng.random() < 0.5):
             k = rng.randrange(preload)
             s = time.perf_counter()
             try:
-                cur.execute("SELECT v FROM bench WHERE id=%s", (k,))
+                cur.execute(read_sql, (k,))
                 cur.fetchone()
             except Exception:
                 e += 1
@@ -69,7 +86,7 @@ def worker(t):
             _id = preload + t * 10_000_000 + i
             s = time.perf_counter()
             try:
-                cur.execute("INSERT INTO bench (id,v) VALUES (%s,%s)", (_id, f"payload-{_id}"))
+                cur.execute(write_sql, (_id, f"payload-{_id}"))
             except Exception:
                 e += 1
         lats.append((time.perf_counter() - s) * 1000)

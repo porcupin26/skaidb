@@ -40,6 +40,29 @@ pub struct Request {
     pub consistency: Consistency,
 }
 
+/// A client request, including the prepared-statement operations. The
+/// one-shot [`ClientRequest::Query`] is wire-identical to the original
+/// [`Request`], so old clients keep working against new servers; the other
+/// opcodes are rejected as unknown by old servers.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClientRequest {
+    /// Parse and execute one SQL statement.
+    Query { sql: String, consistency: Consistency },
+    /// Parse `sql` once (it may contain `?` placeholders) and cache it on
+    /// this connection; answered with [`Response::Prepared`].
+    Prepare { sql: String },
+    /// Execute a statement prepared on this connection, binding `params` to
+    /// its `?` placeholders in order.
+    Execute {
+        id: u32,
+        params: Vec<Value>,
+        consistency: Consistency,
+    },
+    /// Discard a prepared statement, freeing its slot. Acked with
+    /// [`Response::Ddl`] (no payload).
+    Close { id: u32 },
+}
+
 /// A server response.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Response {
@@ -54,6 +77,9 @@ pub enum Response {
     Ddl,
     /// The statement failed.
     Error(String),
+    /// Reply to [`ClientRequest::Prepare`]: the statement handle and how many
+    /// `?` parameters it expects.
+    Prepared { id: u32, params: u16 },
 }
 
 /// Errors decoding a protocol message.
@@ -64,10 +90,14 @@ pub enum ProtoError {
 }
 
 const OP_QUERY: u8 = 1;
+const OP_PREPARE: u8 = 2;
+const OP_EXECUTE: u8 = 3;
+const OP_CLOSE: u8 = 4;
 const RESP_ROWS: u8 = 0;
 const RESP_MUTATION: u8 = 1;
 const RESP_DDL: u8 = 2;
 const RESP_ERROR: u8 = 3;
+const RESP_PREPARED: u8 = 4;
 
 impl Request {
     /// Encode: `u8 OP_QUERY | u8 consistency | u32 sql_len | sql`.
@@ -89,6 +119,94 @@ impl Request {
             Consistency::from_u8(c.u8()?).ok_or(ProtoError::Malformed("bad consistency"))?;
         let sql = c.string()?;
         Ok(Request { sql, consistency })
+    }
+}
+
+impl ClientRequest {
+    /// Encode:
+    /// - Query:   `u8 OP_QUERY | u8 consistency | u32 sql_len | sql`
+    /// - Prepare: `u8 OP_PREPARE | u32 sql_len | sql`
+    /// - Execute: `u8 OP_EXECUTE | u8 consistency | u32 id | u16 nparams |
+    ///             nparams × (u32 len | value bytes)`
+    /// - Close:   `u8 OP_CLOSE | u32 id`
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.encode_into(&mut out);
+        out
+    }
+
+    /// Encode appending to `out` (reusable per-connection buffer).
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        match self {
+            ClientRequest::Query { sql, consistency } => {
+                out.push(OP_QUERY);
+                out.push(consistency.to_u8());
+                write_bytes(out, sql.as_bytes());
+            }
+            ClientRequest::Prepare { sql } => {
+                out.push(OP_PREPARE);
+                write_bytes(out, sql.as_bytes());
+            }
+            ClientRequest::Execute {
+                id,
+                params,
+                consistency,
+            } => {
+                out.push(OP_EXECUTE);
+                out.push(consistency.to_u8());
+                out.extend_from_slice(&id.to_le_bytes());
+                out.extend_from_slice(&(params.len() as u16).to_le_bytes());
+                for v in params {
+                    // Value encoded in place behind a backfilled length
+                    // prefix, as in Response::Rows.
+                    let len_pos = out.len();
+                    out.extend_from_slice(&[0u8; 4]);
+                    v.encode_value_into(out);
+                    let len = (out.len() - len_pos - 4) as u32;
+                    out[len_pos..len_pos + 4].copy_from_slice(&len.to_le_bytes());
+                }
+            }
+            ClientRequest::Close { id } => {
+                out.push(OP_CLOSE);
+                out.extend_from_slice(&id.to_le_bytes());
+            }
+        }
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<ClientRequest, ProtoError> {
+        let mut c = Cursor::new(buf);
+        Ok(match c.u8()? {
+            OP_QUERY => {
+                let consistency = Consistency::from_u8(c.u8()?)
+                    .ok_or(ProtoError::Malformed("bad consistency"))?;
+                ClientRequest::Query {
+                    sql: c.string()?,
+                    consistency,
+                }
+            }
+            OP_PREPARE => ClientRequest::Prepare { sql: c.string()? },
+            OP_EXECUTE => {
+                let consistency = Consistency::from_u8(c.u8()?)
+                    .ok_or(ProtoError::Malformed("bad consistency"))?;
+                let id = c.u32()?;
+                let nparams = u16::from_le_bytes(c.take(2)?.try_into().unwrap()) as usize;
+                let mut params = Vec::with_capacity(nparams);
+                for _ in 0..nparams {
+                    let bytes = c.bytes()?;
+                    params.push(
+                        Value::decode(bytes)
+                            .map_err(|_| ProtoError::Malformed("bad value encoding"))?,
+                    );
+                }
+                ClientRequest::Execute {
+                    id,
+                    params,
+                    consistency,
+                }
+            }
+            OP_CLOSE => ClientRequest::Close { id: c.u32()? },
+            _ => return Err(ProtoError::Malformed("unknown opcode")),
+        })
     }
 }
 
@@ -132,6 +250,11 @@ impl Response {
                 out.push(RESP_ERROR);
                 write_bytes(out, msg.as_bytes());
             }
+            Response::Prepared { id, params } => {
+                out.push(RESP_PREPARED);
+                out.extend_from_slice(&id.to_le_bytes());
+                out.extend_from_slice(&params.to_le_bytes());
+            }
         }
     }
 
@@ -163,6 +286,10 @@ impl Response {
             RESP_MUTATION => Response::Mutation { affected: c.u64()? },
             RESP_DDL => Response::Ddl,
             RESP_ERROR => Response::Error(c.string()?),
+            RESP_PREPARED => Response::Prepared {
+                id: c.u32()?,
+                params: u16::from_le_bytes(c.take(2)?.try_into().unwrap()),
+            },
             _ => return Err(ProtoError::Malformed("unknown response tag")),
         })
     }
@@ -230,6 +357,55 @@ mod tests {
             consistency: Consistency::Quorum,
         };
         assert_eq!(Request::decode(&req.encode()).unwrap(), req);
+    }
+
+    #[test]
+    fn client_request_roundtrips() {
+        for req in [
+            ClientRequest::Query {
+                sql: "SELECT 1".into(),
+                consistency: Consistency::One,
+            },
+            ClientRequest::Prepare {
+                sql: "INSERT INTO t (id, v) VALUES (?, ?)".into(),
+            },
+            ClientRequest::Execute {
+                id: 3,
+                params: vec![Value::Int(7), Value::String("x".into()), Value::Null],
+                consistency: Consistency::Quorum,
+            },
+            ClientRequest::Execute {
+                id: 0,
+                params: vec![],
+                consistency: Consistency::All,
+            },
+            ClientRequest::Close { id: 9 },
+        ] {
+            assert_eq!(ClientRequest::decode(&req.encode()).unwrap(), req);
+        }
+    }
+
+    #[test]
+    fn prepared_response_roundtrips() {
+        let resp = Response::Prepared { id: 5, params: 2 };
+        assert_eq!(Response::decode(&resp.encode()).unwrap(), resp);
+    }
+
+    #[test]
+    fn query_wire_format_matches_legacy_request() {
+        // Old clients send `Request`; new servers decode `ClientRequest`.
+        let old = Request {
+            sql: "SELECT * FROM t".into(),
+            consistency: Consistency::Quorum,
+        };
+        let new = ClientRequest::decode(&old.encode()).unwrap();
+        assert_eq!(
+            new,
+            ClientRequest::Query {
+                sql: "SELECT * FROM t".into(),
+                consistency: Consistency::Quorum,
+            }
+        );
     }
 
     #[test]

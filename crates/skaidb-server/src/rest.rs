@@ -303,6 +303,9 @@ fn response_to_json(response: Response) -> (u16, Json) {
         Response::Mutation { affected } => (200, json!({ "affected": affected })),
         Response::Ddl => (200, json!({ "ok": true })),
         Response::Error(msg) => (400, json!({ "error": msg })),
+        // Prepared statements are a binary-protocol feature; the REST path
+        // never issues a Prepare, so this is unreachable there.
+        Response::Prepared { id, params } => (200, json!({ "prepared": id, "params": params })),
     }
 }
 

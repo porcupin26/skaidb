@@ -6,12 +6,25 @@ use std::thread::{self, JoinHandle};
 
 use skaidb_proto::{
     auth_message, begin_frame, finish_frame, read_frame, read_frame_into, write_frame,
-    AuthChallenge, AuthFinish, AuthOutcome, AuthStart, Request, Response,
+    AuthChallenge, AuthFinish, AuthOutcome, AuthStart, ClientRequest, Response,
 };
+use skaidb_sql::ast::Statement;
 
 use crate::authn::AuthResult;
 use crate::metrics::Endpoint;
-use crate::shared::{execute_session_as, Shared};
+use crate::shared::{execute_session_as, execute_session_statement_as, Shared};
+
+/// Cap on statements prepared per connection, so a misbehaving client can't
+/// grow the per-connection cache without bound. `Close` frees slots.
+const MAX_PREPARED_PER_CONN: usize = 256;
+
+/// One statement prepared on a connection: the original template text (for
+/// audit/metrics) and its parsed form, bound with fresh parameters on every
+/// `Execute`.
+struct PreparedStmt {
+    sql: String,
+    stmt: Statement,
+}
 
 /// Bind the binary endpoint and serve it on a background thread.
 ///
@@ -65,15 +78,42 @@ fn handle_connection(stream: TcpStream, ctx: Shared) {
 
     // Request and response buffers are reused across the connection's life,
     // so steady-state a request costs no allocation in the framing layer.
+    // Prepared statements are per-connection state, like `current_db`.
     let mut inbuf = Vec::new();
     let mut outbuf = Vec::new();
+    let mut prepared: Vec<Option<PreparedStmt>> = Vec::new();
     loop {
         if read_frame_into(&mut reader, &mut inbuf).is_err() {
             return; // disconnect or framing error
         }
-        let response = match Request::decode(&inbuf) {
-            Ok(req) => {
-                execute_session_as(&ctx, &role, &mut current_db, &req.sql, Some(req.consistency))
+        let response = match ClientRequest::decode(&inbuf) {
+            Ok(ClientRequest::Query { sql, consistency }) => {
+                execute_session_as(&ctx, &role, &mut current_db, &sql, Some(consistency))
+            }
+            Ok(ClientRequest::Prepare { sql }) => prepare(&mut prepared, sql),
+            Ok(ClientRequest::Execute {
+                id,
+                params,
+                consistency,
+            }) => match prepared.get(id as usize).and_then(Option::as_ref) {
+                Some(ps) => match skaidb_sql::bind(&ps.stmt, &params) {
+                    Ok(bound) => execute_session_statement_as(
+                        &ctx,
+                        &role,
+                        &mut current_db,
+                        &ps.sql,
+                        Ok(bound),
+                        Some(consistency),
+                    ),
+                    Err(e) => Response::Error(e.to_string()),
+                },
+                None => Response::Error(format!("unknown prepared statement id {id}")),
+            },
+            Ok(ClientRequest::Close { id }) => {
+                match prepared.get_mut(id as usize).map(Option::take) {
+                    Some(Some(_)) => Response::Ddl,
+                    _ => Response::Error(format!("unknown prepared statement id {id}")),
+                }
             }
             Err(e) => Response::Error(format!("protocol error: {e}")),
         };
@@ -84,6 +124,39 @@ fn handle_connection(stream: TcpStream, ctx: Shared) {
         if finish_frame(&mut writer, &mut outbuf).is_err() {
             return;
         }
+    }
+}
+
+/// Handle a `Prepare`: parse once, reject unpreparable statement kinds, and
+/// stash the template in the connection's statement table (reusing a closed
+/// slot when one is free).
+fn prepare(prepared: &mut Vec<Option<PreparedStmt>>, sql: String) -> Response {
+    let stmt = match skaidb_sql::parse(&sql) {
+        Ok(s) => s,
+        Err(e) => return Response::Error(e.to_string()),
+    };
+    let Some(nparams) = skaidb_sql::param_count(&stmt) else {
+        return Response::Error("statement kind cannot be prepared".into());
+    };
+    let entry = PreparedStmt { sql, stmt };
+    let id = match prepared.iter().position(Option::is_none) {
+        Some(free) => {
+            prepared[free] = Some(entry);
+            free
+        }
+        None if prepared.len() >= MAX_PREPARED_PER_CONN => {
+            return Response::Error(format!(
+                "too many prepared statements (max {MAX_PREPARED_PER_CONN}); close some first"
+            ));
+        }
+        None => {
+            prepared.push(Some(entry));
+            prepared.len() - 1
+        }
+    };
+    Response::Prepared {
+        id: id as u32,
+        params: nparams as u16,
     }
 }
 

@@ -368,7 +368,22 @@ pub fn execute_session_as(
     // choice, and (on the local backend) execution itself. SQL that fails to
     // parse skips the check — the backend then reports the parse error.
     let parsed = skaidb_sql::parse(sql);
+    execute_session_statement_as(ctx, role, current_db, sql, parsed, consistency)
+}
 
+/// [`execute_session_as`] for an already-parsed statement — the prepared
+/// `EXECUTE` path, where the per-request parse is exactly what is being
+/// skipped. `sql` is the statement's original template text (with `?`
+/// placeholders), used for audit and metrics; the privilege check runs
+/// against the bound statement like any other.
+pub fn execute_session_statement_as(
+    ctx: &Shared,
+    role: &str,
+    current_db: &mut String,
+    sql: &str,
+    parsed: Result<Statement, ParseError>,
+    consistency: Option<ProtoConsistency>,
+) -> Response {
     // Authorization: check the role may perform the statement before executing.
     if let Some((privilege, object)) = parsed.as_ref().ok().and_then(required_privilege) {
         if !ctx.roles.has_privilege(role, privilege, &object) {

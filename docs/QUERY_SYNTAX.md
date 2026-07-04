@@ -142,6 +142,13 @@ SHOW DATABASES
   9. parentheses `( … )`
 - **Aggregate functions:** `COUNT(*)` / `COUNT(<expr>)`, `SUM`, `AVG`, `MIN`,
   `MAX`. Using an aggregate (or `GROUP BY`) puts the query in aggregate mode.
+- **Bind parameters:** `?` marks a positional parameter in any expression
+  position of a **prepared** `SELECT`/`INSERT`/`UPDATE`/`DELETE` (e.g.
+  `INSERT INTO t (id, v) VALUES (?, ?)`). Parameters are numbered by order of
+  appearance and bound to values at execute time via the binary protocol's
+  prepared-statement messages (or a driver's `prepare`/`execute` API). DDL
+  and session-control statements cannot be prepared, and a `?` submitted
+  through the plain one-shot query path is an error at execution.
 - Comparisons follow three-valued logic (`NULL` compares as unknown).
 
 ## Identifiers & literals (lexical)

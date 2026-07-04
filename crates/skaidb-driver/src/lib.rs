@@ -15,8 +15,9 @@ use std::time::{Duration, Instant};
 use skaidb_auth::scram;
 use skaidb_proto::{
     auth_message, read_frame, write_frame, AuthChallenge, AuthFinish, AuthOutcome, AuthStart,
-    Consistency, ProtoError, Request, Response,
+    ClientRequest, Consistency, ProtoError, Request, Response,
 };
+use skaidb_types::Value;
 
 /// How long to wait for the latency probe TCP connect before giving up on an
 /// endpoint's ordering (it is still retained as a last-resort failover target).
@@ -35,6 +36,17 @@ pub enum DriverError {
     Auth(String),
     #[error("no endpoint reachable: {0}")]
     NoEndpoint(String),
+}
+
+/// A statement prepared on the server via [`Client::prepare`]: parse once,
+/// execute many times with different parameter bindings. Holds the template
+/// text so the driver can re-prepare transparently after a failover.
+#[derive(Debug, Clone)]
+pub struct Prepared {
+    id: u32,
+    /// How many `?` parameters the statement expects.
+    pub params: u16,
+    sql: String,
 }
 
 /// A synchronous connection to a skaidb cluster, with failover across endpoints.
@@ -165,6 +177,79 @@ impl Client {
             sql: sql.to_string(),
             consistency,
         };
+        write_frame(&mut self.stream, &req.encode())?;
+        let payload = read_frame(&mut self.stream)?;
+        match Response::decode(&payload)? {
+            Response::Error(msg) => Err(DriverError::Server(msg)),
+            other => Ok(other),
+        }
+    }
+
+    /// Parse `sql` (which may contain `?` placeholders) once on the server
+    /// and cache it on this connection. Execute it any number of times with
+    /// [`Client::execute_prepared`], paying no per-call parse.
+    pub fn prepare(&mut self, sql: &str) -> Result<Prepared, DriverError> {
+        let req = ClientRequest::Prepare {
+            sql: sql.to_string(),
+        };
+        match self.roundtrip(&req) {
+            Err(DriverError::Io(_)) => {
+                self.reconnect()?;
+                self.roundtrip(&req)
+            }
+            other => other,
+        }
+        .and_then(|resp| match resp {
+            Response::Prepared { id, params } => Ok(Prepared {
+                id,
+                params,
+                sql: sql.to_string(),
+            }),
+            other => Err(DriverError::Server(format!(
+                "unexpected response to Prepare: {other:?}"
+            ))),
+        })
+    }
+
+    /// Execute a prepared statement at the default consistency.
+    pub fn execute_prepared(
+        &mut self,
+        stmt: &mut Prepared,
+        params: &[Value],
+    ) -> Result<Response, DriverError> {
+        self.execute_prepared_with(stmt, params, self.default_consistency)
+    }
+
+    /// Execute a prepared statement at an explicit consistency. Prepared ids
+    /// are per-connection, so on failover the statement is transparently
+    /// re-prepared on the new connection (updating `stmt`) and retried once.
+    pub fn execute_prepared_with(
+        &mut self,
+        stmt: &mut Prepared,
+        params: &[Value],
+        consistency: Consistency,
+    ) -> Result<Response, DriverError> {
+        let req = ClientRequest::Execute {
+            id: stmt.id,
+            params: params.to_vec(),
+            consistency,
+        };
+        match self.roundtrip(&req) {
+            Err(DriverError::Io(_)) => {
+                self.reconnect()?;
+                *stmt = self.prepare(&stmt.sql)?;
+                self.roundtrip(&ClientRequest::Execute {
+                    id: stmt.id,
+                    params: params.to_vec(),
+                    consistency,
+                })
+            }
+            other => other,
+        }
+    }
+
+    /// One request/response round-trip over the current stream (no reconnect).
+    fn roundtrip(&mut self, req: &ClientRequest) -> Result<Response, DriverError> {
         write_frame(&mut self.stream, &req.encode())?;
         let payload = read_frame(&mut self.stream)?;
         match Response::decode(&payload)? {

@@ -14,6 +14,8 @@ pub fn print_response(resp: &Response) {
         Response::Ddl => println!("OK"),
         // The driver maps errors to `Err`, so this arm is not normally hit.
         Response::Error(msg) => eprintln!("error: {msg}"),
+        // The shell never issues Prepare; printed for completeness.
+        Response::Prepared { id, params } => println!("PREPARED {id} ({params} params)"),
     }
 }
 

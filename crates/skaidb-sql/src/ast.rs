@@ -241,6 +241,10 @@ pub struct Delete {
 pub enum Expr {
     /// A literal value.
     Literal(Value),
+    /// A positional bind parameter (`?`), 0-indexed in order of appearance.
+    /// Present only in prepared statements; `bind` replaces every parameter
+    /// with a literal before execution.
+    Parameter(u16),
     /// A column / field path like `a.b.c`.
     Column(String),
     /// Unary operator application.

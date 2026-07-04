@@ -820,7 +820,9 @@ fn put_expr(o: &mut Vec<u8>, e: &Expr) {
             put_expr(o, expr);
             o.push(u8::from(*negated));
         }
-        Expr::Aggregate { .. } => o.push(255), // not valid in a filter
+        // Not valid in a pushed filter: aggregates never are, and parameters
+        // are substituted by `bind` before any statement executes.
+        Expr::Aggregate { .. } | Expr::Parameter(_) => o.push(255),
     }
 }
 

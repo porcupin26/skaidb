@@ -144,7 +144,7 @@ pool/reuse it).
 ### 3.1 Request
 
 ```
-u8  = 1                       # OP_QUERY (the only opcode)
+u8  = 1                       # OP_QUERY
 u8  consistency               # 0 = ONE, 1 = QUORUM, 2 = ALL
 u32 sql_len (LE)
 sql bytes (UTF-8)
@@ -152,6 +152,9 @@ sql bytes (UTF-8)
 
 Consistency selects how many replicas must acknowledge (writes) or be consulted
 (reads) before the server answers. Drivers default to **QUORUM (1)**.
+
+Servers ≥ 0.16.8 also accept the prepared-statement opcodes 2–4 (§3.3); a
+driver that only ever sends `OP_QUERY` is fully compatible in both directions.
 
 ### 3.2 Response
 
@@ -163,6 +166,7 @@ First byte is a tag:
 | 1   | Mutation  |
 | 2   | Ddl       |
 | 3   | Error     |
+| 4   | Prepared  |
 
 **Rows (0)** — a `SELECT` result set:
 ```
@@ -195,6 +199,51 @@ str message      (u32 LE len + UTF-8)
 ```
 Drivers should raise/return this `message` as a query error.
 
+**Prepared (4)** — reply to `OP_PREPARE` (§3.3):
+```
+u8  = 4
+u32 statement id (LE)
+u16 parameter count (LE)
+```
+
+### 3.3 Prepared statements (server ≥ 0.16.8)
+
+A statement containing `?` placeholders can be parsed **once** and executed
+many times with different bindings — skipping the per-request SQL parse and
+giving a typed, injection-safe parameter path. Prepared ids are scoped to the
+connection that created them: they are invalid on any other connection, and
+gone when the connection closes. Only `SELECT`/`INSERT`/`UPDATE`/`DELETE` can
+be prepared; DDL and session statements are refused with `Error`.
+
+`OP_PREPARE` — parse and cache; answered with `Prepared`:
+```
+u8  = 2                       # OP_PREPARE
+u32 sql_len (LE)
+sql bytes (UTF-8), may contain `?` placeholders
+```
+
+`OP_EXECUTE` — run a prepared statement; answered like a normal query:
+```
+u8  = 3                       # OP_EXECUTE
+u8  consistency               # as in OP_QUERY
+u32 statement id (LE)
+u16 nparams (LE)
+nparams × [ u32 len (LE) + value bytes ]   # §4 Value encoding, in `?` order
+```
+The binding count must equal the statement's parameter count exactly, else
+`Error`.
+
+`OP_CLOSE` — free a prepared statement's slot (a server caps open statements
+per connection at 256); answered with `Ddl` on success:
+```
+u8  = 4                       # OP_CLOSE
+u32 statement id (LE)
+```
+
+An old server (< 0.16.8) answers opcodes 2–4 with `Error("unknown opcode")` —
+drivers can feature-detect by preparing once and falling back to client-side
+interpolation (§5).
+
 ---
 
 ## 4. Value encoding
@@ -226,12 +275,12 @@ Notes:
 
 ---
 
-## 5. Parameter binding (client-side)
+## 5. Parameter binding (client-side fallback)
 
-The protocol has **no server-side bind parameters** — a request carries one SQL
-string. To offer the familiar parameterized API (`?`/`%s`/`$1` placeholders),
-drivers interpolate arguments into the SQL **client-side**, with correct SQL
-quoting:
+Against servers ≥ 0.16.8 prefer the server-side prepared statements of §3.3.
+For older servers (or drivers that have not implemented §3.3), offer the
+parameterized API (`?`/`%s`/`$1` placeholders) by interpolating arguments into
+the SQL **client-side**, with correct SQL quoting:
 
 - **string**: wrap in single quotes; escape each `'` by doubling it → `''`.
   (skaidb uses standard SQL `''` escaping; backslashes are literal.)

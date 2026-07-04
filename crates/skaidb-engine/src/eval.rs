@@ -23,6 +23,11 @@ pub fn eval(expr: &Expr, row: &Document) -> Result<Value> {
         }
         Expr::Unary { op, expr } => eval_unary(*op, eval(expr, row)?),
         Expr::Binary { op, left, right } => eval_binary(*op, left, right, row),
+        // Parameters are substituted by `bind` before execution; one
+        // surviving to evaluation means the statement was never bound.
+        Expr::Parameter(_) => Err(EngineError::Type(
+            "unbound parameter (`?`) in expression".into(),
+        )),
         Expr::Aggregate { .. } => Err(EngineError::Type(
             "aggregate function not allowed here".into(),
         )),

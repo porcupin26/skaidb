@@ -35,6 +35,8 @@ pub enum Token {
     Gt,
     GtEq,
     Semicolon,
+    /// A positional bind-parameter placeholder (`?`), for prepared statements.
+    Question,
 
     /// End of input.
     Eof,
@@ -262,6 +264,10 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             }
             b';' => {
                 tokens.push(Token::Semicolon);
+                i += 1;
+            }
+            b'?' => {
+                tokens.push(Token::Question);
                 i += 1;
             }
             b'=' => {

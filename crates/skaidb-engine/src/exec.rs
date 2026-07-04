@@ -2985,7 +2985,7 @@ fn contains_aggregate(expr: &Expr) -> bool {
         Expr::Aggregate { .. } => true,
         Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => contains_aggregate(expr),
         Expr::Binary { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
-        Expr::Literal(_) | Expr::Column(_) => false,
+        Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) => false,
     }
 }
 
@@ -3185,7 +3185,7 @@ fn lower_aggregates(expr: &Expr, docs: &[Document]) -> Result<Expr> {
             left: Box::new(lower_aggregates(left, docs)?),
             right: Box::new(lower_aggregates(right, docs)?),
         },
-        Expr::Literal(_) | Expr::Column(_) => expr.clone(),
+        Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) => expr.clone(),
     })
 }
 

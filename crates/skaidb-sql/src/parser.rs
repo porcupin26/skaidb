@@ -21,7 +21,7 @@ pub enum ParseError {
 /// Parse a single SQL statement (a trailing semicolon is permitted).
 pub fn parse(sql: &str) -> Result<Statement, ParseError> {
     let tokens = tokenize(sql)?;
-    let mut p = Parser { tokens, pos: 0 };
+    let mut p = Parser { tokens, pos: 0, params: 0 };
     let stmt = p.parse_statement()?;
     p.eat(&Token::Semicolon);
     p.expect_eof()?;
@@ -31,6 +31,8 @@ pub fn parse(sql: &str) -> Result<Statement, ParseError> {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Bind parameters (`?`) seen so far; assigns each its positional index.
+    params: u16,
 }
 
 /// The bare table name from a (possibly `db.table`-qualified) reference — used
@@ -775,6 +777,14 @@ impl Parser {
             Token::Keyword(Keyword::Null) => {
                 self.advance();
                 Ok(Expr::Literal(Value::Null))
+            }
+            Token::Question => {
+                self.advance();
+                let idx = self.params;
+                self.params = self.params.checked_add(1).ok_or_else(|| {
+                    ParseError::Other("too many bind parameters".into())
+                })?;
+                Ok(Expr::Parameter(idx))
             }
             Token::LParen => {
                 self.advance();

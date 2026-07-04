@@ -5,9 +5,11 @@
 //! it against the storage layer.
 
 pub mod ast;
+pub mod bind;
 mod parser;
 mod token;
 
 pub use ast::*;
+pub use bind::{bind, param_count, BindError};
 pub use parser::{parse, ParseError};
 pub use token::{tokenize, Keyword, LexError, Token};
