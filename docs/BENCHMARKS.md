@@ -5,7 +5,7 @@ A throughput/latency comparison of **skaidb** against four production databases 
 identical containers with matched durability semantics, across four
 cluster/consistency configurations.
 
-Latest full-matrix run: **2026-07-03**, skaidb **v0.16.4** (the coordination-path
+Latest full-matrix run: **2026-07-03**, skaidb **v0.16.5** (the coordination-path
 optimization pass described [below](#v016x-performance-optimization-passes); all
 other systems at the versions above).
 
@@ -103,7 +103,7 @@ across all 3 nodes** (round-robin), in the C4 (3-node quorum) config:
 | read 16c  | 3,000 | **3,156** |
 | mixed 16c | **1,856** | 1,748 |
 
-Since the v0.16.4 coordination-path rework a single coordinator no longer
+Since the v0.16.5 coordination-path rework a single coordinator no longer
 bottlenecks on threading, so fan-out only wins on pure reads (spreading the
 local-read work); on writes the extra cross-node coordination slightly
 outweighs it. The larger point of fan-out remains **availability and client
@@ -178,7 +178,7 @@ sharded read cache, concurrent `&self` reads under RwLock, `COUNT(*)` fast
 path, hash equi-joins, group-commit WAL, parallel replica fan-out, batched
 internode `ApplyBatch` RPC, lock-free metrics, byte-cursor lexer.
 
-**v0.16.4**: a coordination-path pass driven by syscall profiling on the bench
+**v0.16.5**: a coordination-path pass driven by syscall profiling on the bench
 nodes (an `strace -c` of the coordinator showed the per-write cost was thread
 machinery — `clone3` + stack setup + futex parks — not I/O; the fdatasync
 itself is ~50–170 µs on these containers):
@@ -203,7 +203,7 @@ itself is ~50–170 µs on these containers):
 Measured on the canonical 1 vCPU / 512 MB bench containers, all on 2026-07-03
 (same nodes, same client, C4 = 3-node quorum):
 
-| Workload | v0.16.0 | v0.16.3 | v0.16.4 | v0.16.4 vs v0.16.0 |
+| Workload | v0.16.0 | v0.16.3 | v0.16.5 | v0.16.5 vs v0.16.0 |
 |----------|--------:|--------:|--------:|-------------------:|
 | write 1c  |   136 |   134 |   149 | +10% |
 | write 16c | 1,071 | 1,246 | **1,328** | +24% |
