@@ -256,6 +256,41 @@ replication); the C4 mixed gain comes from the freed background-worker CPU —
 each C4 write ships one beyond-quorum tail copy, and batching those frees
 coordinator cycles that the interleaved reads then use.
 
+**v0.16.7**: an allocation/copy pass on the framing layers, driven by a CPU
+profile of the coordinator under 16-connection write load (allocator calls
+were ~20% of on-CPU cycles; every internode send built three buffers and
+every received ack allocated twice):
+
+- **Reused frame buffers everywhere.** Client connections and pooled
+  internode connections now read each frame into a per-connection buffer and
+  build outbound frames (length prefix + payload, encoded in place) in
+  another — steady-state, a request/response pair allocates nothing in the
+  framing layer on either side.
+- **Fused internode message writes.** A replicated write used to be encoded
+  into one buffer, wrapped into a compression envelope in a second, and
+  coalesced with the length prefix into a third; it is now encoded once,
+  directly behind the frame header, and written with one call.
+- **Borrowing decode.** Uncompressed internode payloads (acks, point ops) are
+  decoded straight out of the connection's read buffer instead of being
+  copied out of the envelope first.
+
+Profile after the pass: internode ack handling fell from 16% to 12% of
+coordinator CPU, send-side from 4.5% to 3.3%, and the proto-decode and
+response-encode allocations disappeared. **Same-day A/B on the fleet measured
+no throughput change** (C4 write 16c: 1,283 vs 1,291 avg; C2: 1,359 vs 1,367)
+— the saved cycles are a few percent of per-op service time, under this
+setup's ±5% noise floor. The pass ships anyway: it is strictly less CPU and
+allocator pressure per operation, which matters more on TLS internode links
+and busier cores.
+
+The remaining concurrent-write gap to PostgreSQL on this hardware (~25% at
+C4) is per-statement service time spread across SQL parsing (~8% of
+coordinator CPU), WAL append + memtable (~24%), and executor setup — there is
+no single plumbing lever left. The structural next step would be prepared
+statements / a parameterized-statement cache at the protocol level, which
+removes the parse and most of the per-statement setup rather than shaving
+them.
+
 ## Reproducing
 
 skaidb's load generator is in-tree:
