@@ -588,6 +588,11 @@ pub fn call(addr: &str, req: &Request) -> io::Result<Response> {
 /// One request/response round-trip over any authenticated connection.
 fn roundtrip<S: Read + Write>(stream: &mut S, req: &Request) -> io::Result<Response> {
     write_frame(stream, &frame_encode(&req.encode()))?;
+    read_response(stream)
+}
+
+/// Read and decode one response frame.
+fn read_response<S: Read>(stream: &mut S) -> io::Result<Response> {
     let framed = read_frame(stream)?;
     let payload =
         frame_decode(&framed).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -686,11 +691,7 @@ impl Pending<'_> {
     /// the connection to the pool.
     pub fn finish(mut self) -> io::Result<Response> {
         let mut conn = self.conn.take().expect("Pending::finish called twice");
-        let framed = read_frame(&mut conn)?;
-        let payload = frame_decode(&framed)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        let resp = Response::decode(&payload)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let resp = read_response(&mut conn)?;
         self.pool.put(&self.addr, conn);
         Ok(resp)
     }

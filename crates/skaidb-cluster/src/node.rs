@@ -301,6 +301,11 @@ enum BgTask {
 /// (anti-entropy reconciles whatever overflows).
 const MAX_HINTS_PER_REPLICA: usize = 4096;
 
+/// Max deferred tasks the background worker drains per wakeup: bounds the
+/// size of one batched send while still collapsing a burst of async-tail
+/// replication into few round-trips.
+const BG_BATCH_MAX: usize = 256;
+
 /// Startup catch-up / self-announce: how many times to wait for a peer to become
 /// reachable before giving up, and how long between attempts. The interval is
 /// shortened under test so background threads reach their exit condition (and
@@ -352,10 +357,92 @@ impl Node {
         thread::spawn(move || {
             while let Ok(task) = bg_rx.recv() {
                 let Some(node) = weak.upgrade() else { return };
-                node.run_bg_task(task);
+                // Drain whatever else queued up while the worker was busy, so
+                // a burst of async-tail replication collapses into batched
+                // sends (one `ApplyBatch` per peer) instead of one blocking
+                // round-trip per write.
+                let mut tasks = vec![task];
+                while tasks.len() < BG_BATCH_MAX {
+                    match bg_rx.try_recv() {
+                        Ok(t) => tasks.push(t),
+                        Err(_) => break,
+                    }
+                }
+                node.run_bg_tasks(tasks);
             }
         });
         node
+    }
+
+    /// Execute a drained batch of deferred tasks on the background worker
+    /// thread. Replication tasks are regrouped by peer and table so a burst
+    /// of async-tail writes reaches each replica as a few `ApplyBatch`
+    /// round-trips (one lock + one fsync per batch on the peer) instead of
+    /// one blocking round-trip per write; hint flushes run once at the end,
+    /// after any freshly-failed sends have buffered their hints.
+    fn run_bg_tasks(&self, tasks: Vec<BgTask>) {
+        if tasks.len() == 1 && !matches!(tasks[0], BgTask::FlushHints) {
+            let mut tasks = tasks;
+            return self.run_bg_task(tasks.pop().expect("non-empty"));
+        }
+        let mut flush = false;
+        // Rows per (replica, addr), grouped per table in arrival order.
+        type PeerBatches = Vec<(String, Vec<BatchRow>)>;
+        let mut by_peer: Vec<((NodeId, String), PeerBatches)> = Vec::new();
+        let mut add = |peer: &(NodeId, String), table: &str, rows: &[BatchRow]| {
+            let idx = match by_peer.iter().position(|(p, _)| p == peer) {
+                Some(i) => i,
+                None => {
+                    by_peer.push((peer.clone(), Vec::new()));
+                    by_peer.len() - 1
+                }
+            };
+            let tables = &mut by_peer[idx].1;
+            match tables.iter_mut().find(|(t, _)| t == table) {
+                Some((_, batch)) => batch.extend_from_slice(rows),
+                None => tables.push((table.to_string(), rows.to_vec())),
+            }
+        };
+        for task in &tasks {
+            match task {
+                BgTask::FlushHints => flush = true,
+                BgTask::Replicate {
+                    peers,
+                    table,
+                    key,
+                    op,
+                    hlc,
+                } => {
+                    let row: BatchRow = match op {
+                        WriteOp::Put(bytes) => (key.clone(), bytes.clone(), *hlc, true),
+                        WriteOp::Delete => (key.clone(), Vec::new(), *hlc, false),
+                    };
+                    for peer in peers {
+                        add(peer, table, std::slice::from_ref(&row));
+                    }
+                }
+                BgTask::ReplicateBatch { peers, table, rows } => {
+                    for peer in peers {
+                        add(peer, table, rows);
+                    }
+                }
+            }
+        }
+        for ((replica, addr), tables) in by_peer {
+            for (table, rows) in tables {
+                if self.send_batch(&addr, &table, &rows) {
+                    if let Some((_, _, hlc, _)) = rows.last() {
+                        self.note_acked(&replica, *hlc);
+                    }
+                } else {
+                    self.hint_batch(&replica, &table, &rows);
+                }
+            }
+        }
+        if flush {
+            self.hint_flush_queued.store(false, Ordering::Release);
+            self.flush_hints();
+        }
     }
 
     /// Execute one deferred task on the node's background worker thread.
@@ -1808,6 +1895,14 @@ impl Node {
         //    is hinted and the next untried replica takes its place (retry
         //    waves below), so the set contacted synchronously matches the old
         //    sequential loop.
+        //
+        //    (Measured dead end, kept for the record: coalescing concurrent
+        //    writers' frames into shared per-peer ApplyBatch flushes —
+        //    replication group commit — cost ~9% write throughput at 16
+        //    clients on 1-vCPU nodes. The coordinator is CPU-bound there, so
+        //    the saved peer frames bought nothing while the queue/wake
+        //    machinery added coordinator CPU; only the async tail benefits
+        //    from batching, which `run_bg_tasks` does off the client path.)
         let peers: Vec<(NodeId, String)> = replicas
             .iter()
             .filter(|r| **r != self.id)
@@ -3134,6 +3229,48 @@ mod tests {
         na.execute("INSERT INTO t (id, v) VALUES (1, 'x')").unwrap();
         let rs = rows(nb.execute("SELECT v FROM t WHERE id = 1").unwrap());
         assert_eq!(rs.rows, vec![vec![Value::String("x".into())]]);
+    }
+
+    #[test]
+    fn concurrent_writers_replicate_and_converge() {
+        // 2 nodes, rf=2, QUORUM writes: every write must sync-replicate to
+        // the peer, so concurrent writers exercise the pipelined scatter
+        // (overlapped send/fsync/collect) under contention.
+        let (a, b) = (free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b)];
+        let na = Node::new(
+            Database::open(temp_dir("lane-a")).unwrap(),
+            cfg_auth("a", &a, &members, 2, Authenticator::None),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("lane-b")).unwrap(),
+            cfg_auth("b", &b, &members, 2, Authenticator::None),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+
+        const WRITERS: usize = 8;
+        const PER_WRITER: usize = 25;
+        thread::scope(|s| {
+            for w in 0..WRITERS {
+                let na = &na;
+                s.spawn(move || {
+                    for i in 0..PER_WRITER {
+                        let id = w * PER_WRITER + i;
+                        na.execute(&format!("INSERT INTO t (id, v) VALUES ({id}, 'v{id}')"))
+                            .unwrap();
+                    }
+                });
+            }
+        });
+
+        // Quorum reads on a 2-of-2 cluster touch both replicas, so a write
+        // acked but not applied on either replica would surface here.
+        for node in [&na, &nb] {
+            let rs = rows(node.execute("SELECT id FROM t").unwrap());
+            assert_eq!(rs.rows.len(), WRITERS * PER_WRITER);
+        }
     }
 
     #[test]
