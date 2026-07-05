@@ -77,6 +77,10 @@ fn visit_statement(stmt: &Statement, f: &mut impl FnMut(&Expr)) -> bool {
 }
 
 fn visit_select(s: &Select, f: &mut impl FnMut(&Expr)) {
+    if let Some(n) = &s.nearest {
+        visit_expr(&n.query, f);
+        visit_expr(&n.k, f);
+    }
     for item in &s.items {
         if let SelectItem::Expr { expr, .. } = item {
             visit_expr(expr, f);
@@ -145,6 +149,10 @@ fn visit_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
 }
 
 fn mutate_select(s: &mut Select, f: &mut impl FnMut(&mut Expr)) {
+    if let Some(n) = &mut s.nearest {
+        mutate_expr(&mut n.query, f);
+        mutate_expr(&mut n.k, f);
+    }
     for item in &mut s.items {
         if let SelectItem::Expr { expr, .. } = item {
             mutate_expr(expr, f);
@@ -234,6 +242,25 @@ mod tests {
         assert_eq!(param_count(&stmt), Some(1));
         let bound = bind(&stmt, &[Value::Int(3)]).unwrap();
         assert_eq!(bound, parse("SELECT v FROM t WHERE id = 3").unwrap());
+    }
+
+    #[test]
+    fn bind_nearest_clause() {
+        let stmt = parse("SELECT id FROM docs NEAREST (embedding, ?, ?) WHERE cat = ?").unwrap();
+        assert_eq!(param_count(&stmt), Some(3));
+        let bound = bind(
+            &stmt,
+            &[
+                Value::Array(vec![Value::Float(1.0), Value::Float(0.0)]),
+                Value::Int(5),
+                Value::String("a".into()),
+            ],
+        )
+        .unwrap();
+        let expect =
+            parse("SELECT id FROM docs NEAREST (embedding, [1.0, 0.0], 5) WHERE cat = 'a'")
+                .unwrap();
+        assert_eq!(bound, expect);
     }
 
     #[test]

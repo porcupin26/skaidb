@@ -15,7 +15,7 @@ pub mod vector;
 pub use error::EngineError;
 pub use exec::{
     filter_rows, run, statement_is_read_only, Cluster, Database, DbStats, IndexScanRange,
-    TableStats,
+    pk_point_key, TableStats,
 };
 pub use skaidb_storage::{Codec, EngineOptions};
 pub use namespace::DEFAULT_DATABASE;

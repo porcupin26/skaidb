@@ -368,6 +368,16 @@ impl Database {
     }
 
     /// The `(name, path)` of every vector index on `table`.
+    /// The name of the vector index on `(table, path)`, if one exists — the
+    /// resolution step behind the SQL `NEAREST` clause.
+    pub fn vector_index_for(&self, table: &str, path: &str) -> Option<String> {
+        self.catalog
+            .vector_indexes
+            .iter()
+            .find(|(_, def)| def.table == table && def.path == path)
+            .map(|(name, _)| name.clone())
+    }
+
     fn vector_indexes_on(&self, table: &str) -> Vec<(String, String)> {
         self.catalog
             .vector_indexes
@@ -1230,6 +1240,28 @@ impl Database {
         order: Option<&str>,
         fetch_limit: Option<usize>,
     ) -> Result<OrderedRows> {
+        // Fast path: the whole filter is a primary-key equality — one point
+        // read (memtable → read cache → SSTables with bloom filters) instead
+        // of a table scan. ≤ 1 row is trivially in any requested order.
+        if let Some(key) = pk_point_key(&self.table_def(table)?.primary_key, filter) {
+            let engine = self
+                .tables
+                .get(table)
+                .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+            let rows = match engine.get(&key)? {
+                Some(bytes) => match Value::decode(&bytes) {
+                    Ok(Value::Document(doc)) => vec![(key, doc)],
+                    Ok(_) => {
+                        return Err(EngineError::Constraint(
+                            "stored row is not a document".into(),
+                        ))
+                    }
+                    Err(e) => return Err(EngineError::Constraint(format!("corrupt row: {e}"))),
+                },
+                None => Vec::new(),
+            };
+            return Ok((rows, true));
+        }
         let Some((index_name, start, end, sorted)) = self.plan_index(table, filter, order) else {
             // No usable index: stream the table scan (decode one row at a
             // time) and, when no ordering is required, stop as soon as the
@@ -1757,6 +1789,30 @@ impl Database {
             .collect())
     }
 
+    /// One bounded page of [`Database::local_scan_versioned_with_tombstones`]:
+    /// up to `limit` rows with key strictly greater than `after`, in key
+    /// order. Memory is proportional to the page, not the table — the seam
+    /// incremental anti-entropy pages through.
+    pub fn local_scan_versioned_page(
+        &self,
+        table: &str,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<VersionedTombstoneRow>> {
+        let engine = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+        Ok(engine
+            .scan_versioned_page(after, limit)?
+            .into_iter()
+            .map(|(key, hlc, value)| match value {
+                Some(bytes) => (key, bytes, hlc, true),
+                None => (key, Vec::new(), hlc, false),
+            })
+            .collect())
+    }
+
     /// **Filter pushdown**: the primary keys of this node's rows whose latest
     /// local version is a `Put` matching `filter`. The coordinator unions these
     /// candidate keys across replicas and re-reads each at quorum — exactly like a
@@ -1993,6 +2049,22 @@ pub trait Cluster {
     fn count_rows(&self, _table: &str) -> Result<Option<usize>> {
         Ok(None)
     }
+    /// Approximate nearest-neighbor search over the vector index on
+    /// `(table, path)`: the `k` rows whose vector is closest to `query`,
+    /// nearest first, as `(key, doc, distance)`. `filter` restricts results
+    /// (evaluated authoritatively by the implementation).
+    fn vector_search(
+        &self,
+        _table: &str,
+        _path: &str,
+        _query: &[f32],
+        _k: usize,
+        _filter: &Option<Expr>,
+    ) -> Result<Vec<(Vec<u8>, Document, f32)>> {
+        Err(EngineError::Unsupported(
+            "vector search is not available on this backend".into(),
+        ))
+    }
     /// Write `doc` under `key` in `table` (and maintain indexes/replicas).
     fn put(&mut self, table: &str, key: &[u8], doc: &Document) -> Result<()>;
     /// Write a whole statement's rows in one call. Implementations may batch
@@ -2059,6 +2131,10 @@ fn run_insert(ins: Insert, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
 }
 
 fn run_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> {
+    // ANN clause: a distance-ordered top-k gather replaces the normal scan.
+    if sel.nearest.is_some() {
+        return run_nearest_select(sel, cluster);
+    }
     // Compound query (`UNION [ALL]`): project each core without ordering/limiting,
     // combine the row sets, then apply the whole-query DISTINCT / ORDER BY / LIMIT.
     if !sel.set_ops.is_empty() {
@@ -2085,6 +2161,70 @@ fn run_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> {
     }
     // Simple single-table query: keep the index-accelerated ORDER BY / top-N path.
     run_simple_select(sel, cluster)
+}
+
+/// Execute a `NEAREST` (vector search) select: resolve the query vector and
+/// `k`, run the ANN gather (already filtered and nearest-first), expose each
+/// hit's distance as a `_distance` field, and project as usual.
+fn run_nearest_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> {
+    let nearest = sel.nearest.as_ref().expect("checked by run_select");
+    if !sel.joins.is_empty() || !sel.set_ops.is_empty() {
+        return Err(EngineError::Unsupported(
+            "NEAREST cannot be combined with JOIN or UNION".into(),
+        ));
+    }
+    if is_grouped(sel) || sel.having.is_some() {
+        return Err(EngineError::Unsupported(
+            "NEAREST cannot be combined with aggregates or GROUP BY".into(),
+        ));
+    }
+    if !sel.order_by.is_empty() {
+        return Err(EngineError::Unsupported(
+            "NEAREST results are already ordered by distance; ORDER BY is not supported".into(),
+        ));
+    }
+    let empty = Document::new();
+    let query = match eval(&nearest.query, &empty)? {
+        Value::Array(items) => {
+            let mut v = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::Int(i) => v.push(i as f32),
+                    Value::Float(f) => v.push(f as f32),
+                    _ => {
+                        return Err(EngineError::Type(
+                            "NEAREST query vector must be a numeric array".into(),
+                        ))
+                    }
+                }
+            }
+            v
+        }
+        _ => {
+            return Err(EngineError::Type(
+                "NEAREST query vector must be a numeric array".into(),
+            ))
+        }
+    };
+    let k = match eval(&nearest.k, &empty)? {
+        Value::Int(k) if k > 0 => k as usize,
+        _ => {
+            return Err(EngineError::Type(
+                "NEAREST k must be a positive integer".into(),
+            ))
+        }
+    };
+    let hits = cluster.vector_search(&sel.from, &nearest.path, &query, k, &sel.filter)?;
+    let docs: Vec<Document> = hits
+        .into_iter()
+        .map(|(_, mut doc, dist)| {
+            doc.insert("_distance", Value::Float(dist as f64));
+            doc
+        })
+        .collect();
+    let mut rs = project(sel, docs, &HashSet::new(), true)?;
+    apply_offset_limit(&mut rs.rows, sel.offset, sel.limit);
+    Ok(rs)
 }
 
 /// Whether the query is in aggregate/grouped mode.
@@ -2508,6 +2648,33 @@ fn run_delete(del: Delete, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
     Ok(QueryOutput::Mutation { affected })
 }
 
+/// When the entire filter is `pk = <literal>` on a single-column primary key,
+/// the storage key for that row so the read can be a point get. The key must
+/// be built exactly as the engine builds it for inserts: the order-preserving
+/// encoding of a one-element array holding the value.
+pub fn pk_point_key(pk: &[String], filter: &Option<Expr>) -> Option<Vec<u8>> {
+    if pk.len() != 1 {
+        return None;
+    }
+    let Some(Expr::Binary {
+        op: BinaryOp::Eq,
+        left,
+        right,
+    }) = filter
+    else {
+        return None;
+    };
+    let col = &pk[0];
+    let value = match (left.as_ref(), right.as_ref()) {
+        (Expr::Column(c), Expr::Literal(v)) | (Expr::Literal(v), Expr::Column(c)) if c == col => v,
+        _ => return None,
+    };
+    if value.is_null() {
+        return None;
+    }
+    Some(Value::Array(vec![value.clone()]).encode_key())
+}
+
 /// The embedded, single-node implementation of [`Cluster`].
 ///
 /// Writes are appended with **deferred durability**: each put/delete lands in
@@ -2578,6 +2745,20 @@ impl Cluster for LocalCluster<'_> {
 
     fn count_rows(&self, table: &str) -> Result<Option<usize>> {
         self.db.local_count_rows(table)
+    }
+
+    fn vector_search(
+        &self,
+        table: &str,
+        path: &str,
+        query: &[f32],
+        k: usize,
+        filter: &Option<Expr>,
+    ) -> Result<Vec<(Vec<u8>, Document, f32)>> {
+        let index = self.db.vector_index_for(table, path).ok_or_else(|| {
+            EngineError::Unsupported(format!("no vector index on {table} ({path})"))
+        })?;
+        self.db.vector_search(&index, query, k, filter)
     }
 
     fn put(&mut self, table: &str, key: &[u8], doc: &Document) -> Result<()> {
@@ -2653,6 +2834,20 @@ impl Cluster for LocalRead<'_> {
 
     fn count_rows(&self, table: &str) -> Result<Option<usize>> {
         self.db.local_count_rows(table)
+    }
+
+    fn vector_search(
+        &self,
+        table: &str,
+        path: &str,
+        query: &[f32],
+        k: usize,
+        filter: &Option<Expr>,
+    ) -> Result<Vec<(Vec<u8>, Document, f32)>> {
+        let index = self.db.vector_index_for(table, path).ok_or_else(|| {
+            EngineError::Unsupported(format!("no vector index on {table} ({path})"))
+        })?;
+        self.db.vector_search(&index, query, k, filter)
     }
 
     fn put(&mut self, _table: &str, _key: &[u8], _doc: &Document) -> Result<()> {

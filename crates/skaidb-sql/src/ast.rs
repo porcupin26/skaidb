@@ -3,6 +3,10 @@
 use skaidb_types::Value;
 
 /// A top-level SQL statement.
+// `Select` (many optional clauses) is inherently larger than the DDL
+// variants; boxing it would touch every match site in the engine for no
+// runtime benefit (statements aren't stored in bulk — one per parse).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     CreateTable(CreateTable),
@@ -164,6 +168,13 @@ pub struct Insert {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
     pub distinct: bool,
+    /// `NEAREST (<path>, <query>, <k>)` — approximate nearest-neighbor clause:
+    /// return the `k` rows whose vector at `path` is closest to `query`
+    /// (which must evaluate to a numeric array), ordered nearest-first, with
+    /// the distance exposed as a `_distance` field. Requires a vector index
+    /// on `(table, path)`. Mutually exclusive with joins, grouping, set ops,
+    /// and `ORDER BY`.
+    pub nearest: Option<Box<Nearest>>,
     pub items: Vec<SelectItem>,
     pub from: String,
     /// Alias for the `FROM` table (defaults to the table name).
@@ -176,6 +187,17 @@ pub struct Select {
     pub order_by: Vec<OrderKey>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+}
+
+/// The `NEAREST (<path>, <query>, <k>)` clause of a [`Select`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Nearest {
+    /// Document path of the indexed vector field (e.g. `embedding`).
+    pub path: String,
+    /// The query vector: an array literal or a bind parameter.
+    pub query: Expr,
+    /// How many neighbors to return: an integer literal or a bind parameter.
+    pub k: Expr,
 }
 
 /// A joined table: `[<kind>] JOIN <table> [AS alias] [ON <expr>]`.

@@ -451,6 +451,20 @@ impl Parser {
             joins.push(self.parse_join(kind)?);
         }
 
+        // `NEAREST (<path>, <query>, <k>)` — ANN clause (vector search).
+        let nearest = if self.eat_keyword(Keyword::Nearest) {
+            self.expect(&Token::LParen)?;
+            let path = self.parse_path()?;
+            self.expect(&Token::Comma)?;
+            let query = self.parse_expr()?;
+            self.expect(&Token::Comma)?;
+            let k = self.parse_expr()?;
+            self.expect(&Token::RParen)?;
+            Some(Box::new(Nearest { path, query, k }))
+        } else {
+            None
+        };
+
         let filter = if self.eat_keyword(Keyword::Where) {
             Some(self.parse_expr()?)
         } else {
@@ -476,6 +490,7 @@ impl Parser {
 
         Ok(Select {
             distinct,
+            nearest,
             items,
             from,
             from_alias,
