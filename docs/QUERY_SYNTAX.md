@@ -211,7 +211,7 @@ exists. Cannot combine with `JOIN`, `UNION`, aggregates/`GROUP BY`, or
 
 `CREATE TIMESERIES TABLE` declares a table whose rows are **samples**, stored
 in the time-series engine (Gorilla-compressed chunks; feature status and
-internals in [TIMESERIES.md](TIMESERIES.md), design plan in
+internals in [TIMESERIES.md](TIMESERIES.md), pending work in
 [TODO.md](TODO.md)). Distributed: the DDL broadcasts, series place on the
 ring and replicate at the write consistency, and queries union-merge across
 members. Joins and

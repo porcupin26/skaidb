@@ -40,8 +40,7 @@ stored as its own compressed stream. Full grammar and semantics:
 
 ## What's implemented
 
-**Storage** (`skaidb-tsdb`, measured on workstation NVMe — see
-`docs/TODO.md` phase 1 for the full numbers):
+**Storage** (`skaidb-tsdb`, measured on workstation NVMe):
 
 - Gorilla compression (delta-of-delta timestamps + XOR floats):
   **1.0–1.5 bytes/sample** on typical fleet patterns (counters, mostly-idle
@@ -121,16 +120,16 @@ stored as its own compressed stream. Full grammar and semantics:
 
 ## What's missing (and where it's planned)
 
-Roadmap phases refer to the implementation plan in [`TODO.md`](TODO.md).
+All tracked, with more detail, in [`TODO.md`](TODO.md).
 
 | Gap | Notes | Planned |
 |---|---|---|
 | TS hinted handoff | repair converges lagging replicas (below); a faster per-write hint replay like row tables have is still open | later |
-| **Partial-aggregate pushdown** | cluster queries ship matching raw samples to the coordinator; per-node partial aggregation (sum/count per bucket, per-series rate segments) would cut transfer for wide aggregations | phase 3 follow-up |
+| **Partial-aggregate pushdown** | cluster queries ship matching raw samples to the coordinator; per-node partial aggregation (sum/count per bucket, per-series rate segments) would cut transfer for wide aggregations | open |
 | Self-scrape (`/metrics` → TS table) | remote_write covers external scrapers | later |
 | TS reclaim | after a reshard, former owners keep stale series copies (harmless under union-merge; no `reclaim` pass for TS yet) | with TS anti-entropy |
-| Rollup query rewrite | queries must target the rollup table explicitly; picking the coarsest satisfying rollup automatically is open | phase 6 follow-up |
-| Rollup backfill/repair | rollups aggregate at flush; repair-merged (gap-filled) samples don't retroactively update them | phase 6 follow-up |
+| Rollup query rewrite | queries must target the rollup table explicitly; picking the coarsest satisfying rollup automatically is open | open |
+| Rollup backfill/repair | rollups aggregate at flush; repair-merged (gap-filled) samples don't retroactively update them | open |
 | PromQL: regex matchers, offset, arithmetic, histogram_quantile | the shipped subset covers selectors, rate/increase/delta, and sum/avg/min/max/count by/without | phase 7 follow-up |
 | Label postings index | matchers scan the per-block series list (fine at moderate cardinality) | with pushdown work |
 | Regex label matchers | only `=` / `!=` push down | with postings |
