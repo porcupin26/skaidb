@@ -64,10 +64,22 @@ pub struct TableDef {
     pub primary_key: Vec<String>,
 }
 
+/// A time-series table definition: label columns and optional retention.
+/// The implicit sample key is `(series key, ts)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TsTableDef {
+    pub series_key: Vec<String>,
+    pub retention_ms: Option<i64>,
+}
+
 /// The set of all tables and indexes.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Catalog {
     pub tables: BTreeMap<String, TableDef>,
+    /// Time-series tables (stored in the tsdb engine, not the LSM). Shares
+    /// the table namespace with `tables`. `default` so older catalogs load.
+    #[serde(default)]
+    pub timeseries: BTreeMap<String, TsTableDef>,
     pub indexes: BTreeMap<String, IndexDef>,
     /// Vector indexes (rebuilt in memory on open). `default` so older catalogs load.
     #[serde(default)]

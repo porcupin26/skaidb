@@ -14,6 +14,8 @@ pub enum Token {
     Int(i64),
     /// Floating-point literal.
     Float(f64),
+    /// Duration literal (`15s`, `5m`, `2h`, `30d`, `250ms`, `1w`), in ms.
+    Duration(i64),
     /// String literal (quotes already stripped, escapes resolved).
     Str(String),
 
@@ -108,6 +110,9 @@ pub enum Keyword {
     Show,
     Tables,
     Indexes,
+    Timeseries,
+    Series,
+    Retention,
 }
 
 /// Length of the longest keyword ("TRANSACTION").
@@ -173,6 +178,9 @@ impl Keyword {
             b"COLUMN" => Column,
             b"DISTINCT" => Distinct,
             b"HAVING" => Having,
+            b"TIMESERIES" => Timeseries,
+            b"SERIES" => Series,
+            b"RETENTION" => Retention,
             b"UNION" => Union,
             b"ALL" => All,
             b"BEGIN" => Begin,
@@ -418,18 +426,39 @@ fn lex_number(input: &str, start: usize) -> Result<(Token, usize), LexError> {
         i += 1;
     }
     let text = &input[start..i];
-    let token = if seen_dot {
-        Token::Float(
-            text.parse()
-                .map_err(|_| LexError::InvalidNumber(text.to_string()))?,
-        )
-    } else {
-        Token::Int(
-            text.parse()
-                .map_err(|_| LexError::InvalidNumber(text.to_string()))?,
-        )
-    };
-    Ok((token, i))
+    if seen_dot {
+        return Ok((
+            Token::Float(
+                text.parse()
+                    .map_err(|_| LexError::InvalidNumber(text.to_string()))?,
+            ),
+            i,
+        ));
+    }
+    let value: i64 = text
+        .parse()
+        .map_err(|_| LexError::InvalidNumber(text.to_string()))?;
+    // An immediately-adjacent unit suffix makes a duration literal: `15s`,
+    // `5m`, `2h`, `30d`, `1w`, `250ms` (the suffix must end the word).
+    let word_end = lex_word_end(input, i);
+    if word_end > i {
+        let per_unit = match &input[i..word_end] {
+            "ms" => Some(1),
+            "s" => Some(1000),
+            "m" => Some(60 * 1000),
+            "h" => Some(3600 * 1000),
+            "d" => Some(24 * 3600 * 1000),
+            "w" => Some(7 * 24 * 3600 * 1000),
+            _ => None,
+        };
+        if let Some(per_unit) = per_unit {
+            let ms = value
+                .checked_mul(per_unit)
+                .ok_or_else(|| LexError::InvalidNumber(input[start..word_end].to_string()))?;
+            return Ok((Token::Duration(ms), word_end));
+        }
+    }
+    Ok((Token::Int(value), i))
 }
 
 /// Byte index just past the identifier/keyword word starting at `start`.

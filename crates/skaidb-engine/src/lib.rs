@@ -10,6 +10,7 @@ mod exec;
 pub mod namespace;
 mod result;
 mod session;
+mod ts_query;
 pub mod vector;
 
 pub use error::EngineError;
@@ -72,6 +73,199 @@ mod tests {
         assert_eq!(rs.rows.len(), 2);
         assert_eq!(rs.rows[0], vec![Value::Int(1), Value::String("ada".into())]);
         assert_eq!(rs.rows[1], vec![Value::Int(2), Value::String("bob".into())]);
+    }
+
+    /// Shared fixture: a TS table with two hosts sampling `value` every 15 s
+    /// for two minutes (values rise 1/s), plus a `temp` field on host a.
+    fn ts_fixture(db: &mut Database) {
+        db.execute("CREATE TIMESERIES TABLE cpu (SERIES KEY (host, core), RETENTION 30d)")
+            .unwrap();
+        for host in ["a", "b"] {
+            for i in 0..8i64 {
+                let ts = i * 15_000;
+                let sql = format!(
+                    "INSERT INTO cpu (host, core, ts, value{extra}) VALUES ('{host}', '0', {ts}, {v}{extra_v})",
+                    v = i * 15,
+                    extra = if host == "a" { ", temp" } else { "" },
+                    extra_v = if host == "a" { format!(", {}", 50 + i) } else { String::new() },
+                );
+                assert_eq!(affected(db.execute(&sql).unwrap()), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn timeseries_create_insert_select_roundtrip() {
+        let mut db = Database::open(tempdir()).unwrap();
+        ts_fixture(&mut db);
+
+        // Raw range read with label + ts pushdown, ordered by time.
+        let rs = rows(
+            db.execute(
+                "SELECT ts, value FROM cpu \
+                 WHERE host = 'a' AND ts >= 30000 AND ts < 90000 ORDER BY ts",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.columns, vec!["ts", "value"]);
+        assert_eq!(rs.rows.len(), 4); // 30000, 45000, 60000, 75000
+        assert_eq!(rs.rows[0], vec![Value::Timestamp(30_000), Value::Float(30.0)]);
+        assert_eq!(rs.rows[3], vec![Value::Timestamp(75_000), Value::Float(75.0)]);
+
+        // Wildcard shows labels + ts + all fields; the hidden series id
+        // stays hidden.
+        let rs = rows(
+            db.execute("SELECT * FROM cpu WHERE host = 'a' AND ts = 0")
+                .unwrap(),
+        );
+        assert!(rs.columns.contains(&"host".to_string()));
+        assert!(rs.columns.contains(&"temp".to_string()));
+        assert!(!rs.columns.iter().any(|c| c.starts_with("__")));
+
+        // SHOW TABLES lists it with the implicit key.
+        let rs = rows(db.execute("SHOW TABLES").unwrap());
+        assert!(rs
+            .rows
+            .iter()
+            .any(|r| r[0] == Value::String("cpu".into())
+                && r[1] == Value::String("host, core, ts".into())));
+    }
+
+    #[test]
+    fn timeseries_bucketed_aggregation_and_ts_functions() {
+        let mut db = Database::open(tempdir()).unwrap();
+        ts_fixture(&mut db);
+
+        // avg per bucket per host: values rise linearly, so bucket 0 of host
+        // a averages (0+15+30+45)/4 = 22.5.
+        let rs = rows(
+            db.execute(
+                "SELECT time_bucket(1m, ts) AS t, host, avg(value) FROM cpu \
+                 GROUP BY t, host ORDER BY t, host",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.columns, vec!["t", "host", "avg"]);
+        assert_eq!(rs.rows.len(), 4); // 2 buckets x 2 hosts
+        assert_eq!(
+            rs.rows[0],
+            vec![
+                Value::Timestamp(0),
+                Value::String("a".into()),
+                Value::Float(22.5)
+            ]
+        );
+
+        // rate(): each series rises 1/s; grouped per bucket per host the
+        // per-series rate is 1.0.
+        let rs = rows(
+            db.execute(
+                "SELECT time_bucket(1m, ts) AS t, host, rate(value) FROM cpu \
+                 GROUP BY t, host ORDER BY t, host",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows[0][2], Value::Float(1.0));
+
+        // rate() across both hosts sums per-series rates: 2.0.
+        let rs = rows(
+            db.execute("SELECT rate(value) FROM cpu WHERE ts <= 45000").unwrap(),
+        );
+        assert_eq!(rs.rows[0][0], Value::Float(2.0));
+
+        // first()/last()/delta() over one host's window.
+        let rs = rows(
+            db.execute(
+                "SELECT first(value), last(value), delta(value) FROM cpu WHERE host = 'b'",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            rs.rows[0],
+            vec![Value::Float(0.0), Value::Float(105.0), Value::Float(105.0)]
+        );
+    }
+
+    #[test]
+    fn timeseries_counter_reset_and_increase() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TIMESERIES TABLE reqs (SERIES KEY (h))")
+            .unwrap();
+        // Counter climbs to 10, resets, climbs to 3: increase = 10 + 3.
+        for (ts, v) in [(0, 0.0), (1000, 10.0), (2000, 3.0)] {
+            db.execute(&format!(
+                "INSERT INTO reqs (h, ts, value) VALUES ('x', {ts}, {v})"
+            ))
+            .unwrap();
+        }
+        let rs = rows(db.execute("SELECT increase(value) FROM reqs").unwrap());
+        assert_eq!(rs.rows[0][0], Value::Float(13.0));
+    }
+
+    #[test]
+    fn timeseries_now_and_duration_literals() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TIMESERIES TABLE m (SERIES KEY (h))").unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        db.execute(&format!(
+            "INSERT INTO m (h, ts, value) VALUES ('x', {}, 1), ('x', {}, 2)",
+            now - 2 * 3600 * 1000, // two hours ago
+            now - 60_000,          // a minute ago
+        ))
+        .unwrap();
+        let rs = rows(
+            db.execute("SELECT value FROM m WHERE ts >= now() - 1h").unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Float(2.0)]]);
+    }
+
+    #[test]
+    fn timeseries_rejects_update_delete_and_bad_inserts() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TIMESERIES TABLE m (SERIES KEY (h))").unwrap();
+        db.execute("INSERT INTO m (h, ts, value) VALUES ('x', 1000, 1)")
+            .unwrap();
+
+        let err = db.execute("UPDATE m SET value = 2 WHERE h = 'x'").unwrap_err();
+        assert!(err.to_string().contains("append-only"), "{err}");
+        let err = db.execute("DELETE FROM m WHERE h = 'x'").unwrap_err();
+        assert!(err.to_string().contains("append-only"), "{err}");
+
+        // Missing series key / ts / fields, and non-numeric fields.
+        for (sql, needle) in [
+            ("INSERT INTO m (ts, value) VALUES (1, 1)", "series key"),
+            ("INSERT INTO m (h, value) VALUES ('x', 1)", "ts"),
+            ("INSERT INTO m (h, ts) VALUES ('x', 1)", "at least one"),
+            ("INSERT INTO m (h, ts, value) VALUES ('x', 2000, 'oops')", "numeric"),
+        ] {
+            let err = db.execute(sql).unwrap_err();
+            assert!(err.to_string().contains(needle), "{sql}: {err}");
+        }
+    }
+
+    #[test]
+    fn timeseries_survives_reopen_and_drop() {
+        let dir = tempdir();
+        {
+            let mut db = Database::open(&dir).unwrap();
+            db.execute("CREATE TIMESERIES TABLE m (SERIES KEY (h), RETENTION 30d)")
+                .unwrap();
+            db.execute("INSERT INTO m (h, ts, value) VALUES ('x', 1000, 1), ('x', 2000, 2)")
+                .unwrap();
+        }
+        let mut db = Database::open(&dir).unwrap();
+        let rs = rows(db.execute("SELECT ts, value FROM m ORDER BY ts").unwrap());
+        assert_eq!(rs.rows.len(), 2);
+        assert_eq!(rs.rows[1], vec![Value::Timestamp(2000), Value::Float(2.0)]);
+
+        db.execute("DROP TABLE m").unwrap();
+        let err = db.execute("SELECT * FROM m").unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "{err}");
+        // Name is reusable as a regular table after the drop.
+        db.execute("CREATE TABLE m (PRIMARY KEY (id))").unwrap();
     }
 
     #[test]

@@ -19,6 +19,8 @@ current database (see *Databases* below).
 ```sql
 -- DDL
 CREATE TABLE [IF NOT EXISTS] <table> (PRIMARY KEY (<col> [, <col> ...]))
+CREATE TIMESERIES TABLE [IF NOT EXISTS] <table>
+       (SERIES KEY (<label> [, <label> ...]) [, RETENTION <duration>])
 DROP   TABLE [IF EXISTS] <table>
 CREATE INDEX [IF NOT EXISTS] <name> ON <table> (<path> [, <path> ...])
 DROP   INDEX [IF EXISTS] <name>
@@ -146,7 +148,17 @@ SHOW DATABASES
   8. unary: `-<expr>`, `NOT <expr>`
   9. parentheses `( … )`
 - **Aggregate functions:** `COUNT(*)` / `COUNT(<expr>)`, `SUM`, `AVG`, `MIN`,
-  `MAX`. Using an aggregate (or `GROUP BY`) puts the query in aggregate mode.
+  `MAX`, and the time-series aggregates `RATE`, `INCREASE`, `DELTA`, `FIRST`,
+  `LAST` (see *Time-series tables* below). Using an aggregate (or `GROUP BY`)
+  puts the query in aggregate mode.
+- **Duration literals:** an integer immediately followed by a unit — `250ms`,
+  `15s`, `5m`, `2h`, `30d`, `1w` — is a duration, valued as integer
+  milliseconds (`5m` = `300000`). Usable anywhere an integer is.
+- **Scalar functions:** `now()` (the query's start time, as a timestamp —
+  one instant per statement) and `time_bucket(<step>, <ts>)` (floors `<ts>`
+  to a `<step>`-wide bucket: `time_bucket(5m, ts)`). A bare identifier
+  directly followed by `(` parses as a function call; unknown functions are
+  execution errors.
 - **Bind parameters:** `?` marks a positional parameter in any expression
   position of a **prepared** `SELECT`/`INSERT`/`UPDATE`/`DELETE` (e.g.
   `INSERT INTO t (id, v) VALUES (?, ?)`). Parameters are numbered by order of
@@ -191,6 +203,50 @@ prepared statement. Requires a vector index on the path; errors if none
 exists. Cannot combine with `JOIN`, `UNION`, aggregates/`GROUP BY`, or
 `ORDER BY` (results are already ordered by distance) — `WHERE`, `LIMIT`, and
 `OFFSET` apply normally, post-search.
+
+## Time-series tables
+
+`CREATE TIMESERIES TABLE` declares a table whose rows are **samples**, stored
+in the time-series engine (Gorilla-compressed chunks; see
+[TODO.md](TODO.md) for the design). Single-node only for now — cluster mode
+rejects the DDL until the distribution phase lands.
+
+```sql
+CREATE TIMESERIES TABLE cpu (SERIES KEY (host, core), RETENTION 30d);
+INSERT INTO cpu (host, core, ts, value) VALUES ('web1', '0', 1712000000000, 0.63);
+
+SELECT time_bucket(1m, ts) AS t, host, avg(value), max(value)
+FROM cpu WHERE ts >= now() - 1h AND host = 'web1'
+GROUP BY t, host ORDER BY t;
+
+SELECT time_bucket(5m, ts) AS t, rate(value) FROM cpu
+WHERE ts >= now() - 6h GROUP BY t;
+```
+
+- **Columns have roles.** `SERIES KEY` columns are string **labels** (every
+  insert must set all of them); `ts` is the sample timestamp (a `timestamp`
+  or integer milliseconds, required, strictly increasing per series); every
+  other inserted column is a numeric **field**. Names starting with `__` are
+  reserved.
+- **Append-only.** `UPDATE`/`DELETE` are rejected; old data expires via
+  `RETENTION <duration>` (whole storage blocks drop as they age out).
+  Duplicate/older timestamps for a series are rejected per sample (an
+  out-of-order ingest window is planned).
+- **Pushdown.** `AND`-combined `ts` comparisons and label `=`/`!=`
+  predicates narrow the storage read; any other predicate still applies with
+  full SQL semantics afterward.
+- **Time-series aggregates**, valid wherever other aggregates are:
+  `rate(f)` (per-second counter rate, reset-aware), `increase(f)` (total
+  counter increase, reset-aware), `delta(f)` (`last - first`), `first(f)` /
+  `last(f)` (value at the earliest/latest `ts` in the group).
+  `rate`/`increase`/`delta` are computed **per series** over its
+  time-ordered samples, then **summed** across the series in the group —
+  PromQL `sum(rate(...))` semantics. Group by label columns to keep series
+  separate.
+- **`GROUP BY`/`ORDER BY` may reference output aliases** on time-series
+  tables (`GROUP BY t` with `time_bucket(1m, ts) AS t`).
+- Not supported on time-series tables: `JOIN`, `UNION`, `NEAREST`,
+  transactions.
 
 ## Indexing notes (query-relevant)
 

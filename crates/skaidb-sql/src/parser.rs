@@ -243,6 +243,37 @@ impl Parser {
                 if_not_exists,
                 primary_key,
             }))
+        } else if self.eat_keyword(Keyword::Timeseries) {
+            // CREATE TIMESERIES TABLE [IF NOT EXISTS] name
+            //   (SERIES KEY (l1 [, ...]) [, RETENTION <duration>])
+            self.expect_keyword(Keyword::Table)?;
+            let if_not_exists = self.parse_if_not_exists()?;
+            let name = self.parse_table_name()?;
+            self.expect(&Token::LParen)?;
+            self.expect_keyword(Keyword::Series)?;
+            self.expect_keyword(Keyword::Key)?;
+            self.expect(&Token::LParen)?;
+            let series_key = self.parse_ident_list()?;
+            self.expect(&Token::RParen)?;
+            let mut retention_ms = None;
+            if self.eat(&Token::Comma) {
+                self.expect_keyword(Keyword::Retention)?;
+                retention_ms = Some(match self.advance() {
+                    Token::Duration(ms) => ms,
+                    other => {
+                        return Err(ParseError::Other(format!(
+                            "RETENTION expects a duration like 30d or 12h, found {other:?}"
+                        )))
+                    }
+                });
+            }
+            self.expect(&Token::RParen)?;
+            Ok(Statement::CreateTimeseriesTable(CreateTimeseriesTable {
+                name,
+                if_not_exists,
+                series_key,
+                retention_ms,
+            }))
         } else if self.eat_keyword(Keyword::Vector) {
             self.expect_keyword(Keyword::Index)?;
             let if_not_exists = self.parse_if_not_exists()?;
@@ -777,6 +808,12 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Literal(Value::Float(f)))
             }
+            // Duration literals (`5m`, `2h`, `30d`) are millisecond integers.
+            Token::Duration(ms) => {
+                let ms = *ms;
+                self.advance();
+                Ok(Expr::Literal(Value::Int(ms)))
+            }
             Token::Str(_) => match self.advance() {
                 Token::Str(s) => Ok(Expr::Literal(Value::String(s))),
                 _ => unreachable!(),
@@ -840,10 +877,55 @@ impl Parser {
             }
             Token::Ident(_) => {
                 let path = self.parse_path()?;
+                // A bare name directly followed by `(` is a function call:
+                // the time-series aggregates get `Expr::Aggregate` (the
+                // executor treats them like other aggregates), everything
+                // else becomes a scalar `Expr::Func` resolved at evaluation.
+                if !path.contains('.') && self.peek() == &Token::LParen {
+                    self.advance();
+                    let mut args = Vec::new();
+                    if !self.eat(&Token::RParen) {
+                        loop {
+                            args.push(self.parse_expr()?);
+                            if !self.eat(&Token::Comma) {
+                                break;
+                            }
+                        }
+                        self.expect(&Token::RParen)?;
+                    }
+                    if let Some(func) = ts_agg_func(&path) {
+                        if args.len() != 1 {
+                            return Err(ParseError::Other(format!(
+                                "{path}() takes exactly one argument"
+                            )));
+                        }
+                        return Ok(Expr::Aggregate {
+                            func,
+                            arg: AggArg::Expr(Box::new(args.into_iter().next().unwrap())),
+                        });
+                    }
+                    return Ok(Expr::Func {
+                        name: path.to_ascii_lowercase(),
+                        args,
+                    });
+                }
                 Ok(Expr::Column(path))
             }
             _ => Err(self.unexpected("an expression".into())),
         }
+    }
+}
+
+/// Time-series aggregate functions, spelled as ordinary identifiers so the
+/// names stay usable as column names when not called.
+fn ts_agg_func(name: &str) -> Option<AggFunc> {
+    match name.to_ascii_lowercase().as_str() {
+        "rate" => Some(AggFunc::Rate),
+        "increase" => Some(AggFunc::Increase),
+        "delta" => Some(AggFunc::Delta),
+        "first" => Some(AggFunc::First),
+        "last" => Some(AggFunc::Last),
+        _ => None,
     }
 }
 

@@ -144,6 +144,11 @@ fn visit_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
                 visit_expr(expr, f);
             }
         }
+        Expr::Func { args, .. } => {
+            for arg in args {
+                visit_expr(arg, f);
+            }
+        }
         Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) => {}
     }
 }
@@ -221,8 +226,26 @@ fn mutate_expr(e: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
                 mutate_expr(expr, f);
             }
         }
+        Expr::Func { args, .. } => {
+            for arg in args {
+                mutate_expr(arg, f);
+            }
+        }
         Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) => {}
     }
+}
+
+/// Replace every `now()` call with the given timestamp literal, so one
+/// query-wide instant drives range predicates and bucketing (and pushdown
+/// sees plain literals). Called once per execution by the engine.
+pub fn resolve_now(stmt: &mut Statement, now_ms: i64) {
+    mutate_statement(stmt, &mut |e| {
+        if let Expr::Func { name, args } = e {
+            if name == "now" && args.is_empty() {
+                *e = Expr::Literal(Value::Timestamp(now_ms));
+            }
+        }
+    });
 }
 
 #[cfg(test)]

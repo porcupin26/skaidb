@@ -19,7 +19,9 @@ use skaidb_storage::{
 };
 use skaidb_types::{Document, Value};
 
-use crate::catalog::{Catalog, IndexDef, SchemaVersion, TableDef, VectorIndexDef};
+use skaidb_tsdb::{Tsdb, TsdbOptions};
+
+use crate::catalog::{Catalog, IndexDef, SchemaVersion, TableDef, TsTableDef, VectorIndexDef};
 use crate::error::{EngineError, Result};
 use crate::eval::{compare, eval, eval_predicate};
 use crate::namespace::{self, DEFAULT_DATABASE};
@@ -55,6 +57,8 @@ pub struct Database {
     storage_opts: EngineOptions,
     catalog: Catalog,
     tables: HashMap<String, StorageEngine>,
+    /// Time-series stores by table name (the tsdb engine, not the LSM).
+    timeseries: HashMap<String, Tsdb>,
     /// Secondary index storage by index name; entries map an indexed value to a
     /// table primary-key (so a `WHERE path = v` lookup avoids a full scan).
     indexes: HashMap<String, StorageEngine>,
@@ -135,6 +139,15 @@ impl Database {
         std::fs::create_dir_all(&dir)?;
         let catalog = Catalog::load(dir.join("catalog.json"))?;
 
+        // Seed the DDL clock past every persisted schema stamp, so the first
+        // DDL after a reopen can't be stamped behind (and silently lose
+        // last-writer-wins to) a version recorded by the previous process in
+        // the same millisecond.
+        let clock = HlcClock::new();
+        for version in catalog.schema_versions.values() {
+            clock.observe(version.hlc());
+        }
+
         let mut tables = HashMap::new();
         for name in catalog.tables.keys() {
             let engine = StorageEngine::open_with_options(table_dir(&dir, name), opts)?;
@@ -145,6 +158,11 @@ impl Database {
         for name in catalog.indexes.keys() {
             let engine = StorageEngine::open_with_options(index_dir(&dir, name), opts)?;
             indexes.insert(name.clone(), engine);
+        }
+
+        let mut timeseries = HashMap::new();
+        for (name, def) in &catalog.timeseries {
+            timeseries.insert(name.clone(), open_tsdb(&dir, name, def)?);
         }
 
         // Vector indexes live in memory; rebuild each from its table's rows.
@@ -170,10 +188,11 @@ impl Database {
             storage_opts: opts,
             catalog,
             tables,
+            timeseries,
             indexes,
             vector_indexes,
             txn: None,
-            clock: HlcClock::new(),
+            clock,
             ddl_hlc: None,
             vector_rebuild_ms,
         })
@@ -438,6 +457,8 @@ impl Database {
     /// works here: it reads through the buffered overlay, which needs only
     /// shared access.
     pub fn execute_read_statement(&self, stmt: Statement) -> Result<QueryOutput> {
+        let mut stmt = stmt;
+        skaidb_sql::resolve_now(&mut stmt, now_ms());
         match stmt {
             Statement::Select(sel) => {
                 run_select(&sel, &LocalRead { db: self }).map(QueryOutput::Rows)
@@ -458,10 +479,18 @@ impl Database {
     /// [`Session`](crate::Session) dispatch a statement it has classified
     /// without re-parsing it.
     pub fn execute_statement(&mut self, stmt: Statement) -> Result<QueryOutput> {
+        let mut stmt = stmt;
+        skaidb_sql::resolve_now(&mut stmt, now_ms());
         match stmt {
             Statement::CreateTable(ct) => {
                 self.create_table(&ct.name, ct.primary_key, ct.if_not_exists)
             }
+            Statement::CreateTimeseriesTable(ct) => self.create_timeseries_table(
+                &ct.name,
+                ct.series_key,
+                ct.retention_ms,
+                ct.if_not_exists,
+            ),
             Statement::DropTable { name, if_exists } => self.drop_table(&name, if_exists),
             Statement::CreateIndex(ci) => {
                 self.create_index(&ci.name, &ci.table, &ci.paths, ci.if_not_exists)
@@ -717,7 +746,7 @@ impl Database {
 
     /// `SHOW TABLES` filtered to `current_db`, with names de-qualified.
     fn show_tables_in(&self, current_db: &str) -> ResultSet {
-        let rows = self
+        let mut rows: Vec<Vec<Value>> = self
             .catalog
             .tables
             .iter()
@@ -729,6 +758,15 @@ impl Database {
                 ]
             })
             .collect();
+        for (name, def) in &self.catalog.timeseries {
+            if namespace::belongs_to(name, current_db) {
+                rows.push(vec![
+                    Value::String(namespace::split(name).1.to_string()),
+                    Value::String(format!("{}, ts", def.series_key.join(", "))),
+                ]);
+            }
+        }
+        rows.sort_by(|a, b| a[0].total_cmp(&b[0]));
         ResultSet {
             columns: vec!["table".into(), "primary_key".into()],
             rows,
@@ -793,7 +831,7 @@ impl Database {
         if !self.schema_advances(&key, hlc) {
             return Ok(QueryOutput::Ddl);
         }
-        if self.catalog.tables.contains_key(name) {
+        if self.catalog.tables.contains_key(name) || self.catalog.timeseries.contains_key(name) {
             if if_not_exists {
                 self.record_schema(key, hlc, false);
                 self.save_catalog()?;
@@ -811,10 +849,67 @@ impl Database {
         Ok(QueryOutput::Ddl)
     }
 
+    /// `CREATE TIMESERIES TABLE`: register the definition and open its tsdb
+    /// store. Shares the table namespace (and the `t:` schema-LWW key space)
+    /// with regular tables, so drops and re-creates order correctly.
+    fn create_timeseries_table(
+        &mut self,
+        name: &str,
+        series_key: Vec<String>,
+        retention_ms: Option<i64>,
+        if_not_exists: bool,
+    ) -> Result<QueryOutput> {
+        if series_key.is_empty() {
+            return Err(EngineError::Constraint(
+                "SERIES KEY must have at least one column".into(),
+            ));
+        }
+        if series_key.iter().any(|c| c == "ts" || c.starts_with("__")) {
+            return Err(EngineError::Constraint(
+                "series key columns may not be named `ts` or start with `__`".into(),
+            ));
+        }
+        let hlc = self.ddl_stamp();
+        let key = format!("t:{name}");
+        if !self.schema_advances(&key, hlc) {
+            return Ok(QueryOutput::Ddl);
+        }
+        if self.catalog.tables.contains_key(name) || self.catalog.timeseries.contains_key(name) {
+            if if_not_exists {
+                self.record_schema(key, hlc, false);
+                self.save_catalog()?;
+                return Ok(QueryOutput::Ddl);
+            }
+            return Err(EngineError::TableExists(name.to_string()));
+        }
+        let def = TsTableDef {
+            series_key,
+            retention_ms,
+        };
+        let store = open_tsdb(&self.dir, name, &def)?;
+        self.timeseries.insert(name.to_string(), store);
+        self.catalog.timeseries.insert(name.to_string(), def);
+        self.record_schema(key, hlc, false);
+        self.save_catalog()?;
+        Ok(QueryOutput::Ddl)
+    }
+
     fn drop_table(&mut self, name: &str, if_exists: bool) -> Result<QueryOutput> {
         let hlc = self.ddl_stamp();
         let key = format!("t:{name}");
         if !self.schema_advances(&key, hlc) {
+            return Ok(QueryOutput::Ddl);
+        }
+        // Time-series tables drop with plain `DROP TABLE` too.
+        if self.catalog.timeseries.contains_key(name) {
+            self.timeseries.remove(name);
+            self.catalog.timeseries.remove(name);
+            self.record_schema(key, hlc, true);
+            self.save_catalog()?;
+            let dir = ts_dir(&self.dir, name);
+            if dir.exists() {
+                std::fs::remove_dir_all(dir)?;
+            }
             return Ok(QueryOutput::Ddl);
         }
         if !self.catalog.tables.contains_key(name) {
@@ -1588,6 +1683,20 @@ impl Database {
                 ),
             ));
         }
+        for (name, def) in &self.catalog.timeseries {
+            let (db, bare) = namespace::split(name);
+            let retention = def
+                .retention_ms
+                .map(|ms| format!(", RETENTION {ms}ms"))
+                .unwrap_or_default();
+            out.push((
+                db.to_string(),
+                format!(
+                    "CREATE TIMESERIES TABLE IF NOT EXISTS {bare} (SERIES KEY ({}){retention})",
+                    def.series_key.join(", ")
+                ),
+            ));
+        }
         for (name, idx) in &self.catalog.indexes {
             let (db, bare) = namespace::split(name);
             let table = namespace::split(&idx.table).1;
@@ -1613,9 +1722,46 @@ impl Database {
         out
     }
 
-    /// `SHOW TABLES`: the catalog's tables and their primary keys, in name order.
+    /// Series-key columns when `table` is a time-series table.
+    pub fn ts_series_key(&self, table: &str) -> Option<Vec<String>> {
+        self.catalog
+            .timeseries
+            .get(table)
+            .map(|d| d.series_key.clone())
+    }
+
+    fn ts_store(&self, table: &str) -> Result<&Tsdb> {
+        self.timeseries
+            .get(table)
+            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))
+    }
+
+    /// Append samples to a time-series table (see [`Cluster::ts_append`]).
+    pub fn ts_append(&self, table: &str, rows: &[(skaidb_tsdb::Labels, i64, f64)]) -> Result<usize> {
+        let res = self
+            .ts_store(table)?
+            .append_batch(rows)
+            .map_err(|e| EngineError::Timeseries(e.to_string()))?;
+        Ok(res.appended)
+    }
+
+    /// Query samples from a time-series table (see [`Cluster::ts_query`]).
+    pub fn ts_query(
+        &self,
+        table: &str,
+        matchers: &[skaidb_tsdb::Matcher],
+        t0: i64,
+        t1: i64,
+    ) -> Result<Vec<(skaidb_tsdb::Labels, Vec<skaidb_tsdb::Sample>)>> {
+        self.ts_store(table)?
+            .query(matchers, t0, t1)
+            .map_err(|e| EngineError::Timeseries(e.to_string()))
+    }
+
+    /// `SHOW TABLES`: the catalog's tables and their primary keys, in name
+    /// order. Time-series tables list their implicit `(series key, ts)` key.
     pub fn show_tables(&self) -> ResultSet {
-        let rows = self
+        let mut rows: Vec<Vec<Value>> = self
             .catalog
             .tables
             .iter()
@@ -1626,6 +1772,13 @@ impl Database {
                 ]
             })
             .collect();
+        for (name, def) in &self.catalog.timeseries {
+            rows.push(vec![
+                Value::String(name.clone()),
+                Value::String(format!("{}, ts", def.series_key.join(", "))),
+            ]);
+        }
+        rows.sort_by(|a, b| a[0].total_cmp(&b[0]));
         ResultSet {
             columns: vec!["table".into(), "primary_key".into()],
             rows,
@@ -2078,6 +2231,32 @@ pub trait Cluster {
     }
     /// Delete `key` from `table`; `doc` is the row being removed (for indexes).
     fn delete(&mut self, table: &str, key: &[u8], doc: &Document) -> Result<()>;
+
+    /// Series-key (label) columns when `table` is a **time-series** table;
+    /// `None` for regular tables. Routes DML/SELECT to the tsdb paths.
+    fn ts_series_key(&self, _table: &str) -> Result<Option<Vec<String>>> {
+        Ok(None)
+    }
+    /// Append samples to a time-series table. Labels include the reserved
+    /// `__field__` pair and are sorted by key.
+    fn ts_append(&mut self, _table: &str, _rows: &[(skaidb_tsdb::Labels, i64, f64)]) -> Result<usize> {
+        Err(EngineError::Unsupported(
+            "time-series tables are not available on this backend".into(),
+        ))
+    }
+    /// Samples in `[t0, t1]` for series matching every matcher, per series,
+    /// time-ordered.
+    fn ts_query(
+        &self,
+        _table: &str,
+        _matchers: &[skaidb_tsdb::Matcher],
+        _t0: i64,
+        _t1: i64,
+    ) -> Result<Vec<(skaidb_tsdb::Labels, Vec<skaidb_tsdb::Sample>)>> {
+        Err(EngineError::Unsupported(
+            "time-series tables are not available on this backend".into(),
+        ))
+    }
 }
 
 /// Whether `stmt` only reads — i.e. it can run through the shared-access entry
@@ -2114,6 +2293,9 @@ pub fn run(stmt: Statement, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
 }
 
 fn run_insert(ins: Insert, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
+    if let Some(series_key) = cluster.ts_series_key(&ins.table)? {
+        return crate::ts_query::run_ts_insert(&ins, &series_key, cluster);
+    }
     let pk = cluster.primary_key(&ins.table)?;
     let empty = Document::new();
     let mut rows: Vec<(Vec<u8>, Document)> = Vec::with_capacity(ins.rows.len());
@@ -2131,6 +2313,11 @@ fn run_insert(ins: Insert, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
 }
 
 fn run_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> {
+    // Time-series tables gather compressed samples with time-range + label
+    // pushdown, then reuse the ordinary projection/aggregation machinery.
+    if let Some(series_key) = cluster.ts_series_key(&sel.from)? {
+        return crate::ts_query::run_ts_select(sel, &series_key, cluster);
+    }
     // ANN clause: a distance-ordered top-k gather replaces the normal scan.
     if sel.nearest.is_some() {
         return run_nearest_select(sel, cluster);
@@ -2306,7 +2493,7 @@ fn project_core(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> {
 }
 
 /// Group-or-row projection over already-gathered docs.
-fn project(
+pub(crate) fn project(
     sel: &Select,
     docs: Vec<Document>,
     hide: &HashSet<String>,
@@ -2621,6 +2808,11 @@ fn index_order_column(order_by: &[OrderKey]) -> Option<String> {
 }
 
 fn run_update(upd: Update, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
+    if cluster.ts_series_key(&upd.table)?.is_some() {
+        return Err(EngineError::Unsupported(
+            "time-series tables are append-only; UPDATE is not supported".into(),
+        ));
+    }
     let pk = cluster.primary_key(&upd.table)?;
     let matches = cluster.matching_rows(&upd.table, &upd.filter)?;
     let affected = matches.len();
@@ -2640,6 +2832,11 @@ fn run_update(upd: Update, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
 }
 
 fn run_delete(del: Delete, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
+    if cluster.ts_series_key(&del.table)?.is_some() {
+        return Err(EngineError::Unsupported(
+            "time-series tables are append-only; expired data is dropped by RETENTION".into(),
+        ));
+    }
     let matches = cluster.matching_rows(&del.table, &del.filter)?;
     let affected = matches.len();
     for (key, doc) in matches {
@@ -2800,6 +2997,29 @@ impl Cluster for LocalCluster<'_> {
         self.db.maintain_vectors_del(table, key);
         Ok(())
     }
+
+    fn ts_series_key(&self, table: &str) -> Result<Option<Vec<String>>> {
+        Ok(self.db.ts_series_key(table))
+    }
+
+    fn ts_append(&mut self, table: &str, rows: &[(skaidb_tsdb::Labels, i64, f64)]) -> Result<usize> {
+        if self.db.txn.is_some() {
+            return Err(EngineError::Unsupported(
+                "time-series tables cannot be written inside a transaction".into(),
+            ));
+        }
+        self.db.ts_append(table, rows)
+    }
+
+    fn ts_query(
+        &self,
+        table: &str,
+        matchers: &[skaidb_tsdb::Matcher],
+        t0: i64,
+        t1: i64,
+    ) -> Result<Vec<(skaidb_tsdb::Labels, Vec<skaidb_tsdb::Sample>)>> {
+        self.db.ts_query(table, matchers, t0, t1)
+    }
 }
 
 /// A read-only [`Cluster`] over a shared `&Database` — the seam behind
@@ -2861,6 +3081,20 @@ impl Cluster for LocalRead<'_> {
             "write statement reached the read-only executor".into(),
         ))
     }
+
+    fn ts_series_key(&self, table: &str) -> Result<Option<Vec<String>>> {
+        Ok(self.db.ts_series_key(table))
+    }
+
+    fn ts_query(
+        &self,
+        table: &str,
+        matchers: &[skaidb_tsdb::Matcher],
+        t0: i64,
+        t1: i64,
+    ) -> Result<Vec<(skaidb_tsdb::Labels, Vec<skaidb_tsdb::Sample>)>> {
+        self.db.ts_query(table, matchers, t0, t1)
+    }
 }
 
 fn table_dir(root: &Path, name: &str) -> PathBuf {
@@ -2869,6 +3103,30 @@ fn table_dir(root: &Path, name: &str) -> PathBuf {
 
 fn index_dir(root: &Path, name: &str) -> PathBuf {
     root.join("indexes").join(name)
+}
+
+fn ts_dir(root: &Path, name: &str) -> PathBuf {
+    root.join("timeseries").join(name)
+}
+
+/// Open a time-series store for a catalog definition.
+fn open_tsdb(root: &Path, name: &str, def: &TsTableDef) -> Result<Tsdb> {
+    Tsdb::open(
+        &ts_dir(root, name),
+        TsdbOptions {
+            retention_ms: def.retention_ms,
+            ..TsdbOptions::default()
+        },
+    )
+    .map_err(|e| EngineError::Timeseries(e.to_string()))
+}
+
+/// Current wall-clock in milliseconds (`now()` resolution).
+pub(crate) fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// The indexed values of `doc` at `paths` (a missing field indexes as `NULL`).
@@ -3180,6 +3438,7 @@ fn contains_aggregate(expr: &Expr) -> bool {
         Expr::Aggregate { .. } => true,
         Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => contains_aggregate(expr),
         Expr::Binary { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
+        Expr::Func { args, .. } => args.iter().any(contains_aggregate),
         Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) => false,
     }
 }
@@ -3194,8 +3453,14 @@ fn expr_name(expr: &Expr) -> String {
             AggFunc::Avg => "avg",
             AggFunc::Min => "min",
             AggFunc::Max => "max",
+            AggFunc::Rate => "rate",
+            AggFunc::Increase => "increase",
+            AggFunc::Delta => "delta",
+            AggFunc::First => "first",
+            AggFunc::Last => "last",
         }
         .to_string(),
+        Expr::Func { name, .. } => name.clone(),
         _ => "expr".to_string(),
     }
 }
@@ -3380,6 +3645,13 @@ fn lower_aggregates(expr: &Expr, docs: &[Document]) -> Result<Expr> {
             left: Box::new(lower_aggregates(left, docs)?),
             right: Box::new(lower_aggregates(right, docs)?),
         },
+        Expr::Func { name, args } => Expr::Func {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| lower_aggregates(a, docs))
+                .collect::<Result<Vec<_>>>()?,
+        },
         Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) => expr.clone(),
     })
 }
@@ -3416,7 +3688,115 @@ fn eval_aggregate(func: AggFunc, arg: &AggArg, docs: &[Document]) -> Result<Valu
         }
         AggFunc::Min => reduce_extreme(&values, std::cmp::Ordering::Less),
         AggFunc::Max => reduce_extreme(&values, std::cmp::Ordering::Greater),
+        AggFunc::Rate | AggFunc::Increase | AggFunc::Delta => {
+            let AggArg::Expr(e) = arg else {
+                return Err(EngineError::Type(
+                    "rate()/increase()/delta() take a field argument, not *".into(),
+                ));
+            };
+            eval_ts_change(func, e, docs)?
+        }
+        AggFunc::First | AggFunc::Last => {
+            let AggArg::Expr(e) = arg else {
+                return Err(EngineError::Type(
+                    "first()/last() take a field argument, not *".into(),
+                ));
+            };
+            let want_last = func == AggFunc::Last;
+            let mut best: Option<(i64, Value)> = None;
+            for doc in docs {
+                let Some(ts) = doc.get("ts").and_then(crate::eval::as_int_ms) else {
+                    return Err(EngineError::Type(
+                        "first()/last() require a `ts` column on every row".into(),
+                    ));
+                };
+                let v = eval(e, doc)?;
+                if v.is_null() {
+                    continue;
+                }
+                let better = match &best {
+                    None => true,
+                    Some((bts, _)) => {
+                        if want_last {
+                            ts > *bts
+                        } else {
+                            ts < *bts
+                        }
+                    }
+                };
+                if better {
+                    best = Some((ts, v));
+                }
+            }
+            best.map(|(_, v)| v).unwrap_or(Value::Null)
+        }
     })
+}
+
+/// `rate` / `increase` / `delta` over a group's rows: samples are segmented
+/// per series (the hidden `__series__` field the time-series gather adds; a
+/// plain table with a `ts` column is treated as one series), each series'
+/// change is computed over its time-ordered samples — counter-reset-aware
+/// for rate/increase, plain `last - first` for delta — and the per-series
+/// results are summed, PromQL `sum(rate(...))`-style.
+fn eval_ts_change(func: AggFunc, e: &Expr, docs: &[Document]) -> Result<Value> {
+    // Per-series time-ordered samples (docs arrive series-grouped and
+    // time-ordered from the gather; sort defensively anyway).
+    let mut per: Vec<(String, Vec<(i64, f64)>)> = Vec::new();
+    let mut idx: HashMap<String, usize> = HashMap::new();
+    for doc in docs {
+        let Some(ts) = doc.get("ts").and_then(crate::eval::as_int_ms) else {
+            return Err(EngineError::Type(
+                "rate()/increase()/delta() require a `ts` column on every row".into(),
+            ));
+        };
+        let v = eval(e, doc)?;
+        let Some(v) = number(&v) else { continue };
+        let series = match doc.get("__series__") {
+            Some(Value::String(s)) => s.clone(),
+            _ => String::new(),
+        };
+        match idx.get(&series) {
+            Some(&i) => per[i].1.push((ts, v)),
+            None => {
+                idx.insert(series.clone(), per.len());
+                per.push((series, vec![(ts, v)]));
+            }
+        }
+    }
+
+    let mut total = 0f64;
+    let mut any = false;
+    for (_, samples) in &mut per {
+        samples.sort_by_key(|(ts, _)| *ts);
+        if samples.len() < 2 {
+            continue;
+        }
+        let change = if func == AggFunc::Delta {
+            samples[samples.len() - 1].1 - samples[0].1
+        } else {
+            // Counter increase: a drop is a reset — the counter restarted
+            // from zero, so the new value is its own contribution.
+            let mut inc = 0f64;
+            let mut prev = samples[0].1;
+            for &(_, v) in &samples[1..] {
+                inc += if v >= prev { v - prev } else { v };
+                prev = v;
+            }
+            inc
+        };
+        if func == AggFunc::Rate {
+            let span_secs = (samples[samples.len() - 1].0 - samples[0].0) as f64 / 1000.0;
+            if span_secs <= 0.0 {
+                continue;
+            }
+            total += change / span_secs;
+        } else {
+            total += change;
+        }
+        any = true;
+    }
+    Ok(if any { Value::Float(total) } else { Value::Null })
 }
 
 fn sum_values(values: &[Value]) -> Value {

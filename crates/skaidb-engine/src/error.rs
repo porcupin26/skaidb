@@ -44,6 +44,9 @@ pub enum EngineError {
 
     #[error("cluster error: {0}")]
     Cluster(String),
+
+    #[error("time-series error: {0}")]
+    Timeseries(String),
 }
 
 /// Convenience result alias for engine operations.

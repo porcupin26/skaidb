@@ -276,6 +276,15 @@ Benchmarks:
    bucketed aggregates + `rate`/`increase`/`first`/`last`, label postings +
    matchers, cardinality caps, SHOW/metrics. Exit: the §3 examples all run;
    QUERY_SYNTAX.md updated.
+   **✅ Done (v0.21.0).** Everything above except block-level label
+   postings (matchers currently scan the in-memory series list per block —
+   fine at current cardinality, postings move to phase 3 with the
+   distributed query path) and SHOW STATUS/metrics detail (basic
+   `SHOW TABLES` integration shipped; per-store stats surface with the
+   cluster phase). Cluster mode rejects TS DDL until phase 3. Also fixed
+   en route: the DDL HLC clock is now seeded from persisted schema stamps
+   on open, closing a same-millisecond reopen window where a DROP could
+   silently lose last-writer-wins to the previous process's CREATE.
 3. **Cluster** — series placement on the ring, `TsAppendBatch` replication +
    hints, broadcast queries with partial-aggregate pushdown, checksum-based
    anti-entropy. Limitation shipped: topology changes refused with TS tables.

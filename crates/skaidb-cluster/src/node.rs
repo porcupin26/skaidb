@@ -2014,6 +2014,15 @@ impl Node {
             }
             return Ok(SessionEffect::UseDatabase(name.clone()));
         }
+        // Time-series tables are single-node for now: cluster placement,
+        // replication, and scatter-gather are the next phase of
+        // docs/TODO.md's plan. Reject the DDL cleanly rather than letting it
+        // fall through to a misleading executor error.
+        if matches!(stmt, Statement::CreateTimeseriesTable(_)) {
+            return Err(EngineError::Unsupported(
+                "time-series tables are not yet supported in cluster mode".into(),
+            ));
+        }
         // DDL — including CREATE/DROP DATABASE — broadcasts to every member so the
         // schema and database registry stay identical cluster-wide.
         if is_ddl(&stmt) {

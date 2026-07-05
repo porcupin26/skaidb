@@ -843,9 +843,11 @@ fn put_expr(o: &mut Vec<u8>, e: &Expr) {
             put_expr(o, expr);
             o.push(u8::from(*negated));
         }
-        // Not valid in a pushed filter: aggregates never are, and parameters
-        // are substituted by `bind` before any statement executes.
-        Expr::Aggregate { .. } | Expr::Parameter(_) => o.push(255),
+        // Not valid in a pushed filter: aggregates never are, parameters are
+        // substituted by `bind`, and scalar functions (`now()` resolves to a
+        // literal; `time_bucket` never lands in an index-pushdown filter) are
+        // evaluated coordinator-side before pushdown.
+        Expr::Aggregate { .. } | Expr::Parameter(_) | Expr::Func { .. } => o.push(255),
     }
 }
 

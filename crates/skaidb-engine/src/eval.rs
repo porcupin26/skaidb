@@ -31,6 +31,55 @@ pub fn eval(expr: &Expr, row: &Document) -> Result<Value> {
         Expr::Aggregate { .. } => Err(EngineError::Type(
             "aggregate function not allowed here".into(),
         )),
+        Expr::Func { name, args } => eval_func(name, args, row),
+    }
+}
+
+/// Scalar function evaluation. `now()` never reaches here — it is replaced
+/// with a literal once per execution (`skaidb_sql::resolve_now`), so a whole
+/// query shares one instant.
+fn eval_func(name: &str, args: &[Expr], row: &Document) -> Result<Value> {
+    match name {
+        "time_bucket" => {
+            if args.len() != 2 {
+                return Err(EngineError::Type(
+                    "time_bucket(step, ts) takes exactly two arguments".into(),
+                ));
+            }
+            let step = eval(&args[0], row)?;
+            let ts = eval(&args[1], row)?;
+            if ts.is_null() {
+                return Ok(Value::Null);
+            }
+            let step_ms = as_int_ms(&step).ok_or_else(|| {
+                EngineError::Type("time_bucket step must be a duration or integer ms".into())
+            })?;
+            if step_ms <= 0 {
+                return Err(EngineError::Type("time_bucket step must be positive".into()));
+            }
+            let t = as_int_ms(&ts).ok_or_else(|| {
+                EngineError::Type("time_bucket timestamp must be numeric".into())
+            })?;
+            let bucket = t.div_euclid(step_ms) * step_ms;
+            Ok(match ts {
+                Value::Timestamp(_) => Value::Timestamp(bucket),
+                _ => Value::Int(bucket),
+            })
+        }
+        "now" => Ok(Value::Timestamp(
+            crate::exec::now_ms(),
+        )),
+        other => Err(EngineError::Type(format!("unknown function {other}()"))),
+    }
+}
+
+/// Millisecond projection for time arguments (`Int`, `Timestamp`, `Float`).
+pub(crate) fn as_int_ms(v: &Value) -> Option<i64> {
+    match v {
+        Value::Int(i) => Some(*i),
+        Value::Timestamp(t) => Some(*t),
+        Value::Float(f) => Some(*f as i64),
+        _ => None,
     }
 }
 

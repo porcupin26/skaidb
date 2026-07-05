@@ -10,6 +10,9 @@ use skaidb_types::Value;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     CreateTable(CreateTable),
+    /// `CREATE TIMESERIES TABLE` — a table whose rows are samples, stored in
+    /// the time-series engine. Dropped with plain `DROP TABLE`.
+    CreateTimeseriesTable(CreateTimeseriesTable),
     DropTable { name: String, if_exists: bool },
     CreateIndex(CreateIndex),
     DropIndex { name: String, if_exists: bool },
@@ -53,6 +56,7 @@ impl Statement {
     pub fn for_each_table_mut(&mut self, mut f: impl FnMut(&mut String)) {
         match self {
             Statement::CreateTable(c) => f(&mut c.name),
+            Statement::CreateTimeseriesTable(c) => f(&mut c.name),
             Statement::DropTable { name, .. } => f(name),
             Statement::CreateIndex(c) => f(&mut c.table),
             Statement::CreateVectorIndex(c) => f(&mut c.table),
@@ -123,6 +127,18 @@ pub struct CreateTable {
     pub name: String,
     pub if_not_exists: bool,
     pub primary_key: Vec<String>,
+}
+
+/// `CREATE TIMESERIES TABLE [IF NOT EXISTS] name (SERIES KEY (l1 [, ...])
+/// [, RETENTION <duration>])`. Series-key columns are string labels; the
+/// implicit sample key is `(series key, ts)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateTimeseriesTable {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub series_key: Vec<String>,
+    /// Milliseconds; `None` keeps data forever.
+    pub retention_ms: Option<i64>,
 }
 
 /// `CREATE INDEX [IF NOT EXISTS] name ON table (path1 [, path2, ...])`.
@@ -281,6 +297,9 @@ pub enum Expr {
     IsNull { expr: Box<Expr>, negated: bool },
     /// An aggregate function call (`COUNT(*)`, `SUM(x)`, ...).
     Aggregate { func: AggFunc, arg: AggArg },
+    /// A scalar function call (`time_bucket(5m, ts)`, `now()`). Names are
+    /// resolved at evaluation; unknown functions are execution errors.
+    Func { name: String, args: Vec<Expr> },
 }
 
 /// Argument to an aggregate.
@@ -300,6 +319,17 @@ pub enum AggFunc {
     Avg,
     Min,
     Max,
+    /// Per-second counter rate over the group, reset-aware, computed per
+    /// series then summed (time-series tables only).
+    Rate,
+    /// Counter-reset-aware total increase (time-series tables only).
+    Increase,
+    /// `last - first` per series, summed (time-series tables only).
+    Delta,
+    /// Value at the earliest timestamp in the group (time-series tables only).
+    First,
+    /// Value at the latest timestamp in the group (time-series tables only).
+    Last,
 }
 
 /// Unary operators.
