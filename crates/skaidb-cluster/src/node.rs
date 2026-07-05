@@ -3710,6 +3710,7 @@ fn is_ddl(stmt: &Statement) -> bool {
         stmt,
         Statement::CreateTable(_)
             | Statement::CreateTimeseriesTable(_)
+            | Statement::CreateRollup(_)
             | Statement::DropTable { .. }
             | Statement::CreateIndex(_)
             | Statement::DropIndex { .. }

@@ -73,6 +73,19 @@ pub struct TsTableDef {
     /// Out-of-order acceptance window (ms); default 0 = strict monotonic.
     #[serde(default)]
     pub ooo_window_ms: i64,
+    /// Rollups derived from this table, maintained at flush.
+    #[serde(default)]
+    pub rollups: Vec<RollupDef>,
+    /// When this table IS a rollup: its source table.
+    #[serde(default)]
+    pub rollup_of: Option<String>,
+}
+
+/// One rollup registration on its source table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RollupDef {
+    pub name: String,
+    pub bucket_ms: i64,
 }
 
 /// The set of all tables and indexes.

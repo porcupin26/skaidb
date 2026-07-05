@@ -114,6 +114,8 @@ pub enum Keyword {
     Series,
     Retention,
     Ooo,
+    Rollup,
+    Bucket,
 }
 
 /// Length of the longest keyword ("TRANSACTION").
@@ -183,6 +185,8 @@ impl Keyword {
             b"SERIES" => Series,
             b"RETENTION" => Retention,
             b"OOO" => Ooo,
+            b"ROLLUP" => Rollup,
+            b"BUCKET" => Bucket,
             b"UNION" => Union,
             b"ALL" => All,
             b"BEGIN" => Begin,

@@ -22,6 +22,8 @@ CREATE TABLE [IF NOT EXISTS] <table> (PRIMARY KEY (<col> [, <col> ...]))
 CREATE TIMESERIES TABLE [IF NOT EXISTS] <table>
        (SERIES KEY (<label> [, <label> ...])
         [, RETENTION <duration>] [, OOO <duration>])
+CREATE ROLLUP [IF NOT EXISTS] <name> ON <ts-table> BUCKET <duration>
+       [RETENTION <duration>]
 DROP   TABLE [IF EXISTS] <table>
 CREATE INDEX [IF NOT EXISTS] <name> ON <table> (<path> [, <path> ...])
 DROP   INDEX [IF EXISTS] <name>
@@ -251,6 +253,17 @@ WHERE ts >= now() - 6h GROUP BY t;
   separate.
 - **`GROUP BY`/`ORDER BY` may reference output aliases** on time-series
   tables (`GROUP BY t` with `time_bucket(1m, ts) AS t`).
+- **Rollups** (`CREATE ROLLUP r30m ON cpu BUCKET 30m RETENTION 90d`): a
+  derived time-series table holding per-bucket partials of its source,
+  maintained automatically when source windows flush. For each source field
+  `f` it stores `f_count`, `f_sum`, `f_min`, `f_max`, `f_first`, `f_last`
+  (so `avg = f_sum / f_count`), keyed by the same series labels at the
+  bucket-start timestamp. Query it like any TS table
+  (`SELECT ts, value_sum / value_count FROM r30m WHERE host = '...'`).
+  `BUCKET` must evenly divide the 2 h storage window. Dropped with
+  `DROP TABLE` (dropping the source cascades). Repair-merged samples do not
+  retroactively update rollups; there is no automatic query rewrite yet —
+  query the rollup table directly.
 - Not supported on time-series tables: `JOIN`, `UNION`, `NEAREST`,
   transactions.
 

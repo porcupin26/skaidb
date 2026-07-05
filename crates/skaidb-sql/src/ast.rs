@@ -13,6 +13,9 @@ pub enum Statement {
     /// `CREATE TIMESERIES TABLE` — a table whose rows are samples, stored in
     /// the time-series engine. Dropped with plain `DROP TABLE`.
     CreateTimeseriesTable(CreateTimeseriesTable),
+    /// `CREATE ROLLUP` — a downsampled companion of a time-series table,
+    /// maintained automatically. Dropped with plain `DROP TABLE`.
+    CreateRollup(CreateRollup),
     DropTable { name: String, if_exists: bool },
     CreateIndex(CreateIndex),
     DropIndex { name: String, if_exists: bool },
@@ -57,6 +60,10 @@ impl Statement {
         match self {
             Statement::CreateTable(c) => f(&mut c.name),
             Statement::CreateTimeseriesTable(c) => f(&mut c.name),
+            Statement::CreateRollup(c) => {
+                f(&mut c.name);
+                f(&mut c.table);
+            }
             Statement::DropTable { name, .. } => f(name),
             Statement::CreateIndex(c) => f(&mut c.table),
             Statement::CreateVectorIndex(c) => f(&mut c.table),
@@ -141,6 +148,18 @@ pub struct CreateTimeseriesTable {
     pub retention_ms: Option<i64>,
     /// Out-of-order acceptance window in ms; `None`/0 = strict monotonic.
     pub ooo_ms: Option<i64>,
+}
+
+/// `CREATE ROLLUP [IF NOT EXISTS] name ON table BUCKET <duration>
+/// [RETENTION <duration>]`: a derived time-series table holding per-bucket
+/// partials (`<field>_count/_sum/_min/_max/_first/_last`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateRollup {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub table: String,
+    pub bucket_ms: i64,
+    pub retention_ms: Option<i64>,
 }
 
 /// `CREATE INDEX [IF NOT EXISTS] name ON table (path1 [, path2, ...])`.

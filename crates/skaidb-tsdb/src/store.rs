@@ -12,6 +12,10 @@ use crate::head::Head;
 use crate::wal::{Record, Wal};
 use crate::{Labels, Result, TsdbError};
 
+/// What one window flush wrote to blocks: `(labels, sealed chunks)` per
+/// series — the input to rollup maintenance.
+pub type FlushedSeries = Vec<(Labels, Vec<crate::head::SealedChunk>)>;
+
 /// Store configuration.
 #[derive(Debug, Clone)]
 pub struct TsdbOptions {
@@ -174,6 +178,16 @@ impl Tsdb {
     /// batch. Individually bad samples are counted, not fatal. Completed
     /// block windows flush automatically.
     pub fn append_batch(&self, rows: &[(Labels, i64, f64)]) -> Result<AppendResult> {
+        self.append_batch_with_flush(rows).map(|(r, _)| r)
+    }
+
+    /// [`Tsdb::append_batch`], additionally returning whatever a triggered
+    /// window flush wrote to blocks (`(labels, sealed chunks)` per series) —
+    /// the hook rollup maintenance aggregates from.
+    pub fn append_batch_with_flush(
+        &self,
+        rows: &[(Labels, i64, f64)],
+    ) -> Result<(AppendResult, FlushedSeries)> {
         let mut inner = self.inner.lock().expect("tsdb lock");
         let mut result = AppendResult::default();
         let mut new_series: Vec<Record> = Vec::new();
@@ -220,10 +234,11 @@ impl Tsdb {
         // Flush any window that is now complete.
         let boundary = inner.head.max_ts.div_euclid(self.opts.block_span_ms)
             * self.opts.block_span_ms;
+        let mut flushed = Vec::new();
         if boundary > inner.flushed_through {
-            self.flush_before(&mut inner, boundary)?;
+            flushed = self.flush_before(&mut inner, boundary)?;
         }
-        Ok(result)
+        Ok((result, flushed))
     }
 
     /// Force-flush everything currently in the head (shutdown, tests).
@@ -233,14 +248,19 @@ impl Tsdb {
             return Ok(());
         }
         let boundary = inner.head.max_ts + 1;
-        self.flush_before(&mut inner, boundary)
+        self.flush_before(&mut inner, boundary)?;
+        Ok(())
     }
 
-    fn flush_before(&self, inner: &mut Inner, boundary: i64) -> Result<()> {
+    fn flush_before(
+        &self,
+        inner: &mut Inner,
+        boundary: i64,
+    ) -> Result<FlushedSeries> {
         let flushed = inner.head.take_before(boundary, self.opts.block_span_ms)?;
         if !flushed.is_empty() {
             let seq = inner.next_block_seq;
-            let dir = write_block(&self.dir.join("blocks"), seq, 0, flushed)?;
+            let dir = write_block(&self.dir.join("blocks"), seq, 0, flushed.clone())?;
             inner.next_block_seq += 1;
             inner.blocks.push(Block::open(&dir)?);
             inner
@@ -288,7 +308,7 @@ impl Tsdb {
             inner.next_block_seq += 1;
             inner.blocks = Block::open_all(&self.dir.join("blocks"))?;
         }
-        Ok(())
+        Ok(flushed)
     }
 
     /// All samples in `[t0, t1]` for series matching every matcher, grouped

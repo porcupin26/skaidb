@@ -327,6 +327,13 @@ Benchmarks:
    under-sustained-ingest soak remains to be run on the fleet.
 6. **Downsampling** — `CREATE ROLLUP`, tiered retention, query-time rollup
    selection. Exit: year-long queries hit rollups, not raw.
+   **✅ Core done (v0.27.0).** `CREATE ROLLUP ... ON ... BUCKET ...
+   [RETENTION ...]` with fixed partials maintained at flush, replicated
+   via schema DDL, cascade-dropped with the source; per-replica local
+   maintenance is placement-consistent (same labels → same replicas).
+   **Still open:** automatic query-time rollup selection (queries target
+   the rollup table explicitly today) and rollup backfill for
+   repair-merged samples.
 7. **Stretch: PromQL subset** — `/api/v1/query_range` for Grafana. Re-scope
    or drop based on demand once 1–6 are real.
 

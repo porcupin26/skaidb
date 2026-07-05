@@ -540,6 +540,7 @@ fn required_privilege(stmt: &Statement) -> Option<(Privilege, Object)> {
         Statement::Delete(d) => (Privilege::Delete, Object::Table(d.table.clone())),
         Statement::CreateTable(_) => (Privilege::Create, Object::Global),
         Statement::CreateTimeseriesTable(_) => (Privilege::Create, Object::Global),
+        Statement::CreateRollup(cr) => (Privilege::Create, Object::Table(cr.table.clone())),
         Statement::CreateIndex(ci) => (Privilege::Create, Object::Table(ci.table.clone())),
         Statement::CreateVectorIndex(ci) => (Privilege::Create, Object::Table(ci.table.clone())),
         Statement::DropTable { name, .. } => (Privilege::Drop, Object::Table(name.clone())),

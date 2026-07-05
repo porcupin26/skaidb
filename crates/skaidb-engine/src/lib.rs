@@ -223,6 +223,58 @@ mod tests {
     }
 
     #[test]
+    fn timeseries_rollup_maintained_at_flush() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TIMESERIES TABLE cpu (SERIES KEY (host))").unwrap();
+        db.execute("CREATE ROLLUP cpu_30m ON cpu BUCKET 30m RETENTION 30d").unwrap();
+
+        // Fill the first 2h window (15m apart, values = quarter-hours) and
+        // cross into the next window so the first flushes.
+        let q = 15 * 60 * 1000i64; // 15m
+        for i in 0..8i64 {
+            db.execute(&format!(
+                "INSERT INTO cpu (host, ts, value) VALUES ('a', {}, {})",
+                i * q,
+                i as f64
+            ))
+            .unwrap();
+        }
+        db.execute(&format!(
+            "INSERT INTO cpu (host, ts, value) VALUES ('a', {}, 100)",
+            8 * q // 2h: completes the first window
+        ))
+        .unwrap();
+
+        // 4 buckets of 30m in the flushed window, 2 samples each:
+        // sums 0+1, 2+3, 4+5, 6+7; count 2 each; last = 1,3,5,7.
+        let rs = rows(
+            db.execute(
+                "SELECT ts, value_count, value_sum, value_last FROM cpu_30m ORDER BY ts",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows.len(), 4);
+        for (i, row) in rs.rows.iter().enumerate() {
+            let i = i as i64;
+            assert_eq!(row[0], Value::Timestamp(i * 30 * 60 * 1000));
+            assert_eq!(row[1], Value::Float(2.0));
+            assert_eq!(row[2], Value::Float((4 * i + 1) as f64), "sum");
+            assert_eq!(row[3], Value::Float((i * 2 + 1) as f64));
+        }
+
+        // Labels carry over: rollup filters by host like the source.
+        let rs = rows(
+            db.execute("SELECT count(value_sum) FROM cpu_30m WHERE host = 'a'").unwrap(),
+        );
+        assert_eq!(rs.rows[0][0], Value::Int(4));
+
+        // DROP of the source cascades to the rollup.
+        db.execute("DROP TABLE cpu").unwrap();
+        let err = db.execute("SELECT * FROM cpu_30m").unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "{err}");
+    }
+
+    #[test]
     fn timeseries_ooo_window_and_status() {
         let mut db = Database::open(tempdir()).unwrap();
         db.execute("CREATE TIMESERIES TABLE m (SERIES KEY (h), RETENTION 30d, OOO 2m)")

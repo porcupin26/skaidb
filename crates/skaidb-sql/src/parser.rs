@@ -282,6 +282,40 @@ impl Parser {
                 retention_ms,
                 ooo_ms,
             }))
+        } else if self.eat_keyword(Keyword::Rollup) {
+            // CREATE ROLLUP [IF NOT EXISTS] name ON table BUCKET <dur>
+            //   [RETENTION <dur>]
+            let if_not_exists = self.parse_if_not_exists()?;
+            let name = self.parse_table_name()?;
+            self.expect_keyword(Keyword::On)?;
+            let table = self.parse_table_name()?;
+            self.expect_keyword(Keyword::Bucket)?;
+            let bucket_ms = match self.advance() {
+                Token::Duration(ms) => ms,
+                other => {
+                    return Err(ParseError::Other(format!(
+                        "BUCKET expects a duration like 5m, found {other:?}"
+                    )))
+                }
+            };
+            let mut retention_ms = None;
+            if self.eat_keyword(Keyword::Retention) {
+                retention_ms = Some(match self.advance() {
+                    Token::Duration(ms) => ms,
+                    other => {
+                        return Err(ParseError::Other(format!(
+                            "RETENTION expects a duration like 90d, found {other:?}"
+                        )))
+                    }
+                });
+            }
+            Ok(Statement::CreateRollup(CreateRollup {
+                name,
+                if_not_exists,
+                table,
+                bucket_ms,
+                retention_ms,
+            }))
         } else if self.eat_keyword(Keyword::Vector) {
             self.expect_keyword(Keyword::Index)?;
             let if_not_exists = self.parse_if_not_exists()?;

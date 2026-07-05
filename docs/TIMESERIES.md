@@ -9,7 +9,7 @@ aggregates, and time-bucketed queries.
 > replicate at the configured write consistency; queries union-merge across
 > members at the read consistency; joins/decommissions migrate series like
 > any other data. Shipped in v0.20.0 (storage), v0.21.0 (SQL), v0.22.0
-> (cluster), v0.23.0 (remote_write), v0.24.0 (resharding), v0.25.0 (OOO DDL + stats), v0.26.0 (anti-entropy).
+> (cluster), v0.23.0 (remote_write), v0.24.0 (resharding), v0.25.0 (OOO DDL + stats), v0.26.0 (anti-entropy), v0.27.0 (rollups).
 
 ## Usage
 
@@ -80,6 +80,13 @@ stored as its own compressed stream. Full grammar and semantics:
   store, so `WHERE name = '...' AND instance = '...'` is efficient without
   declaring every label. In a cluster, ingested samples replicate through
   the same series-placement path as SQL INSERTs.
+- **Rollups / downsampling** (v0.27.0): `CREATE ROLLUP r30m ON cpu BUCKET
+  30m RETENTION 90d` — per-bucket partials (`<field>_{count,sum,min,max,
+  first,last}`) maintained automatically at window flush and queryable as a
+  normal TS table with the same labels. Each replica maintains its rollups
+  locally: a rollup series has the same labels as its source, so it places
+  on the same replica set by construction. Long retention on the rollup +
+  short on the source = classic tiered downsampling.
 - **Anti-entropy** (v0.26.0): `repair()` (the periodic pass and
   `cluster repair`) converges TS replicas — per-series `(count, checksum)`
   summaries are compared per peer, and the series' elected sender pushes
@@ -111,7 +118,8 @@ Roadmap phases refer to the implementation plan in [`TODO.md`](TODO.md).
 | **Partial-aggregate pushdown** | cluster queries ship matching raw samples to the coordinator; per-node partial aggregation (sum/count per bucket, per-series rate segments) would cut transfer for wide aggregations | phase 3 follow-up |
 | Self-scrape (`/metrics` → TS table) | remote_write covers external scrapers | later |
 | TS reclaim | after a reshard, former owners keep stale series copies (harmless under union-merge; no `reclaim` pass for TS yet) | with TS anti-entropy |
-| **Downsampling / rollups** | `CREATE ROLLUP`, tiered retention, query-time rollup selection | phase 6 |
+| Rollup query rewrite | queries must target the rollup table explicitly; picking the coarsest satisfying rollup automatically is open | phase 6 follow-up |
+| Rollup backfill/repair | rollups aggregate at flush; repair-merged (gap-filled) samples don't retroactively update them | phase 6 follow-up |
 | **PromQL subset / Grafana datasource** | `/api/v1/query_range` + metadata endpoints | phase 7 (stretch) |
 | Label postings index | matchers scan the per-block series list (fine at moderate cardinality) | with pushdown work |
 | Regex label matchers | only `=` / `!=` push down | with postings |

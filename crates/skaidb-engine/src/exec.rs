@@ -21,7 +21,7 @@ use skaidb_types::{Document, Value};
 
 use skaidb_tsdb::{Tsdb, TsdbOptions};
 
-use crate::catalog::{Catalog, IndexDef, SchemaVersion, TableDef, TsTableDef, VectorIndexDef};
+use crate::catalog::{Catalog, IndexDef, RollupDef, SchemaVersion, TableDef, TsTableDef, VectorIndexDef};
 use crate::error::{EngineError, Result};
 use crate::eval::{compare, eval, eval_predicate};
 use crate::namespace::{self, DEFAULT_DATABASE};
@@ -492,6 +492,13 @@ impl Database {
                 ct.ooo_ms.unwrap_or(0),
                 ct.if_not_exists,
             ),
+            Statement::CreateRollup(cr) => self.create_rollup(
+                &cr.name,
+                &cr.table,
+                cr.bucket_ms,
+                cr.retention_ms,
+                cr.if_not_exists,
+            ),
             Statement::DropTable { name, if_exists } => self.drop_table(&name, if_exists),
             Statement::CreateIndex(ci) => {
                 self.create_index(&ci.name, &ci.table, &ci.paths, ci.if_not_exists)
@@ -888,10 +895,77 @@ impl Database {
             series_key,
             retention_ms,
             ooo_window_ms,
+            rollups: Vec::new(),
+            rollup_of: None,
         };
         let store = open_tsdb(&self.dir, name, &def)?;
         self.timeseries.insert(name.to_string(), store);
         self.catalog.timeseries.insert(name.to_string(), def);
+        self.record_schema(key, hlc, false);
+        self.save_catalog()?;
+        Ok(QueryOutput::Ddl)
+    }
+
+    /// `CREATE ROLLUP`: register a derived time-series table holding
+    /// per-bucket partials of its source, maintained at flush.
+    fn create_rollup(
+        &mut self,
+        name: &str,
+        source: &str,
+        bucket_ms: i64,
+        retention_ms: Option<i64>,
+        if_not_exists: bool,
+    ) -> Result<QueryOutput> {
+        let Some(src_def) = self.catalog.timeseries.get(source).cloned() else {
+            return Err(EngineError::Unsupported(format!(
+                "ROLLUP source {source} must be a timeseries table"
+            )));
+        };
+        if src_def.rollup_of.is_some() {
+            return Err(EngineError::Unsupported(
+                "cannot create a rollup of a rollup".into(),
+            ));
+        }
+        // Flushes happen at block-window boundaries; a bucket must nest
+        // inside them or its partials would split across two appends.
+        let span = 2 * 3600 * 1000i64;
+        if bucket_ms <= 0 || span % bucket_ms != 0 {
+            return Err(EngineError::Constraint(
+                "BUCKET must be positive and evenly divide 2h".into(),
+            ));
+        }
+        let hlc = self.ddl_stamp();
+        let key = format!("t:{name}");
+        if !self.schema_advances(&key, hlc) {
+            return Ok(QueryOutput::Ddl);
+        }
+        if self.catalog.tables.contains_key(name) || self.catalog.timeseries.contains_key(name) {
+            if if_not_exists {
+                self.record_schema(key, hlc, false);
+                self.save_catalog()?;
+                return Ok(QueryOutput::Ddl);
+            }
+            return Err(EngineError::TableExists(name.to_string()));
+        }
+        let def = TsTableDef {
+            series_key: src_def.series_key.clone(),
+            retention_ms,
+            ooo_window_ms: 0,
+            rollups: Vec::new(),
+            rollup_of: Some(source.to_string()),
+        };
+        let store = open_tsdb(&self.dir, name, &def)?;
+        self.timeseries.insert(name.to_string(), store);
+        self.catalog.timeseries.insert(name.to_string(), def);
+        self.catalog
+            .timeseries
+            .get_mut(source)
+            .expect("source checked")
+            .rollups
+            .push(RollupDef {
+                name: name.to_string(),
+                bucket_ms,
+            });
         self.record_schema(key, hlc, false);
         self.save_catalog()?;
         Ok(QueryOutput::Ddl)
@@ -903,16 +977,26 @@ impl Database {
         if !self.schema_advances(&key, hlc) {
             return Ok(QueryOutput::Ddl);
         }
-        // Time-series tables drop with plain `DROP TABLE` too.
-        if self.catalog.timeseries.contains_key(name) {
-            self.timeseries.remove(name);
-            self.catalog.timeseries.remove(name);
-            self.record_schema(key, hlc, true);
-            self.save_catalog()?;
-            let dir = ts_dir(&self.dir, name);
-            if dir.exists() {
-                std::fs::remove_dir_all(dir)?;
+        // Time-series tables drop with plain `DROP TABLE` too: a rollup
+        // deregisters from its source; a source cascades to its rollups.
+        if let Some(def) = self.catalog.timeseries.get(name).cloned() {
+            let mut to_remove = vec![name.to_string()];
+            to_remove.extend(def.rollups.iter().map(|r| r.name.clone()));
+            if let Some(source) = &def.rollup_of {
+                if let Some(sdef) = self.catalog.timeseries.get_mut(source) {
+                    sdef.rollups.retain(|r| r.name != name);
+                }
             }
+            for victim in &to_remove {
+                self.timeseries.remove(victim);
+                self.catalog.timeseries.remove(victim);
+                self.record_schema(format!("t:{victim}"), hlc, true);
+                let dir = ts_dir(&self.dir, victim);
+                if dir.exists() {
+                    std::fs::remove_dir_all(dir)?;
+                }
+            }
+            self.save_catalog()?;
             return Ok(QueryOutput::Ddl);
         }
         if !self.catalog.tables.contains_key(name) {
@@ -1609,12 +1693,25 @@ impl Database {
             ));
         }
         for (name, def) in &self.catalog.timeseries {
+            if def.rollup_of.is_some() {
+                continue; // emitted as CREATE ROLLUP below
+            }
             let (db, bare) = namespace::split(name);
             out.push((
                 db.to_string(),
                 ts_create_ddl(bare, def),
                 ver(&format!("t:{name}")),
             ));
+            for r in &def.rollups {
+                if let Some(rdef) = self.catalog.timeseries.get(&r.name) {
+                    let (rdb, rbare) = namespace::split(&r.name);
+                    out.push((
+                        rdb.to_string(),
+                        ts_rollup_ddl(rbare, bare, r.bucket_ms, rdef),
+                        ver(&format!("t:{}", r.name)),
+                    ));
+                }
+            }
         }
         for (name, idx) in &self.catalog.indexes {
             let (db, bare) = namespace::split(name);
@@ -1695,11 +1792,20 @@ impl Database {
             ));
         }
         for (name, def) in &self.catalog.timeseries {
+            if def.rollup_of.is_some() {
+                continue; // emitted as CREATE ROLLUP below
+            }
             let (db, bare) = namespace::split(name);
-            out.push((
-                db.to_string(),
-                ts_create_ddl(bare, def),
-            ));
+            out.push((db.to_string(), ts_create_ddl(bare, def)));
+            for r in &def.rollups {
+                if let Some(rdef) = self.catalog.timeseries.get(&r.name) {
+                    let (rdb, rbare) = namespace::split(&r.name);
+                    out.push((
+                        rdb.to_string(),
+                        ts_rollup_ddl(rbare, bare, r.bucket_ms, rdef),
+                    ));
+                }
+            }
         }
         for (name, idx) in &self.catalog.indexes {
             let (db, bare) = namespace::split(name);
@@ -1770,11 +1876,26 @@ impl Database {
     }
 
     /// Append samples to a time-series table (see [`Cluster::ts_append`]).
+    /// A triggered window flush also maintains the table's rollups — each
+    /// replica does this locally: a rollup series carries the same labels as
+    /// its source, so it places on the same replica set.
     pub fn ts_append(&self, table: &str, rows: &[(skaidb_tsdb::Labels, i64, f64)]) -> Result<usize> {
-        let res = self
+        let (res, flushed) = self
             .ts_store(table)?
-            .append_batch(rows)
+            .append_batch_with_flush(rows)
             .map_err(|e| EngineError::Timeseries(e.to_string()))?;
+        if !flushed.is_empty() {
+            if let Some(def) = self.catalog.timeseries.get(table) {
+                for rollup in &def.rollups {
+                    let rows = rollup_rows(&flushed, rollup.bucket_ms)?;
+                    if let Some(store) = self.timeseries.get(&rollup.name) {
+                        store
+                            .append_batch(&rows)
+                            .map_err(|e| EngineError::Timeseries(e.to_string()))?;
+                    }
+                }
+            }
+        }
         Ok(res.appended)
     }
 
@@ -3153,8 +3274,80 @@ fn index_dir(root: &Path, name: &str) -> PathBuf {
     root.join("indexes").join(name)
 }
 
+/// Aggregate a flushed window into rollup samples: per series and bucket,
+/// `<field>_{count,sum,min,max,first,last}` rows at the bucket start.
+fn rollup_rows(
+    flushed: &skaidb_tsdb::FlushedSeries,
+    bucket_ms: i64,
+) -> Result<Vec<(skaidb_tsdb::Labels, i64, f64)>> {
+    let mut out = Vec::new();
+    for (labels, chunks) in flushed {
+        let field = labels
+            .iter()
+            .find(|(k, _)| k == "__field__")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| "value".into());
+        let base: skaidb_tsdb::Labels = labels
+            .iter()
+            .filter(|(k, _)| k != "__field__")
+            .cloned()
+            .collect();
+        // (count, sum, min, max, first_ts, first, last_ts, last) per bucket.
+        // (count, sum, min, max, first_ts, first, last_ts, last)
+        type Acc = (u64, f64, f64, f64, i64, f64, i64, f64);
+        let mut buckets: BTreeMap<i64, Acc> = BTreeMap::new();
+        for chunk in chunks {
+            for s in skaidb_tsdb::decode_chunk(&chunk.data)
+                .map_err(|e| EngineError::Timeseries(e.to_string()))?
+            {
+                let b = s.ts.div_euclid(bucket_ms) * bucket_ms;
+                let e = buckets
+                    .entry(b)
+                    .or_insert((0, 0.0, f64::INFINITY, f64::NEG_INFINITY, s.ts, s.value, s.ts, s.value));
+                e.0 += 1;
+                e.1 += s.value;
+                e.2 = e.2.min(s.value);
+                e.3 = e.3.max(s.value);
+                if s.ts < e.4 {
+                    e.4 = s.ts;
+                    e.5 = s.value;
+                }
+                if s.ts >= e.6 {
+                    e.6 = s.ts;
+                    e.7 = s.value;
+                }
+            }
+        }
+        for (bucket, (count, sum, min, max, _, first, _, last)) in buckets {
+            for (suffix, value) in [
+                ("count", count as f64),
+                ("sum", sum),
+                ("min", min),
+                ("max", max),
+                ("first", first),
+                ("last", last),
+            ] {
+                let mut l = base.clone();
+                l.push(("__field__".to_string(), format!("{field}_{suffix}")));
+                l.sort();
+                out.push((l, bucket, value));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Render the idempotent CREATE DDL for a time-series table definition
 /// (schema replay/bootstrap/repair all share it).
+/// Render the idempotent CREATE ROLLUP DDL.
+fn ts_rollup_ddl(bare: &str, source_bare: &str, bucket_ms: i64, def: &TsTableDef) -> String {
+    let retention = def
+        .retention_ms
+        .map(|ms| format!(" RETENTION {ms}ms"))
+        .unwrap_or_default();
+    format!("CREATE ROLLUP IF NOT EXISTS {bare} ON {source_bare} BUCKET {bucket_ms}ms{retention}")
+}
+
 fn ts_create_ddl(bare: &str, def: &TsTableDef) -> String {
     let retention = def
         .retention_ms

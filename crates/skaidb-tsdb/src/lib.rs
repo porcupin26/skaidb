@@ -19,8 +19,9 @@ mod store;
 mod varenc;
 mod wal;
 
-pub use chunk::Sample;
-pub use store::{AppendResult, Matcher, Tsdb, TsdbOptions, TsdbStats};
+pub use chunk::{decode as decode_chunk, Sample};
+pub use head::SealedChunk;
+pub use store::{AppendResult, FlushedSeries, Matcher, Tsdb, TsdbOptions, TsdbStats};
 
 /// A series identity: label pairs sorted by key (the caller sorts; the store
 /// asserts in debug builds).
