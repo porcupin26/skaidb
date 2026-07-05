@@ -1,8 +1,10 @@
 # skaidb query syntax
 
-The SQL surface skaidb accepts. It's a subset of SQL: one statement per call,
-no transactions, joins, or subqueries. Rows are schema-less documents keyed by a
-declared primary key; any field not present reads as `NULL`.
+The SQL surface skaidb accepts. It's a subset of SQL — one statement per call,
+no subqueries or CTEs (joins, `UNION`, aggregates, prepared statements, and
+embedded-engine transactions are supported; see below). Rows are schema-less
+documents keyed by a declared primary key; any field not present reads as
+`NULL`.
 
 > **Maintenance:** this document is the source of truth for the query language.
 > Whenever the parser/grammar changes — a new statement, clause, operator,
@@ -68,8 +70,8 @@ SHOW DATABASES
 - `CREATE VECTOR INDEX` builds an HNSW index for nearest-neighbor search over the
   float array at `<path>`. `DIM <n>` (the vector dimension) is **required**;
   `USING <metric>` is `cosine` (default), `l2`, or `dot`. It broadcasts across
-  the cluster so every node indexes its shard. **Querying** it is via the
-  `vector_search` API, not SQL yet (see below and [VECTOR.md](VECTOR.md)).
+  the cluster so every node indexes its shard. Query it with the `NEAREST`
+  clause (see *Vector search* below and [VECTOR.md](VECTOR.md)).
 - `<select-item>` is `*` (all fields seen in the result rows) or
   `<expr> [[AS] <alias>]`.
 - `ALTER TABLE … RENAME TO` renames a table (moving its on-disk data and
@@ -107,11 +109,13 @@ SHOW DATABASES
     databases there with `db.table` qualifiers rather than `USE`.
 - **`DISTINCT`** removes duplicate output rows. **`HAVING`** filters groups after
   aggregation (it may reference aggregates and the `GROUP BY` columns).
-- **`JOIN`** combines tables by nested-loop. `INNER`/`LEFT`/`RIGHT`/`CROSS` are
-  supported (`JOIN` alone means `INNER`; `CROSS JOIN` takes no `ON`). Reference
-  columns **qualified** by table alias (`u.id`, `o.amt`); an unqualified field
-  resolves against whichever joined table defines it (first table wins on a name
-  clash). `SELECT *` over a join expands to the underlying fields.
+- **`JOIN`** combines tables — equi-joins (`ON a = b`) run as a hash join,
+  other predicates and `RIGHT` joins fall back to a nested loop.
+  `INNER`/`LEFT`/`RIGHT`/`CROSS` are supported (`JOIN` alone means `INNER`;
+  `CROSS JOIN` takes no `ON`). Reference columns **qualified** by table alias
+  (`u.id`, `o.amt`); an unqualified field resolves against whichever joined
+  table defines it (first table wins on a name clash). `SELECT *` over a join
+  expands to the underlying fields.
 - **`UNION`** / **`UNION ALL`** concatenate the rows of several `SELECT`s that
   share a column count (`UNION` removes duplicates, `UNION ALL` keeps them). A
   trailing `ORDER BY`/`LIMIT`/`OFFSET` after the last branch applies to the whole
@@ -212,9 +216,7 @@ exists. Cannot combine with `JOIN`, `UNION`, aggregates/`GROUP BY`, or
   rejects transaction control (no distributed 2PC yet).
 - **Joins have no pushdown in a cluster:** a single-table `WHERE` *is* pushed to
   the shards (each node returns only matching keys, re-read at quorum), but a
-  *join* pulls each table to the coordinator and nested-loops there — so joins
-  suit modest tables / lookups, not large fact-to-fact joins.
-- **Vector index *creation* is SQL** (`CREATE VECTOR INDEX …`), but the
-  **nearest-neighbor *query* has no SQL syntax yet** — searches go through the
-  `Database::vector_search` / `Node::vector_search` API (see
-  [VECTOR.md](VECTOR.md)), not an `ORDER BY embedding <-> [...]` operator.
+  *join* pulls each table to the coordinator and joins there — so joins suit
+  modest tables / lookups, not large fact-to-fact joins.
+- **Vector search uses `NEAREST`**, not an `ORDER BY embedding <-> [...]`
+  operator (see *Vector search* above).

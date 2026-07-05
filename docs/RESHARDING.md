@@ -105,11 +105,12 @@ divergence:
   replays it once that replica is reachable again — opportunistically on the next
   write, or via `flush_hints`. Faster recovery than waiting for a full repair.
 - **Active anti-entropy** (`Node::repair` / `repair_cluster`). A background pass
-  reconciles each pair of co-replicas: they exchange per-key version stamps and
-  copy the newer side in both directions (tombstones included). This is the
-  durable backstop that converges replicas even with no reads and even if hints
-  were lost. It's a full-table comparison today; a Merkle tree would let it skip
-  identical key ranges instead of streaming the whole shard (future work).
+  reconciles each pair of co-replicas: a merge-join over two paged, key-ordered
+  scans (2,000 rows/page per side) copies the newer version in both directions
+  (tombstones included), so repair memory stays O(page) regardless of table
+  size. This is the durable backstop that converges replicas even with no reads
+  and even if hints were lost. It still *compares* every key; a Merkle tree
+  would let it skip identical key ranges entirely (future work).
 
 ## Reclaiming space after a move
 

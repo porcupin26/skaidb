@@ -1,4 +1,4 @@
-# Vector search (HNSW) — prototype
+# Vector search (HNSW)
 
 skaidb can store embeddings and run **approximate nearest-neighbor (ANN)**
 search over them with an in-memory **HNSW** index, including **filtered** search
@@ -90,22 +90,23 @@ is present, since filtering happens after the re-read).
 
 ANN is a distinct index family from the B-tree / inverted indexes the OLTP and
 search engines use. Where vector search sits across the systems compared in
-[`docs/INDEX_BENCH.md`](INDEX_BENCH.md) plus dedicated vector stores:
+[`docs/BENCHMARKS.md`](BENCHMARKS.md) plus dedicated vector stores:
 
 | Capability | PostgreSQL | MongoDB | Elasticsearch | Qdrant | Milvus | Weaviate | skaidb |
 |---|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
 | Vector ANN (kNN) | ⚠️ `pgvector` | ⚠️ Atlas | ✅ `dense_vector` | ✅ | ✅ | ✅ | ✅ (HNSW, embedded) |
 | Filtered ANN (`WHERE` + vector) | ✅ | ✅ | ✅ | ✅ (core) | ✅ | ✅ | ✅ |
 | ANN index types | HNSW/IVFFlat | HNSW | HNSW | HNSW (+quantization) | HNSW/IVF/PQ/DiskANN/GPU | HNSW | HNSW |
-| Distributed vector search | single-primary | sharded | sharded | sharded | sharded | sharded | ❌ (single-node) |
+| Distributed vector search | single-primary | sharded | sharded | sharded | sharded | sharded | ✅ (sharded scatter-gather) |
 | Primary durable store + tunable consistency | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ |
 
 The dedicated vector DBs (Qdrant, Milvus, Weaviate; plus managed Pinecone) are
 specialists — superb at ANN and filtered ANN, but not transactional systems of
 record, so they usually run beside a primary DB. The general engines add vector
-search as a *feature* (pgvector, Mongo Atlas, ES `dense_vector`). skaidb now sits
-in that second group: a durable, tunably-consistent store that can also do
-filtered ANN — for moderate, single-node vector sets.
+search as a *feature* (pgvector, Mongo Atlas, ES `dense_vector`). skaidb sits in
+that second group: a durable, tunably-consistent store that can also do
+filtered, distributed ANN — for moderate vector sets (each node's graph is
+in-memory; see limitations).
 
 ## Limitations
 

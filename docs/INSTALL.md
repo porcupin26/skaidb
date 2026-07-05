@@ -18,6 +18,7 @@ binaries**:
 ## Contents
 
 - [Which download do I want?](#which-download-do-i-want)
+- [Package repository (apt / dnf)](#package-repository-apt--dnf)
 - [Downloading the right file](#downloading-the-right-file)
 - [Verifying the download](#verifying-the-download-recommended)
 - [Linux](#linux)
@@ -55,6 +56,39 @@ binaries**:
 
 Not sure of your CPU? `uname -m` on Linux/macOS (`x86_64` → amd64/x86_64,
 `aarch64`/`arm64` → ARM64). On Apple Silicon Macs `uname -m` prints `arm64`.
+
+## Package repository (apt / dnf)
+
+Every release is also published to a signed package repository at
+`repo.zapolski.nyc`, so `apt`/`dnf` handle installs **and upgrades** (no
+manual downloads):
+
+```sh
+# Debian / Ubuntu
+curl -fsSL https://repo.zapolski.nyc/pubkey.gpg \
+  | sudo tee /etc/apt/keyrings/repo-zapolski.gpg > /dev/null
+echo "deb [signed-by=/etc/apt/keyrings/repo-zapolski.gpg] https://repo.zapolski.nyc/deb stable main" \
+  | sudo tee /etc/apt/sources.list.d/repo-zapolski.list
+sudo apt update && sudo apt install skaidb
+```
+
+```sh
+# Fedora / RHEL / Rocky / Alma
+sudo tee /etc/yum.repos.d/repo-zapolski.repo <<'EOF'
+[repo-zapolski]
+name=repo.zapolski.nyc
+baseurl=https://repo.zapolski.nyc/rpm
+enabled=1
+gpgcheck=0
+repo_gpgcheck=1
+gpgkey=https://repo.zapolski.nyc/pubkey.gpg
+EOF
+sudo dnf install skaidb
+```
+
+Upgrades are then just `apt upgrade` / `dnf upgrade` (in a cluster, upgrade one
+node at a time). The sections below cover installing directly from GitHub
+Release assets instead.
 
 ## Downloading the right file
 
