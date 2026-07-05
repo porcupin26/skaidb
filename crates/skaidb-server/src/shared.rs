@@ -107,6 +107,24 @@ impl Backend {
         matches!(self, Backend::Cluster(_))
     }
 
+    /// Query time-series samples (the Prometheus HTTP API path): local
+    /// store, or union-merged across the cluster.
+    pub fn ts_query(
+        &self,
+        table: &str,
+        matchers: &[skaidb_tsdb::Matcher],
+        t0: i64,
+        t1: i64,
+    ) -> Result<Vec<(skaidb_tsdb::Labels, Vec<skaidb_tsdb::Sample>)>, skaidb_engine::EngineError> {
+        match self {
+            Backend::Local(db) => db
+                .read()
+                .map_err(|_| skaidb_engine::EngineError::Cluster("lock poisoned".into()))?
+                .ts_query(table, matchers, t0, t1),
+            Backend::Cluster(node) => node.ts_query_replicated(table, matchers, t0, t1),
+        }
+    }
+
     /// Append time-series samples (remote_write ingest): local store or
     /// replicated via the cluster coordinator.
     pub fn ts_append(

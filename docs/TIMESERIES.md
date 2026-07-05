@@ -9,7 +9,7 @@ aggregates, and time-bucketed queries.
 > replicate at the configured write consistency; queries union-merge across
 > members at the read consistency; joins/decommissions migrate series like
 > any other data. Shipped in v0.20.0 (storage), v0.21.0 (SQL), v0.22.0
-> (cluster), v0.23.0 (remote_write), v0.24.0 (resharding), v0.25.0 (OOO DDL + stats), v0.26.0 (anti-entropy), v0.27.0 (rollups).
+> (cluster), v0.23.0 (remote_write), v0.24.0 (resharding), v0.25.0 (OOO DDL + stats), v0.26.0 (anti-entropy), v0.27.0 (rollups), v0.28.0 (PromQL API).
 
 ## Usage
 
@@ -80,6 +80,16 @@ stored as its own compressed stream. Full grammar and semantics:
   store, so `WHERE name = '...' AND instance = '...'` is efficient without
   declaring every label. In a cluster, ingested samples replicate through
   the same series-placement path as SQL INSERTs.
+- **Prometheus query API / Grafana** (v0.28.0): point Grafana's built-in
+  Prometheus datasource at skaidb's REST listener. `/api/v1/query` and
+  `/api/v1/query_range` evaluate a PromQL subset — instant selectors with
+  `=`/`!=` matchers, `rate`/`increase`/`delta` over range selectors
+  (counter-reset-aware, matching the SQL aggregates), and
+  `sum/avg/min/max/count [by|without (...)]` — over the remote_write
+  `metrics` table. `/api/v1/labels`, `/api/v1/label/<n>/values`,
+  `/api/v1/series`, buildinfo and metadata stubs power Grafana's
+  autocomplete. Not yet: regex matchers, `offset`, vector arithmetic,
+  `histogram_quantile`.
 - **Rollups / downsampling** (v0.27.0): `CREATE ROLLUP r30m ON cpu BUCKET
   30m RETENTION 90d` — per-bucket partials (`<field>_{count,sum,min,max,
   first,last}`) maintained automatically at window flush and queryable as a
@@ -120,7 +130,7 @@ Roadmap phases refer to the implementation plan in [`TODO.md`](TODO.md).
 | TS reclaim | after a reshard, former owners keep stale series copies (harmless under union-merge; no `reclaim` pass for TS yet) | with TS anti-entropy |
 | Rollup query rewrite | queries must target the rollup table explicitly; picking the coarsest satisfying rollup automatically is open | phase 6 follow-up |
 | Rollup backfill/repair | rollups aggregate at flush; repair-merged (gap-filled) samples don't retroactively update them | phase 6 follow-up |
-| **PromQL subset / Grafana datasource** | `/api/v1/query_range` + metadata endpoints | phase 7 (stretch) |
+| PromQL: regex matchers, offset, arithmetic, histogram_quantile | the shipped subset covers selectors, rate/increase/delta, and sum/avg/min/max/count by/without | phase 7 follow-up |
 | Label postings index | matchers scan the per-block series list (fine at moderate cardinality) | with pushdown work |
 | Regex label matchers | only `=` / `!=` push down | with postings |
 | TS gauges on `/metrics` | per-store stats are in `SHOW STATUS`; Prometheus-endpoint gauges pending | soon |

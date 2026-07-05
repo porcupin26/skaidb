@@ -93,6 +93,52 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) -> io::Result<()> {
         return write_response(&mut stream, status, &payload);
     }
 
+    // Prometheus HTTP query API (GET with a query string, or POST with a
+    // form body — Grafana uses both).
+    let bare_path = req.path.split('?').next().unwrap_or(&req.path).to_string();
+    if bare_path.starts_with("/api/v1/") && bare_path != "/api/v1/write" {
+        let role_ok = if ctx.authn.required {
+            basic_auth_role(&ctx, req.authorization.as_deref()).is_some()
+        } else {
+            true
+        };
+        if !role_ok {
+            return write_unauthorized(&mut stream);
+        }
+        // Merge query-string and form-body params (body wins on conflict).
+        let mut params = crate::promql::parse_params(
+            req.path.split_once('?').map(|(_, q)| q).unwrap_or(""),
+        );
+        if req.method == "POST" {
+            for (k, v) in crate::promql::parse_params(&String::from_utf8_lossy(&req.body)) {
+                params.insert(k, v);
+            }
+        }
+        let (status, payload) = match bare_path.as_str() {
+            "/api/v1/query" => crate::promql::query(&ctx, &params),
+            "/api/v1/query_range" => crate::promql::query_range(&ctx, &params),
+            "/api/v1/labels" => crate::promql::labels(&ctx, None),
+            "/api/v1/series" => crate::promql::series(&ctx, &params),
+            "/api/v1/status/buildinfo" => (
+                200,
+                json!({"status": "success",
+                       "data": {"version": env!("CARGO_PKG_VERSION"), "application": "skaidb"}}),
+            ),
+            "/api/v1/metadata" => (200, json!({"status": "success", "data": {}})),
+            path => {
+                if let Some(label) = path
+                    .strip_prefix("/api/v1/label/")
+                    .and_then(|rest| rest.strip_suffix("/values"))
+                {
+                    crate::promql::labels(&ctx, Some(label))
+                } else {
+                    (404, json!({"status": "error", "error": "unknown api route"}))
+                }
+            }
+        };
+        return write_response(&mut stream, status, &payload);
+    }
+
     // Prometheus remote_write: snappy-compressed protobuf WriteRequest.
     if req.method == "POST" && req.path == "/api/v1/write" {
         let role = if ctx.authn.required {

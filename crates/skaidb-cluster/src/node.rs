@@ -819,6 +819,18 @@ impl Node {
     }
 
     /// Addresses of all current peers (snapshot, cloned) — never held across I/O.
+    /// Cluster-wide time-series query at the configured read consistency
+    /// (union-merged across members) — the PromQL/HTTP query path.
+    pub fn ts_query_replicated(
+        &self,
+        table: &str,
+        matchers: &[skaidb_tsdb::Matcher],
+        t0: i64,
+        t1: i64,
+    ) -> EngineResult<Vec<(skaidb_tsdb::Labels, Vec<skaidb_tsdb::Sample>)>> {
+        self.ts_scatter(table, matchers, t0, t1, None)
+    }
+
     /// Replicated time-series append at the configured write consistency
     /// (the remote_write ingest path; SQL INSERT uses the same logic via
     /// the per-statement Coordinator).

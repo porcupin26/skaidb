@@ -50,7 +50,7 @@ impl Default for TsdbOptions {
 /// A label matcher (phase 1: equality forms; regex arrives with the SQL
 /// surface). A series matches when every matcher accepts it; a missing
 /// label reads as the empty string, Prometheus-style.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Matcher {
     Eq(String, String),
     Ne(String, String),

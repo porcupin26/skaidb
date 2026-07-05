@@ -11,6 +11,7 @@ pub mod audit;
 pub mod authn;
 pub mod binary;
 pub mod memory;
+mod promql;
 mod promwrite;
 pub mod metrics;
 pub mod rest;
@@ -510,6 +511,77 @@ mod tests {
         let mut resp = String::new();
         stream.read_to_string(&mut resp).unwrap();
         assert!(resp.contains("[[1.0]]"), "{resp}");
+    }
+
+    #[test]
+    fn promql_api_end_to_end() {
+        let ctx = temp_ctx();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
+        // Ingest counters via remote_write: two jobs, 60s apart, +60/step.
+        let body = crate::promwrite::tests::encode_write_request(&[
+            (
+                &[("__name__", "http_requests_total"), ("job", "api")],
+                &[(0, 0.0), (60_000, 60.0), (120_000, 120.0)],
+            ),
+            (
+                &[("__name__", "http_requests_total"), ("job", "web")],
+                &[(0, 0.0), (60_000, 30.0), (120_000, 60.0)],
+            ),
+        ]);
+        let post = |path: &str, body: &[u8], form: bool| -> String {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            let ctype = if form {
+                "Content-Type: application/x-www-form-urlencoded\r\n"
+            } else {
+                ""
+            };
+            let head = format!(
+                "POST {path} HTTP/1.1\r\n{ctype}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+            let mut resp = String::new();
+            stream.read_to_string(&mut resp).unwrap();
+            resp
+        };
+        let get = |path: &str| -> String {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            let head = format!("GET {path} HTTP/1.1\r\nConnection: close\r\n\r\n");
+            stream.write_all(head.as_bytes()).unwrap();
+            let mut resp = String::new();
+            stream.read_to_string(&mut resp).unwrap();
+            resp
+        };
+        assert!(post("/api/v1/write", &body, false).contains("200"));
+
+        // Instant query at t=120s: raw selector returns both series.
+        let resp = get("/api/v1/query?query=http_requests_total&time=120");
+        assert!(resp.contains("\"resultType\":\"vector\""), "{resp}");
+        assert!(resp.contains("\"__name__\":\"http_requests_total\""), "{resp}");
+        assert!(resp.contains("\"job\":\"api\"") && resp.contains("\"job\":\"web\""));
+
+        // Range query, form-POST like Grafana: sum(rate(...)[2m])) = 1+0.5.
+        let form = "query=sum%28rate%28http_requests_total%5B2m%5D%29%29&start=120&end=120&step=60";
+        let resp = post("/api/v1/query_range", form.as_bytes(), true);
+        assert!(resp.contains("\"resultType\":\"matrix\""), "{resp}");
+        assert!(resp.contains("[120.0,\"1.5\"]") || resp.contains("[120,\"1.5\"]"), "{resp}");
+
+        // by-clause keeps job separate: api rates 1/s.
+        let resp = get(
+            "/api/v1/query_range?query=sum%20by%20%28job%29%20%28rate%28http_requests_total%5B2m%5D%29%29&start=120&end=120&step=60",
+        );
+        assert!(resp.contains("\"job\":\"api\"") && resp.contains("\"1\""), "{resp}");
+
+        // Metadata endpoints.
+        let resp = get("/api/v1/labels");
+        assert!(resp.contains("__name__") && resp.contains("job"), "{resp}");
+        let resp = get("/api/v1/label/job/values");
+        assert!(resp.contains("api") && resp.contains("web"), "{resp}");
+        let resp = get("/api/v1/label/__name__/values");
+        assert!(resp.contains("http_requests_total"), "{resp}");
+        let resp = get("/api/v1/status/buildinfo");
+        assert!(resp.contains("skaidb"), "{resp}");
     }
 
     #[test]

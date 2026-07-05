@@ -336,6 +336,13 @@ Benchmarks:
    repair-merged samples.
 7. **Stretch: PromQL subset** — `/api/v1/query_range` for Grafana. Re-scope
    or drop based on demand once 1–6 are real.
+   **✅ Core done (v0.28.0).** query/query_range + labels/label-values/
+   series/buildinfo/metadata endpoints, GET and form-POST, evaluating
+   selectors + rate/increase/delta + sum/avg/min/max/count by/without
+   with one data fetch per query. **Still open:** regex matchers, offset,
+   vector arithmetic, histogram_quantile, and the panel-by-panel
+   node-exporter dashboard diff against a real Prometheus (the original
+   exit criterion).
 
 Each phase ends with the TSBS/fleet comparison for what exists so far,
 documented in BENCHMARKS.md (current-notes section, per the docs policy).
