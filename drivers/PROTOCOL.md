@@ -153,7 +153,7 @@ sql bytes (UTF-8)
 Consistency selects how many replicas must acknowledge (writes) or be consulted
 (reads) before the server answers. Drivers default to **QUORUM (1)**.
 
-Servers ≥ 0.16.8 also accept the prepared-statement opcodes 2–4 (§3.3); a
+Servers ≥ 0.17.0 also accept the prepared-statement opcodes 2–4 (§3.3); a
 driver that only ever sends `OP_QUERY` is fully compatible in both directions.
 
 ### 3.2 Response
@@ -206,7 +206,7 @@ u32 statement id (LE)
 u16 parameter count (LE)
 ```
 
-### 3.3 Prepared statements (server ≥ 0.16.8)
+### 3.3 Prepared statements (server ≥ 0.17.0)
 
 A statement containing `?` placeholders can be parsed **once** and executed
 many times with different bindings — skipping the per-request SQL parse and
@@ -240,7 +240,7 @@ u8  = 4                       # OP_CLOSE
 u32 statement id (LE)
 ```
 
-An old server (< 0.16.8) answers opcodes 2–4 with `Error("unknown opcode")` —
+An old server (< 0.17.0) answers opcodes 2–4 with `Error("unknown opcode")` —
 drivers can feature-detect by preparing once and falling back to client-side
 interpolation (§5).
 
@@ -277,7 +277,7 @@ Notes:
 
 ## 5. Parameter binding (client-side fallback)
 
-Against servers ≥ 0.16.8 prefer the server-side prepared statements of §3.3.
+Against servers ≥ 0.17.0 prefer the server-side prepared statements of §3.3.
 For older servers (or drivers that have not implemented §3.3), offer the
 parameterized API (`?`/`%s`/`$1` placeholders) by interpolating arguments into
 the SQL **client-side**, with correct SQL quoting:

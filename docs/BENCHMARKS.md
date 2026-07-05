@@ -287,9 +287,9 @@ The remaining concurrent-write gap to PostgreSQL on this hardware (~25% at
 C4) is per-statement service time spread across SQL parsing (~8% of
 coordinator CPU), WAL append + memtable (~24%), and executor setup — there is
 no single plumbing lever left. The structural next step was prepared
-statements at the protocol level — measured below (v0.16.8).
+statements at the protocol level — measured below (v0.17.0).
 
-**v0.16.8**: **prepared statements**, end to end — `?` placeholders in the
+**v0.17.0**: **prepared statements**, end to end — `?` placeholders in the
 grammar, `Prepare`/`Execute`/`Close` opcodes in the binary protocol
 (per-connection statement cache, parse once / bind per call), and
 `prepare()`/`execute_prepared()` in the Rust driver. Statements are bound
