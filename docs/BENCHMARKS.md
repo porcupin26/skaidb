@@ -331,6 +331,72 @@ behind extra table-churn legs). Alternating text/prepared runs back-to-back
 reversed the sign. On this fleet, position-in-sequence effects are the same
 size as single-digit deltas; only alternating same-day A/Bs are trusted.
 
+**v0.17.1**: **`memory_target`** — an opt-in storage memory budget
+(`[storage] memory_target = "auto"` or an explicit `"512MB"`-style size) that
+sizes the memtable and read cache together instead of via two independent
+knobs. `"auto"` detects the node's own memory limit — the **cgroup** limit
+when one applies, so a container gets its own budget, not the host's — and
+spends half of it on storage. This landed alongside two correctness fixes
+anti-entropy testing on a 1M-row table surfaced:
+
+- **Bounded background-replication queue.** The async-tail queue
+  ([[v0.16.6]]'s batching target) was unbounded; a sustained large preload
+  that outran the tail could queue hundreds of MB of cloned rows and get the
+  node OOM-killed on a 512 MB node. It's now a bounded channel (1024 tasks);
+  full means the write becomes a hint instead, reconciled by the mechanism
+  below. Merged background sends are also chunked (2,000 rows/frame) so one
+  drain can't build one multi-megabyte frame with a multi-second lock hold on
+  the receiving replica.
+- **Paged anti-entropy.** `repair()` used to pull whole tables into memory on
+  both ends to diff them — fine at thousand-row scale, but it also OOM-killed
+  512 MB nodes at a million rows. It's now a merge-join over two paged,
+  key-ordered scans (2,000 rows/page each side), so repair memory is
+  O(page), not O(table), regardless of dataset size.
+
+Both were caught by *scaling the benchmark itself* to 1M rows for this
+release — the existing 1,000-row suite could never have found them.
+
+**What the numbers show, honestly:** at this fleet's benchmark shape (16
+client connections, quorum reads crossing 1-vCPU LXCs on one oversubscribed
+Proxmox host), `memory_target` produced **no measurable throughput change** —
+and neither did the cache-size gap it's meant to control:
+
+| 1M rows × 100B, C4 | skaidb default | skaidb `memory_target=auto` |
+|---------------------|---------------:|------------------------------:|
+| read 16c, 100k hot set | 3,175 | 3,206 |
+| read 16c, uniform      | 2,939 | 2,867 |
+
+That's a tie in both directions — and it turns out *every* database tested
+lands in the same band on this leg, regardless of engine or cache config:
+PostgreSQL 2,980–3,102, MongoDB 7 ~2,540, MongoDB 8 ~2,435, MariaDB
+2,764–2,863. A ping from the **Proxmox host itself** (not the WiFi'd
+workstation) to a bench node still shows ~5ms RTT — this fleet's per-op floor
+is the shared, oversubscribed host and the cross-node quorum hop, not client
+network or storage-engine caching. 16 connections × ~5ms/op ≈ 3,200 ops/s is
+almost exactly the ceiling every system hits here; raising to 64 connections
+on skaidb lifts it to 4,347 ops/s (confirming it's a concurrency/queuing
+ceiling, not a hard cap) — the fleet just isn't shaped to isolate what a
+storage memory budget does.
+
+Isolated from that confound — one node, loopback (no quorum hop, no VLAN),
+1M rows, comparing a deliberately **undersized** 48 MB budget (94% of rows
+forced out of the 16 MB memtable onto SSTables) against everything fitting in
+a 256 MB memtable — the mechanism is real, and its cost is small on fast
+local storage:
+
+| Config (single node, loopback) | read 16c throughput |
+|---------------------------------|---------------------:|
+| 256 MB memtable (all rows resident) | 321,038 ops/s |
+| 48 MB budget (94% of rows on SSTables) | 294,887 ops/s |
+
+An ~8% cost for correctly shrinking a node's RAM commitment to a fraction of
+its dataset — the block cache and bloom filters keep SSTable point-reads
+nearly memtable-speed. `memory_target` is a genuine, verified capacity
+control; it just isn't the lever that moves *this* cluster benchmark, because
+this cluster benchmark is bound by something else entirely. Worth knowing
+before reaching for it to fix a throughput number — check whether the
+bottleneck is actually memory-bound first.
+
 ## Reproducing
 
 skaidb's load generator is in-tree:

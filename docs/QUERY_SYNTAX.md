@@ -34,6 +34,7 @@ DELETE FROM <table> [WHERE <expr>]
 SELECT [DISTINCT] <select-item> [, <select-item> ...]
 FROM <table> [[AS] <alias>]
 [ <join> ... ]
+[NEAREST (<path>, <query-vector>, <k>)]
 [WHERE <expr>]
 [GROUP BY <expr> [, <expr> ...]]
 [HAVING <expr>]
@@ -167,6 +168,25 @@ Values are dynamically typed: `null`, `bool`, `int64`, `float64`, `decimal`,
 `document`. Only `int`, `float`, `string`, `bool`, `null`, and `array` literals
 can be written directly in SQL; `decimal`/`uuid`/`bytes`/`timestamp`/`document`
 values arrive via stored data or the value codec, not as SQL literals.
+
+## Vector search (`NEAREST`)
+
+`NEAREST (<path>, <query-vector>, <k>)` runs an approximate nearest-neighbor
+search over a [vector index](VECTOR.md) on `(<table>, <path>)`, returning the
+`<k>` closest rows ordered nearest-first, with the match distance exposed as a
+`_distance` field:
+
+```sql
+CREATE VECTOR INDEX docs_emb ON docs (embedding) DIM 3 USING cosine;
+SELECT id, _distance FROM docs NEAREST (embedding, [1.0, 0.0, 0.0], 5);
+SELECT id FROM docs NEAREST (embedding, [1.0, 0.0, 0.0], 5) WHERE cat = 'news';
+```
+
+`<query-vector>` and `<k>` may be literals or bind parameters (`?`) in a
+prepared statement. Requires a vector index on the path; errors if none
+exists. Cannot combine with `JOIN`, `UNION`, aggregates/`GROUP BY`, or
+`ORDER BY` (results are already ordered by distance) — `WHERE`, `LIMIT`, and
+`OFFSET` apply normally, post-search.
 
 ## Indexing notes (query-relevant)
 

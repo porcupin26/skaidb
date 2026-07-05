@@ -6,8 +6,8 @@ search over them with an in-memory **HNSW** index, including **filtered** search
 search / RAG / recommendations.
 
 > Status: **distributed** (sharded scatter-gather) but still in-memory and
-> rebuilt from the table on open; the kNN *query* has no SQL syntax yet (index
-> creation does). See limitations at the end.
+> rebuilt from the table on open. Both index creation and the kNN query have
+> SQL syntax (`NEAREST`, below). See limitations at the end.
 
 ## Storing vectors
 
@@ -31,7 +31,22 @@ DROP   VECTOR INDEX docs_emb
 its own shard. The index is maintained automatically on `INSERT`/`UPDATE`/
 `DELETE` (a replace soft-deletes the old vector and inserts the new one).
 
+## Searching (SQL)
+
+```sql
+SELECT id, _distance FROM docs NEAREST (embedding, [0.1, -0.2, 0.9], 10);
+SELECT id FROM docs NEAREST (embedding, [0.1, -0.2, 0.9], 10) WHERE cat = 'news';
+```
+
+`NEAREST (<path>, <query>, <k>)` returns the `k` nearest rows ordered
+nearest-first with their distance exposed as `_distance`; `<query>` and `<k>`
+may be bind parameters. Full grammar in
+[`QUERY_SYNTAX.md`](QUERY_SYNTAX.md#vector-search-nearest).
+
 ## Searching (API)
+
+The SQL path above calls into the same embedded/cluster methods directly
+usable from Rust:
 
 ```rust
 // Embedded single-node:
@@ -94,8 +109,6 @@ filtered ANN — for moderate, single-node vector sets.
 
 ## Limitations
 
-- **No SQL kNN syntax** yet — index *creation* is SQL, but searches go through
-  the `vector_search` API, not `ORDER BY embedding <-> [..] LIMIT k`.
 - **In-memory, rebuilt on open** — the HNSW lives in RAM and is reconstructed by
   scanning the table at startup (slow for very large sets). The performant fix is
   to persist per-segment graphs that ride the LSM (snapshot + mmap), with
