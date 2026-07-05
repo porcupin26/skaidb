@@ -331,7 +331,8 @@ behind extra table-churn legs). Alternating text/prepared runs back-to-back
 reversed the sign. On this fleet, position-in-sequence effects are the same
 size as single-digit deltas; only alternating same-day A/Bs are trusted.
 
-**v0.17.1**: **`memory_target`** — an opt-in storage memory budget
+**v0.18.0**: **`memory_target`** and **`NEAREST`** (SQL vector search) — an
+opt-in storage memory budget
 (`[storage] memory_target = "auto"` or an explicit `"512MB"`-style size) that
 sizes the memtable and read cache together instead of via two independent
 knobs. `"auto"` detects the node's own memory limit — the **cgroup** limit
