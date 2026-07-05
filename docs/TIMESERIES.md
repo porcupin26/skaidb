@@ -97,6 +97,11 @@ stored as its own compressed stream. Full grammar and semantics:
   locally: a rollup series has the same labels as its source, so it places
   on the same replica set by construction. Long retention on the rollup +
   short on the source = classic tiered downsampling.
+- **Hinted handoff** (v0.30.0): a replica unreachable during an append
+  gets its batch buffered on the coordinator (bounded per peer) and
+  replayed via the gap-filling merge as soon as it's reachable — brief
+  outages recover in seconds; anti-entropy repair remains the durable
+  backstop for anything the bounded buffer dropped.
 - **Anti-entropy** (v0.26.0): `repair()` (the periodic pass and
   `cluster repair`) converges TS replicas — per-series `(count, checksum)`
   summaries are compared per peer, and the series' elected sender pushes
@@ -124,7 +129,6 @@ All tracked, with more detail, in [`TODO.md`](TODO.md).
 
 | Gap | Notes | Planned |
 |---|---|---|
-| TS hinted handoff | repair converges lagging replicas (below); a faster per-write hint replay like row tables have is still open | later |
 | **Partial-aggregate pushdown** | cluster queries ship matching raw samples to the coordinator; per-node partial aggregation (sum/count per bucket, per-series rate segments) would cut transfer for wide aggregations | open |
 | Self-scrape (`/metrics` → TS table) | remote_write covers external scrapers | later |
 | TS reclaim | after a reshard, former owners keep stale series copies (harmless under union-merge; no `reclaim` pass for TS yet) | with TS anti-entropy |

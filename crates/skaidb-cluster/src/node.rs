@@ -147,6 +147,9 @@ pub struct Node {
     /// for replay when it comes back — *hinted handoff*. In-memory and bounded;
     /// anti-entropy ([`Node::repair`]) is the durable backstop if hints are lost.
     hints: Mutex<HashMap<NodeId, Vec<HintedWrite>>>,
+    /// Buffered time-series batches for unreachable replicas, replayed via
+    /// the gap-filling `TsMerge` on recovery (per peer: `(table, rows)`).
+    ts_hints: Mutex<HashMap<NodeId, Vec<TsHint>>>,
     /// Highest HLC each peer has confirmed it applied (a successful replicated
     /// write or hint replay). Compared against [`Node::write_watermark`] to
     /// estimate how far behind a peer is — see [`Node::note_acked`] and the
@@ -270,6 +273,8 @@ type HintedWrite = (String, Vec<u8>, WriteOp, Hlc);
 /// row shape carried by [`Request::ApplyBatch`]; `is_put == false` marks a
 /// tombstone (delete, empty value).
 type BatchRow = (Vec<u8>, Vec<u8>, Hlc, bool);
+/// One buffered time-series hint: the table and its undelivered samples.
+type TsHint = (String, Vec<(skaidb_tsdb::Labels, i64, f64)>);
 
 /// Rows per anti-entropy scan page (both the local and the remote side), and
 /// per flushed repair batch: bounds repair memory and each repair RPC/fsync,
@@ -421,6 +426,7 @@ impl Node {
             auth: auth.clone(),
             pool: internode::Pool::new(auth),
             hints: Mutex::new(HashMap::new()),
+            ts_hints: Mutex::new(HashMap::new()),
             acked: Mutex::new(HashMap::new()),
             write_watermark: AtomicU64::new(0),
             membership_lock: Mutex::new(()),
@@ -1915,9 +1921,30 @@ impl Node {
         }
     }
 
+    /// Buffer a time-series batch that couldn't reach `replica`. Bounded by
+    /// total buffered samples per peer; overflow is dropped (anti-entropy
+    /// repair remains the durable backstop).
+    fn store_ts_hint(
+        &self,
+        replica: &NodeId,
+        table: &str,
+        rows: Vec<(skaidb_tsdb::Labels, i64, f64)>,
+    ) {
+        const MAX_TS_HINT_SAMPLES_PER_REPLICA: usize = 100_000;
+        let n = rows.len();
+        let mut hints = self.ts_hints.lock().expect("ts hints lock");
+        let bucket = hints.entry(replica.clone()).or_default();
+        let buffered: usize = bucket.iter().map(|(_, r)| r.len()).sum();
+        if buffered + n <= MAX_TS_HINT_SAMPLES_PER_REPLICA {
+            bucket.push((table.to_string(), rows));
+            self.counters.hints_stored.fetch_add(n as u64, Ordering::Relaxed);
+        }
+    }
+
     /// Whether any hints are buffered (cheap check before spawning a flush).
     fn hints_pending(&self) -> bool {
         !self.hints.lock().expect("hints lock").is_empty()
+            || !self.ts_hints.lock().expect("ts hints lock").is_empty()
     }
 
     /// Replay buffered hints to replicas that are reachable again — *hinted
@@ -1963,6 +1990,38 @@ impl Node {
                 self.hints
                     .lock()
                     .expect("hints lock")
+                    .entry(replica)
+                    .or_default()
+                    .extend(remaining);
+            }
+        }
+        // Time-series hints replay via TsMerge, which accepts samples of any
+        // age (the receiver may have moved past them while it was down).
+        let ts_pending: Vec<(NodeId, Vec<TsHint>)> = {
+            let mut hints = self.ts_hints.lock().expect("ts hints lock");
+            hints.drain().collect()
+        };
+        for (replica, batches) in ts_pending {
+            let Some(addr) = self.peer_addr(&replica) else {
+                continue;
+            };
+            let mut remaining = Vec::new();
+            for (table, rows) in batches {
+                match self.pool.call(
+                    &addr,
+                    &Request::TsMerge {
+                        table: table.clone(),
+                        rows: rows.clone(),
+                    },
+                ) {
+                    Ok(Response::Ack) => delivered += rows.len(),
+                    _ => remaining.push((table, rows)),
+                }
+            }
+            if !remaining.is_empty() {
+                self.ts_hints
+                    .lock()
+                    .expect("ts hints lock")
                     .entry(replica)
                     .or_default()
                     .extend(remaining);
@@ -3881,6 +3940,9 @@ impl Cluster for Coordinator {
                                 .counters
                                 .peer_errors
                                 .fetch_add(1, Ordering::Relaxed);
+                            // Hinted handoff: replay to this replica when it
+                            // is reachable again (repair is the backstop).
+                            self.node.store_ts_hint(replica, table, batch.clone());
                         }
                     }
                 }
@@ -5089,6 +5151,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn ts_hinted_handoff_replays_to_a_recovered_replica() {
+        // rf=3, QUORUM: with c down the append succeeds 2/3 and c's batch
+        // buffers as a hint; when c recovers, flush_hints replays it via
+        // the gap-filling TsMerge.
+        let q = Consistency::Quorum;
+        let cfg3 = |id: &str, addr: &str, members: &[(NodeId, String)]| NodeConfig {
+            id: NodeId::new(id),
+            internode_addr: addr.to_string(),
+            members: members.to_vec(),
+            replication_factor: 3,
+            vnodes_per_node: 64,
+            read_consistency: q,
+            write_consistency: q,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
+            anti_entropy_interval_secs: 0,
+        };
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let m = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let na = Node::new(Database::open(temp_dir("tsha")).unwrap(), cfg3("a", &a, &m));
+        let nb = Node::new(Database::open(temp_dir("tshb")).unwrap(), cfg3("b", &b, &m));
+        let nc = Node::new(Database::open(temp_dir("tshc")).unwrap(), cfg3("c", &c, &m));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        // c is intentionally NOT served yet.
+
+        let _ = na.execute("CREATE TIMESERIES TABLE m (SERIES KEY (h))");
+        na.execute("INSERT INTO m (h, ts, value) VALUES ('x', 1000, 1), ('x', 2000, 2)")
+            .unwrap();
+
+        // c recovers; DDL converges via schema sync, samples via the hint.
+        nc.serve_internode().unwrap();
+        na.repair_cluster().ok(); // schema for the TS table reaches c
+        let replayed = na.flush_hints();
+        assert!(replayed >= 2, "expected the buffered batch to replay, got {replayed}");
+
+        let r = internode::call(
+            &c,
+            &Request::TsQuery {
+                table: "m".into(),
+                matchers: vec![],
+                t0: i64::MIN,
+                t1: i64::MAX,
+            },
+        )
+        .unwrap();
+        let Response::TsSeries { series } = r else { panic!("expected TsSeries") };
+        assert_eq!(series[0].1.len(), 2, "hinted samples landed on c locally");
     }
 
     #[test]

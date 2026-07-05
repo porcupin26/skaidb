@@ -19,9 +19,6 @@ including the Prometheus endpoints. Remaining:
 
 ## 2. Time-series follow-ups
 
-- **TS hinted handoff** — buffer failed replica `TsAppend` batches per peer
-  (bounded, like row hints) and replay via `TsMerge` on reachability;
-  repair already converges but hints recover brief outages in seconds.
 - **Partial-aggregate pushdown** — cluster TS queries ship raw matching
   samples to the coordinator; push per-series per-bucket partials
   (count/sum/min/max/first/last/increase) to the nodes and pick one
