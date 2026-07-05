@@ -279,6 +279,15 @@ const REPAIR_PAGE_ROWS: usize = 2_000;
 #[cfg(test)]
 const REPAIR_PAGE_ROWS: usize = 8;
 
+/// Rows per `ScanPage` pulled from each member during a distributed
+/// full-table gather (`cluster_scan`): bounds the coordinator's transient
+/// buffering to a few in-flight pages regardless of table size, instead of
+/// every peer's whole shard at once.
+#[cfg(not(test))]
+const SCAN_PAGE_ROWS: usize = 2_000;
+#[cfg(test)]
+const SCAN_PAGE_ROWS: usize = 8;
+
 /// Why reconciling one table with one peer stopped.
 enum RepairPeerError {
     /// Peer predates the paged scan RPC (rolling upgrade).
@@ -2821,42 +2830,59 @@ impl Node {
         let mut merged: BTreeMap<Vec<u8>, (Hlc, Option<Vec<u8>>)> = BTreeMap::new();
         let mut responders = 0usize;
 
-        // Local shard (with tombstones).
+        // Local shard (with tombstones), paged: the read lock is held one
+        // page at a time and no whole-shard `Vec` is built beside the merge
+        // map. Writes landing between pages resolve by last-writer-wins,
+        // like writes landing between two peers' scans always have.
         {
-            let db = self
-                .local
-                .read()
-                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
-            for (key, value, hlc, is_put) in db.local_scan_versioned_with_tombstones(table)? {
-                merge_row(&mut merged, key, is_put.then_some(value), hlc);
+            let mut after: Option<Vec<u8>> = None;
+            loop {
+                let rows = self
+                    .local
+                    .read()
+                    .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+                    .local_scan_versioned_page(table, after.as_deref(), SCAN_PAGE_ROWS)?;
+                let full = rows.len() == SCAN_PAGE_ROWS;
+                after = rows.last().map(|(k, ..)| k.clone());
+                for (key, value, hlc, is_put) in rows {
+                    merge_row(&mut merged, key, is_put.then_some(value), hlc);
+                }
+                if !full {
+                    break;
+                }
             }
             responders += 1;
         }
 
-        // Peers, gathered concurrently (scatter/gather) and merged in
-        // deterministic peer order.
+        // Peers: one worker per peer pages its shard concurrently, feeding
+        // pages into the merge as they arrive. Peak memory is the merge map
+        // plus a few in-flight pages — never every peer's whole shard at
+        // once (an unpaged gather held full shards and OOM-killed 512 MB
+        // nodes at 1M rows). A peer failing mid-scan may leave some of its
+        // rows merged; that is harmless (they are real replica data and LWW
+        // applies) and it is not counted as a responder.
         let addrs = self.peer_addrs();
-        let shards = scatter(&addrs, |addr| {
-            self.counters.peer_requests.fetch_add(1, Ordering::Relaxed);
-            match self.pool.call(
-                addr,
-                &Request::LocalScan {
-                    table: table.to_string(),
-                },
-            ) {
-                Ok(Response::Scan { rows }) => Some(rows),
-                _ => {
-                    self.counters.peer_errors.fetch_add(1, Ordering::Relaxed);
-                    None
+        let peer_ok: Vec<bool> = thread::scope(|s| {
+            let (tx, rx) = mpsc::sync_channel::<Vec<BatchRow>>(addrs.len().max(1));
+            let handles: Vec<_> = addrs
+                .iter()
+                .map(|addr| {
+                    let tx = tx.clone();
+                    s.spawn(move || self.scan_peer_paged(addr, table, &tx))
+                })
+                .collect();
+            drop(tx);
+            for rows in rx {
+                for (key, value, hlc, is_put) in rows {
+                    merge_row(&mut merged, key, is_put.then_some(value), hlc);
                 }
             }
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("scan worker panicked"))
+                .collect()
         });
-        for rows in shards.into_iter().flatten() {
-            for (key, value, hlc, is_put) in rows {
-                merge_row(&mut merged, key, is_put.then_some(value), hlc);
-            }
-            responders += 1;
-        }
+        responders += peer_ok.into_iter().filter(|ok| *ok).count();
 
         let needed = oc
             .unwrap_or(self.cfg.read_consistency)
@@ -2888,6 +2914,59 @@ impl Node {
             }
         }
         Ok(out)
+    }
+
+    /// Stream one peer's shard of `table` into `tx`, one `ScanPage` at a
+    /// time. Returns whether the peer supplied its complete shard (only then
+    /// does it count toward the read quorum). Peers that predate `ScanPage`
+    /// fall back to a single whole-table pull.
+    fn scan_peer_paged(&self, addr: &str, table: &str, tx: &mpsc::SyncSender<Vec<BatchRow>>) -> bool {
+        let mut after: Option<Vec<u8>> = None;
+        let mut first = true;
+        loop {
+            self.counters.peer_requests.fetch_add(1, Ordering::Relaxed);
+            match self.pool.call(
+                addr,
+                &Request::ScanPage {
+                    table: table.to_string(),
+                    after: after.clone(),
+                    limit: SCAN_PAGE_ROWS as u32,
+                },
+            ) {
+                Ok(Response::Scan { rows }) => {
+                    first = false;
+                    let full = rows.len() == SCAN_PAGE_ROWS;
+                    after = rows.last().map(|(k, ..)| k.clone());
+                    if tx.send(rows).is_err() {
+                        return false; // merge side gone; scan abandoned
+                    }
+                    if !full {
+                        return true;
+                    }
+                }
+                // Rolling upgrade: the peer predates ScanPage. Fall back to
+                // the old whole-shard pull for it.
+                Ok(Response::Err(e)) if first && e.contains("unknown request op") => {
+                    self.counters.peer_requests.fetch_add(1, Ordering::Relaxed);
+                    return match self.pool.call(
+                        addr,
+                        &Request::LocalScan {
+                            table: table.to_string(),
+                        },
+                    ) {
+                        Ok(Response::Scan { rows }) => tx.send(rows).is_ok(),
+                        _ => {
+                            self.counters.peer_errors.fetch_add(1, Ordering::Relaxed);
+                            false
+                        }
+                    };
+                }
+                _ => {
+                    self.counters.peer_errors.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+            }
+        }
     }
 
     /// Distributed secondary-index lookup: gather candidate row keys from every
@@ -4392,6 +4471,74 @@ mod tests {
         assert!(repaired >= 40, "expected ≥40 rows repaired, got {repaired}");
 
         // Both nodes now agree: 40 rows, ids 0..9 at the newer b version.
+        for node in [&na, &nb] {
+            let rs = rows(node.execute("SELECT id, v FROM t ORDER BY id").unwrap());
+            assert_eq!(rs.rows.len(), 40);
+            for id in 0..40i64 {
+                let expect = if id < 10 { 1000 + id } else { id };
+                assert_eq!(
+                    rs.rows[id as usize],
+                    vec![Value::Int(id), Value::Int(expect)],
+                    "row {id} mismatch"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn paged_cluster_scan_merges_divergent_multi_page_shards() {
+        use skaidb_types::Document;
+        // A full-table SELECT gathers every member's shard in ScanPage-sized
+        // pages (8 under test) and merges by last-writer-wins. Shards are
+        // left deliberately divergent — no repair — so the merge itself must
+        // reconcile them across many pages: a holds 40 rows b lacks, b holds
+        // 10 newer versions a lacks.
+        let q = Consistency::Quorum;
+        let cfg2 = |id: &str, addr: &str, members: &[(NodeId, String)]| NodeConfig {
+            id: NodeId::new(id),
+            internode_addr: addr.to_string(),
+            members: members.to_vec(),
+            replication_factor: 2,
+            vnodes_per_node: 64,
+            read_consistency: q,
+            write_consistency: q,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
+            anti_entropy_interval_secs: 0,
+        };
+        let (a, b) = (free_addr(), free_addr());
+        let m = vec![member("a", &a), member("b", &b)];
+        let na = Node::new(Database::open(temp_dir("psa")).unwrap(), cfg2("a", &a, &m));
+        let nb = Node::new(Database::open(temp_dir("psb")).unwrap(), cfg2("b", &b, &m));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+
+        let inject = |addr: &str, id: i64, v: i64, hlc: Hlc| {
+            let mut doc = Document::new();
+            doc.insert("id", Value::Int(id));
+            doc.insert("v", Value::Int(v));
+            let r = internode::call(
+                addr,
+                &Request::ApplyPut {
+                    table: "t".into(),
+                    key: Value::Array(vec![Value::Int(id)]).encode_key(),
+                    value: Value::Document(doc).encode(),
+                    hlc,
+                },
+            )
+            .unwrap();
+            assert!(matches!(r, Response::Ack));
+        };
+        for id in 0..40 {
+            inject(&a, id, id, Hlc::new(100 + id as u64, 0));
+        }
+        for id in 0..10 {
+            inject(&b, id, 1000 + id, Hlc::new(500 + id as u64, 0));
+        }
+
+        // Scanned from either coordinator, the merged view is identical:
+        // all 40 rows, ids 0..9 at b's newer version.
         for node in [&na, &nb] {
             let rs = rows(node.execute("SELECT id, v FROM t ORDER BY id").unwrap());
             assert_eq!(rs.rows.len(), 40);

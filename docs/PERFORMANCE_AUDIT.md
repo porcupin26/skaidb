@@ -24,6 +24,35 @@ Everything below was implemented in the same pass, except three deliberate skips
 
 Verified: 261 workspace tests green, clippy clean (`--all-targets`), plus an end-to-end smoke run (DDL, multi-row insert, indexed range + top-k, hash join, txn overlay count, REST).
 
+## Implementation status update (2026-07-05, v0.19.0)
+
+A code-level re-verification found the summary above glossed over a few
+individual Tier-3 bullets. Resolved since:
+
+- **Result streaming** (Tier 3 network) — done: `QueryStream` opcode with
+  header/chunk/end response frames (~256 KB chunks), `Client::query_stream`
+  in the Rust driver, opt-in per query so old clients/servers interoperate.
+  Also lifts the previous hard failure where a result set past the 64 MiB
+  frame limit dropped the connection (now a proper error on the buffered
+  path, and no limit at all streamed). *Request pipelining* (id-tagged
+  concurrent requests on one connection) remains unimplemented.
+- **Peer scan buffering** (Tier 3 network) — done: `cluster_scan` pages every
+  member (local included) through `ScanPage` (2,000 rows/page), merging pages
+  as they arrive; coordinator transient memory is O(pages in flight), not
+  O(sum of shards). Old peers fall back to the whole-shard pull.
+- **Compiled predicates / borrowed `eval`** (Tier 3 SQL) — **attempted and
+  reverted**: a `Cow`-based borrowed eval measured 3–6% *slower* on AND-chain
+  predicates over 200k-row scans (alternating A/B, three rounds), because
+  per-row document decode dominates scan cost and the wrapper overhead
+  exceeded the small-clone savings. See BENCHMARKS.md §v0.19.0. Stays
+  deferred until row decode itself is borrowed.
+
+Still deliberately outstanding: per-statement replica/peer-address snapshot
+(`replicas_for` allocates per row in batch replication — marginal vs the
+fsync+RTT it sits next to), memtable-flush move-instead-of-clone (background
+path, transient spike only), atomic HLC (mutex is under the write lock
+already; repacking risks the on-disk stamp format).
+
 The codebase has good bones — bloom filters, block-index seeking, WAL group-commit machinery, TCP_NODELAY everywhere, pooled mTLS internode connections, a compact binary wire protocol, and locks that are snapshotted before network I/O. The findings below are the places where design choices or hot-path allocations cap throughput and latency below what the hardware can do.
 
 ---

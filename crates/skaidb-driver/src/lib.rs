@@ -258,6 +258,70 @@ impl Client {
         }
     }
 
+    /// Run a query whose result arrives as a stream of row chunks, at the
+    /// default consistency. See [`Client::query_stream_with`].
+    pub fn query_stream(&mut self, sql: &str) -> Result<RowStream<'_>, DriverError> {
+        self.query_stream_with(sql, self.default_consistency)
+    }
+
+    /// Run a query whose result arrives as a stream of row chunks, so the
+    /// client never holds more than one chunk in memory — use this for result
+    /// sets too large to buffer. Non-row statements yield an empty stream
+    /// (check [`RowStream::affected`]).
+    ///
+    /// The returned [`RowStream`] borrows the connection exclusively until it
+    /// is drained or dropped (dropping it reads and discards the rest of the
+    /// stream). Failover applies only to sending the request; an endpoint
+    /// dying mid-stream surfaces as an error from the iterator, and the caller
+    /// decides whether to re-run the query. Servers older than the
+    /// `QueryStream` opcode reject it with a server error; use
+    /// [`Client::execute`] against those.
+    pub fn query_stream_with(
+        &mut self,
+        sql: &str,
+        consistency: Consistency,
+    ) -> Result<RowStream<'_>, DriverError> {
+        let req = ClientRequest::QueryStream {
+            sql: sql.to_string(),
+            consistency,
+        };
+        if write_frame(&mut self.stream, &req.encode()).is_err() {
+            // The node died since the last use — fail over before the stream
+            // starts, like execute() does.
+            self.reconnect()?;
+            write_frame(&mut self.stream, &req.encode())?;
+        }
+        let payload = read_frame(&mut self.stream)?;
+        match Response::decode(&payload)? {
+            Response::Error(msg) => Err(DriverError::Server(msg)),
+            Response::RowsHeader { columns } => Ok(RowStream {
+                client: self,
+                columns,
+                affected: 0,
+                chunk: Vec::new().into_iter(),
+                done: false,
+            }),
+            // Non-row statement: a single ordinary response ends the exchange.
+            Response::Mutation { affected } => Ok(RowStream {
+                client: self,
+                columns: Vec::new(),
+                affected,
+                chunk: Vec::new().into_iter(),
+                done: true,
+            }),
+            Response::Ddl => Ok(RowStream {
+                client: self,
+                columns: Vec::new(),
+                affected: 0,
+                chunk: Vec::new().into_iter(),
+                done: true,
+            }),
+            other => Err(DriverError::Server(format!(
+                "unexpected response to QueryStream: {other:?}"
+            ))),
+        }
+    }
+
     /// Re-establish the connection after a failure, preferring a *different*
     /// node than the one that just died, then falling back to any reachable one.
     fn reconnect(&mut self) -> Result<(), DriverError> {
@@ -277,6 +341,77 @@ impl Client {
             }
         }
         Err(DriverError::NoEndpoint(last))
+    }
+}
+
+/// A streamed result set from [`Client::query_stream`]: iterate to receive
+/// rows chunk by chunk. Holds at most one chunk in memory. Borrows the
+/// [`Client`] exclusively; dropping the stream early drains the remaining
+/// frames so the connection stays usable.
+#[derive(Debug)]
+pub struct RowStream<'a> {
+    client: &'a mut Client,
+    /// Column names of the result set (empty for non-row statements).
+    pub columns: Vec<String>,
+    /// Rows affected, when the statement turned out to be a mutation.
+    pub affected: u64,
+    chunk: std::vec::IntoIter<Vec<Value>>,
+    done: bool,
+}
+
+impl RowStream<'_> {
+    /// Fetch the next frame after the current chunk ran dry.
+    fn next_frame(&mut self) -> Result<(), DriverError> {
+        let payload = read_frame(&mut self.client.stream)?;
+        match Response::decode(&payload)? {
+            Response::RowsChunk { rows } => self.chunk = rows.into_iter(),
+            Response::RowsEnd => self.done = true,
+            Response::Error(msg) => {
+                self.done = true;
+                return Err(DriverError::Server(msg));
+            }
+            other => {
+                self.done = true;
+                return Err(DriverError::Server(format!(
+                    "unexpected frame in row stream: {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Iterator for RowStream<'_> {
+    type Item = Result<Vec<Value>, DriverError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(row) = self.chunk.next() {
+                return Some(Ok(row));
+            }
+            if self.done {
+                return None;
+            }
+            if let Err(e) = self.next_frame() {
+                // An I/O error also marks the stream finished: the connection
+                // is broken and the next client call will fail over.
+                self.done = true;
+                return Some(Err(e));
+            }
+        }
+    }
+}
+
+impl Drop for RowStream<'_> {
+    fn drop(&mut self) {
+        // Read out any frames the server is still sending, so the connection
+        // is positioned at a request boundary for the next call. On error the
+        // socket is broken anyway and the client will reconnect on next use.
+        while !self.done {
+            if self.next_frame().is_err() {
+                break;
+            }
+        }
     }
 }
 

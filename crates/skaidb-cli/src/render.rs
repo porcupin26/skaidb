@@ -14,8 +14,12 @@ pub fn print_response(resp: &Response) {
         Response::Ddl => println!("OK"),
         // The driver maps errors to `Err`, so this arm is not normally hit.
         Response::Error(msg) => eprintln!("error: {msg}"),
-        // The shell never issues Prepare; printed for completeness.
+        // The shell never issues Prepare or QueryStream; printed for
+        // completeness.
         Response::Prepared { id, params } => println!("PREPARED {id} ({params} params)"),
+        Response::RowsHeader { columns } => print_rows(columns, &[]),
+        Response::RowsChunk { rows } => print_rows(&[], rows),
+        Response::RowsEnd => {}
     }
 }
 

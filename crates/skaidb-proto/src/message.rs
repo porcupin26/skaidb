@@ -61,6 +61,13 @@ pub enum ClientRequest {
     /// Discard a prepared statement, freeing its slot. Acked with
     /// [`Response::Ddl`] (no payload).
     Close { id: u32 },
+    /// Like `Query`, but a row-returning result comes back as a stream of
+    /// frames — [`Response::RowsHeader`], then any number of
+    /// [`Response::RowsChunk`], then [`Response::RowsEnd`] — so neither side
+    /// ever holds the whole encoded result set. Non-row results are answered
+    /// with a single ordinary frame. Old servers reject the opcode with
+    /// [`Response::Error`], which callers surface as "server too old".
+    QueryStream { sql: String, consistency: Consistency },
 }
 
 /// A server response.
@@ -80,6 +87,12 @@ pub enum Response {
     /// Reply to [`ClientRequest::Prepare`]: the statement handle and how many
     /// `?` parameters it expects.
     Prepared { id: u32, params: u16 },
+    /// First frame of a streamed result set: the column names.
+    RowsHeader { columns: Vec<String> },
+    /// One batch of rows of a streamed result set.
+    RowsChunk { rows: Vec<Vec<Value>> },
+    /// Terminator of a streamed result set.
+    RowsEnd,
 }
 
 /// Errors decoding a protocol message.
@@ -93,11 +106,15 @@ const OP_QUERY: u8 = 1;
 const OP_PREPARE: u8 = 2;
 const OP_EXECUTE: u8 = 3;
 const OP_CLOSE: u8 = 4;
+const OP_QUERY_STREAM: u8 = 5;
 const RESP_ROWS: u8 = 0;
 const RESP_MUTATION: u8 = 1;
 const RESP_DDL: u8 = 2;
 const RESP_ERROR: u8 = 3;
 const RESP_PREPARED: u8 = 4;
+const RESP_ROWS_HEADER: u8 = 5;
+const RESP_ROWS_CHUNK: u8 = 6;
+const RESP_ROWS_END: u8 = 7;
 
 impl Request {
     /// Encode: `u8 OP_QUERY | u8 consistency | u32 sql_len | sql`.
@@ -170,6 +187,11 @@ impl ClientRequest {
                 out.push(OP_CLOSE);
                 out.extend_from_slice(&id.to_le_bytes());
             }
+            ClientRequest::QueryStream { sql, consistency } => {
+                out.push(OP_QUERY_STREAM);
+                out.push(consistency.to_u8());
+                write_bytes(out, sql.as_bytes());
+            }
         }
     }
 
@@ -205,6 +227,14 @@ impl ClientRequest {
                 }
             }
             OP_CLOSE => ClientRequest::Close { id: c.u32()? },
+            OP_QUERY_STREAM => {
+                let consistency = Consistency::from_u8(c.u8()?)
+                    .ok_or(ProtoError::Malformed("bad consistency"))?;
+                ClientRequest::QueryStream {
+                    sql: c.string()?,
+                    consistency,
+                }
+            }
             _ => return Err(ProtoError::Malformed("unknown opcode")),
         })
     }
@@ -223,22 +253,10 @@ impl Response {
         match self {
             Response::Rows { columns, rows } => {
                 out.push(RESP_ROWS);
-                out.extend_from_slice(&(columns.len() as u32).to_le_bytes());
-                for col in columns {
-                    write_bytes(out, col.as_bytes());
-                }
+                encode_columns(out, columns);
                 out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
                 for row in rows {
-                    out.extend_from_slice(&(row.len() as u32).to_le_bytes());
-                    for v in row {
-                        // Encode in place behind a backfilled length prefix —
-                        // no per-cell temporary buffer.
-                        let len_pos = out.len();
-                        out.extend_from_slice(&[0u8; 4]);
-                        v.encode_value_into(out);
-                        let len = (out.len() - len_pos - 4) as u32;
-                        out[len_pos..len_pos + 4].copy_from_slice(&len.to_le_bytes());
-                    }
+                    encode_row_into(out, row);
                 }
             }
             Response::Mutation { affected } => {
@@ -255,6 +273,18 @@ impl Response {
                 out.extend_from_slice(&id.to_le_bytes());
                 out.extend_from_slice(&params.to_le_bytes());
             }
+            Response::RowsHeader { columns } => {
+                out.push(RESP_ROWS_HEADER);
+                encode_columns(out, columns);
+            }
+            Response::RowsChunk { rows } => {
+                out.push(RESP_ROWS_CHUNK);
+                out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+                for row in rows {
+                    encode_row_into(out, row);
+                }
+            }
+            Response::RowsEnd => out.push(RESP_ROWS_END),
         }
     }
 
@@ -263,24 +293,8 @@ impl Response {
         let tag = c.u8()?;
         Ok(match tag {
             RESP_ROWS => {
-                let ncols = c.u32()? as usize;
-                let mut columns = Vec::with_capacity(ncols);
-                for _ in 0..ncols {
-                    columns.push(c.string()?);
-                }
-                let nrows = c.u32()? as usize;
-                let mut rows = Vec::with_capacity(nrows);
-                for _ in 0..nrows {
-                    let cells = c.u32()? as usize;
-                    let mut row = Vec::with_capacity(cells);
-                    for _ in 0..cells {
-                        let bytes = c.bytes()?;
-                        let v = Value::decode(bytes)
-                            .map_err(|_| ProtoError::Malformed("bad value encoding"))?;
-                        row.push(v);
-                    }
-                    rows.push(row);
-                }
+                let columns = decode_columns(&mut c)?;
+                let rows = decode_rows(&mut c)?;
                 Response::Rows { columns, rows }
             }
             RESP_MUTATION => Response::Mutation { affected: c.u64()? },
@@ -290,8 +304,93 @@ impl Response {
                 id: c.u32()?,
                 params: u16::from_le_bytes(c.take(2)?.try_into().unwrap()),
             },
+            RESP_ROWS_HEADER => Response::RowsHeader {
+                columns: decode_columns(&mut c)?,
+            },
+            RESP_ROWS_CHUNK => Response::RowsChunk {
+                rows: decode_rows(&mut c)?,
+            },
+            RESP_ROWS_END => Response::RowsEnd,
             _ => return Err(ProtoError::Malformed("unknown response tag")),
         })
+    }
+}
+
+fn encode_columns(out: &mut Vec<u8>, columns: &[String]) {
+    out.extend_from_slice(&(columns.len() as u32).to_le_bytes());
+    for col in columns {
+        write_bytes(out, col.as_bytes());
+    }
+}
+
+/// Encode one row: `u32 ncells | ncells × (u32 len | value bytes)`. Each value
+/// is encoded in place behind a backfilled length prefix — no per-cell
+/// temporary buffer.
+fn encode_row_into(out: &mut Vec<u8>, row: &[Value]) {
+    out.extend_from_slice(&(row.len() as u32).to_le_bytes());
+    for v in row {
+        let len_pos = out.len();
+        out.extend_from_slice(&[0u8; 4]);
+        v.encode_value_into(out);
+        let len = (out.len() - len_pos - 4) as u32;
+        out[len_pos..len_pos + 4].copy_from_slice(&len.to_le_bytes());
+    }
+}
+
+fn decode_columns(c: &mut Cursor) -> Result<Vec<String>, ProtoError> {
+    let ncols = c.u32()? as usize;
+    let mut columns = Vec::with_capacity(ncols);
+    for _ in 0..ncols {
+        columns.push(c.string()?);
+    }
+    Ok(columns)
+}
+
+fn decode_rows(c: &mut Cursor) -> Result<Vec<Vec<Value>>, ProtoError> {
+    let nrows = c.u32()? as usize;
+    let mut rows = Vec::with_capacity(nrows);
+    for _ in 0..nrows {
+        let cells = c.u32()? as usize;
+        let mut row = Vec::with_capacity(cells);
+        for _ in 0..cells {
+            let bytes = c.bytes()?;
+            let v =
+                Value::decode(bytes).map_err(|_| ProtoError::Malformed("bad value encoding"))?;
+            row.push(v);
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+/// Incremental encoder for a [`Response::RowsChunk`] payload: lets a sender
+/// append rows one at a time (watching the buffer size to pick its own chunk
+/// boundary) without first splitting them into per-chunk `Vec`s. The encoding
+/// is byte-identical to `Response::RowsChunk { rows }.encode_into(out)`.
+#[derive(Debug)]
+pub struct RowsChunkEncoder {
+    count_pos: usize,
+    count: u32,
+}
+
+impl RowsChunkEncoder {
+    /// Start a chunk, appending to `out` (which may already hold frame-header
+    /// bytes). Must be paired with [`RowsChunkEncoder::finish`].
+    pub fn begin(out: &mut Vec<u8>) -> RowsChunkEncoder {
+        out.push(RESP_ROWS_CHUNK);
+        let count_pos = out.len();
+        out.extend_from_slice(&[0u8; 4]);
+        RowsChunkEncoder { count_pos, count: 0 }
+    }
+
+    pub fn push_row(&mut self, out: &mut Vec<u8>, row: &[Value]) {
+        encode_row_into(out, row);
+        self.count += 1;
+    }
+
+    /// Backfill the row count, completing the payload.
+    pub fn finish(self, out: &mut [u8]) {
+        out[self.count_pos..self.count_pos + 4].copy_from_slice(&self.count.to_le_bytes());
     }
 }
 
@@ -429,6 +528,49 @@ mod tests {
         ] {
             assert_eq!(Response::decode(&resp.encode()).unwrap(), resp);
         }
+    }
+
+    #[test]
+    fn query_stream_request_roundtrips() {
+        let req = ClientRequest::QueryStream {
+            sql: "SELECT * FROM big".into(),
+            consistency: Consistency::One,
+        };
+        assert_eq!(ClientRequest::decode(&req.encode()).unwrap(), req);
+    }
+
+    #[test]
+    fn streamed_response_frames_roundtrip() {
+        for resp in [
+            Response::RowsHeader {
+                columns: vec!["id".into(), "v".into()],
+            },
+            Response::RowsChunk {
+                rows: vec![
+                    vec![Value::Int(1), Value::String("a".into())],
+                    vec![Value::Int(2), Value::Null],
+                ],
+            },
+            Response::RowsChunk { rows: vec![] },
+            Response::RowsEnd,
+        ] {
+            assert_eq!(Response::decode(&resp.encode()).unwrap(), resp);
+        }
+    }
+
+    #[test]
+    fn chunk_encoder_matches_rows_chunk_encoding() {
+        let rows = vec![
+            vec![Value::Int(1), Value::String("a".into())],
+            vec![Value::Float(2.5), Value::Bool(true)],
+        ];
+        let mut incremental = Vec::new();
+        let mut enc = RowsChunkEncoder::begin(&mut incremental);
+        for row in &rows {
+            enc.push_row(&mut incremental, row);
+        }
+        enc.finish(&mut incremental);
+        assert_eq!(incremental, Response::RowsChunk { rows }.encode());
     }
 
     #[test]

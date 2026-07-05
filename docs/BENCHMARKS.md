@@ -398,6 +398,65 @@ this cluster benchmark is bound by something else entirely. Worth knowing
 before reaching for it to fix a throughput number — check whether the
 bottleneck is actually memory-bound first.
 
+## v0.19.0 — streamed query results; a predicate-eval dead end
+
+This release closes the two remaining performance-audit items with real-world
+impact: chunked result streaming on the client protocol, and paged peer
+gathers for distributed full-table scans. It also records a **measured dead
+end** on a third candidate (borrowed predicate evaluation), so nobody
+re-attempts it without new evidence.
+
+**Streamed results (`QueryStream` opcode / `Client::query_stream`).** A
+buffered `SELECT` encodes the entire result set into one response frame, so
+the coordinator briefly holds the rows *plus* a full encoded copy, the client
+holds the whole decoded set, and — the sharpest edge — any result whose
+encoding passes the 64 MiB frame limit simply **could not be returned at
+all** (the server dropped the connection mid-write; the client saw an
+unhelpful EOF). Streaming sends a header frame, ~256 KB row chunks (rows are
+freed as they're encoded), and an end frame. Single node, loopback, release
+build, `SELECT id, pad FROM t` over ~220 B rows, steady state:
+
+| 250k rows (~55 MB encoded) | buffered `execute()` | streamed `query_stream()` |
+|-----------------------------|---------------------:|--------------------------:|
+| total time | 274–282 ms | **213–216 ms** |
+| first usable row | = total | 188–191 ms |
+| client peak RSS | ~140 MB | **< 9 MB** |
+
+| 300k rows (~66 MB encoded, past the frame limit) | result |
+|---------------------------------------------------|--------|
+| buffered `execute()` | error (was: connection dropped) |
+| streamed `query_stream()` | 300k rows in ~270 ms, client at 3.5 MB |
+
+Streaming is opt-in per query, so every existing driver keeps working
+unchanged; old servers answer the new opcode with a normal error. The
+buffered path now also returns a proper `Error` ("use a streaming query or
+add LIMIT") instead of killing the connection when a result exceeds the
+frame limit. Time-to-first-row still includes full result materialization on
+the server — the engine executes the query completely before the first frame;
+streaming removes the *transfer/decode* serialization and the memory cliffs,
+not the execution time.
+
+**Paged distributed scans.** `cluster_scan` (full-table SELECTs at cluster
+level) used to pull each peer's **entire shard in one internode response**
+and hold all shards simultaneously before merging — the same O(table)
+pattern whose repair-path sibling OOM-killed 512 MB nodes in v0.18.0. It now
+pages every member (local shard included) through the existing `ScanPage` op
+at 2,000 rows/page, merging pages as they arrive, with the same
+rolling-upgrade fallback for old peers. Coordinator transient memory for the
+gather is now O(pages in flight), not O(sum of shards).
+
+**The dead end, for the record.** The audit's remaining Tier-3 SQL item —
+borrowed/pre-split predicate evaluation — was implemented (a `Cow`-based
+`eval` that stopped cloning column values per row) and benchmarked with
+alternating A/B runs over 200k-row unindexed scans… and came out **3–6%
+slower** on AND-chain predicates, consistently across three rounds. Root
+cause of the surprise: per-row document *decode* dominates scan cost, so even
+removing a 60-byte string clone per row was unmeasurable, while the `Cow`
+wrapper added real per-node overhead. The rewrite was reverted (only a minor
+`get_path` simplification, measured neutral, was kept). The item stays
+deferred until row decode itself is borrowed — anything short of that is
+optimizing a rounding error.
+
 ## Reproducing
 
 skaidb's load generator is in-tree:

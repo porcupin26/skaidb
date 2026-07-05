@@ -405,6 +405,64 @@ mod tests {
     }
 
     #[test]
+    fn streamed_query_end_to_end() {
+        let ctx = temp_ctx();
+        let (addr, _h) = binary::spawn("127.0.0.1:0", ctx).unwrap();
+        let mut client = Client::connect(addr).unwrap();
+        client.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+
+        // ~60 rows × ~100 B ≫ the test-profile chunk budget (512 B), so the
+        // result crosses many chunk frames.
+        let mut ins = client
+            .prepare("INSERT INTO t (id, pad) VALUES (?, ?)")
+            .unwrap();
+        for i in 0..60i64 {
+            client
+                .execute_prepared(&mut ins, &[Value::Int(i), Value::String("x".repeat(100))])
+                .unwrap();
+        }
+
+        // Full drain: all rows arrive, in order, with the right columns.
+        {
+            let stream = client
+                .query_stream("SELECT id, pad FROM t ORDER BY id")
+                .unwrap();
+            assert_eq!(stream.columns, vec!["id", "pad"]);
+            let rows: Vec<Vec<Value>> = stream.map(|r| r.unwrap()).collect();
+            assert_eq!(rows.len(), 60);
+            for (i, row) in rows.iter().enumerate() {
+                assert_eq!(row[0], Value::Int(i as i64));
+            }
+        }
+
+        // Early drop mid-stream: the remaining frames are drained so the
+        // connection stays usable for the next request.
+        {
+            let mut stream = client.query_stream("SELECT id FROM t ORDER BY id").unwrap();
+            assert_eq!(stream.next().unwrap().unwrap(), vec![Value::Int(0)]);
+        }
+        assert!(matches!(
+            client.execute("SELECT id FROM t WHERE id = 5").unwrap(),
+            Response::Rows { .. }
+        ));
+
+        // Non-row statements through the stream API: single-frame answers.
+        let s = client
+            .query_stream("INSERT INTO t (id, pad) VALUES (100, 'y')")
+            .unwrap();
+        assert_eq!(s.affected, 1);
+        assert_eq!(s.count(), 0);
+        let err = client.query_stream("SELECT * FROM missing").unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "got: {err}");
+
+        // An empty result set still streams (header + end, no chunks).
+        let stream = client
+            .query_stream("SELECT id FROM t WHERE id = 9999")
+            .unwrap();
+        assert_eq!(stream.count(), 0);
+    }
+
+    #[test]
     fn binary_endpoint_reports_errors() {
         let ctx = temp_ctx();
         let (addr, _h) = binary::spawn("127.0.0.1:0", ctx).unwrap();

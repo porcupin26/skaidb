@@ -111,21 +111,26 @@ impl Document {
 
     /// Resolve a dotted field path like `a.b.c`, descending nested documents.
     pub fn get_path(&self, path: &str) -> Option<&Value> {
-        let mut cur: Option<&Value> = None;
-        let mut doc = self;
-        let mut parts = path.split('.').peekable();
-        while let Some(part) = parts.next() {
-            let v = doc.get(part)?;
-            if parts.peek().is_none() {
-                cur = Some(v);
-                break;
-            }
-            match v {
-                Value::Document(d) => doc = d,
-                _ => return None,
+        // Top-level fields (no dot) are the common case in predicates and
+        // projections; skip the segment machinery for them.
+        match path.split_once('.') {
+            None => self.get(path),
+            Some((first, rest)) => {
+                let mut doc = match self.get(first)? {
+                    Value::Document(d) => d,
+                    _ => return None,
+                };
+                let mut rest = rest;
+                while let Some((part, tail)) = rest.split_once('.') {
+                    match doc.get(part)? {
+                        Value::Document(d) => doc = d,
+                        _ => return None,
+                    }
+                    rest = tail;
+                }
+                doc.get(rest)
             }
         }
-        cur
     }
 
     pub fn len(&self) -> usize {
