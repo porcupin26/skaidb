@@ -209,8 +209,10 @@ exists. Cannot combine with `JOIN`, `UNION`, aggregates/`GROUP BY`, or
 `CREATE TIMESERIES TABLE` declares a table whose rows are **samples**, stored
 in the time-series engine (Gorilla-compressed chunks; feature status and
 internals in [TIMESERIES.md](TIMESERIES.md), design plan in
-[TODO.md](TODO.md)). Single-node only for now — cluster mode rejects the DDL
-until the distribution phase lands.
+[TODO.md](TODO.md)). Distributed: the DDL broadcasts, series place on the
+ring and replicate at the write consistency, and queries union-merge across
+members. Topology changes are refused while TS tables exist (chunk
+migration is future work).
 
 ```sql
 CREATE TIMESERIES TABLE cpu (SERIES KEY (host, core), RETENTION 30d);

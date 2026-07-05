@@ -505,6 +505,7 @@ dependencies = [
  "skaidb-proto",
  "skaidb-sql",
  "skaidb-storage",
+ "skaidb-tsdb",
  "skaidb-types",
  "thiserror",
 ]

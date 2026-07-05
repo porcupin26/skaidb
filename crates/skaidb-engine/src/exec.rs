@@ -1722,6 +1722,11 @@ impl Database {
         out
     }
 
+    /// Whether any time-series table exists (topology-change guard).
+    pub fn has_timeseries_tables(&self) -> bool {
+        !self.catalog.timeseries.is_empty()
+    }
+
     /// Series-key columns when `table` is a time-series table.
     pub fn ts_series_key(&self, table: &str) -> Option<Vec<String>> {
         self.catalog

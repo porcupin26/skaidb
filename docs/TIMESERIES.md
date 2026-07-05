@@ -5,9 +5,11 @@ samples in a purpose-built storage engine (Prometheus-style compressed
 chunks), not the document LSM — with retention, counter-aware SQL
 aggregates, and time-bucketed queries.
 
-> Status: **single-node** (cluster mode rejects the DDL until the
-> distribution phase lands — see the roadmap at the end). Shipped in
-> v0.20.0 (storage engine) and v0.21.0 (SQL surface).
+> Status: **distributed** — series place on the consistent-hash ring and
+> replicate at the configured write consistency; queries union-merge across
+> members at the read consistency. Topology changes (join/decommission) are
+> refused while TS tables exist until chunk-level migration lands (phase 5).
+> Shipped in v0.20.0 (storage engine), v0.21.0 (SQL), v0.22.0 (cluster).
 
 ## Usage
 
@@ -64,6 +66,14 @@ stored as its own compressed stream. Full grammar and semantics:
   the ordinary `COUNT/SUM/AVG/MIN/MAX`.
 - Storage pushdown of `AND`-combined `ts` ranges and label `=` / `!=`
   predicates; everything else applies afterward with full SQL semantics.
+- **Cluster distribution**: TS DDL broadcasts like other DDL; a series (its
+  labels) is the placement unit on the ring, replicated to RF nodes — all of
+  a series' field streams co-locate. Appends group per replica set (one
+  internode batch per replica, per-sample idempotent on replay) and ack at
+  the write consistency. Queries broadcast matchers + range to all members
+  and **union-merge** per series (samples are immutable facts keyed by
+  timestamp, so any responder holding a sample covers a replica that missed
+  it), requiring the read-consistency responder count.
 - The whole ordinary SELECT surface on top: `GROUP BY` (including by output
   alias, `GROUP BY t`), `HAVING`, `ORDER BY`, `DISTINCT`, `LIMIT/OFFSET`,
   multi-field queries, `SELECT *`.
@@ -76,15 +86,16 @@ Roadmap phases refer to the implementation plan in [`TODO.md`](TODO.md).
 
 | Gap | Notes | Planned |
 |---|---|---|
-| **Cluster mode** | DDL rejected on clustered nodes today; series placement on the ring, replicated appends, scatter-gather with partial-aggregate pushdown | phase 3 |
-| **Label postings index** | matchers scan the per-block series list (fine at moderate cardinality) | phase 3 |
+| **TS anti-entropy / hints** | a replica down during a write stays missing those samples until re-written; reads stay correct via union-merge at quorum, but there is no background repair or hinted handoff for TS data yet (block-checksum repair planned) | phase 3 follow-up |
+| **Partial-aggregate pushdown** | cluster queries ship matching raw samples to the coordinator; per-node partial aggregation (sum/count per bucket, per-series rate segments) would cut transfer for wide aggregations | phase 3 follow-up |
 | **Prometheus `remote_write`** | ingest endpoint + `__name__` mapping; self-scrape option | phase 4 |
 | **Out-of-order ingest window** | samples older than a series' last ts are rejected today | phase 4 |
-| **Resharding with TS tables** | chunk-level migrate/drain on join/decommission | phase 5 |
+| **Resharding with TS tables** | chunk-level migrate/drain; joins/decommissions are refused while TS tables exist | phase 5 |
 | **Downsampling / rollups** | `CREATE ROLLUP`, tiered retention, query-time rollup selection | phase 6 |
 | **PromQL subset / Grafana datasource** | `/api/v1/query_range` + metadata endpoints | phase 7 (stretch) |
-| Regex label matchers | only `=` / `!=` push down | with phase 3 postings |
-| Per-store stats in `SHOW STATUS` / `/metrics` | series counts, disk bytes, rejection counters exist internally | with phase 3 |
-| `memory_target` integration | head memory isn't yet part of the storage budget | with phase 3 |
+| Label postings index | matchers scan the per-block series list (fine at moderate cardinality) | with pushdown work |
+| Regex label matchers | only `=` / `!=` push down | with postings |
+| Per-store stats in `SHOW STATUS` / `/metrics` | series counts, disk bytes, rejection counters exist internally | soon |
+| `memory_target` integration | head memory isn't yet part of the storage budget | soon |
 | Streamed TS results | TS SELECT materializes its result before the (streamable) wire; raw range dumps of very large windows should stream end-to-end | later |
 | Exemplars / native histograms | schema headroom reserved in the chunk format | later |

@@ -289,6 +289,15 @@ Benchmarks:
    hints, broadcast queries with partial-aggregate pushdown, checksum-based
    anti-entropy. Limitation shipped: topology changes refused with TS tables.
    Exit: 3-node fleet ingest/query correct under node kill + recovery.
+   **✅ Core done (v0.22.0).** DDL broadcast; series placement by ring hash
+   of labels (field streams co-locate); appends grouped per replica set,
+   acked at write consistency, idempotent on replay; queries broadcast and
+   union-merge per series at read consistency (a replica that missed a
+   write is covered by any responder holding the sample); topology guard
+   in place. **Still open from this phase:** TS hinted handoff +
+   checksum-based anti-entropy (durable convergence of a long-down
+   replica), and partial-aggregate pushdown (queries currently ship raw
+   matching samples to the coordinator).
 4. **remote_write + OOO** — `/api/v1/write` endpoint, `__name__` mapping,
    out-of-order window, staleness markers, self-scrape option. Exit: a real
    Prometheus remote-writing to skaidb for 24 h with zero data loss vs its

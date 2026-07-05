@@ -819,6 +819,111 @@ impl Node {
     }
 
     /// Addresses of all current peers (snapshot, cloned) — never held across I/O.
+    /// Chunk-level migration of time-series stores is not built yet
+    /// (docs/TODO.md phase 5) — joins/decommissions would strand or lose
+    /// series, so they are refused while any TS table exists.
+    fn reject_if_timeseries(&self, what: &str) -> EngineResult<()> {
+        let has = self
+            .local
+            .read()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .has_timeseries_tables();
+        if has {
+            return Err(EngineError::Unsupported(format!(
+                "{what} are not yet supported while time-series tables exist (drop them first)"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Gather matching time-series samples from every member and union-merge
+    /// per series (samples are immutable facts keyed by timestamp, so the
+    /// union is the authoritative view — a replica that missed a write is
+    /// covered by any responder that has it). Requires the read-consistency
+    /// number of responders.
+    fn ts_scatter(
+        &self,
+        table: &str,
+        matchers: &[skaidb_tsdb::Matcher],
+        t0: i64,
+        t1: i64,
+        oc: Option<Consistency>,
+    ) -> EngineResult<Vec<(skaidb_tsdb::Labels, Vec<skaidb_tsdb::Sample>)>> {
+        let mut merged: BTreeMap<skaidb_tsdb::Labels, BTreeMap<i64, f64>> = BTreeMap::new();
+        let mut responders = 0usize;
+        {
+            let db = self
+                .local
+                .read()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
+            for (labels, samples) in db.ts_query(table, matchers, t0, t1)? {
+                let entry = merged.entry(labels).or_default();
+                for s in samples {
+                    entry.insert(s.ts, s.value);
+                }
+            }
+            responders += 1;
+        }
+        let wire_matchers: Vec<(bool, String, String)> = matchers
+            .iter()
+            .map(|m| match m {
+                skaidb_tsdb::Matcher::Eq(k, v) => (false, k.clone(), v.clone()),
+                skaidb_tsdb::Matcher::Ne(k, v) => (true, k.clone(), v.clone()),
+            })
+            .collect();
+        let addrs = self.peer_addrs();
+        let shards = scatter(&addrs, |addr| {
+            self.counters.peer_requests.fetch_add(1, Ordering::Relaxed);
+            match self.pool.call(
+                addr,
+                &Request::TsQuery {
+                    table: table.to_string(),
+                    matchers: wire_matchers.clone(),
+                    t0,
+                    t1,
+                },
+            ) {
+                Ok(Response::TsSeries { series }) => Some(series),
+                _ => {
+                    self.counters.peer_errors.fetch_add(1, Ordering::Relaxed);
+                    None
+                }
+            }
+        });
+        for shard in shards.into_iter().flatten() {
+            for (labels, samples) in shard {
+                let entry = merged.entry(labels).or_default();
+                for (ts, value) in samples {
+                    entry.insert(ts, value);
+                }
+            }
+            responders += 1;
+        }
+        let needed = oc
+            .unwrap_or(self.cfg.read_consistency)
+            .required(self.member_count());
+        if responders < needed {
+            self.counters
+                .read_quorum_failures
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(EngineError::Cluster(format!(
+                "read quorum not met: {responders}/{needed} members responded"
+            )));
+        }
+        Ok(merged
+            .into_iter()
+            .map(|(labels, samples)| {
+                (
+                    labels,
+                    samples
+                        .into_iter()
+                        .map(|(ts, value)| skaidb_tsdb::Sample { ts, value })
+                        .collect(),
+                )
+            })
+            .collect())
+    }
+
     fn peer_addrs(&self) -> Vec<String> {
         self.topo
             .read()
@@ -1071,6 +1176,7 @@ impl Node {
     /// cluster. The joiner and a member quorum must be reachable; a member that
     /// missed the broadcast needs it re-sent (see [docs/RESHARDING.md]).
     pub fn add_member(&self, id: &str, addr: &str) -> EngineResult<()> {
+        self.reject_if_timeseries("topology changes")?;
         let _guard = self.membership_lock.lock().expect("membership lock");
         let joiner = NodeId::new(id);
         let old_members = self.members_snapshot();
@@ -1166,6 +1272,7 @@ impl Node {
     /// owners to be reachable, and assumes a quiescent cluster — as `add_member`
     /// does. See [docs/RESHARDING.md].
     pub fn remove_member(&self, id: &str) -> EngineResult<()> {
+        self.reject_if_timeseries("topology changes")?;
         let _guard = self.membership_lock.lock().expect("membership lock");
         let leaving = NodeId::new(id);
         let members = self.members_snapshot();
@@ -1815,6 +1922,47 @@ impl Node {
                 }
                 Err(_) => Response::Err("local lock poisoned".into()),
             },
+            Request::TsAppend { table, rows } => match self.local.read() {
+                Ok(db) => match db.ts_append(&table, &rows) {
+                    Ok(_) => Response::Ack,
+                    Err(e) => Response::Err(e.to_string()),
+                },
+                Err(_) => Response::Err("local lock poisoned".into()),
+            },
+            Request::TsQuery {
+                table,
+                matchers,
+                t0,
+                t1,
+            } => match self.local.read() {
+                Ok(db) => {
+                    let matchers: Vec<skaidb_tsdb::Matcher> = matchers
+                        .into_iter()
+                        .map(|(negated, k, v)| {
+                            if negated {
+                                skaidb_tsdb::Matcher::Ne(k, v)
+                            } else {
+                                skaidb_tsdb::Matcher::Eq(k, v)
+                            }
+                        })
+                        .collect();
+                    match db.ts_query(&table, &matchers, t0, t1) {
+                        Ok(series) => Response::TsSeries {
+                            series: series
+                                .into_iter()
+                                .map(|(labels, samples)| {
+                                    (
+                                        labels,
+                                        samples.into_iter().map(|s| (s.ts, s.value)).collect(),
+                                    )
+                                })
+                                .collect(),
+                        },
+                        Err(e) => Response::Err(e.to_string()),
+                    }
+                }
+                Err(_) => Response::Err("local lock poisoned".into()),
+            },
             Request::LocalGet { table, key } => match self.local.read() {
                 Ok(db) => match db.local_get_versioned(&table, &key) {
                     Ok(entry) => Response::Get { entry },
@@ -2013,15 +2161,6 @@ impl Node {
                 return Err(EngineError::DatabaseNotFound(name.clone()));
             }
             return Ok(SessionEffect::UseDatabase(name.clone()));
-        }
-        // Time-series tables are single-node for now: cluster placement,
-        // replication, and scatter-gather are the next phase of
-        // docs/TODO.md's plan. Reject the DDL cleanly rather than letting it
-        // fall through to a misleading executor error.
-        if matches!(stmt, Statement::CreateTimeseriesTable(_)) {
-            return Err(EngineError::Unsupported(
-                "time-series tables are not yet supported in cluster mode".into(),
-            ));
         }
         // DDL — including CREATE/DROP DATABASE — broadcasts to every member so the
         // schema and database registry stay identical cluster-wide.
@@ -3331,10 +3470,28 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     h
 }
 
+/// Ring-placement key for a series: its labels minus the reserved
+/// `__field__` discriminator, so every field stream of a logical series
+/// lands on the same replica set.
+fn ts_placement_key(labels: &[(String, String)]) -> Vec<u8> {
+    let mut key = Vec::new();
+    for (k, v) in labels {
+        if k == "__field__" {
+            continue;
+        }
+        key.extend_from_slice(k.as_bytes());
+        key.push(0);
+        key.extend_from_slice(v.as_bytes());
+        key.push(0);
+    }
+    key
+}
+
 fn is_ddl(stmt: &Statement) -> bool {
     matches!(
         stmt,
         Statement::CreateTable(_)
+            | Statement::CreateTimeseriesTable(_)
             | Statement::DropTable { .. }
             | Statement::CreateIndex(_)
             | Statement::DropIndex { .. }
@@ -3378,6 +3535,96 @@ impl Cluster for Coordinator {
             .read()
             .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
             .table_primary_key(table)
+    }
+
+    fn ts_series_key(&self, table: &str) -> EngineResult<Option<Vec<String>>> {
+        Ok(self
+            .node
+            .local
+            .read()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .ts_series_key(table))
+    }
+
+    fn ts_append(
+        &mut self,
+        table: &str,
+        rows: &[(skaidb_tsdb::Labels, i64, f64)],
+    ) -> EngineResult<usize> {
+        // A series is the placement unit: group samples by the replica set
+        // of their series (labels minus the per-field discriminator, so all
+        // of a series' field streams co-locate), then ship one batch per
+        // replica. Replays of a duplicate batch are harmless (per-sample
+        // rejection), so retries can't double-count.
+        let mut groups: HashMap<Vec<NodeId>, Vec<(skaidb_tsdb::Labels, i64, f64)>> =
+            HashMap::new();
+        for row in rows {
+            let key = ts_placement_key(&row.0);
+            groups
+                .entry(self.node.replicas_for(&key))
+                .or_default()
+                .push(row.clone());
+        }
+        let needed = self
+            .oc
+            .unwrap_or(self.node.cfg.write_consistency)
+            .required(self.node.member_count());
+        let mut appended = 0usize;
+        for (replicas, batch) in groups {
+            let mut acks = 0usize;
+            for replica in &replicas {
+                if *replica == self.node.cfg.id {
+                    let db = self
+                        .node
+                        .local
+                        .read()
+                        .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
+                    db.ts_append(table, &batch)?;
+                    acks += 1;
+                } else if let Some(addr) = self.node.peer_addr(replica) {
+                    self.node
+                        .counters
+                        .peer_requests
+                        .fetch_add(1, Ordering::Relaxed);
+                    match self.node.pool.call(
+                        &addr,
+                        &Request::TsAppend {
+                            table: table.to_string(),
+                            rows: batch.clone(),
+                        },
+                    ) {
+                        Ok(Response::Ack) => acks += 1,
+                        _ => {
+                            self.node
+                                .counters
+                                .peer_errors
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+            if acks < needed {
+                self.node
+                    .counters
+                    .write_quorum_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(EngineError::Cluster(format!(
+                    "write quorum not met: {acks}/{needed} replicas acked"
+                )));
+            }
+            appended += batch.len();
+        }
+        Ok(appended)
+    }
+
+    fn ts_query(
+        &self,
+        table: &str,
+        matchers: &[skaidb_tsdb::Matcher],
+        t0: i64,
+        t1: i64,
+    ) -> EngineResult<Vec<(skaidb_tsdb::Labels, Vec<skaidb_tsdb::Sample>)>> {
+        self.node.ts_scatter(table, matchers, t0, t1, self.oc)
     }
 
     fn vector_search(
@@ -4560,6 +4807,91 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn timeseries_cluster_end_to_end() {
+        // 3 nodes, rf=3, QUORUM: TS DDL broadcasts, samples replicate by
+        // series placement, queries union-merge across members.
+        let q = Consistency::Quorum;
+        let cfg3 = |id: &str, addr: &str, members: &[(NodeId, String)]| NodeConfig {
+            id: NodeId::new(id),
+            internode_addr: addr.to_string(),
+            members: members.to_vec(),
+            replication_factor: 3,
+            vnodes_per_node: 64,
+            read_consistency: q,
+            write_consistency: q,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
+            anti_entropy_interval_secs: 0,
+        };
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let m = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let na = Node::new(Database::open(temp_dir("tsa")).unwrap(), cfg3("a", &a, &m));
+        let nb = Node::new(Database::open(temp_dir("tsb")).unwrap(), cfg3("b", &b, &m));
+        let nc = Node::new(Database::open(temp_dir("tsc")).unwrap(), cfg3("c", &c, &m));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        nc.serve_internode().unwrap();
+
+        // DDL broadcast from one node; visible on another.
+        na.execute("CREATE TIMESERIES TABLE cpu (SERIES KEY (host), RETENTION 30d)")
+            .unwrap();
+        // Inserts via different coordinators.
+        na.execute("INSERT INTO cpu (host, ts, value) VALUES ('x', 0, 0), ('x', 15000, 15)")
+            .unwrap();
+        nb.execute("INSERT INTO cpu (host, ts, value) VALUES ('x', 30000, 30), ('y', 0, 100)")
+            .unwrap();
+
+        // Query via the third coordinator: full view, correct math.
+        let rs = rows(
+            nc.execute("SELECT ts, value FROM cpu WHERE host = 'x' ORDER BY ts")
+                .unwrap(),
+        );
+        assert_eq!(rs.rows.len(), 3);
+        assert_eq!(rs.rows[2][1], Value::Float(30.0));
+        let rs = rows(nc.execute("SELECT rate(value) FROM cpu WHERE host = 'x'").unwrap());
+        assert_eq!(rs.rows[0][0], Value::Float(1.0));
+        for node in [&na, &nb, &nc] {
+            let rs = rows(node.execute("SELECT last(value) FROM cpu WHERE host = 'y'").unwrap());
+            assert_eq!(rs.rows[0][0], Value::Float(100.0));
+        }
+
+        // Union-merge covers a replica that has data the others miss: inject
+        // a sample directly into one node's local store only.
+        let r = internode::call(
+            &a,
+            &Request::TsAppend {
+                table: "cpu".into(),
+                rows: vec![(
+                    vec![
+                        ("__field__".into(), "value".into()),
+                        ("host".into(), "z".into()),
+                    ],
+                    5_000,
+                    7.0,
+                )],
+            },
+        )
+        .unwrap();
+        assert!(matches!(r, Response::Ack));
+        let rs = rows(nb.execute("SELECT value FROM cpu WHERE host = 'z'").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::Float(7.0)]]);
+
+        // Append-only holds in cluster mode too.
+        let err = nb.execute("UPDATE cpu SET value = 1 WHERE host = 'x'").unwrap_err();
+        assert!(err.to_string().contains("append-only"), "{err}");
+
+        // Topology changes are refused while TS tables exist.
+        let err = na.add_member("d", "127.0.0.1:1").unwrap_err();
+        assert!(err.to_string().contains("time-series"), "{err}");
+
+        // Dropping the TS table lifts the guard (the join still fails to
+        // reach the bogus address, but past the TS check).
+        na.execute("DROP TABLE cpu").unwrap();
+        let err = na.add_member("d", "127.0.0.1:1").unwrap_err();
+        assert!(!err.to_string().contains("time-series"), "{err}");
     }
 
     #[test]

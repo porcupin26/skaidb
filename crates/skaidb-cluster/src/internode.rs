@@ -57,6 +57,22 @@ pub enum Request {
         after: Option<Vec<u8>>,
         limit: u32,
     },
+    /// Append time-series samples to the peer's local store (TS replication).
+    /// Rows are `(sorted labels, ts ms, value)`; replays are harmless (an
+    /// already-present timestamp is rejected per sample, not per batch).
+    TsAppend {
+        table: String,
+        rows: Vec<TsRow>,
+    },
+    /// The peer's local samples for series matching every matcher in
+    /// `[t0, t1]`. Matchers are `(negated, label, value)` equality forms.
+    /// Answered with [`Response::TsSeries`].
+    TsQuery {
+        table: String,
+        matchers: Vec<(bool, String, String)>,
+        t0: i64,
+        t1: i64,
+    },
     /// Like [`Request::LocalScan`] but pushes a `WHERE` filter to the node: it
     /// returns only rows matching `filter` (plus all tombstones, for LWW), so a
     /// non-indexed scan ships far less than the whole shard.
@@ -181,11 +197,20 @@ pub enum Response {
         rows: u64,
         hlc_ms: u64,
     },
+    /// Reply to [`Request::TsQuery`]: this node's matching series and samples.
+    TsSeries {
+        series: TsSeriesData,
+    },
 }
 
 /// A versioned row on the wire: `(key, value, hlc, is_put)` — the shape shared
 /// by [`Response::Scan`] and [`Request::ApplyBatch`].
 type WireRow = (Vec<u8>, Vec<u8>, Hlc, bool);
+
+/// A time-series sample on the wire: `(sorted labels, ts ms, value)`.
+pub type TsRow = (Vec<(String, String)>, i64, f64);
+/// Per-series samples on the wire: `(labels, [(ts, value)])`.
+pub type TsSeriesData = Vec<(Vec<(String, String)>, Vec<(i64, f64)>)>;
 
 /// Errors decoding an internode message.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -213,6 +238,8 @@ const REQ_ANNOUNCE: u8 = 16;
 const REQ_NODESTATUS: u8 = 17;
 const REQ_BATCH: u8 = 18;
 const REQ_SCANPAGE: u8 = 19;
+const REQ_TSAPPEND: u8 = 20;
+const REQ_TSQUERY: u8 = 21;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
@@ -223,6 +250,7 @@ const RES_KEYS: u8 = 5;
 const RES_VHITS: u8 = 6;
 const RES_SCHEMA: u8 = 7;
 const RES_NODESTATUS: u8 = 8;
+const RES_TSSERIES: u8 = 9;
 
 impl Request {
     pub fn encode(&self) -> Vec<u8> {
@@ -267,6 +295,33 @@ impl Request {
                 put_str(o, table);
                 put_opt_bytes(o, after.as_deref());
                 o.extend_from_slice(&limit.to_le_bytes());
+            }
+            Request::TsAppend { table, rows } => {
+                o.push(REQ_TSAPPEND);
+                put_str(o, table);
+                o.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+                for (labels, ts, value) in rows {
+                    put_labels(o, labels);
+                    o.extend_from_slice(&ts.to_le_bytes());
+                    o.extend_from_slice(&value.to_bits().to_le_bytes());
+                }
+            }
+            Request::TsQuery {
+                table,
+                matchers,
+                t0,
+                t1,
+            } => {
+                o.push(REQ_TSQUERY);
+                put_str(o, table);
+                o.extend_from_slice(&(matchers.len() as u32).to_le_bytes());
+                for (negated, k, v) in matchers {
+                    o.push(u8::from(*negated));
+                    put_str(o, k);
+                    put_str(o, v);
+                }
+                o.extend_from_slice(&t0.to_le_bytes());
+                o.extend_from_slice(&t1.to_le_bytes());
             }
             Request::FilteredScan { table, filter } => {
                 o.push(REQ_FSCAN);
@@ -359,6 +414,35 @@ impl Request {
                 after: c.opt_bytes()?,
                 limit: c.u32()?,
             },
+            REQ_TSAPPEND => {
+                let table = c.string()?;
+                let n = c.u32()? as usize;
+                let mut rows = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let labels = c.labels()?;
+                    let ts = c.u64()? as i64;
+                    let value = f64::from_bits(c.u64()?);
+                    rows.push((labels, ts, value));
+                }
+                Request::TsAppend { table, rows }
+            }
+            REQ_TSQUERY => {
+                let table = c.string()?;
+                let n = c.u32()? as usize;
+                let mut matchers = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let negated = c.u8()? != 0;
+                    let k = c.string()?;
+                    let v = c.string()?;
+                    matchers.push((negated, k, v));
+                }
+                Request::TsQuery {
+                    table,
+                    matchers,
+                    t0: c.u64()? as i64,
+                    t1: c.u64()? as i64,
+                }
+            }
             REQ_FSCAN => Request::FilteredScan {
                 table: c.string()?,
                 filter: c.expr()?,
@@ -496,6 +580,18 @@ impl Response {
                 o.extend_from_slice(&rows.to_le_bytes());
                 o.extend_from_slice(&hlc_ms.to_le_bytes());
             }
+            Response::TsSeries { series } => {
+                o.push(RES_TSSERIES);
+                o.extend_from_slice(&(series.len() as u32).to_le_bytes());
+                for (labels, samples) in series {
+                    put_labels(o, labels);
+                    o.extend_from_slice(&(samples.len() as u32).to_le_bytes());
+                    for (ts, value) in samples {
+                        o.extend_from_slice(&ts.to_le_bytes());
+                        o.extend_from_slice(&value.to_bits().to_le_bytes());
+                    }
+                }
+            }
         }
     }
 
@@ -560,6 +656,21 @@ impl Response {
                     rows,
                     hlc_ms,
                 }
+            }
+            RES_TSSERIES => {
+                let n = c.u32()? as usize;
+                let mut series = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let labels = c.labels()?;
+                    let m = c.u32()? as usize;
+                    let mut samples = Vec::with_capacity(m);
+                    for _ in 0..m {
+                        let ts = c.u64()? as i64;
+                        samples.push((ts, f64::from_bits(c.u64()?)));
+                    }
+                    series.push((labels, samples));
+                }
+                Response::TsSeries { series }
             }
             _ => return Err(WireError::Malformed("unknown response op")),
         })
@@ -812,6 +923,14 @@ impl Pending<'_> {
     }
 }
 
+fn put_labels(o: &mut Vec<u8>, labels: &[(String, String)]) {
+    o.extend_from_slice(&(labels.len() as u32).to_le_bytes());
+    for (k, v) in labels {
+        put_str(o, k);
+        put_str(o, v);
+    }
+}
+
 fn put_str(o: &mut Vec<u8>, s: &str) {
     put_bytes(o, s.as_bytes());
 }
@@ -980,6 +1099,16 @@ impl<'a> Cur<'a> {
     fn string(&mut self) -> Result<String, WireError> {
         String::from_utf8(self.bytes()?).map_err(|_| WireError::Malformed("bad utf-8"))
     }
+    fn labels(&mut self) -> Result<Vec<(String, String)>, WireError> {
+        let n = self.u32()? as usize;
+        let mut labels = Vec::with_capacity(n);
+        for _ in 0..n {
+            let k = self.string()?;
+            let v = self.string()?;
+            labels.push((k, v));
+        }
+        Ok(labels)
+    }
     fn expr(&mut self) -> Result<Expr, WireError> {
         Ok(match self.u8()? {
             0 => Expr::Literal(
@@ -1076,6 +1205,23 @@ mod tests {
                 after: None,
                 limit: 1,
             },
+            Request::TsAppend {
+                table: "cpu".into(),
+                rows: vec![
+                    (
+                        vec![("__field__".into(), "value".into()), ("host".into(), "a".into())],
+                        1_700_000_000_000,
+                        0.5,
+                    ),
+                    (vec![("host".into(), "b".into())], 1, f64::NEG_INFINITY),
+                ],
+            },
+            Request::TsQuery {
+                table: "cpu".into(),
+                matchers: vec![(false, "host".into(), "a".into()), (true, "core".into(), "0".into())],
+                t0: i64::MIN,
+                t1: i64::MAX,
+            },
             Request::FilteredScan {
                 table: "t".into(),
                 filter: Expr::Binary {
@@ -1170,6 +1316,15 @@ mod tests {
             },
             Response::Err("x".into()),
             Response::Pong,
+            Response::TsSeries {
+                series: vec![
+                    (
+                        vec![("host".into(), "a".into())],
+                        vec![(1000, 0.5), (2000, f64::MAX)],
+                    ),
+                    (vec![], vec![]),
+                ],
+            },
         ] {
             assert_eq!(Response::decode(&res.encode()).unwrap(), res);
         }
