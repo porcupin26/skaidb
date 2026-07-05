@@ -337,6 +337,60 @@ impl Tsdb {
             .collect())
     }
 
+    /// Repair-path ingest: accept samples of ANY age for their series by
+    /// writing them directly as a new level-0 block (durable via the block
+    /// commit protocol; no WAL involvement). Overlaps with existing data are
+    /// resolved by the query-time sort+dedupe and folded together by
+    /// compaction.
+    pub fn merge_samples(&self, rows: &[(Labels, i64, f64)]) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let mut per: BTreeMap<Labels, Vec<Sample>> = BTreeMap::new();
+        for (labels, ts, value) in rows {
+            per.entry(labels.clone()).or_default().push(Sample {
+                ts: *ts,
+                value: *value,
+            });
+        }
+        let mut series = Vec::with_capacity(per.len());
+        let mut n = 0usize;
+        for (labels, mut samples) in per {
+            samples.sort_by_key(|s| s.ts);
+            samples.dedup_by_key(|s| s.ts);
+            n += samples.len();
+            let chunks = crate::head::rechunk(&samples, self.opts.block_span_ms)?;
+            series.push((labels, chunks));
+        }
+        let mut inner = self.inner.lock().expect("tsdb lock");
+        let seq = inner.next_block_seq;
+        let dir = write_block(&self.dir.join("blocks"), seq, 0, series)?;
+        inner.next_block_seq += 1;
+        inner.blocks.push(Block::open(&dir)?);
+        inner.blocks.sort_by_key(|b| (b.meta.min_ts, b.meta.seq));
+        Ok(n)
+    }
+
+    /// Per-series `(labels, deduped sample count, order-independent
+    /// checksum)` — the anti-entropy comparison unit. Costs a full decode;
+    /// meant for background repair, not hot paths.
+    pub fn series_summaries(&self) -> Result<Vec<(Labels, u64, u64)>> {
+        let all = self.query(&[], i64::MIN, i64::MAX)?;
+        Ok(all
+            .into_iter()
+            .map(|(labels, samples)| {
+                let mut checksum = 0u64;
+                for s in &samples {
+                    let mut h = (s.ts as u64).wrapping_mul(0x9E3779B97F4A7C15);
+                    h ^= s.value.to_bits().wrapping_mul(0xC2B2AE3D27D4EB4F);
+                    h ^= h >> 29;
+                    checksum ^= h.wrapping_mul(0x165667B19E3779F9);
+                }
+                (labels, samples.len() as u64, checksum)
+            })
+            .collect())
+    }
+
     /// Every series label set in the store (head + blocks, deduplicated) —
     /// the migration unit for resharding.
     pub fn series_labels(&self) -> Vec<Labels> {

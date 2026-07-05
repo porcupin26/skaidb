@@ -9,7 +9,7 @@ aggregates, and time-bucketed queries.
 > replicate at the configured write consistency; queries union-merge across
 > members at the read consistency; joins/decommissions migrate series like
 > any other data. Shipped in v0.20.0 (storage), v0.21.0 (SQL), v0.22.0
-> (cluster), v0.23.0 (remote_write), v0.24.0 (resharding), v0.25.0 (OOO DDL + stats).
+> (cluster), v0.23.0 (remote_write), v0.24.0 (resharding), v0.25.0 (OOO DDL + stats), v0.26.0 (anti-entropy).
 
 ## Usage
 
@@ -80,6 +80,13 @@ stored as its own compressed stream. Full grammar and semantics:
   store, so `WHERE name = '...' AND instance = '...'` is efficient without
   declaring every label. In a cluster, ingested samples replicate through
   the same series-placement path as SQL INSERTs.
+- **Anti-entropy** (v0.26.0): `repair()` (the periodic pass and
+  `cluster repair`) converges TS replicas — per-series `(count, checksum)`
+  summaries are compared per peer, and the series' elected sender pushes
+  divergent series via a merge path that accepts samples of any age (fills
+  mid-series gaps a normal append would reject). Duplicate chunks the merge
+  creates fold away at the next compaction. A long-down replica now
+  converges durably, not just at read time.
 - **Cluster distribution**: TS DDL broadcasts like other DDL; a series (its
   labels) is the placement unit on the ring, replicated to RF nodes — all of
   a series' field streams co-locate. Appends group per replica set (one
@@ -100,7 +107,7 @@ Roadmap phases refer to the implementation plan in [`TODO.md`](TODO.md).
 
 | Gap | Notes | Planned |
 |---|---|---|
-| **TS anti-entropy / hints** | a replica down during a write stays missing those samples until re-written; reads stay correct via union-merge at quorum, but there is no background repair or hinted handoff for TS data yet (block-checksum repair planned) | phase 3 follow-up |
+| TS hinted handoff | repair converges lagging replicas (below); a faster per-write hint replay like row tables have is still open | later |
 | **Partial-aggregate pushdown** | cluster queries ship matching raw samples to the coordinator; per-node partial aggregation (sum/count per bucket, per-series rate segments) would cut transfer for wide aggregations | phase 3 follow-up |
 | Self-scrape (`/metrics` → TS table) | remote_write covers external scrapers | later |
 | TS reclaim | after a reshard, former owners keep stale series copies (harmless under union-merge; no `reclaim` pass for TS yet) | with TS anti-entropy |

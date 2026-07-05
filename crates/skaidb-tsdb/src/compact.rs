@@ -77,6 +77,32 @@ pub fn merge(blocks_dir: &Path, seq: u64, inputs: &[&Block]) -> Result<()> {
             }
         }
     }
+    // A series whose concatenated chunks overlap in time (repair-merged
+    // blocks) is decoded, deduplicated, and re-chunked so duplicates don't
+    // accumulate across compactions.
+    for (_, chunks) in &mut merged {
+        let overlapping = chunks
+            .windows(2)
+            .any(|w| w[1].min_ts <= w[0].max_ts);
+        if overlapping {
+            let mut samples = Vec::new();
+            for c in chunks.iter() {
+                samples.extend(crate::chunk::decode(&c.data)?);
+            }
+            samples.sort_by_key(|s| s.ts);
+            samples.dedup_by(|later, earlier| {
+                if later.ts == earlier.ts {
+                    earlier.value = later.value;
+                    true
+                } else {
+                    false
+                }
+            });
+            // Re-chunk with a huge span: the merged block already owns the
+            // whole window, so only the 120-sample cut applies.
+            *chunks = crate::head::rechunk(&samples, i64::MAX)?;
+        }
+    }
     write_block(blocks_dir, seq, level, merged)?;
     for block in inputs {
         fs::remove_dir_all(&block.dir)?;

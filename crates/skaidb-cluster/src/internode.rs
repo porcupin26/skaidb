@@ -73,6 +73,17 @@ pub enum Request {
         t0: i64,
         t1: i64,
     },
+    /// Repair-path merge: apply samples of any age to the peer's local
+    /// store (fills mid-series gaps that `TsAppend` would reject).
+    TsMerge {
+        table: String,
+        rows: Vec<TsRow>,
+    },
+    /// The peer's per-series anti-entropy summaries for `table`. Answered
+    /// with [`Response::TsSummaries`].
+    TsSummary {
+        table: String,
+    },
     /// Like [`Request::LocalScan`] but pushes a `WHERE` filter to the node: it
     /// returns only rows matching `filter` (plus all tombstones, for LWW), so a
     /// non-indexed scan ships far less than the whole shard.
@@ -201,6 +212,10 @@ pub enum Response {
     TsSeries {
         series: TsSeriesData,
     },
+    /// Reply to [`Request::TsSummary`]: `(labels, deduped count, checksum)`.
+    TsSummaries {
+        series: Vec<TsSummaryRow>,
+    },
 }
 
 /// A versioned row on the wire: `(key, value, hlc, is_put)` — the shape shared
@@ -211,6 +226,8 @@ type WireRow = (Vec<u8>, Vec<u8>, Hlc, bool);
 pub type TsRow = (Vec<(String, String)>, i64, f64);
 /// Per-series samples on the wire: `(labels, [(ts, value)])`.
 pub type TsSeriesData = Vec<(Vec<(String, String)>, Vec<(i64, f64)>)>;
+/// One anti-entropy summary row: `(labels, deduped count, checksum)`.
+pub type TsSummaryRow = (Vec<(String, String)>, u64, u64);
 
 /// Errors decoding an internode message.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -240,6 +257,8 @@ const REQ_BATCH: u8 = 18;
 const REQ_SCANPAGE: u8 = 19;
 const REQ_TSAPPEND: u8 = 20;
 const REQ_TSQUERY: u8 = 21;
+const REQ_TSMERGE: u8 = 22;
+const REQ_TSSUMMARY: u8 = 23;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
@@ -251,6 +270,7 @@ const RES_VHITS: u8 = 6;
 const RES_SCHEMA: u8 = 7;
 const RES_NODESTATUS: u8 = 8;
 const RES_TSSERIES: u8 = 9;
+const RES_TSSUMMARIES: u8 = 10;
 
 impl Request {
     pub fn encode(&self) -> Vec<u8> {
@@ -322,6 +342,20 @@ impl Request {
                 }
                 o.extend_from_slice(&t0.to_le_bytes());
                 o.extend_from_slice(&t1.to_le_bytes());
+            }
+            Request::TsMerge { table, rows } => {
+                o.push(REQ_TSMERGE);
+                put_str(o, table);
+                o.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+                for (labels, ts, value) in rows {
+                    put_labels(o, labels);
+                    o.extend_from_slice(&ts.to_le_bytes());
+                    o.extend_from_slice(&value.to_bits().to_le_bytes());
+                }
+            }
+            Request::TsSummary { table } => {
+                o.push(REQ_TSSUMMARY);
+                put_str(o, table);
             }
             Request::FilteredScan { table, filter } => {
                 o.push(REQ_FSCAN);
@@ -443,6 +477,19 @@ impl Request {
                     t1: c.u64()? as i64,
                 }
             }
+            REQ_TSMERGE => {
+                let table = c.string()?;
+                let n = c.u32()? as usize;
+                let mut rows = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let labels = c.labels()?;
+                    let ts = c.u64()? as i64;
+                    let value = f64::from_bits(c.u64()?);
+                    rows.push((labels, ts, value));
+                }
+                Request::TsMerge { table, rows }
+            }
+            REQ_TSSUMMARY => Request::TsSummary { table: c.string()? },
             REQ_FSCAN => Request::FilteredScan {
                 table: c.string()?,
                 filter: c.expr()?,
@@ -580,6 +627,15 @@ impl Response {
                 o.extend_from_slice(&rows.to_le_bytes());
                 o.extend_from_slice(&hlc_ms.to_le_bytes());
             }
+            Response::TsSummaries { series } => {
+                o.push(RES_TSSUMMARIES);
+                o.extend_from_slice(&(series.len() as u32).to_le_bytes());
+                for (labels, count, checksum) in series {
+                    put_labels(o, labels);
+                    o.extend_from_slice(&count.to_le_bytes());
+                    o.extend_from_slice(&checksum.to_le_bytes());
+                }
+            }
             Response::TsSeries { series } => {
                 o.push(RES_TSSERIES);
                 o.extend_from_slice(&(series.len() as u32).to_le_bytes());
@@ -671,6 +727,17 @@ impl Response {
                     series.push((labels, samples));
                 }
                 Response::TsSeries { series }
+            }
+            RES_TSSUMMARIES => {
+                let n = c.u32()? as usize;
+                let mut series = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let labels = c.labels()?;
+                    let count = c.u64()?;
+                    let checksum = c.u64()?;
+                    series.push((labels, count, checksum));
+                }
+                Response::TsSummaries { series }
             }
             _ => return Err(WireError::Malformed("unknown response op")),
         })

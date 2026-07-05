@@ -278,7 +278,7 @@ impl Head {
 
 /// Rebuild sealed chunks from sorted, deduplicated samples, cutting at
 /// block-window boundaries and the per-chunk sample cap.
-fn rechunk(samples: &[Sample], block_span: i64) -> Result<Vec<SealedChunk>> {
+pub(crate) fn rechunk(samples: &[Sample], block_span: i64) -> Result<Vec<SealedChunk>> {
     let mut out = Vec::new();
     let mut builder = ChunkBuilder::new();
     let mut window = i64::MIN;

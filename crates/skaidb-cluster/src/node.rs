@@ -834,6 +834,100 @@ impl Node {
         Cluster::ts_append(&mut coordinator, table, rows)
     }
 
+    /// Time-series anti-entropy: for each TS table and peer, compare
+    /// per-series `(count, checksum)` summaries and push whole series that
+    /// differ (or that the peer lacks) via `TsMerge`, which accepts
+    /// any-aged samples. Only the series' elected sender (its primary under
+    /// the current ring) pushes, and only to peers that replicate it.
+    /// Duplicate chunks the merge creates fold away at compaction.
+    fn ts_repair(&self) -> EngineResult<usize> {
+        let mut repaired = 0usize;
+        let tables = self
+            .local
+            .read()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .ts_table_names();
+        for table in tables {
+            let local: HashMap<skaidb_tsdb::Labels, (u64, u64)> = self
+                .local
+                .read()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+                .ts_summaries(&table)?
+                .into_iter()
+                .map(|(labels, count, sum)| (labels, (count, sum)))
+                .collect();
+            for (pid, addr) in self.peers_with_ids() {
+                let theirs: HashMap<skaidb_tsdb::Labels, (u64, u64)> = match self
+                    .pool
+                    .call(&addr, &Request::TsSummary { table: table.clone() })
+                {
+                    Ok(Response::TsSummaries { series }) => series
+                        .into_iter()
+                        .map(|(labels, count, sum)| (labels, (count, sum)))
+                        .collect(),
+                    // Old peer or table missing there: schema sync/DDL will
+                    // converge it; skip this pass.
+                    _ => continue,
+                };
+                for (labels, mine) in &local {
+                    let key = ts_placement_key(labels);
+                    let replicas = self.replicas_for(&key);
+                    if replicas.first() != Some(&self.id) || !replicas.contains(&pid) {
+                        continue; // not this series' sender, or peer not a replica
+                    }
+                    if theirs.get(labels) == Some(mine) {
+                        continue; // converged
+                    }
+                    self.ts_push_series_merge(&addr, &table, labels)?;
+                    repaired += 1;
+                }
+            }
+        }
+        Ok(repaired)
+    }
+
+    /// Push one series' full history via `TsMerge` (repair: fills gaps of
+    /// any age on the receiver).
+    fn ts_push_series_merge(
+        &self,
+        addr: &str,
+        table: &str,
+        labels: &skaidb_tsdb::Labels,
+    ) -> EngineResult<()> {
+        let matchers: Vec<skaidb_tsdb::Matcher> = labels
+            .iter()
+            .map(|(k, v)| skaidb_tsdb::Matcher::Eq(k.clone(), v.clone()))
+            .collect();
+        let series = self
+            .local
+            .read()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .ts_query(table, &matchers, i64::MIN, i64::MAX)?;
+        for (slabels, samples) in series {
+            for chunk in samples.chunks(10_000) {
+                let rows: Vec<(skaidb_tsdb::Labels, i64, f64)> = chunk
+                    .iter()
+                    .map(|s| (slabels.clone(), s.ts, s.value))
+                    .collect();
+                match self.pool.call(
+                    addr,
+                    &Request::TsMerge {
+                        table: table.to_string(),
+                        rows,
+                    },
+                ) {
+                    Ok(Response::Ack) => {}
+                    other => {
+                        return Err(EngineError::Cluster(format!(
+                            "ts repair: merge to {addr} not acked: {other:?}"
+                        )))
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Push one series' full sample history to `addr` in bounded TsAppend
     /// batches. Idempotent: replays reject per sample on the receiver.
     fn ts_push_series(
@@ -1572,6 +1666,7 @@ impl Node {
                 }
             }
         }
+        repaired += self.ts_repair()?;
         Ok(repaired)
     }
 
@@ -2070,6 +2165,20 @@ impl Node {
                         Err(e) => Response::Err(e.to_string()),
                     }
                 }
+                Err(_) => Response::Err("local lock poisoned".into()),
+            },
+            Request::TsMerge { table, rows } => match self.local.read() {
+                Ok(db) => match db.ts_merge(&table, &rows) {
+                    Ok(_) => Response::Ack,
+                    Err(e) => Response::Err(e.to_string()),
+                },
+                Err(_) => Response::Err("local lock poisoned".into()),
+            },
+            Request::TsSummary { table } => match self.local.read() {
+                Ok(db) => match db.ts_summaries(&table) {
+                    Ok(series) => Response::TsSummaries { series },
+                    Err(e) => Response::Err(e.to_string()),
+                },
                 Err(_) => Response::Err("local lock poisoned".into()),
             },
             Request::LocalGet { table, key } => match self.local.read() {
@@ -4916,6 +5025,76 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn timeseries_repair_converges_lagging_replica() {
+        // rf=3: every node replicates every series. Inject a window of
+        // samples into only two of the three nodes (as if the third was
+        // down), then repair() from the sender and verify the lagging
+        // node's LOCAL store has the gap filled — mid-series, which
+        // TsAppend alone could never fix.
+        let q = Consistency::Quorum;
+        let cfg3 = |id: &str, addr: &str, members: &[(NodeId, String)]| NodeConfig {
+            id: NodeId::new(id),
+            internode_addr: addr.to_string(),
+            members: members.to_vec(),
+            replication_factor: 3,
+            vnodes_per_node: 64,
+            read_consistency: q,
+            write_consistency: q,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
+            anti_entropy_interval_secs: 0,
+        };
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let m = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let na = Node::new(Database::open(temp_dir("tra")).unwrap(), cfg3("a", &a, &m));
+        let nb = Node::new(Database::open(temp_dir("trb")).unwrap(), cfg3("b", &b, &m));
+        let nc = Node::new(Database::open(temp_dir("trc")).unwrap(), cfg3("c", &c, &m));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        nc.serve_internode().unwrap();
+        na.execute("CREATE TIMESERIES TABLE m (SERIES KEY (h))").unwrap();
+
+        let labels = vec![
+            ("__field__".to_string(), "value".to_string()),
+            ("h".to_string(), "x".to_string()),
+        ];
+        // ts=1000 everywhere; ts=2000 only on a and b; ts=3000 everywhere.
+        for (addr, tss) in [
+            (&a, vec![1000i64, 2000, 3000]),
+            (&b, vec![1000, 2000, 3000]),
+            (&c, vec![1000, 3000]),
+        ] {
+            let rows: Vec<_> = tss.iter().map(|&ts| (labels.clone(), ts, ts as f64)).collect();
+            let r = internode::call(addr, &Request::TsAppend { table: "m".into(), rows }).unwrap();
+            assert!(matches!(r, Response::Ack));
+        }
+
+        // Repair from every node (only the series' elected sender pushes).
+        for node in [&na, &nb, &nc] {
+            node.repair().unwrap();
+        }
+
+        // The lagging node now holds the mid-series gap locally.
+        let r = internode::call(
+            &c,
+            &Request::TsQuery {
+                table: "m".into(),
+                matchers: vec![],
+                t0: i64::MIN,
+                t1: i64::MAX,
+            },
+        )
+        .unwrap();
+        let Response::TsSeries { series } = r else { panic!("expected TsSeries") };
+        let samples = &series[0].1;
+        assert_eq!(
+            samples.iter().map(|(ts, _)| *ts).collect::<Vec<_>>(),
+            vec![1000, 2000, 3000],
+            "gap filled on the lagging replica"
+        );
     }
 
     #[test]

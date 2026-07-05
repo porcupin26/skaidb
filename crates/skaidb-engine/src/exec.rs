@@ -1736,6 +1736,20 @@ impl Database {
         Ok(self.ts_store(table)?.series_labels())
     }
 
+    /// Repair-path sample merge (accepts any-aged samples; see tsdb docs).
+    pub fn ts_merge(&self, table: &str, rows: &[(skaidb_tsdb::Labels, i64, f64)]) -> Result<usize> {
+        self.ts_store(table)?
+            .merge_samples(rows)
+            .map_err(|e| EngineError::Timeseries(e.to_string()))
+    }
+
+    /// Per-series anti-entropy summaries `(labels, count, checksum)`.
+    pub fn ts_summaries(&self, table: &str) -> Result<Vec<(skaidb_tsdb::Labels, u64, u64)>> {
+        self.ts_store(table)?
+            .series_summaries()
+            .map_err(|e| EngineError::Timeseries(e.to_string()))
+    }
+
     /// Whether any time-series table exists (topology-change guard).
     pub fn has_timeseries_tables(&self) -> bool {
         !self.catalog.timeseries.is_empty()
