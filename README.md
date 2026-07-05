@@ -162,6 +162,11 @@ Implemented end-to-end and tested (202 tests):
   ("nearest neighbors `WHERE …`"); cosine/L2/dot. **Distributed** — the index is
   broadcast so each node indexes its shard and queries scatter-gather + merge.
   In-memory/rebuilt-on-open for now — see [docs/VECTOR.md](docs/VECTOR.md)
+- **time-series tables**: `CREATE TIMESERIES TABLE … (SERIES KEY (…),
+  RETENTION 30d)` stores samples in a Prometheus-style engine
+  (Gorilla-compressed chunks, ~1–1.5 B/sample, ≥2M samples/s ingest) with
+  `time_bucket()` bucketing and counter-aware `rate()`/`increase()`
+  aggregates. Single-node for now — see [docs/TIMESERIES.md](docs/TIMESERIES.md)
 - **leaderless replication**: consistent-hash placement; every node serves reads
   and writes; **tunable write consistency** (`ONE`/`QUORUM`/`ALL`) where weaker
   levels ack early and replicate the rest in the background, and a coordinated

@@ -207,9 +207,10 @@ exists. Cannot combine with `JOIN`, `UNION`, aggregates/`GROUP BY`, or
 ## Time-series tables
 
 `CREATE TIMESERIES TABLE` declares a table whose rows are **samples**, stored
-in the time-series engine (Gorilla-compressed chunks; see
-[TODO.md](TODO.md) for the design). Single-node only for now — cluster mode
-rejects the DDL until the distribution phase lands.
+in the time-series engine (Gorilla-compressed chunks; feature status and
+internals in [TIMESERIES.md](TIMESERIES.md), design plan in
+[TODO.md](TODO.md)). Single-node only for now — cluster mode rejects the DDL
+until the distribution phase lands.
 
 ```sql
 CREATE TIMESERIES TABLE cpu (SERIES KEY (host, core), RETENTION 30d);
