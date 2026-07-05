@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/skaidb-types",
     "crates/skaidb-storage",
+    "crates/skaidb-tsdb",
     "crates/skaidb-auth",
     "crates/skaidb-config",
     "crates/skaidb-sql",
@@ -24,6 +25,7 @@ rust-version = "1.93"
 [workspace.dependencies]
 skaidb-types = { path = "crates/skaidb-types" }
 skaidb-storage = { path = "crates/skaidb-storage" }
+skaidb-tsdb = { path = "crates/skaidb-tsdb" }
 skaidb-auth = { path = "crates/skaidb-auth" }
 skaidb-config = { path = "crates/skaidb-config" }
 skaidb-sql = { path = "crates/skaidb-sql" }

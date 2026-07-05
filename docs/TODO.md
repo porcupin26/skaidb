@@ -191,6 +191,39 @@ Prometheus-style head/blocks layout, one instance per TS table per node:
 - Not planned: Influx line protocol, Graphite (adapters exist upstream that
   speak remote_write).
 
+### Grafana integration
+
+Four candidate routes, in recommended order:
+
+1. **Prometheus datasource emulation** (the prize; phase 7): implement the
+   Prometheus HTTP query API — `/api/v1/query_range`, `/api/v1/query`, plus
+   the cheap metadata endpoints `/api/v1/labels`, `/api/v1/label/<n>/values`,
+   `/api/v1/series` (direct reads of the postings index, and what powers
+   Grafana's autocomplete). Every existing Prometheus dashboard then works
+   unchanged — the VictoriaMetrics adoption path. The PromQL subset needed is
+   measurable, not speculative: the top community dashboards
+   (node-exporter-full, kubernetes-mixin) are dominated by selectors,
+   `rate`/`irate`/`increase`, `sum/avg/min/max by()`, `topk`, and
+   `histogram_quantile` (which waits on histograms anyway). Exit criterion:
+   load the node-exporter dashboard against skaidb and diff panel-by-panel
+   against a real Prometheus scraping the same targets. Grafana **alerting**
+   rides on the datasource, so this also delivers alerts without skaidb
+   building an alerting engine.
+2. **Infinity/JSON datasource recipe** (free, day one of phase 2): skaidb's
+   REST `POST /query` already returns `{columns, rows}` JSON; the Infinity
+   plugin can POST SQL with `$__from`/`$__to` interpolated. Clunky but real —
+   document the recipe for dogfooding and demos.
+3. **Native skaidb datasource plugin** (only if SQL becomes the primary query
+   story): TypeScript/Go plugin with `$__timeFilter(ts)` macros and label
+   pickers. Separate codebase + catalog signing cycle; reaches only users who
+   install it, vs route 1's built-in datasource.
+4. **PostgreSQL wire emulation** — ruled out: Grafana's pg datasource
+   generates PostgreSQL-dialect SQL (casts, `date_trunc`) that skaidb would
+   have to chase forever.
+
+Sequencing: metadata endpoints ship early with `remote_write` (phase 4, they
+share the ingest mapping); the evaluator is phase 7.
+
 ## 9. Retention & downsampling
 
 - `RETENTION <dur>` per table: a background pass drops expired blocks (and
@@ -230,6 +263,14 @@ Benchmarks:
    property-tested against a naive store, fuzzed on edge floats), head + WAL
    + replay, block flush/compaction/retention. Exit: 500k samples/s + ≤2 B/s
    sample on workstation, crash-recovery tests green. *(Largest phase.)*
+   **✅ Done (v0.20.0).** Measured (workstation NVMe, 10M samples, 10k
+   series, one WAL fsync per scrape round, `ts_bench` example): ingest
+   2.0–2.7M samples/s; 1.54 B/sample counters, 1.02 B/sample mostly-idle
+   gauges, 6.67 B/sample worst-case random-walk gauges (full mantissa
+   churn — inherent to Gorilla), 3.08 B/sample on a ⅓/⅓/⅓ mix; 8k-sample
+   query over 2 blocks + head in 1.1 ms; reopen replay 0.01 s; 24 unit
+   tests including torn-WAL, crash-recovery, no-duplication-after-flush,
+   retention, and compaction invariants.
 2. **SQL surface, single node** — `CREATE TIMESERIES TABLE`, INSERT routing,
    scalar-function grammar (`time_bucket`, `now`, durations), range SELECT +
    bucketed aggregates + `rate`/`increase`/`first`/`last`, label postings +

@@ -585,6 +585,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "skaidb-tsdb"
+version = "0.19.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "skaidb-types"
 version = "0.19.0"
 dependencies = [
