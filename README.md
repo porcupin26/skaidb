@@ -225,6 +225,15 @@ the `pg` gem, PDO, ADO.NET) so there's almost nothing new to learn, and each
 speaks the binary protocol directly with SCRAM auth and safe parameter binding.
 The wire protocol is specified in [`drivers/PROTOCOL.md`](drivers/PROTOCOL.md).
 
+## Examples
+
+Runnable, self-contained usage examples for every language above (plus Rust)
+live in [`examples/`](examples/) — connect, DDL, batch insert, query, update,
+a primary-key point read, error handling, delete. A separate walkthrough in
+[`examples/vectors/`](examples/vectors/) covers vector search end to end:
+turning text into an embedding, storing and indexing it, and running
+filtered nearest-neighbor search.
+
 ## License
 
 skaidb is licensed under the **Server Side Public License, version 1 (SSPL-1.0)** —

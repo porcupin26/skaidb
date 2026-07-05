@@ -1,0 +1,16 @@
+[workspace]
+
+[package]
+name = "skaidb-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "basic_usage"
+path = "basic_usage.rs"
+
+[dependencies]
+skaidb-driver = { path = "../../crates/skaidb-driver" }
+skaidb-proto = { path = "../../crates/skaidb-proto" }
+skaidb-types = { path = "../../crates/skaidb-types" }

@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Skaidb.Examples</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Path reference to the in-repo driver; in a real project, reference
+         the published NuGet package instead. -->
+    <Compile Include="../../drivers/dotnet/Skaidb.cs" />
+  </ItemGroup>
+</Project>

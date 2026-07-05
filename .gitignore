@@ -12,6 +12,14 @@ CLAUDE.md
 **/*.rs.bk
 # Cargo.lock IS committed: skaidb ships binaries, so lockfile reproducibility matters.
 
+# Standalone example projects build their own target/ and don't ship —
+# their Cargo.lock is regenerated on demand, unlike the workspace's.
+examples/rust/target/
+examples/rust/Cargo.lock
+examples/vectors/rust/target/
+examples/vectors/rust/Cargo.lock
+examples/java/out/
+
 # Release packaging scratch (produced by nfpm in CI / local builds)
 /dist/
 /staging/

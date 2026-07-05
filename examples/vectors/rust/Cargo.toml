@@ -1,0 +1,16 @@
+[workspace]
+
+[package]
+name = "skaidb-vector-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "vector_search"
+path = "vector_search.rs"
+
+[dependencies]
+skaidb-driver = { path = "../../../crates/skaidb-driver" }
+skaidb-proto = { path = "../../../crates/skaidb-proto" }
+skaidb-types = { path = "../../../crates/skaidb-types" }
