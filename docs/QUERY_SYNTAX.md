@@ -211,8 +211,8 @@ in the time-series engine (Gorilla-compressed chunks; feature status and
 internals in [TIMESERIES.md](TIMESERIES.md), design plan in
 [TODO.md](TODO.md)). Distributed: the DDL broadcasts, series place on the
 ring and replicate at the write consistency, and queries union-merge across
-members. Topology changes are refused while TS tables exist (chunk
-migration is future work).
+members. Joins and
+decommissions migrate series like any other data.
 
 ```sql
 CREATE TIMESERIES TABLE cpu (SERIES KEY (host, core), RETENTION 30d);

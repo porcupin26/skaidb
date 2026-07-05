@@ -337,6 +337,22 @@ impl Tsdb {
             .collect())
     }
 
+    /// Every series label set in the store (head + blocks, deduplicated) —
+    /// the migration unit for resharding.
+    pub fn series_labels(&self) -> Vec<Labels> {
+        let inner = self.inner.lock().expect("tsdb lock");
+        let mut set: std::collections::BTreeSet<Labels> = std::collections::BTreeSet::new();
+        for (_, labels) in inner.head.live_series() {
+            set.insert(labels.clone());
+        }
+        for block in &inner.blocks {
+            for labels in block.series_labels() {
+                set.insert(labels);
+            }
+        }
+        set.into_iter().collect()
+    }
+
     pub fn stats(&self) -> TsdbStats {
         let inner = self.inner.lock().expect("tsdb lock");
         let disk_bytes = dir_size(&self.dir).unwrap_or(0);

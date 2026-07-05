@@ -1605,6 +1605,21 @@ impl Database {
                 ver(&format!("t:{name}")),
             ));
         }
+        for (name, def) in &self.catalog.timeseries {
+            let (db, bare) = namespace::split(name);
+            let retention = def
+                .retention_ms
+                .map(|ms| format!(", RETENTION {ms}ms"))
+                .unwrap_or_default();
+            out.push((
+                db.to_string(),
+                format!(
+                    "CREATE TIMESERIES TABLE IF NOT EXISTS {bare} (SERIES KEY ({}){retention})",
+                    def.series_key.join(", ")
+                ),
+                ver(&format!("t:{name}")),
+            ));
+        }
         for (name, idx) in &self.catalog.indexes {
             let (db, bare) = namespace::split(name);
             let table = namespace::split(&idx.table).1;
@@ -1720,6 +1735,16 @@ impl Database {
             ));
         }
         out
+    }
+
+    /// Names of all time-series tables.
+    pub fn ts_table_names(&self) -> Vec<String> {
+        self.catalog.timeseries.keys().cloned().collect()
+    }
+
+    /// Every series label set in `table` (the resharding migration unit).
+    pub fn ts_series_labels(&self, table: &str) -> Result<Vec<skaidb_tsdb::Labels>> {
+        Ok(self.ts_store(table)?.series_labels())
     }
 
     /// Whether any time-series table exists (topology-change guard).

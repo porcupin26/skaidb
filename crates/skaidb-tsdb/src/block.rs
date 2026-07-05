@@ -216,6 +216,11 @@ impl Block {
         Ok(out)
     }
 
+    /// The label sets of every series in this block.
+    pub fn series_labels(&self) -> Vec<Labels> {
+        self.series.iter().map(|s| s.labels.clone()).collect()
+    }
+
     /// Samples in `[t0, t1]` for series accepted by `keep`.
     pub fn query(
         &self,

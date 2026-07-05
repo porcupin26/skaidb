@@ -7,9 +7,9 @@ aggregates, and time-bucketed queries.
 
 > Status: **distributed** — series place on the consistent-hash ring and
 > replicate at the configured write consistency; queries union-merge across
-> members at the read consistency. Topology changes (join/decommission) are
-> refused while TS tables exist until chunk-level migration lands (phase 5).
-> Shipped in v0.20.0 (storage), v0.21.0 (SQL), v0.22.0 (cluster), v0.23.0 (remote_write).
+> members at the read consistency; joins/decommissions migrate series like
+> any other data. Shipped in v0.20.0 (storage), v0.21.0 (SQL), v0.22.0
+> (cluster), v0.23.0 (remote_write), v0.24.0 (resharding).
 
 ## Usage
 
@@ -99,7 +99,7 @@ Roadmap phases refer to the implementation plan in [`TODO.md`](TODO.md).
 | **Partial-aggregate pushdown** | cluster queries ship matching raw samples to the coordinator; per-node partial aggregation (sum/count per bucket, per-series rate segments) would cut transfer for wide aggregations | phase 3 follow-up |
 | Self-scrape (`/metrics` → TS table) | remote_write covers external scrapers | later |
 | OOO window in DDL/config | the storage engine supports a bounded out-of-order window (`TsdbOptions.ooo_window_ms`, merged at flush and in reads), but no SQL/config surface sets it yet — tables run strict-monotonic and remote_write counts OOO rejections per batch | phase 4 follow-up |
-| **Resharding with TS tables** | chunk-level migrate/drain; joins/decommissions are refused while TS tables exist | phase 5 |
+| TS reclaim | after a reshard, former owners keep stale series copies (harmless under union-merge; no `reclaim` pass for TS yet) | with TS anti-entropy |
 | **Downsampling / rollups** | `CREATE ROLLUP`, tiered retention, query-time rollup selection | phase 6 |
 | **PromQL subset / Grafana datasource** | `/api/v1/query_range` + metadata endpoints | phase 7 (stretch) |
 | Label postings index | matchers scan the per-block series list (fine at moderate cardinality) | with pushdown work |

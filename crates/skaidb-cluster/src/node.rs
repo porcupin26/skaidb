@@ -834,19 +834,109 @@ impl Node {
         Cluster::ts_append(&mut coordinator, table, rows)
     }
 
-    /// Chunk-level migration of time-series stores is not built yet
-    /// (docs/TODO.md phase 5) — joins/decommissions would strand or lose
-    /// series, so they are refused while any TS table exists.
-    fn reject_if_timeseries(&self, what: &str) -> EngineResult<()> {
-        let has = self
+    /// Push one series' full sample history to `addr` in bounded TsAppend
+    /// batches. Idempotent: replays reject per sample on the receiver.
+    fn ts_push_series(
+        &self,
+        addr: &str,
+        table: &str,
+        labels: &skaidb_tsdb::Labels,
+    ) -> EngineResult<()> {
+        let matchers: Vec<skaidb_tsdb::Matcher> = labels
+            .iter()
+            .map(|(k, v)| skaidb_tsdb::Matcher::Eq(k.clone(), v.clone()))
+            .collect();
+        let series = self
             .local
             .read()
             .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
-            .has_timeseries_tables();
-        if has {
-            return Err(EngineError::Unsupported(format!(
-                "{what} are not yet supported while time-series tables exist (drop them first)"
-            )));
+            .ts_query(table, &matchers, i64::MIN, i64::MAX)?;
+        for (slabels, samples) in series {
+            for chunk in samples.chunks(10_000) {
+                let rows: Vec<(skaidb_tsdb::Labels, i64, f64)> = chunk
+                    .iter()
+                    .map(|s| (slabels.clone(), s.ts, s.value))
+                    .collect();
+                match self.pool.call(
+                    addr,
+                    &Request::TsAppend {
+                        table: table.to_string(),
+                        rows,
+                    },
+                ) {
+                    Ok(Response::Ack) => {}
+                    other => {
+                        return Err(EngineError::Cluster(format!(
+                            "ts migration: append to {addr} not acked: {other:?}"
+                        )))
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Time-series share of a rebalance: push every local series the joiner
+    /// now replicates, elected single-sender style (the series' primary
+    /// under the pre-join ring pushes).
+    fn ts_rebalance_to(&self, joiner: &NodeId, addr: &str, old_ring: &Ring) -> EngineResult<()> {
+        let rf = self.cfg.replication_factor;
+        let tables = self
+            .local
+            .read()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .ts_table_names();
+        for table in tables {
+            let all_series = self
+                .local
+                .read()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+                .ts_series_labels(&table)?;
+            for labels in all_series {
+                let key = ts_placement_key(&labels);
+                if !self.replicas_for(&key).contains(joiner) {
+                    continue; // joiner doesn't own this series under the new ring
+                }
+                let elected = old_ring.replicas_for(&key, rf).first().cloned();
+                if elected.as_ref() != Some(&self.id) {
+                    continue; // another member is this series' sender
+                }
+                self.ts_push_series(addr, &table, &labels)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Time-series share of a drain: push every local series to any owner
+    /// under the post-removal ring that isn't already a replica.
+    fn ts_drain_to(
+        &self,
+        new_ring: &Ring,
+        addr_of: &HashMap<NodeId, String>,
+    ) -> EngineResult<()> {
+        let rf = self.cfg.replication_factor;
+        let tables = self
+            .local
+            .read()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .ts_table_names();
+        for table in tables {
+            let all_series = self
+                .local
+                .read()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+                .ts_series_labels(&table)?;
+            for labels in all_series {
+                let key = ts_placement_key(&labels);
+                let old = self.replicas_for(&key);
+                for replica in new_ring.replicas_for(&key, rf) {
+                    if old.contains(&replica) {
+                        continue;
+                    }
+                    let Some(addr) = addr_of.get(&replica) else { continue };
+                    self.ts_push_series(addr, &table, &labels)?;
+                }
+            }
         }
         Ok(())
     }
@@ -1107,6 +1197,10 @@ impl Node {
                 }
             }
         }
+        // Time-series stores migrate too (series-level, idempotent — no
+        // checkpoint needed; a retried join re-pushes harmlessly).
+        self.ts_rebalance_to(joiner, &addr, &old_ring)?;
+
         // Done — clear the checkpoint.
         let _ = std::fs::remove_file(&ckpt);
         Ok(())
@@ -1169,6 +1263,8 @@ impl Node {
                 }
             }
         }
+        // Time-series stores drain the same way, series-level.
+        self.ts_drain_to(&new_ring, &addr_of)?;
         Ok(())
     }
 
@@ -1191,7 +1287,6 @@ impl Node {
     /// cluster. The joiner and a member quorum must be reachable; a member that
     /// missed the broadcast needs it re-sent (see [docs/RESHARDING.md]).
     pub fn add_member(&self, id: &str, addr: &str) -> EngineResult<()> {
-        self.reject_if_timeseries("topology changes")?;
         let _guard = self.membership_lock.lock().expect("membership lock");
         let joiner = NodeId::new(id);
         let old_members = self.members_snapshot();
@@ -1287,7 +1382,6 @@ impl Node {
     /// owners to be reachable, and assumes a quiescent cluster — as `add_member`
     /// does. See [docs/RESHARDING.md].
     pub fn remove_member(&self, id: &str) -> EngineResult<()> {
-        self.reject_if_timeseries("topology changes")?;
         let _guard = self.membership_lock.lock().expect("membership lock");
         let leaving = NodeId::new(id);
         let members = self.members_snapshot();
@@ -4825,6 +4919,72 @@ mod tests {
     }
 
     #[test]
+    fn timeseries_resharding_join_and_decommission() {
+        // rf=1 so placement moves are observable: every series lives on
+        // exactly one node; a join must migrate the joiner's share and a
+        // decommission must drain the leaver's share.
+        let one = Consistency::One;
+        let cfg1 = |id: &str, addr: &str, members: &[(NodeId, String)]| NodeConfig {
+            id: NodeId::new(id),
+            internode_addr: addr.to_string(),
+            members: members.to_vec(),
+            replication_factor: 1,
+            vnodes_per_node: 64,
+            read_consistency: one,
+            write_consistency: one,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
+            anti_entropy_interval_secs: 0,
+        };
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let m2 = vec![member("a", &a), member("b", &b)];
+        let na = Node::new(Database::open(temp_dir("rsa")).unwrap(), cfg1("a", &a, &m2));
+        let nb = Node::new(Database::open(temp_dir("rsb")).unwrap(), cfg1("b", &b, &m2));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+
+        na.execute("CREATE TIMESERIES TABLE m (SERIES KEY (host))").unwrap();
+        for i in 0..20 {
+            na.execute(&format!(
+                "INSERT INTO m (host, ts, value) VALUES ('h{i}', 1000, 1.0), ('h{i}', 2000, 2.0)"
+            ))
+            .unwrap();
+        }
+
+        // Join a third node (previously refused with TS tables present).
+        let m3 = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let nc = Node::new(Database::open(temp_dir("rsc")).unwrap(), cfg1("c", &c, &m3));
+        nc.serve_internode().unwrap();
+        na.add_member("c", &c).unwrap();
+
+        // All samples remain readable from every coordinator...
+        for node in [&na, &nb, &nc] {
+            let rs = rows(node.execute("SELECT count(value) FROM m").unwrap());
+            assert_eq!(rs.rows[0][0], Value::Int(40), "full view after join");
+        }
+        // ...and the joiner actually received its share (local-only check).
+        let r = internode::call(
+            &c,
+            &Request::TsQuery {
+                table: "m".into(),
+                matchers: vec![],
+                t0: i64::MIN,
+                t1: i64::MAX,
+            },
+        )
+        .unwrap();
+        let Response::TsSeries { series } = r else { panic!("expected TsSeries") };
+        assert!(!series.is_empty(), "joiner should own some series");
+
+        // Decommission b: its series drain to their new owners first.
+        na.remove_member("b").unwrap();
+        for node in [&na, &nc] {
+            let rs = rows(node.execute("SELECT count(value) FROM m").unwrap());
+            assert_eq!(rs.rows[0][0], Value::Int(40), "full view after drain");
+        }
+    }
+
+    #[test]
     fn timeseries_cluster_end_to_end() {
         // 3 nodes, rf=3, QUORUM: TS DDL broadcasts, samples replicate by
         // series placement, queries union-merge across members.
@@ -4898,15 +5058,11 @@ mod tests {
         let err = nb.execute("UPDATE cpu SET value = 1 WHERE host = 'x'").unwrap_err();
         assert!(err.to_string().contains("append-only"), "{err}");
 
-        // Topology changes are refused while TS tables exist.
+        // Topology changes work with TS tables (an unreachable joiner is
+        // still an error, but not a TS refusal — migration is covered by
+        // timeseries_resharding_join_and_decommission).
         let err = na.add_member("d", "127.0.0.1:1").unwrap_err();
-        assert!(err.to_string().contains("time-series"), "{err}");
-
-        // Dropping the TS table lifts the guard (the join still fails to
-        // reach the bogus address, but past the TS check).
-        na.execute("DROP TABLE cpu").unwrap();
-        let err = na.add_member("d", "127.0.0.1:1").unwrap_err();
-        assert!(!err.to_string().contains("time-series"), "{err}");
+        assert!(err.to_string().contains("unreachable"), "{err}");
     }
 
     #[test]

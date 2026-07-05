@@ -313,6 +313,15 @@ Benchmarks:
 5. **Resharding for TS tables** — chunk-level migrate/drain, lifting the
    phase-3 limitation. Exit: join + decommission under sustained ingest, all
    samples accounted for.
+   **✅ Done (v0.24.0).** Series-level migration: on join, each member
+   pushes series the joiner now owns (single-sender: the series' primary
+   under the pre-join ring), and drains push all local series to their
+   post-removal owners — via idempotent `TsAppend` batches, so retries
+   are safe without checkpoints. The topology guard is lifted. Also fixed
+   en route: `schema_sync()` (join bootstrap + schema anti-entropy) was
+   missing TS table definitions — only `schema_ddl()` had them. Open:
+   TS `reclaim` (former owners keep harmless stale copies), and the
+   under-sustained-ingest soak remains to be run on the fleet.
 6. **Downsampling** — `CREATE ROLLUP`, tiered retention, query-time rollup
    selection. Exit: year-long queries hit rollups, not raw.
 7. **Stretch: PromQL subset** — `/api/v1/query_range` for Grafana. Re-scope
