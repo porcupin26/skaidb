@@ -70,6 +70,9 @@ pub struct TableDef {
 pub struct TsTableDef {
     pub series_key: Vec<String>,
     pub retention_ms: Option<i64>,
+    /// Out-of-order acceptance window (ms); default 0 = strict monotonic.
+    #[serde(default)]
+    pub ooo_window_ms: i64,
 }
 
 /// The set of all tables and indexes.

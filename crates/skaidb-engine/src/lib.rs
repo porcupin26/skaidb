@@ -223,6 +223,39 @@ mod tests {
     }
 
     #[test]
+    fn timeseries_ooo_window_and_status() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TIMESERIES TABLE m (SERIES KEY (h), RETENTION 30d, OOO 2m)")
+            .unwrap();
+        // In-order, then within-window out-of-order, then beyond-window.
+        db.execute("INSERT INTO m (h, ts, value) VALUES ('x', 600000, 6)").unwrap();
+        assert_eq!(
+            affected(db.execute("INSERT INTO m (h, ts, value) VALUES ('x', 500000, 5)").unwrap()),
+            1,
+            "within the 2m window"
+        );
+        db.execute("INSERT INTO m (h, ts, value) VALUES ('x', 100000, 99)").unwrap();
+        let rs = rows(db.execute("SELECT ts, value FROM m ORDER BY ts").unwrap());
+        // Beyond-window sample (ts=100000) was rejected; the OOO one merged
+        // in time order.
+        assert_eq!(
+            rs.rows,
+            vec![
+                vec![Value::Timestamp(500000), Value::Float(5.0)],
+                vec![Value::Timestamp(600000), Value::Float(6.0)],
+            ]
+        );
+        // Per-store stats are visible.
+        let rs = rows(db.execute("SHOW STATUS").unwrap());
+        assert!(rs.rows.iter().any(|r| r[0] == Value::String("timeseries.m.series".into())));
+        assert!(rs
+            .rows
+            .iter()
+            .any(|r| r[0] == Value::String("timeseries.m.samples_rejected".into())
+                && r[1] == Value::Int(1)));
+    }
+
+    #[test]
     fn timeseries_rejects_update_delete_and_bad_inserts() {
         let mut db = Database::open(tempdir()).unwrap();
         db.execute("CREATE TIMESERIES TABLE m (SERIES KEY (h))").unwrap();

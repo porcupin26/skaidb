@@ -4,7 +4,7 @@
 //! `WriteRequest`s. The decoder below hand-parses just the fields skaidb
 //! needs (labels + samples), so no protobuf dependency is pulled in. Samples
 //! land in the `metrics` time-series table (auto-created on first write as
-//! `SERIES KEY (name)`); the `__name__` label maps to `name` (double
+//! `SERIES KEY (name), OOO 1h` — HA Prometheus pairs interleave); the `__name__` label maps to `name` (double
 //! underscores are reserved in skaidb), other labels pass through.
 
 use skaidb_tsdb::Labels;
@@ -30,7 +30,7 @@ pub fn ingest(ctx: &Shared, role: &str, body: &[u8]) -> Result<usize, String> {
             // under the caller's role so RBAC still applies.
             let mut db = skaidb_engine::DEFAULT_DATABASE.to_string();
             let create = format!(
-                "CREATE TIMESERIES TABLE IF NOT EXISTS {TABLE} (SERIES KEY (name))"
+                "CREATE TIMESERIES TABLE IF NOT EXISTS {TABLE} (SERIES KEY (name), OOO 1h)"
             );
             let resp = execute_session_as(ctx, role, &mut db, &create, None);
             if let skaidb_proto::Response::Error(e) = resp {

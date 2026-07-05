@@ -256,13 +256,20 @@ impl Parser {
             let series_key = self.parse_ident_list()?;
             self.expect(&Token::RParen)?;
             let mut retention_ms = None;
-            if self.eat(&Token::Comma) {
-                self.expect_keyword(Keyword::Retention)?;
-                retention_ms = Some(match self.advance() {
+            let mut ooo_ms = None;
+            while self.eat(&Token::Comma) {
+                let target = if self.eat_keyword(Keyword::Retention) {
+                    &mut retention_ms
+                } else if self.eat_keyword(Keyword::Ooo) {
+                    &mut ooo_ms
+                } else {
+                    return Err(self.unexpected("RETENTION or OOO".into()));
+                };
+                *target = Some(match self.advance() {
                     Token::Duration(ms) => ms,
                     other => {
                         return Err(ParseError::Other(format!(
-                            "RETENTION expects a duration like 30d or 12h, found {other:?}"
+                            "expected a duration like 30d or 12h, found {other:?}"
                         )))
                     }
                 });
@@ -273,6 +280,7 @@ impl Parser {
                 if_not_exists,
                 series_key,
                 retention_ms,
+                ooo_ms,
             }))
         } else if self.eat_keyword(Keyword::Vector) {
             self.expect_keyword(Keyword::Index)?;

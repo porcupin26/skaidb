@@ -20,7 +20,8 @@ current database (see *Databases* below).
 -- DDL
 CREATE TABLE [IF NOT EXISTS] <table> (PRIMARY KEY (<col> [, <col> ...]))
 CREATE TIMESERIES TABLE [IF NOT EXISTS] <table>
-       (SERIES KEY (<label> [, <label> ...]) [, RETENTION <duration>])
+       (SERIES KEY (<label> [, <label> ...])
+        [, RETENTION <duration>] [, OOO <duration>])
 DROP   TABLE [IF EXISTS] <table>
 CREATE INDEX [IF NOT EXISTS] <name> ON <table> (<path> [, <path> ...])
 DROP   INDEX [IF EXISTS] <name>
@@ -233,8 +234,10 @@ WHERE ts >= now() - 6h GROUP BY t;
   reserved.
 - **Append-only.** `UPDATE`/`DELETE` are rejected; old data expires via
   `RETENTION <duration>` (whole storage blocks drop as they age out).
-  Duplicate/older timestamps for a series are rejected per sample (an
-  out-of-order ingest window is planned).
+  Older timestamps for a series are rejected per sample unless the table
+  declares an out-of-order window (`OOO 10m`): samples within the window of
+  the series' newest are buffered and merged in time order; an equal
+  timestamp overwrites (last write wins).
 - **Pushdown.** `AND`-combined `ts` comparisons and label `=`/`!=`
   predicates narrow the storage read; any other predicate still applies with
   full SQL semantics afterward.

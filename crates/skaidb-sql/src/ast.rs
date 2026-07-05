@@ -139,6 +139,8 @@ pub struct CreateTimeseriesTable {
     pub series_key: Vec<String>,
     /// Milliseconds; `None` keeps data forever.
     pub retention_ms: Option<i64>,
+    /// Out-of-order acceptance window in ms; `None`/0 = strict monotonic.
+    pub ooo_ms: Option<i64>,
 }
 
 /// `CREATE INDEX [IF NOT EXISTS] name ON table (path1 [, path2, ...])`.

@@ -9,7 +9,7 @@ aggregates, and time-bucketed queries.
 > replicate at the configured write consistency; queries union-merge across
 > members at the read consistency; joins/decommissions migrate series like
 > any other data. Shipped in v0.20.0 (storage), v0.21.0 (SQL), v0.22.0
-> (cluster), v0.23.0 (remote_write), v0.24.0 (resharding).
+> (cluster), v0.23.0 (remote_write), v0.24.0 (resharding), v0.25.0 (OOO DDL + stats).
 
 ## Usage
 
@@ -52,11 +52,16 @@ stored as its own compressed stream. Full grammar and semantics:
 - Immutable 2 h blocks, 4× tiered compaction, `RETENTION` as O(1)
   whole-block drops.
 - Cardinality cap (default 1M series/node) with per-batch accounting of
-  out-of-order and over-limit rejections.
+  out-of-order and over-limit rejections; per-table
+  `timeseries.<name>.{series,blocks,samples_appended,samples_rejected,disk_bytes}`
+  in `SHOW STATUS`.
 
 **SQL surface:**
 
-- `CREATE TIMESERIES TABLE (SERIES KEY (...) [, RETENTION <dur>])`; plain
+- `CREATE TIMESERIES TABLE (SERIES KEY (...) [, RETENTION <dur>]
+  [, OOO <dur>])` — `OOO` sets a bounded out-of-order ingest window
+  (buffered per series, merged in time order; the remote_write `metrics`
+  table auto-creates with `OOO 1h` for HA Prometheus pairs); plain
   `DROP TABLE`; listed by `SHOW TABLES` with the implicit `(series key, ts)`
   key; survives restart (catalog + WAL replay).
 - Duration literals (`250ms`, `15s`, `5m`, `2h`, `30d`, `1w`),
@@ -98,13 +103,12 @@ Roadmap phases refer to the implementation plan in [`TODO.md`](TODO.md).
 | **TS anti-entropy / hints** | a replica down during a write stays missing those samples until re-written; reads stay correct via union-merge at quorum, but there is no background repair or hinted handoff for TS data yet (block-checksum repair planned) | phase 3 follow-up |
 | **Partial-aggregate pushdown** | cluster queries ship matching raw samples to the coordinator; per-node partial aggregation (sum/count per bucket, per-series rate segments) would cut transfer for wide aggregations | phase 3 follow-up |
 | Self-scrape (`/metrics` → TS table) | remote_write covers external scrapers | later |
-| OOO window in DDL/config | the storage engine supports a bounded out-of-order window (`TsdbOptions.ooo_window_ms`, merged at flush and in reads), but no SQL/config surface sets it yet — tables run strict-monotonic and remote_write counts OOO rejections per batch | phase 4 follow-up |
 | TS reclaim | after a reshard, former owners keep stale series copies (harmless under union-merge; no `reclaim` pass for TS yet) | with TS anti-entropy |
 | **Downsampling / rollups** | `CREATE ROLLUP`, tiered retention, query-time rollup selection | phase 6 |
 | **PromQL subset / Grafana datasource** | `/api/v1/query_range` + metadata endpoints | phase 7 (stretch) |
 | Label postings index | matchers scan the per-block series list (fine at moderate cardinality) | with pushdown work |
 | Regex label matchers | only `=` / `!=` push down | with postings |
-| Per-store stats in `SHOW STATUS` / `/metrics` | series counts, disk bytes, rejection counters exist internally | soon |
+| TS gauges on `/metrics` | per-store stats are in `SHOW STATUS`; Prometheus-endpoint gauges pending | soon |
 | `memory_target` integration | head memory isn't yet part of the storage budget | soon |
 | Streamed TS results | TS SELECT materializes its result before the (streamable) wire; raw range dumps of very large windows should stream end-to-end | later |
 | Exemplars / native histograms | schema headroom reserved in the chunk format | later |

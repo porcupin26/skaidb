@@ -489,6 +489,7 @@ impl Database {
                 &ct.name,
                 ct.series_key,
                 ct.retention_ms,
+                ct.ooo_ms.unwrap_or(0),
                 ct.if_not_exists,
             ),
             Statement::DropTable { name, if_exists } => self.drop_table(&name, if_exists),
@@ -857,6 +858,7 @@ impl Database {
         name: &str,
         series_key: Vec<String>,
         retention_ms: Option<i64>,
+        ooo_window_ms: i64,
         if_not_exists: bool,
     ) -> Result<QueryOutput> {
         if series_key.is_empty() {
@@ -885,6 +887,7 @@ impl Database {
         let def = TsTableDef {
             series_key,
             retention_ms,
+            ooo_window_ms,
         };
         let store = open_tsdb(&self.dir, name, &def)?;
         self.timeseries.insert(name.to_string(), store);
@@ -1607,16 +1610,9 @@ impl Database {
         }
         for (name, def) in &self.catalog.timeseries {
             let (db, bare) = namespace::split(name);
-            let retention = def
-                .retention_ms
-                .map(|ms| format!(", RETENTION {ms}ms"))
-                .unwrap_or_default();
             out.push((
                 db.to_string(),
-                format!(
-                    "CREATE TIMESERIES TABLE IF NOT EXISTS {bare} (SERIES KEY ({}){retention})",
-                    def.series_key.join(", ")
-                ),
+                ts_create_ddl(bare, def),
                 ver(&format!("t:{name}")),
             ));
         }
@@ -1700,16 +1696,9 @@ impl Database {
         }
         for (name, def) in &self.catalog.timeseries {
             let (db, bare) = namespace::split(name);
-            let retention = def
-                .retention_ms
-                .map(|ms| format!(", RETENTION {ms}ms"))
-                .unwrap_or_default();
             out.push((
                 db.to_string(),
-                format!(
-                    "CREATE TIMESERIES TABLE IF NOT EXISTS {bare} (SERIES KEY ({}){retention})",
-                    def.series_key.join(", ")
-                ),
+                ts_create_ddl(bare, def),
             ));
         }
         for (name, idx) in &self.catalog.indexes {
@@ -1887,6 +1876,21 @@ impl Database {
                 row(&format!("table.{}.live_keys", t.name), Value::Int(t.live_keys as i64));
                 row(&format!("table.{}.tombstones", t.name), Value::Int(t.tombstones as i64));
                 row(&format!("table.{}.disk_bytes", t.name), Value::Int(t.disk_bytes as i64));
+            }
+            row("timeseries_tables", Value::Int(self.timeseries.len() as i64));
+            for (name, store) in &self.timeseries {
+                let ts = store.stats();
+                row(&format!("timeseries.{name}.series"), Value::Int(ts.series as i64));
+                row(&format!("timeseries.{name}.blocks"), Value::Int(ts.blocks as i64));
+                row(
+                    &format!("timeseries.{name}.samples_appended"),
+                    Value::Int(ts.samples_appended as i64),
+                );
+                row(
+                    &format!("timeseries.{name}.samples_rejected"),
+                    Value::Int(ts.samples_rejected as i64),
+                );
+                row(&format!("timeseries.{name}.disk_bytes"), Value::Int(ts.disk_bytes as i64));
             }
         }
         ResultSet {
@@ -3135,6 +3139,24 @@ fn index_dir(root: &Path, name: &str) -> PathBuf {
     root.join("indexes").join(name)
 }
 
+/// Render the idempotent CREATE DDL for a time-series table definition
+/// (schema replay/bootstrap/repair all share it).
+fn ts_create_ddl(bare: &str, def: &TsTableDef) -> String {
+    let retention = def
+        .retention_ms
+        .map(|ms| format!(", RETENTION {ms}ms"))
+        .unwrap_or_default();
+    let ooo = if def.ooo_window_ms > 0 {
+        format!(", OOO {}ms", def.ooo_window_ms)
+    } else {
+        String::new()
+    };
+    format!(
+        "CREATE TIMESERIES TABLE IF NOT EXISTS {bare} (SERIES KEY ({}){retention}{ooo})",
+        def.series_key.join(", ")
+    )
+}
+
 fn ts_dir(root: &Path, name: &str) -> PathBuf {
     root.join("timeseries").join(name)
 }
@@ -3145,6 +3167,7 @@ fn open_tsdb(root: &Path, name: &str, def: &TsTableDef) -> Result<Tsdb> {
         &ts_dir(root, name),
         TsdbOptions {
             retention_ms: def.retention_ms,
+            ooo_window_ms: def.ooo_window_ms,
             ..TsdbOptions::default()
         },
     )

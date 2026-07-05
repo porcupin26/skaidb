@@ -113,6 +113,7 @@ pub enum Keyword {
     Timeseries,
     Series,
     Retention,
+    Ooo,
 }
 
 /// Length of the longest keyword ("TRANSACTION").
@@ -181,6 +182,7 @@ impl Keyword {
             b"TIMESERIES" => Timeseries,
             b"SERIES" => Series,
             b"RETENTION" => Retention,
+            b"OOO" => Ooo,
             b"UNION" => Union,
             b"ALL" => All,
             b"BEGIN" => Begin,
