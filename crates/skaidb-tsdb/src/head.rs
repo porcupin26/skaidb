@@ -25,8 +25,14 @@ struct SeriesEntry {
     /// `(window_start, builder)` — the chunk being appended to. Chunks never
     /// span a block window, so flush boundaries cut cleanly.
     open: Option<(i64, ChunkBuilder)>,
+    /// Out-of-order samples within the configured window, kept ts-sorted;
+    /// merged into chunks at flush and into reads before then.
+    ooo: Vec<Sample>,
     last_ts: i64,
 }
+
+/// Cap on buffered out-of-order samples per series.
+const OOO_MAX_PER_SERIES: usize = 512;
 
 /// In-memory head for one store.
 #[derive(Debug, Default)]
@@ -68,6 +74,7 @@ impl Head {
             labels: labels.clone(),
             sealed: Vec::new(),
             open: None,
+            ooo: Vec::new(),
             last_ts: i64::MIN,
         }));
         self.map.insert(labels.clone(), id);
@@ -82,10 +89,31 @@ impl Head {
             .ok_or_else(|| TsdbError::Invalid(format!("unknown series id {id}")))
     }
 
-    /// Append one sample. `block_span` cuts chunks at window boundaries.
-    pub fn append(&mut self, id: u64, ts: i64, value: f64, block_span: i64) -> Result<()> {
+    /// Append one sample. `block_span` cuts chunks at window boundaries;
+    /// samples older than a series' newest land in its out-of-order buffer
+    /// when within `ooo_window` (0 = strict monotonic).
+    pub fn append(
+        &mut self,
+        id: u64,
+        ts: i64,
+        value: f64,
+        block_span: i64,
+        ooo_window: i64,
+    ) -> Result<()> {
         let entry = self.entry_mut(id)?;
         if ts <= entry.last_ts {
+            if ooo_window > 0
+                && ts > entry.last_ts.saturating_sub(ooo_window)
+                && ts < entry.last_ts
+                && entry.ooo.len() < OOO_MAX_PER_SERIES
+            {
+                // Sorted insert; an equal timestamp overwrites (last wins).
+                match entry.ooo.binary_search_by_key(&ts, |s| s.ts) {
+                    Ok(i) => entry.ooo[i].value = value,
+                    Err(i) => entry.ooo.insert(i, Sample { ts, value }),
+                }
+                return Ok(());
+            }
             return Err(TsdbError::OutOfOrder {
                 ts,
                 last: entry.last_ts,
@@ -123,9 +151,15 @@ impl Head {
     }
 
     /// Extract everything strictly before `boundary` for a block flush,
-    /// sealing open chunks from completed windows. Series left with no data
-    /// and no recent appends are dropped (their ids are not reused).
-    pub fn take_before(&mut self, boundary: i64) -> Vec<(Labels, Vec<SealedChunk>)> {
+    /// sealing open chunks from completed windows and merging any buffered
+    /// out-of-order samples into the flushed chunks (a re-encode, only paid
+    /// when OOO data exists). Series left with no data and no recent appends
+    /// are dropped (their ids are not reused).
+    pub fn take_before(
+        &mut self,
+        boundary: i64,
+        block_span: i64,
+    ) -> Result<Vec<(Labels, Vec<SealedChunk>)>> {
         let mut out = Vec::new();
         for slot in &mut self.entries {
             let Some(entry) = slot else { continue };
@@ -136,24 +170,47 @@ impl Head {
             {
                 Self::seal_open(entry);
             }
-            let flushed: Vec<SealedChunk> = entry
+            let mut flushed: Vec<SealedChunk> = entry
                 .sealed
                 .iter()
                 .filter(|c| c.max_ts < boundary)
                 .cloned()
                 .collect();
+            entry.sealed.retain(|c| c.max_ts >= boundary);
+
+            // Fold flushable out-of-order samples in by decoding, merging
+            // (last wins on ties), and re-chunking.
+            let ooo_cut = entry.ooo.partition_point(|s| s.ts < boundary);
+            if ooo_cut > 0 {
+                let ooo: Vec<Sample> = entry.ooo.drain(..ooo_cut).collect();
+                let mut samples: Vec<Sample> = Vec::new();
+                for chunk in &flushed {
+                    samples.extend(crate::chunk::decode(&chunk.data)?);
+                }
+                samples.extend(ooo);
+                samples.sort_by_key(|s| s.ts);
+                samples.dedup_by(|later, earlier| {
+                    if later.ts == earlier.ts {
+                        earlier.value = later.value; // later write wins
+                        true
+                    } else {
+                        false
+                    }
+                });
+                flushed = rechunk(&samples, block_span)?;
+            }
+
             if !flushed.is_empty() {
-                entry.sealed.retain(|c| c.max_ts >= boundary);
                 out.push((entry.labels.clone(), flushed));
             }
-            if entry.sealed.is_empty() && entry.open.is_none() {
+            if entry.sealed.is_empty() && entry.open.is_none() && entry.ooo.is_empty() {
                 // Idle series: garbage-collect (recreated on next append).
                 self.map.remove(&entry.labels);
                 *slot = None;
                 self.live -= 1;
             }
         }
-        out
+        Ok(out)
     }
 
     /// All live series as `(id, labels)` (checkpointing).
@@ -189,6 +246,18 @@ impl Head {
                 }
             }
         }
+        if !entry.ooo.is_empty() {
+            out.extend(entry.ooo.iter().filter(|s| s.ts >= t0 && s.ts <= t1));
+            out.sort_by_key(|s| s.ts);
+            out.dedup_by(|later, earlier| {
+                if later.ts == earlier.ts {
+                    earlier.value = later.value;
+                    true
+                } else {
+                    false
+                }
+            });
+        }
         Ok(out)
     }
 
@@ -207,6 +276,37 @@ impl Head {
     }
 }
 
+/// Rebuild sealed chunks from sorted, deduplicated samples, cutting at
+/// block-window boundaries and the per-chunk sample cap.
+fn rechunk(samples: &[Sample], block_span: i64) -> Result<Vec<SealedChunk>> {
+    let mut out = Vec::new();
+    let mut builder = ChunkBuilder::new();
+    let mut window = i64::MIN;
+    for s in samples {
+        let w = s.ts.div_euclid(block_span) * block_span;
+        if builder.count() > 0 && (w != window || builder.count() >= CHUNK_MAX_SAMPLES) {
+            let done = std::mem::take(&mut builder);
+            out.push(SealedChunk {
+                min_ts: done.first_ts(),
+                max_ts: done.last_ts(),
+                count: done.count(),
+                data: done.seal(),
+            });
+        }
+        window = w;
+        builder.append(s.ts, s.value)?;
+    }
+    if builder.count() > 0 {
+        out.push(SealedChunk {
+            min_ts: builder.first_ts(),
+            max_ts: builder.last_ts(),
+            count: builder.count(),
+            data: builder.seal(),
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,12 +322,12 @@ mod tests {
         assert!(created);
         // 130 samples at 1ms apart: one seal at 120.
         for i in 0..130i64 {
-            head.append(id, i, i as f64, 1_000_000).unwrap();
+            head.append(id, i, i as f64, 1_000_000, 0).unwrap();
         }
         let s = head.samples(id, 0, i64::MAX).unwrap();
         assert_eq!(s.len(), 130);
         // Crossing a window boundary seals too.
-        head.append(id, 1_000_001, 1.0, 1_000_000).unwrap();
+        head.append(id, 1_000_001, 1.0, 1_000_000, 0).unwrap();
         let s = head.samples(id, 0, i64::MAX).unwrap();
         assert_eq!(s.len(), 131);
     }
@@ -237,10 +337,10 @@ mod tests {
         let mut head = Head::new();
         let (a, _) = head.get_or_create(&labels("a"), 10).unwrap();
         let (b, _) = head.get_or_create(&labels("b"), 10).unwrap();
-        head.append(a, 100, 1.0, 1000).unwrap();
-        head.append(a, 1500, 2.0, 1000).unwrap(); // second window
-        head.append(b, 200, 3.0, 1000).unwrap(); // only first window
-        let flushed = head.take_before(1000);
+        head.append(a, 100, 1.0, 1000, 0).unwrap();
+        head.append(a, 1500, 2.0, 1000, 0).unwrap(); // second window
+        head.append(b, 200, 3.0, 1000, 0).unwrap(); // only first window
+        let flushed = head.take_before(1000, 1000).unwrap();
         assert_eq!(flushed.len(), 2);
         // a keeps its open second-window chunk; b is fully flushed + GC'd.
         assert_eq!(head.series_count(), 1);

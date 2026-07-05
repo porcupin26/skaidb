@@ -9,7 +9,7 @@ aggregates, and time-bucketed queries.
 > replicate at the configured write consistency; queries union-merge across
 > members at the read consistency. Topology changes (join/decommission) are
 > refused while TS tables exist until chunk-level migration lands (phase 5).
-> Shipped in v0.20.0 (storage engine), v0.21.0 (SQL), v0.22.0 (cluster).
+> Shipped in v0.20.0 (storage), v0.21.0 (SQL), v0.22.0 (cluster), v0.23.0 (remote_write).
 
 ## Usage
 
@@ -66,6 +66,15 @@ stored as its own compressed stream. Full grammar and semantics:
   the ordinary `COUNT/SUM/AVG/MIN/MAX`.
 - Storage pushdown of `AND`-combined `ts` ranges and label `=` / `!=`
   predicates; everything else applies afterward with full SQL semantics.
+- **Prometheus `remote_write`** (v0.23.0): `POST /api/v1/write` on the REST
+  listener (HTTP Basic auth like `/query`) accepts snappy-compressed
+  protobuf WriteRequests from any Prometheus / Grafana Agent / OTel
+  collector. Samples land in a `metrics` TS table (auto-created on first
+  write, `SERIES KEY (name)`); `__name__` maps to the `name` label, other
+  labels pass through — and **any** label equality in SQL pushes down to the
+  store, so `WHERE name = '...' AND instance = '...'` is efficient without
+  declaring every label. In a cluster, ingested samples replicate through
+  the same series-placement path as SQL INSERTs.
 - **Cluster distribution**: TS DDL broadcasts like other DDL; a series (its
   labels) is the placement unit on the ring, replicated to RF nodes — all of
   a series' field streams co-locate. Appends group per replica set (one
@@ -88,8 +97,8 @@ Roadmap phases refer to the implementation plan in [`TODO.md`](TODO.md).
 |---|---|---|
 | **TS anti-entropy / hints** | a replica down during a write stays missing those samples until re-written; reads stay correct via union-merge at quorum, but there is no background repair or hinted handoff for TS data yet (block-checksum repair planned) | phase 3 follow-up |
 | **Partial-aggregate pushdown** | cluster queries ship matching raw samples to the coordinator; per-node partial aggregation (sum/count per bucket, per-series rate segments) would cut transfer for wide aggregations | phase 3 follow-up |
-| **Prometheus `remote_write`** | ingest endpoint + `__name__` mapping; self-scrape option | phase 4 |
-| **Out-of-order ingest window** | samples older than a series' last ts are rejected today | phase 4 |
+| Self-scrape (`/metrics` → TS table) | remote_write covers external scrapers | later |
+| OOO window in DDL/config | the storage engine supports a bounded out-of-order window (`TsdbOptions.ooo_window_ms`, merged at flush and in reads), but no SQL/config surface sets it yet — tables run strict-monotonic and remote_write counts OOO rejections per batch | phase 4 follow-up |
 | **Resharding with TS tables** | chunk-level migrate/drain; joins/decommissions are refused while TS tables exist | phase 5 |
 | **Downsampling / rollups** | `CREATE ROLLUP`, tiered retention, query-time rollup selection | phase 6 |
 | **PromQL subset / Grafana datasource** | `/api/v1/query_range` + metadata endpoints | phase 7 (stretch) |

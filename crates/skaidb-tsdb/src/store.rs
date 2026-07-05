@@ -22,6 +22,10 @@ pub struct TsdbOptions {
     pub retention_ms: Option<i64>,
     /// Hard cap on live series (cardinality protection).
     pub max_series: usize,
+    /// Accept samples up to this far behind a series' newest timestamp
+    /// (out-of-order window, e.g. HA Prometheus pairs interleaving). `0`
+    /// rejects anything non-monotonic per series.
+    pub ooo_window_ms: i64,
     /// fsync the WAL on every `append_batch` (callers batch, so this is one
     /// fsync per batch, not per sample).
     pub sync_on_append: bool,
@@ -33,6 +37,7 @@ impl Default for TsdbOptions {
             block_span_ms: 2 * 3600 * 1000,
             retention_ms: None,
             max_series: 1_000_000,
+            ooo_window_ms: 0,
             sync_on_append: true,
         }
     }
@@ -138,12 +143,12 @@ impl Tsdb {
             }
             Record::Samples(samples) => {
                 for (id, ts, value) in samples {
-                    if ts < flushed_through {
+                    if ts < flushed_through.saturating_sub(opts.ooo_window_ms) {
                         continue; // already durable in a block
                     }
                     if let Some(&head_id) = id_map.get(&id) {
                         // Out-of-order here means duplicated WAL tail; skip.
-                        let _ = head.append(head_id, ts, value, opts.block_span_ms);
+                        let _ = head.append(head_id, ts, value, opts.block_span_ms, opts.ooo_window_ms);
                     }
                 }
             }
@@ -189,7 +194,7 @@ impl Tsdb {
                     labels: labels.clone(),
                 });
             }
-            match inner.head.append(id, *ts, *value, self.opts.block_span_ms) {
+            match inner.head.append(id, *ts, *value, self.opts.block_span_ms, self.opts.ooo_window_ms) {
                 Ok(()) => {
                     accepted.push((id, *ts, *value));
                     result.appended += 1;
@@ -232,7 +237,7 @@ impl Tsdb {
     }
 
     fn flush_before(&self, inner: &mut Inner, boundary: i64) -> Result<()> {
-        let flushed = inner.head.take_before(boundary);
+        let flushed = inner.head.take_before(boundary, self.opts.block_span_ms)?;
         if !flushed.is_empty() {
             let seq = inner.next_block_seq;
             let dir = write_block(&self.dir.join("blocks"), seq, 0, flushed)?;
@@ -314,7 +319,22 @@ impl Tsdb {
                 merged.entry(labels).or_default().extend(samples);
             }
         }
-        Ok(merged.into_iter().collect())
+        Ok(merged
+            .into_iter()
+            .map(|(labels, mut samples)| {
+                // OOO flushes can produce time-overlapping blocks; normalize.
+                samples.sort_by_key(|s| s.ts);
+                samples.dedup_by(|later, earlier| {
+                    if later.ts == earlier.ts {
+                        earlier.value = later.value;
+                        true
+                    } else {
+                        false
+                    }
+                });
+                (labels, samples)
+            })
+            .collect())
     }
 
     pub fn stats(&self) -> TsdbStats {

@@ -20,6 +20,7 @@ workspace = true
 [dependencies]
 skaidb-config.workspace = true
 skaidb-engine.workspace = true
+skaidb-tsdb.workspace = true
 skaidb-cluster.workspace = true
 skaidb-proto.workspace = true
 skaidb-types.workspace = true
@@ -27,6 +28,7 @@ skaidb-auth.workspace = true
 skaidb-sql.workspace = true
 clap.workspace = true
 serde_json.workspace = true
+snap.workspace = true
 
 [dev-dependencies]
 skaidb-driver.workspace = true

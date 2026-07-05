@@ -77,7 +77,8 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) -> io::Result<()> {
 
     // Cluster control plane: POST /admin/* (RBAC-gated inside admin::handle).
     if req.method == "POST" && req.path.starts_with("/admin/") {
-        let Some(cmd) = crate::admin::parse(&req.path, &req.body) else {
+        let body_text = String::from_utf8_lossy(&req.body);
+        let Some(cmd) = crate::admin::parse(&req.path, &body_text) else {
             return write_response(&mut stream, 404, &json!({"error": "unknown admin route"}));
         };
         let role = if ctx.authn.required {
@@ -90,6 +91,25 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) -> io::Result<()> {
         };
         let (status, payload) = crate::admin::handle(&ctx, &role, cmd);
         return write_response(&mut stream, status, &payload);
+    }
+
+    // Prometheus remote_write: snappy-compressed protobuf WriteRequest.
+    if req.method == "POST" && req.path == "/api/v1/write" {
+        let role = if ctx.authn.required {
+            match basic_auth_role(&ctx, req.authorization.as_deref()) {
+                Some(role) => role,
+                None => return write_unauthorized(&mut stream),
+            }
+        } else {
+            ctx.superuser_role.clone()
+        };
+        return match crate::promwrite::ingest(&ctx, &role, &req.body) {
+            Ok(accepted) => {
+                ctx.metrics.add_rows_returned(0); // no rows out; count via queries metric
+                write_response(&mut stream, 200, &json!({"accepted": accepted}))
+            }
+            Err(e) => write_response(&mut stream, 400, &json!({"error": e})),
+        };
     }
 
     if req.method != "POST" || !req.path.starts_with("/query") {
@@ -112,7 +132,7 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) -> io::Result<()> {
         ctx.superuser_role.clone()
     };
 
-    let sql = extract_sql(&req.body);
+    let sql = extract_sql(&String::from_utf8_lossy(&req.body));
     let response = execute_as(&ctx, &role, &sql);
     let (status, payload) = response_to_json(response);
     // Serialize the payload exactly once: the same string feeds both the
@@ -128,7 +148,7 @@ struct HttpRequest {
     method: String,
     path: String,
     authorization: Option<String>,
-    body: String,
+    body: Vec<u8>,
 }
 
 /// Parse the request line, headers, and body. Returns `None` on a clean EOF.
@@ -170,7 +190,6 @@ fn read_request(stream: &mut TcpStream) -> io::Result<Option<HttpRequest>> {
 
     let mut body = vec![0u8; content_length];
     reader.read_exact(&mut body)?;
-    let body = String::from_utf8(body).unwrap_or_default();
     Ok(Some(HttpRequest {
         method,
         path,

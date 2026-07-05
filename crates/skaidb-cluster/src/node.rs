@@ -819,6 +819,21 @@ impl Node {
     }
 
     /// Addresses of all current peers (snapshot, cloned) — never held across I/O.
+    /// Replicated time-series append at the configured write consistency
+    /// (the remote_write ingest path; SQL INSERT uses the same logic via
+    /// the per-statement Coordinator).
+    pub fn ts_append_replicated(
+        self: &Arc<Self>,
+        table: &str,
+        rows: &[(skaidb_tsdb::Labels, i64, f64)],
+    ) -> EngineResult<usize> {
+        let mut coordinator = Coordinator {
+            node: Arc::clone(self),
+            oc: None,
+        };
+        Cluster::ts_append(&mut coordinator, table, rows)
+    }
+
     /// Chunk-level migration of time-series stores is not built yet
     /// (docs/TODO.md phase 5) — joins/decommissions would strand or lose
     /// series, so they are refused while any TS table exists.

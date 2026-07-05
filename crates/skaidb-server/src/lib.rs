@@ -11,6 +11,7 @@ pub mod audit;
 pub mod authn;
 pub mod binary;
 pub mod memory;
+mod promwrite;
 pub mod metrics;
 pub mod rest;
 pub mod shared;
@@ -470,6 +471,45 @@ mod tests {
         // Selecting a missing table is a server-side error.
         let err = client.execute("SELECT * FROM missing").unwrap_err();
         assert!(err.to_string().contains("does not exist"), "got: {err}");
+    }
+
+    #[test]
+    fn remote_write_end_to_end() {
+        let ctx = temp_ctx();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
+        let body = crate::promwrite::tests::encode_write_request(&[
+            (
+                &[("__name__", "http_requests_total"), ("job", "api")],
+                &[(0, 0.0), (60_000, 60.0)],
+            ),
+            (&[("__name__", "up"), ("job", "api")], &[(60_000, 1.0)]),
+        ]);
+        // Raw HTTP POST (binary body).
+        let mut stream = TcpStream::connect(addr).unwrap();
+        let head = format!(
+            "POST /api/v1/write HTTP/1.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(&body).unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        assert!(resp.contains("200"), "{resp}");
+        assert!(resp.contains("\"accepted\":3"), "{resp}");
+
+        // The auto-created metrics table serves SQL, labels intact and the
+        // counter math works over the ingested samples.
+        let sql = "SELECT rate(value) FROM metrics WHERE name = 'http_requests_total' AND job = 'api'";
+        let mut stream = TcpStream::connect(addr).unwrap();
+        let head = format!(
+            "POST /query HTTP/1.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            sql.len()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(sql.as_bytes()).unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        assert!(resp.contains("[[1.0]]"), "{resp}");
     }
 
     #[test]

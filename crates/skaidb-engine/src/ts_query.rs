@@ -323,7 +323,14 @@ fn extract_pushdown(
                     }
                     _ => {}
                 }
-            } else if series_key.contains(col) {
+            } else if !col.contains('.') && !col.starts_with("__") {
+                // Any string equality pushes down as a label matcher — not
+                // just declared series-key columns, so dynamically-labeled
+                // series (e.g. remote_write ingest) filter at the store.
+                // Safe: the full WHERE re-applies afterward, a matcher can
+                // only widen relative to SQL NULL semantics, and a *field*
+                // column compared to a string matches nothing either way.
+                let _ = series_key; // placement declares labels; matching is dynamic
                 let Ok(v) = eval(rhs, &Document::new()) else {
                     return;
                 };

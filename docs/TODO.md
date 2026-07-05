@@ -302,6 +302,14 @@ Benchmarks:
    out-of-order window, staleness markers, self-scrape option. Exit: a real
    Prometheus remote-writing to skaidb for 24 h with zero data loss vs its
    own TSDB.
+   **✅ Core done (v0.23.0).** `/api/v1/write` (snappy + hand-rolled
+   protobuf decode, no new heavy deps), `__name__`→`name` mapping,
+   auto-created `metrics` table, cluster-replicated ingest, any-label
+   equality pushdown, staleness NaNs stored bit-exact. OOO window
+   implemented + tested in the storage engine (per-series buffer, merged
+   at flush with re-chunking, WAL-replay aware) but not yet settable from
+   DDL/config — tables run strict-monotonic. **Still open:** OOO exposure,
+   self-scrape option, and the 24 h side-by-side validation run.
 5. **Resharding for TS tables** — chunk-level migrate/drain, lifting the
    phase-3 limitation. Exit: join + decommission under sustained ingest, all
    samples accounted for.

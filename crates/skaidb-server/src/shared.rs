@@ -107,6 +107,22 @@ impl Backend {
         matches!(self, Backend::Cluster(_))
     }
 
+    /// Append time-series samples (remote_write ingest): local store or
+    /// replicated via the cluster coordinator.
+    pub fn ts_append(
+        &self,
+        table: &str,
+        rows: &[(skaidb_tsdb::Labels, i64, f64)],
+    ) -> Result<usize, skaidb_engine::EngineError> {
+        match self {
+            Backend::Local(db) => db
+                .read()
+                .map_err(|_| skaidb_engine::EngineError::Cluster("lock poisoned".into()))?
+                .ts_append(table, rows),
+            Backend::Cluster(node) => node.ts_append_replicated(table, rows),
+        }
+    }
+
     /// Client (SQL) endpoints of all cluster members, as `host:quic_port`. Lets
     /// a client that connected to one seed discover its peers for failover.
     /// Members are tracked by internode address (`host:internode_port`); we keep
