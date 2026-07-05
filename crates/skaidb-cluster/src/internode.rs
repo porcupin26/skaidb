@@ -46,6 +46,17 @@ pub enum Request {
     LocalScan {
         table: String,
     },
+    /// One page of a node's versioned shard: up to `limit` rows (tombstones
+    /// included) with key strictly greater than `after`, in key order.
+    /// Answered with [`Response::Scan`]; fewer than `limit` rows marks the
+    /// final page. Anti-entropy pages through these instead of pulling a
+    /// whole table in one [`Request::LocalScan`], so repairing a large table
+    /// costs bounded memory on both ends.
+    ScanPage {
+        table: String,
+        after: Option<Vec<u8>>,
+        limit: u32,
+    },
     /// Like [`Request::LocalScan`] but pushes a `WHERE` filter to the node: it
     /// returns only rows matching `filter` (plus all tombstones, for LWW), so a
     /// non-indexed scan ships far less than the whole shard.
@@ -201,6 +212,7 @@ const REQ_SCHEMA: u8 = 15;
 const REQ_ANNOUNCE: u8 = 16;
 const REQ_NODESTATUS: u8 = 17;
 const REQ_BATCH: u8 = 18;
+const REQ_SCANPAGE: u8 = 19;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
@@ -249,6 +261,12 @@ impl Request {
             Request::LocalScan { table } => {
                 o.push(REQ_SCAN);
                 put_str(o, table);
+            }
+            Request::ScanPage { table, after, limit } => {
+                o.push(REQ_SCANPAGE);
+                put_str(o, table);
+                put_opt_bytes(o, after.as_deref());
+                o.extend_from_slice(&limit.to_le_bytes());
             }
             Request::FilteredScan { table, filter } => {
                 o.push(REQ_FSCAN);
@@ -336,6 +354,11 @@ impl Request {
                 rows: c.rows()?,
             },
             REQ_SCAN => Request::LocalScan { table: c.string()? },
+            REQ_SCANPAGE => Request::ScanPage {
+                table: c.string()?,
+                after: c.opt_bytes()?,
+                limit: c.u32()?,
+            },
             REQ_FSCAN => Request::FilteredScan {
                 table: c.string()?,
                 filter: c.expr()?,
@@ -1041,6 +1064,16 @@ mod tests {
                 rows: vec![],
             },
             Request::LocalScan { table: "t".into() },
+            Request::ScanPage {
+                table: "t".into(),
+                after: Some(vec![3, 4]),
+                limit: 512,
+            },
+            Request::ScanPage {
+                table: "t".into(),
+                after: None,
+                limit: 1,
+            },
             Request::FilteredScan {
                 table: "t".into(),
                 filter: Expr::Binary {

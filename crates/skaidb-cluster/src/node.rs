@@ -21,10 +21,10 @@ use std::time::Duration;
 use std::thread;
 
 use skaidb_engine::{
-    filter_rows, namespace, run, Cluster, Database, DbStats, EngineError, IndexScanRange,
-    QueryOutput, SessionEffect, DEFAULT_DATABASE,
+    filter_rows, namespace, pk_point_key, run, Cluster, Database, DbStats, EngineError,
+    IndexScanRange, QueryOutput, SessionEffect, DEFAULT_DATABASE,
 };
-use skaidb_sql::ast::{BinaryOp, Expr, Statement};
+use skaidb_sql::ast::{Expr, Statement};
 use skaidb_sql::parse;
 use skaidb_storage::{Hlc, HlcClock, WalCommit, WalSync};
 use skaidb_types::{Document, Value};
@@ -169,7 +169,7 @@ pub struct Node {
     /// write. The worker holds only a `Weak<Node>`, so dropping the node closes
     /// this sender and the worker exits — the same lifetime the detached
     /// per-write threads had.
-    bg: mpsc::Sender<BgTask>,
+    bg: mpsc::SyncSender<BgTask>,
     /// Whether a [`BgTask::FlushHints`] is already queued — coalesces the
     /// per-write flush trigger into at most one outstanding task.
     hint_flush_queued: AtomicBool,
@@ -271,6 +271,64 @@ type HintedWrite = (String, Vec<u8>, WriteOp, Hlc);
 /// tombstone (delete, empty value).
 type BatchRow = (Vec<u8>, Vec<u8>, Hlc, bool);
 
+/// Rows per anti-entropy scan page (both the local and the remote side), and
+/// per flushed repair batch: bounds repair memory and each repair RPC/fsync,
+/// independent of table size.
+#[cfg(not(test))]
+const REPAIR_PAGE_ROWS: usize = 2_000;
+#[cfg(test)]
+const REPAIR_PAGE_ROWS: usize = 8;
+
+/// Why reconciling one table with one peer stopped.
+enum RepairPeerError {
+    /// Peer predates the paged scan RPC (rolling upgrade).
+    Unpaged,
+    /// Peer unreachable / bad response: skip it this round.
+    Unreachable,
+    /// Local engine error: abort the repair pass.
+    Engine(EngineError),
+}
+
+/// A paged, key-ordered stream of one side's versioned rows during repair.
+struct PageCursor {
+    buf: std::collections::VecDeque<BatchRow>,
+    /// Key to resume after; `None` before the first page.
+    last: Option<Vec<u8>>,
+    /// The stream is exhausted (a page came back short).
+    done: bool,
+}
+
+impl PageCursor {
+    fn new() -> PageCursor {
+        PageCursor {
+            buf: std::collections::VecDeque::new(),
+            last: None,
+            done: false,
+        }
+    }
+    fn needs_fill(&self) -> bool {
+        self.buf.is_empty() && !self.done
+    }
+    fn after(&self) -> Option<&[u8]> {
+        self.last.as_deref()
+    }
+    fn fill(&mut self, rows: Vec<BatchRow>) {
+        if rows.len() < REPAIR_PAGE_ROWS {
+            self.done = true; // short page: final one
+        }
+        if let Some((k, _, _, _)) = rows.last() {
+            self.last = Some(k.clone());
+        }
+        self.buf = rows.into();
+    }
+    fn head(&self) -> Option<&BatchRow> {
+        self.buf.front()
+    }
+    fn pop(&mut self) -> BatchRow {
+        self.buf.pop_front().expect("popped an empty repair cursor")
+    }
+}
+
 /// Work items for the node's background worker thread: deferred, best-effort
 /// replication work that used to spawn a fresh thread per write.
 #[derive(Debug)]
@@ -305,6 +363,20 @@ const MAX_HINTS_PER_REPLICA: usize = 4096;
 /// replication into few round-trips.
 const BG_BATCH_MAX: usize = 256;
 
+/// Cap on queued background tasks. The queue holds cloned rows, so an
+/// unbounded queue turns a sustained ingest that outruns the async tail into
+/// unbounded coordinator memory (observed: hundreds of MB on a 512 MB node).
+/// When the queue is full the tail rows become hints instead — bounded
+/// memory, reconciled by hint replay and anti-entropy.
+const BG_QUEUE_MAX: usize = 1024;
+
+/// Max rows shipped per background `ApplyBatch` frame. The worker merges its
+/// whole drain per peer; unchunked, that reached ~128k rows (~17 MB) in one
+/// frame — one multi-second lock hold and fsync on the receiving replica, and
+/// transient multi-MB buffers on both ends. Chunking keeps the tail pipeline
+/// in small, steady round-trips.
+const BG_SEND_MAX_ROWS: usize = 2_000;
+
 /// Startup catch-up / self-announce: how many times to wait for a peer to become
 /// reachable before giving up, and how long between attempts. The interval is
 /// shortened under test so background threads reach their exit condition (and
@@ -331,7 +403,7 @@ impl Node {
         };
         let topo = Topology::from_members(&members, &cfg.id, cfg.vnodes_per_node, epoch);
         let auth = cfg.auth.clone();
-        let (bg, bg_rx) = mpsc::channel();
+        let (bg, bg_rx) = mpsc::sync_channel(BG_QUEUE_MAX);
         let node = Arc::new(Node {
             id: cfg.id.clone(),
             local: RwLock::new(local),
@@ -429,12 +501,16 @@ impl Node {
         }
         for ((replica, addr), tables) in by_peer {
             for (table, rows) in tables {
-                if self.send_batch(&addr, &table, &rows) {
-                    if let Some((_, _, hlc, _)) = rows.last() {
-                        self.note_acked(&replica, *hlc);
+                // Chunked sends: bounded frames, bounded lock holds and fsyncs
+                // on the receiving replica (see BG_SEND_MAX_ROWS).
+                for chunk in rows.chunks(BG_SEND_MAX_ROWS) {
+                    if self.send_batch(&addr, &table, chunk) {
+                        if let Some((_, _, hlc, _)) = chunk.last() {
+                            self.note_acked(&replica, *hlc);
+                        }
+                    } else {
+                        self.hint_batch(&replica, &table, chunk);
                     }
-                } else {
-                    self.hint_batch(&replica, &table, &rows);
                 }
             }
         }
@@ -1252,66 +1328,221 @@ impl Node {
             .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
             .table_names();
 
+        // Reconcile each (table, peer) pair as a merge-join over two paged,
+        // key-ordered streams — memory stays O(page) regardless of table size
+        // (an unpaged pass once pulled a whole 1M-row table into RAM on both
+        // ends and OOM-killed 512 MB nodes). Writes that land between pages
+        // are simply seen by the next anti-entropy pass.
         for table in tables {
-            let local_rows = self
-                .local
-                .read()
-                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
-                .local_scan_versioned_with_tombstones(&table)?;
-            let local_map: HashMap<Vec<u8>, (Hlc, bool, Vec<u8>)> = local_rows
-                .into_iter()
-                .map(|(k, v, h, is_put)| (k, (h, is_put, v)))
-                .collect();
-
             for (pid, addr) in self.peers_with_ids() {
-                let remote = match self.pool.call(
-                    &addr,
-                    &Request::LocalScan {
-                        table: table.clone(),
-                    },
-                ) {
-                    Ok(Response::Scan { rows }) => rows,
-                    _ => continue, // unreachable peer: skip this round
-                };
-
-                // Pull: remote versions newer than ours (for keys we replicate)
-                // are gathered and applied locally as one batch — a single lock
-                // acquisition and one WAL fsync, instead of one fsync per row.
-                let mut remote_hlc: HashMap<Vec<u8>, Hlc> = HashMap::new();
-                let mut pull: Vec<BatchRow> = Vec::new();
-                for (key, value, hlc, is_put) in &remote {
-                    remote_hlc.insert(key.clone(), *hlc);
-                    if !self.replicas_for(key).contains(&self.id) {
-                        continue;
+                match self.repair_table_with(&table, &pid, &addr) {
+                    Ok(n) => repaired += n,
+                    Err(RepairPeerError::Unpaged) => {
+                        // Rolling upgrade: the peer predates ScanPage. Fall
+                        // back to the old whole-table pull for it.
+                        repaired += self.repair_table_unpaged(&table, &pid, &addr);
                     }
-                    if local_map.get(key).is_some_and(|(lh, _, _)| *lh >= *hlc) {
-                        continue;
-                    }
-                    pull.push((key.clone(), value.clone(), *hlc, *is_put));
-                }
-                if !pull.is_empty() && self.apply_batch_local(&table, &pull).is_ok() {
-                    repaired += pull.len();
-                }
-
-                // Push: local versions newer than the peer's (for keys the peer
-                // replicates) are sent to it as one ApplyBatch RPC (one
-                // round-trip + one fsync there, not one per row).
-                let mut push: Vec<BatchRow> = Vec::new();
-                for (key, (lh, is_put, value)) in &local_map {
-                    if !self.replicas_for(key).contains(&pid) {
-                        continue;
-                    }
-                    if remote_hlc.get(key).is_some_and(|rh| rh >= lh) {
-                        continue;
-                    }
-                    push.push((key.clone(), value.clone(), *lh, *is_put));
-                }
-                if !push.is_empty() && self.send_batch(&addr, &table, &push) {
-                    repaired += push.len();
+                    Err(RepairPeerError::Unreachable) => continue,
+                    Err(RepairPeerError::Engine(e)) => return Err(e),
                 }
             }
         }
         Ok(repaired)
+    }
+
+    /// Reconcile one table with one peer by merge-joining paged key-ordered
+    /// scans of both sides: pull remote-newer rows (for keys we replicate),
+    /// push local-newer rows (for keys the peer replicates), page by page.
+    fn repair_table_with(
+        &self,
+        table: &str,
+        pid: &NodeId,
+        addr: &str,
+    ) -> Result<usize, RepairPeerError> {
+        let mut repaired = 0usize;
+        let mut local: PageCursor = PageCursor::new();
+        let mut remote: PageCursor = PageCursor::new();
+        let mut pull: Vec<BatchRow> = Vec::new();
+        let mut push: Vec<BatchRow> = Vec::new();
+        loop {
+            // Refill whichever side ran dry (both start empty).
+            if local.needs_fill() {
+                let rows = self
+                    .local
+                    .read()
+                    .map_err(|_| {
+                        RepairPeerError::Engine(EngineError::Cluster("local lock poisoned".into()))
+                    })?
+                    .local_scan_versioned_page(table, local.after(), REPAIR_PAGE_ROWS)
+                    .map_err(RepairPeerError::Engine)?;
+                local.fill(rows);
+            }
+            if remote.needs_fill() {
+                let resp = self.pool.call(
+                    addr,
+                    &Request::ScanPage {
+                        table: table.to_string(),
+                        after: remote.after().map(<[u8]>::to_vec),
+                        limit: REPAIR_PAGE_ROWS as u32,
+                    },
+                );
+                match resp {
+                    Ok(Response::Scan { rows }) => remote.fill(rows),
+                    Ok(Response::Err(e)) if e.contains("unknown request op") => {
+                        return Err(RepairPeerError::Unpaged)
+                    }
+                    _ => return Err(RepairPeerError::Unreachable),
+                }
+            }
+
+            // Merge step: advance the smaller key; equal keys resolve by LWW.
+            match (local.head(), remote.head()) {
+                (None, None) => break,
+                (Some(_), None) => {
+                    let (key, value, hlc, is_put) = local.pop();
+                    if self.replicas_for(&key).contains(pid) {
+                        push.push((key, value, hlc, is_put));
+                    }
+                }
+                (None, Some(_)) => {
+                    let (key, value, hlc, is_put) = remote.pop();
+                    if self.replicas_for(&key).contains(&self.id) {
+                        pull.push((key, value, hlc, is_put));
+                    }
+                }
+                (Some(l), Some(r)) => match l.0.cmp(&r.0) {
+                    std::cmp::Ordering::Less => {
+                        let (key, value, hlc, is_put) = local.pop();
+                        if self.replicas_for(&key).contains(pid) {
+                            push.push((key, value, hlc, is_put));
+                        }
+                    }
+                    std::cmp::Ordering::Greater => {
+                        let (key, value, hlc, is_put) = remote.pop();
+                        if self.replicas_for(&key).contains(&self.id) {
+                            pull.push((key, value, hlc, is_put));
+                        }
+                    }
+                    std::cmp::Ordering::Equal => {
+                        let lh = l.2;
+                        let rh = r.2;
+                        let lrow = local.pop();
+                        let rrow = remote.pop();
+                        match lh.cmp(&rh) {
+                            std::cmp::Ordering::Greater
+                                if self.replicas_for(&lrow.0).contains(pid) =>
+                            {
+                                push.push(lrow);
+                            }
+                            std::cmp::Ordering::Less
+                                if self.replicas_for(&rrow.0).contains(&self.id) =>
+                            {
+                                pull.push(rrow);
+                            }
+                            _ => {}
+                        }
+                    }
+                },
+            }
+
+            // Flush per page so the repair batches stay bounded too.
+            if pull.len() >= REPAIR_PAGE_ROWS {
+                repaired += self.repair_apply_pull(table, &mut pull);
+            }
+            if push.len() >= REPAIR_PAGE_ROWS {
+                repaired += self.repair_send_push(table, addr, &mut push);
+            }
+        }
+        repaired += self.repair_apply_pull(table, &mut pull);
+        repaired += self.repair_send_push(table, addr, &mut push);
+        Ok(repaired)
+    }
+
+    /// Apply a pulled repair batch locally (one lock + one fsync).
+    fn repair_apply_pull(&self, table: &str, pull: &mut Vec<BatchRow>) -> usize {
+        if pull.is_empty() {
+            return 0;
+        }
+        let n = pull.len();
+        let ok = self.apply_batch_local(table, pull).is_ok();
+        pull.clear();
+        if ok {
+            n
+        } else {
+            0
+        }
+    }
+
+    /// Ship a pushed repair batch to the peer (one round-trip + one fsync there).
+    fn repair_send_push(&self, table: &str, addr: &str, push: &mut Vec<BatchRow>) -> usize {
+        if push.is_empty() {
+            return 0;
+        }
+        let n = push.len();
+        let ok = self.send_batch(addr, table, push);
+        push.clear();
+        if ok {
+            n
+        } else {
+            0
+        }
+    }
+
+    /// Pre-`ScanPage` fallback: reconcile one table with one old peer by
+    /// pulling its whole shard in one response — O(table) memory, kept only
+    /// for rolling upgrades against peers that don't know the paged scan.
+    fn repair_table_unpaged(&self, table: &str, pid: &NodeId, addr: &str) -> usize {
+        let mut repaired = 0usize;
+        let Ok(local_rows) = self
+            .local
+            .read()
+            .map_err(|_| ())
+            .and_then(|db| db.local_scan_versioned_with_tombstones(table).map_err(|_| ()))
+        else {
+            return 0;
+        };
+        let local_map: HashMap<Vec<u8>, (Hlc, bool, Vec<u8>)> = local_rows
+            .into_iter()
+            .map(|(k, v, h, is_put)| (k, (h, is_put, v)))
+            .collect();
+        let remote = match self.pool.call(
+            addr,
+            &Request::LocalScan {
+                table: table.to_string(),
+            },
+        ) {
+            Ok(Response::Scan { rows }) => rows,
+            _ => return 0, // unreachable peer: skip this round
+        };
+        let mut remote_hlc: HashMap<Vec<u8>, Hlc> = HashMap::new();
+        let mut pull: Vec<BatchRow> = Vec::new();
+        for (key, value, hlc, is_put) in &remote {
+            remote_hlc.insert(key.clone(), *hlc);
+            if !self.replicas_for(key).contains(&self.id) {
+                continue;
+            }
+            if local_map.get(key).is_some_and(|(lh, _, _)| *lh >= *hlc) {
+                continue;
+            }
+            pull.push((key.clone(), value.clone(), *hlc, *is_put));
+        }
+        if !pull.is_empty() && self.apply_batch_local(table, &pull).is_ok() {
+            repaired += pull.len();
+        }
+        let mut push: Vec<BatchRow> = Vec::new();
+        for (key, (lh, is_put, value)) in &local_map {
+            if !self.replicas_for(key).contains(pid) {
+                continue;
+            }
+            if remote_hlc.get(key).is_some_and(|rh| rh >= lh) {
+                continue;
+            }
+            push.push((key.clone(), value.clone(), *lh, *is_put));
+        }
+        if !push.is_empty() && self.send_batch(addr, table, &push) {
+            repaired += push.len();
+        }
+        repaired
     }
 
     /// Trigger [`Node::repair`] on this node and every peer (a cluster-wide
@@ -1564,6 +1795,15 @@ impl Node {
                     Ok(rows) => Response::Scan { rows },
                     Err(e) => Response::Err(e.to_string()),
                 },
+                Err(_) => Response::Err("local lock poisoned".into()),
+            },
+            Request::ScanPage { table, after, limit } => match self.local.read() {
+                Ok(db) => {
+                    match db.local_scan_versioned_page(&table, after.as_deref(), limit as usize) {
+                        Ok(rows) => Response::Scan { rows },
+                        Err(e) => Response::Err(e.to_string()),
+                    }
+                }
                 Err(_) => Response::Err("local lock poisoned".into()),
             },
             Request::LocalGet { table, key } => match self.local.read() {
@@ -1874,8 +2114,13 @@ impl Node {
         // 0) Opportunistically hand off any buffered hints to recovered replicas
         //    via the background worker (cheap when there are none; non-blocking;
         //    coalesced to at most one queued flush).
-        if self.hints_pending() && !self.hint_flush_queued.swap(true, Ordering::AcqRel) {
-            let _ = self.bg.send(BgTask::FlushHints);
+        if self.hints_pending()
+            && !self.hint_flush_queued.swap(true, Ordering::AcqRel)
+            && self.bg.try_send(BgTask::FlushHints).is_err()
+        {
+            // Queue full: clear the coalescing flag so a later write
+            // re-queues the flush once there is room.
+            self.hint_flush_queued.store(false, Ordering::Release);
         }
 
         // 1) Apply locally to the memtable + WAL buffer under the write lock
@@ -1970,10 +2215,14 @@ impl Node {
                 op: op.clone(),
                 hlc,
             };
-            if let Err(mpsc::SendError(BgTask::Replicate { peers, table, key, op, hlc })) =
-                self.bg.send(task)
+            // Queue full (tail replication can't keep up with ingest) or
+            // worker gone (shutdown): keep the writes as bounded hints
+            // instead of growing the queue without limit.
+            if let Err(
+                mpsc::TrySendError::Full(BgTask::Replicate { peers, table, key, op, hlc })
+                | mpsc::TrySendError::Disconnected(BgTask::Replicate { peers, table, key, op, hlc }),
+            ) = self.bg.try_send(task)
             {
-                // Worker gone (node shutting down): keep the writes as hints.
                 for (replica, _) in peers {
                     self.store_hint(&replica, &table, &key, &op, hlc);
                 }
@@ -2014,8 +2263,13 @@ impl Node {
         if let Some((_, _, hlc)) = rows.last() {
             self.note_local_write(*hlc);
         }
-        if self.hints_pending() && !self.hint_flush_queued.swap(true, Ordering::AcqRel) {
-            let _ = self.bg.send(BgTask::FlushHints);
+        if self.hints_pending()
+            && !self.hint_flush_queued.swap(true, Ordering::AcqRel)
+            && self.bg.try_send(BgTask::FlushHints).is_err()
+        {
+            // Queue full: clear the coalescing flag so a later write
+            // re-queues the flush once there is room.
+            self.hint_flush_queued.store(false, Ordering::Release);
         }
         // Group rows by replica set. With members == RF every key maps to the
         // same set (one group, one batch); larger clusters get one batch per
@@ -2104,8 +2358,11 @@ impl Node {
                 table: table.to_string(),
                 rows: rows.clone(),
             };
-            if let Err(mpsc::SendError(BgTask::ReplicateBatch { peers, table, rows })) =
-                self.bg.send(task)
+            // Full queue or shutdown: bounded hints instead of unbounded queue.
+            if let Err(
+                mpsc::TrySendError::Full(BgTask::ReplicateBatch { peers, table, rows })
+                | mpsc::TrySendError::Disconnected(BgTask::ReplicateBatch { peers, table, rows }),
+            ) = self.bg.try_send(task)
             {
                 for (replica, _) in peers {
                     self.hint_batch(&replica, &table, &rows);
@@ -2866,33 +3123,6 @@ fn merge_row(
         .or_insert((hlc, value));
 }
 
-/// If `filter` is a single-column primary-key equality (`pk = literal`), return
-/// the storage key for that row so the read can be a point get. The key must be
-/// built exactly as the engine builds it for inserts: the order-preserving
-/// encoding of a one-element array holding the value.
-fn pk_point_key(pk: &[String], filter: &Option<Expr>) -> Option<Vec<u8>> {
-    if pk.len() != 1 {
-        return None;
-    }
-    let Some(Expr::Binary {
-        op: BinaryOp::Eq,
-        left,
-        right,
-    }) = filter
-    else {
-        return None;
-    };
-    let col = &pk[0];
-    let value = match (left.as_ref(), right.as_ref()) {
-        (Expr::Column(c), Expr::Literal(v)) | (Expr::Literal(v), Expr::Column(c)) if c == col => v,
-        _ => return None,
-    };
-    if value.is_null() {
-        return None;
-    }
-    Some(Value::Array(vec![value.clone()]).encode_key())
-}
-
 /// Map a local write result to an internode `Ack`/`Err` response.
 fn write_response(result: EngineResult<()>) -> Response {
     match result {
@@ -3060,6 +3290,28 @@ impl Cluster for Coordinator {
             .read()
             .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
             .table_primary_key(table)
+    }
+
+    fn vector_search(
+        &self,
+        table: &str,
+        path: &str,
+        query: &[f32],
+        k: usize,
+        filter: &Option<Expr>,
+    ) -> EngineResult<Vec<(Vec<u8>, Document, f32)>> {
+        let index = self
+            .node
+            .local
+            .read()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .vector_index_for(table, path)
+            .ok_or_else(|| {
+                EngineError::Unsupported(format!("no vector index on {table} ({path})"))
+            })?;
+        // Distributed ANN: scatter to every node's local HNSW, merge by
+        // distance, re-read survivors at the read quorum.
+        self.node.vector_search(&index, query, k, filter)
     }
 
     fn matching_rows(
@@ -3785,6 +4037,44 @@ mod tests {
             ids(nc.vector_search("docs_emb", &[1.0, 0.0, 0.0], 2, &filter).unwrap()),
             vec![1, 3]
         );
+
+        // The same searches through SQL (`NEAREST`), on yet another node:
+        // distance-ordered ids, `_distance` exposed as a projected field.
+        let rs = rows(
+            nb.execute("SELECT id, _distance FROM docs NEAREST (embedding, [1.0, 0.0, 0.0], 2)")
+                .unwrap(),
+        );
+        assert_eq!(rs.columns, vec!["id", "_distance"]);
+        assert_eq!(rs.rows.len(), 2);
+        assert_eq!(rs.rows[0][0], Value::Int(1));
+        assert_eq!(rs.rows[1][0], Value::Int(4));
+        let d0 = match rs.rows[0][1] {
+            Value::Float(f) => f,
+            ref other => panic!("expected float distance, got {other:?}"),
+        };
+        let d1 = match rs.rows[1][1] {
+            Value::Float(f) => f,
+            ref other => panic!("expected float distance, got {other:?}"),
+        };
+        assert!(d0 <= d1, "results must be nearest-first ({d0} > {d1})");
+
+        let rs = rows(
+            nc.execute(
+                "SELECT id FROM docs NEAREST (embedding, [1.0, 0.0, 0.0], 2) WHERE cat = 'a'",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(1)], vec![Value::Int(3)]]);
+
+        // Unindexed path and disallowed combinations error cleanly.
+        let err = na
+            .execute("SELECT id FROM docs NEAREST (missing, [1.0, 0.0, 0.0], 2)")
+            .unwrap_err();
+        assert!(err.to_string().contains("no vector index"), "got: {err}");
+        let err = na
+            .execute("SELECT id FROM docs NEAREST (embedding, [1.0, 0.0, 0.0], 2) ORDER BY id")
+            .unwrap_err();
+        assert!(err.to_string().contains("ORDER BY"), "got: {err}");
     }
 
     #[test]
@@ -4035,6 +4325,85 @@ mod tests {
         let delivered = na.flush_hints();
         assert!(delivered >= 1, "the buffered write was handed off to c");
         assert!(has(&c, &k1), "c received id=1 via hinted handoff");
+    }
+
+    #[test]
+    fn paged_repair_converges_tables_larger_than_one_page() {
+        use skaidb_types::Document;
+        // Divergence spanning many repair pages (REPAIR_PAGE_ROWS is 8 under
+        // test): node a holds 40 rows node b lacks, node b holds 10 newer
+        // versions node a lacks. One repair() from a must converge both
+        // directions with paged scans.
+        let q = Consistency::Quorum;
+        let cfg2 = |id: &str, addr: &str, members: &[(NodeId, String)]| NodeConfig {
+            id: NodeId::new(id),
+            internode_addr: addr.to_string(),
+            members: members.to_vec(),
+            replication_factor: 2,
+            vnodes_per_node: 64,
+            read_consistency: q,
+            write_consistency: q,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
+            anti_entropy_interval_secs: 0,
+        };
+        let (a, b) = (free_addr(), free_addr());
+        let m = vec![member("a", &a), member("b", &b)];
+        let na = Node::new(Database::open(temp_dir("pra")).unwrap(), cfg2("a", &a, &m));
+        let nb = Node::new(Database::open(temp_dir("prb")).unwrap(), cfg2("b", &b, &m));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+
+        let enc = |id: i64, v: i64| -> (Vec<u8>, Vec<u8>) {
+            let mut doc = Document::new();
+            doc.insert("id", Value::Int(id));
+            doc.insert("v", Value::Int(v));
+            (
+                Value::Array(vec![Value::Int(id)]).encode_key(),
+                Value::Document(doc).encode(),
+            )
+        };
+        let inject = |addr: &str, id: i64, v: i64, hlc: Hlc| {
+            let (key, val) = enc(id, v);
+            let r = internode::call(
+                addr,
+                &Request::ApplyPut {
+                    table: "t".into(),
+                    key,
+                    value: val,
+                    hlc,
+                },
+            )
+            .unwrap();
+            assert!(matches!(r, Response::Ack));
+        };
+
+        // 40 rows only on a (b missing them entirely)…
+        for id in 0..40 {
+            inject(&a, id, id, Hlc::new(100 + id as u64, 0));
+        }
+        // …and 10 of those ids with NEWER versions only on b.
+        for id in 0..10 {
+            inject(&b, id, 1000 + id, Hlc::new(500 + id as u64, 0));
+        }
+
+        let repaired = na.repair().unwrap();
+        assert!(repaired >= 40, "expected ≥40 rows repaired, got {repaired}");
+
+        // Both nodes now agree: 40 rows, ids 0..9 at the newer b version.
+        for node in [&na, &nb] {
+            let rs = rows(node.execute("SELECT id, v FROM t ORDER BY id").unwrap());
+            assert_eq!(rs.rows.len(), 40);
+            for id in 0..40i64 {
+                let expect = if id < 10 { 1000 + id } else { id };
+                assert_eq!(
+                    rs.rows[id as usize],
+                    vec![Value::Int(id), Value::Int(expect)],
+                    "row {id} mismatch"
+                );
+            }
+        }
     }
 
     #[test]

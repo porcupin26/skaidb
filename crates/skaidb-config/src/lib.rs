@@ -155,6 +155,13 @@ pub struct EncryptionConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StorageConfig {
+    /// Overall memory budget for storage (memtable + read cache). `"auto"`
+    /// sizes it to half the node's memory limit (cgroup-aware, so containers
+    /// get their *container* limit, not the host's); an explicit size like
+    /// `"256MB"`/`"1GB"` uses that budget; empty (the default) disables
+    /// budgeting and the individual knobs below apply as-is. When set, it
+    /// **overrides** `memtable_size_mb` and `read_cache_entries`.
+    pub memory_target: String,
     pub memtable_size_mb: u64,
     /// Entry capacity of the RAM read cache for point reads that miss the
     /// memtable (0 disables it). Larger values trade RAM for hit rate on
@@ -397,6 +404,7 @@ impl Default for EncryptionConfig {
 impl Default for StorageConfig {
     fn default() -> Self {
         StorageConfig {
+            memory_target: String::new(),
             memtable_size_mb: 256,
             read_cache_entries: 16_384,
             compaction_strategy: "lazy_leveled".to_string(),

@@ -393,6 +393,45 @@ impl Engine {
         })
     }
 
+    /// One bounded page of the merged versioned view, tombstones included: up
+    /// to `limit` rows with key strictly greater than `after`, in key order.
+    /// Every source is seeked (memtable BTree range, SSTable block index), so
+    /// cost is proportional to the page — the building block for incremental,
+    /// memory-bounded anti-entropy over tables of any size.
+    pub fn scan_versioned_page(
+        &self,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<VersionedTombstoneRow>> {
+        let mut sources: Vec<MergeSource<'_>> = Vec::with_capacity(1 + self.sstable_count());
+        // The memtable page is capped at `limit` entries: the merge emits at
+        // most `limit` rows, and consuming a source entry requires an emission,
+        // so a deeper page could never be reached.
+        sources.push(Box::new(
+            self.mem.range_latest_page(after, limit).into_iter().map(Ok),
+        ));
+        for sst in self.sstables_newest_first() {
+            let iter = match after {
+                Some(a) => sst.iter_from(a),
+                None => sst.iter(),
+            };
+            sources.push(Box::new(iter.map(|r| r.map(|e| (e.key, e.hlc, e.value)))));
+        }
+        KWayMerge::new(sources)
+            .filter(|item| match (item, after) {
+                (Ok((k, _, _)), Some(a)) => k.as_slice() > a,
+                _ => true,
+            })
+            .take(limit)
+            .map(|item| {
+                item.map(|(k, hlc, v)| match v {
+                    VersionValue::Put(bytes) => (k, hlc, Some(bytes)),
+                    VersionValue::Delete => (k, hlc, None),
+                })
+            })
+            .collect()
+    }
+
     /// Scan only the live keys that start with `prefix`, in key order. Used by
     /// secondary indexes, whose entries are prefixed by the indexed value.
     /// Delegates to [`Engine::scan_range`], so cost is proportional to the

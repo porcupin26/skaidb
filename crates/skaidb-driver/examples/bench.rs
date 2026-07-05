@@ -4,6 +4,9 @@
 //!   bench <addr> <user> <pass> <mode> <ops> <threads> [preload]
 //!   mode = write | read | mixed          (one-shot SQL text per op)
 //!        | writep | readp | mixedp       (prepared statements + bind params)
+//!   preload = N or NxS — N rows, each with an S-byte value (default value is
+//!   the short "payload-<id>"). Large preloads load in multi-row INSERT
+//!   batches and settle for compactions before the timed phase.
 //!
 //! Each thread holds one authenticated connection (handshake once) and issues
 //! operations in a loop. Reports throughput and latency percentiles.
@@ -29,7 +32,16 @@ fn main() {
     let mode = args[4].clone();
     let ops: usize = args[5].parse().expect("ops");
     let threads: usize = args[6].parse().expect("threads");
-    let preload: usize = args.get(7).map(|s| s.parse().unwrap()).unwrap_or(1000);
+    let (preload, valsize) = parse_preload(args.get(7).map(String::as_str));
+    // READ_SPAN caps the id range reads draw from (default: all preloaded
+    // rows). A span smaller than the preload models a hot working set over a
+    // large table — the shape that distinguishes cache configurations.
+    let read_span: usize = std::env::var("READ_SPAN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(preload)
+        .min(preload.max(1));
 
     let cfg = Arc::new((addrs, user, pass));
 
@@ -39,13 +51,30 @@ fn main() {
         let _ = c.execute("DROP TABLE IF EXISTS bench");
         run_ok(&mut c, "CREATE TABLE bench (PRIMARY KEY (id))");
         if mode != "write" && mode != "writep" {
-            for id in 0..preload {
-                run_ok(
-                    &mut c,
-                    &format!("INSERT INTO bench (id, v) VALUES ({id}, 'payload-{id}')"),
-                );
+            // Multi-row INSERT batches: one statement (and one replication
+            // round per replica group) per batch instead of per row.
+            const BATCH: usize = 500;
+            let mut id = 0;
+            while id < preload {
+                let end = (id + BATCH).min(preload);
+                let mut sql = String::with_capacity(64 + (end - id) * (valsize + 24));
+                sql.push_str("INSERT INTO bench (id, v) VALUES ");
+                for (n, i) in (id..end).enumerate() {
+                    if n > 0 {
+                        sql.push(',');
+                    }
+                    sql.push_str(&format!("({i}, '{}')", padded_payload(i, valsize)));
+                }
+                run_ok(&mut c, &sql);
+                id = end;
             }
-            println!("preloaded {preload} rows");
+            println!("preloaded {preload} rows (value ~{valsize}B)");
+            if preload >= 100_000 {
+                // Let flushes/compactions from the load quiesce so the timed
+                // phase measures steady-state reads, not compaction overlap.
+                println!("settling 10s after large preload…");
+                std::thread::sleep(std::time::Duration::from_secs(10));
+            }
         }
     }
 
@@ -70,7 +99,7 @@ fn main() {
                     .prepare("SELECT v FROM bench WHERE id = ?")
                     .expect("prepare select");
                 for i in 0..per_thread {
-                    let (read, id) = pick_op(base, t, i, preload, &mut rng);
+                    let (read, id) = pick_op(base, t, i, preload, read_span, &mut rng);
                     let op_start = Instant::now();
                     let result = if read {
                         client.execute_prepared(&mut sel, &[Value::Int(id)])
@@ -88,7 +117,7 @@ fn main() {
                 }
             } else {
                 for i in 0..per_thread {
-                    let sql = build_op(&mode, t, i, preload, &mut rng);
+                    let sql = build_op(&mode, t, i, preload, read_span, &mut rng);
                     let op_start = Instant::now();
                     match client.execute(&sql) {
                         Ok(Response::Error(_)) | Err(_) => errors += 1,
@@ -127,8 +156,15 @@ fn main() {
     );
 }
 
-fn build_op(mode: &str, thread: usize, i: usize, preload: usize, rng: &mut u64) -> String {
-    let (read, id) = pick_op(mode, thread, i, preload, rng);
+fn build_op(
+    mode: &str,
+    thread: usize,
+    i: usize,
+    preload: usize,
+    read_span: usize,
+    rng: &mut u64,
+) -> String {
+    let (read, id) = pick_op(mode, thread, i, preload, read_span, rng);
     if read {
         format!("SELECT v FROM bench WHERE id = {id}")
     } else {
@@ -138,14 +174,21 @@ fn build_op(mode: &str, thread: usize, i: usize, preload: usize, rng: &mut u64) 
 
 /// The shared op chooser: whether this op is a read, and the row id it
 /// targets — identical distribution for the text and prepared paths.
-fn pick_op(mode: &str, thread: usize, i: usize, preload: usize, rng: &mut u64) -> (bool, i64) {
+fn pick_op(
+    mode: &str,
+    thread: usize,
+    i: usize,
+    preload: usize,
+    read_span: usize,
+    rng: &mut u64,
+) -> (bool, i64) {
     // xorshift for cheap pseudo-randomness (no external rng dependency).
     *rng ^= *rng << 13;
     *rng ^= *rng >> 7;
     *rng ^= *rng << 17;
     let read = mode == "read" || (mode == "mixed" && (*rng & 1 == 0));
     let id = if read {
-        ((*rng as usize) % preload.max(1)) as i64
+        ((*rng as usize) % read_span.max(1)) as i64
     } else {
         // Unique id per (thread, i) to avoid PK collisions across threads.
         (preload + thread * 10_000_000 + i) as i64
@@ -157,6 +200,27 @@ fn pick_op(mode: &str, thread: usize, i: usize, preload: usize, rng: &mut u64) -
 fn connect(cfg: &(Vec<String>, String, String), idx: usize) -> Client {
     let addr = &cfg.0[idx % cfg.0.len()];
     Client::connect_with(addr, &cfg.1, &cfg.2).expect("connect")
+}
+
+/// Parse the preload argument: `N` or `NxS` (N rows, S-byte values).
+fn parse_preload(arg: Option<&str>) -> (usize, usize) {
+    match arg {
+        None => (1000, 0),
+        Some(s) => match s.split_once('x') {
+            Some((n, sz)) => (n.parse().expect("preload rows"), sz.parse().expect("value size")),
+            None => (s.parse().expect("preload"), 0),
+        },
+    }
+}
+
+/// The preload value for row `i`, padded with dots to `valsize` bytes when a
+/// size is given (0 keeps the short default).
+fn padded_payload(i: usize, valsize: usize) -> String {
+    let mut v = format!("payload-{i}");
+    while v.len() < valsize {
+        v.push('.');
+    }
+    v
 }
 
 fn run_ok(c: &mut Client, sql: &str) {

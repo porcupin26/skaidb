@@ -373,6 +373,23 @@ impl SsTable {
         }
     }
 
+    /// Like [`SsTable::iter`], but starting at the first block that can hold
+    /// `start` (per the block index) — entries before `start` within that
+    /// block are still yielded, so callers filter to their exact bound. Cost
+    /// is proportional to what is consumed, not the table.
+    pub fn iter_from(&self, start: &[u8]) -> SsTableIter<'_> {
+        let first = self
+            .blocks
+            .partition_point(|b| b.first_key.as_slice() <= start)
+            .saturating_sub(1);
+        SsTableIter {
+            table: self,
+            next_block: first,
+            block: Vec::new(),
+            pos: 0,
+        }
+    }
+
     /// Read and decompress one block from disk.
     fn read_block(&self, meta: &BlockMeta) -> Result<Vec<u8>> {
         let mut comp = vec![0u8; meta.comp_len as usize];

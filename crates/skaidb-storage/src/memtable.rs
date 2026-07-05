@@ -136,6 +136,37 @@ impl Memtable {
         out
     }
 
+    /// Up to `max` latest-version entries with key strictly greater than
+    /// `after`, in key order — one bounded page of [`Memtable::range_latest`],
+    /// so a pager over the merged view never materializes the whole memtable.
+    pub fn range_latest_page(
+        &self,
+        after: Option<&[u8]>,
+        max: usize,
+    ) -> Vec<(Vec<u8>, Hlc, VersionValue)> {
+        use std::ops::Bound;
+        let lo = match after {
+            Some(s) => Bound::Included((s.to_vec(), Reverse(Hlc::MAX))),
+            None => Bound::Unbounded,
+        };
+        let mut out = Vec::new();
+        let mut current: Option<Vec<u8>> = None;
+        for ((k, Reverse(stamp)), value) in self.map.range((lo, Bound::Unbounded)) {
+            if after.is_some_and(|a| k.as_slice() <= a) {
+                continue; // strictly-after bound: skip every version of `after`
+            }
+            if current.as_deref() == Some(k.as_slice()) {
+                continue; // already emitted the newest version of this key
+            }
+            if out.len() >= max {
+                break;
+            }
+            current = Some(k.clone());
+            out.push((k.clone(), *stamp, value.clone()));
+        }
+        out
+    }
+
     /// The newest version of `key` whose stamp is `<= as_of`, if any.
     fn latest_version(&self, key: &[u8], as_of: Hlc) -> Option<&VersionValue> {
         let start = (key.to_vec(), Reverse(Hlc::MAX));

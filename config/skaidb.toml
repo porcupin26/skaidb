@@ -45,6 +45,11 @@ at_rest_kek_source = "keyfile"
 at_rest_keyfile = ""
 
 [storage]
+# Overall storage memory budget: "auto" = half the node's (cgroup) memory
+# limit, or an explicit size like "256MB". When set it overrides
+# memtable_size_mb and read_cache_entries below. Recommended on dedicated
+# nodes; the fixed defaults below are deliberately small.
+# memory_target = "auto"
 memtable_size_mb = 256
 # RAM read cache (entries) for point reads that miss the memtable; 0 disables.
 read_cache_entries = 16384

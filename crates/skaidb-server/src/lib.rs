@@ -10,6 +10,7 @@ pub mod admin;
 pub mod audit;
 pub mod authn;
 pub mod binary;
+pub mod memory;
 pub mod metrics;
 pub mod rest;
 pub mod shared;
@@ -124,10 +125,28 @@ pub fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Apply the `[storage]` tuning to every table/index engine the database
     // opens (memtable flush threshold and read-cache capacity; the remaining
-    // engine knobs keep their built-in defaults).
+    // engine knobs keep their built-in defaults). A `memory_target` budget
+    // overrides the two fixed knobs — sized to the node's actual (cgroup)
+    // memory limit when set to "auto".
+    let mut flush_threshold_bytes = (config.storage.memtable_size_mb.max(1) as usize) * 1024 * 1024;
+    let mut read_cache_capacity = config.storage.read_cache_entries as usize;
+    match memory::resolve(&config.storage.memory_target) {
+        Ok(Some(plan)) => {
+            flush_threshold_bytes = plan.memtable_bytes as usize;
+            read_cache_capacity = plan.read_cache_entries as usize;
+            skaidb_types::slog!(
+                "skaidb: storage memory target {} MB (memtable {} MB, read cache {} entries)",
+                plan.budget / (1024 * 1024),
+                plan.memtable_bytes / (1024 * 1024),
+                plan.read_cache_entries
+            );
+        }
+        Ok(None) => {}
+        Err(e) => return Err(e.into()),
+    }
     let storage_opts = skaidb_engine::EngineOptions {
-        flush_threshold_bytes: (config.storage.memtable_size_mb.max(1) as usize) * 1024 * 1024,
-        read_cache_capacity: config.storage.read_cache_entries as usize,
+        flush_threshold_bytes,
+        read_cache_capacity,
         ..Default::default()
     };
     let db = Database::open_with_options(&config.server.data_dir, storage_opts)?;

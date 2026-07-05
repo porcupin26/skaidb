@@ -22,10 +22,27 @@ import sys
 import threading
 import time
 
+import io
+
 import psycopg2
 
+def parse_preload(arg):
+    """`N` or `NxS` -> (rows, value_size); S=0 keeps the short default value."""
+    if arg is None:
+        return 1000, 0
+    if "x" in arg:
+        n, s = arg.split("x", 1)
+        return int(n), int(s)
+    return int(arg), 0
+
+
+def payload(i, valsize):
+    v = f"payload-{i}"
+    return v + "." * max(0, valsize - len(v))
+
+
 host, mode, ops, threads = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
-preload = int(sys.argv[5]) if len(sys.argv) > 5 else 1000
+preload, valsize = parse_preload(sys.argv[5] if len(sys.argv) > 5 else None)
 dsn = (
     f"host={host} port={os.environ.get('PG_PORT', '5432')} "
     f"dbname={os.environ.get('PG_DB', 'bench')} "
@@ -45,13 +62,19 @@ cur = c.cursor()
 cur.execute("CREATE TABLE IF NOT EXISTS bench (id bigint PRIMARY KEY, v text)")
 cur.execute("TRUNCATE bench")
 if mode not in ("write", "writep"):
-    cur.executemany(
-        "INSERT INTO bench (id,v) VALUES (%s,%s)",
-        [(i, f"payload-{i}") for i in range(preload)],
-    )
-    print(f"preloaded {preload} rows")
+    CHUNK = 100_000
+    for base in range(0, preload, CHUNK):
+        buf = io.StringIO(
+            "".join(f"{i},{payload(i, valsize)}\n" for i in range(base, min(base + CHUNK, preload)))
+        )
+        cur.copy_expert("COPY bench (id,v) FROM STDIN WITH (FORMAT csv)", buf)
+    print(f"preloaded {preload} rows (value ~{valsize}B)")
+    if preload >= 100_000:
+        print("settling 10s after large preload…")
+        time.sleep(10)
 c.close()
 
+read_span = min(int(os.environ.get("READ_SPAN", preload) or preload), max(preload, 1))
 per = ops // threads
 lat, err, lock = [], [0], threading.Lock()
 
@@ -75,7 +98,7 @@ def worker(t):
     lats, e, rng = [], 0, random.Random(t)
     for i in range(per):
         if base == "read" or (base == "mixed" and rng.random() < 0.5):
-            k = rng.randrange(preload)
+            k = rng.randrange(read_span)
             s = time.perf_counter()
             try:
                 cur.execute(read_sql, (k,))
