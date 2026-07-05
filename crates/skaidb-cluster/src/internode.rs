@@ -906,13 +906,31 @@ impl Pool {
     }
 
     /// Send `req` to `addr`, reusing a pooled connection if possible. On any I/O
-    /// error the connection is dropped (not returned to the pool).
+    /// error the connection is dropped (not returned to the pool). An error on
+    /// a **reused** connection retries once on a fresh one: after a peer
+    /// restarts, every idle connection to it is silently dead, and without the
+    /// retry each stale socket fails one real request (visible as spurious
+    /// quorum failures for a while after every rolling upgrade).
     pub fn call(&self, addr: &str, req: &Request) -> io::Result<Response> {
-        let mut conn = self.take(addr)?;
-        conn_send(&mut conn, |o| req.encode_into(o))?;
-        let resp = conn_recv_response(&mut conn)?;
+        if let Some(mut conn) = self.take_idle(addr) {
+            if let Ok(resp) = Self::roundtrip(&mut conn, req) {
+                self.put(addr, conn);
+                return Ok(resp);
+            }
+            // Stale pooled connection: fall through to a fresh dial. Also
+            // drop the rest of this peer's idle bucket — they were opened
+            // to the same dead process.
+            self.idle.lock().expect("pool lock").remove(addr);
+        }
+        let mut conn = self.auth.connect(addr, None)?;
+        let resp = Self::roundtrip(&mut conn, req)?;
         self.put(addr, conn);
         Ok(resp)
+    }
+
+    fn roundtrip(conn: &mut Conn, req: &Request) -> io::Result<Response> {
+        conn_send(conn, |o| req.encode_into(o))?;
+        conn_recv_response(conn)
     }
 
     /// First half of [`Pool::call`]: send `req` on a pooled connection and
@@ -940,16 +958,18 @@ impl Pool {
     }
 
     fn take(&self, addr: &str) -> io::Result<Conn> {
-        if let Some(conn) = self
-            .idle
+        match self.take_idle(addr) {
+            Some(conn) => Ok(conn),
+            None => self.auth.connect(addr, None),
+        }
+    }
+
+    fn take_idle(&self, addr: &str) -> Option<Conn> {
+        self.idle
             .lock()
             .expect("pool lock")
             .get_mut(addr)
             .and_then(|v| v.pop())
-        {
-            return Ok(conn);
-        }
-        self.auth.connect(addr, None)
     }
 
     fn put(&self, addr: &str, conn: Conn) {

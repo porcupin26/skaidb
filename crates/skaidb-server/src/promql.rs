@@ -490,10 +490,16 @@ fn fetch(ctx: &Shared, expr: &PExpr, t0: i64, t1: i64) -> Result<Fetched, String
     // (or instant lookback), whichever the expression uses.
     let (_, range) = selector_of(expr)?;
     let back = range.unwrap_or(LOOKBACK_MS);
-    let series = ctx
+    let series = match ctx
         .backend
         .ts_query(TABLE, matchers, t0.saturating_sub(back), t1)
-        .map_err(|e| e.to_string())?;
+    {
+        Ok(series) => series,
+        // No ingest yet: an empty result, not an error — a fresh Grafana
+        // datasource should see empty panels, matching Prometheus.
+        Err(e) if e.to_string().contains("does not exist") => Vec::new(),
+        Err(e) => return Err(e.to_string()),
+    };
     Ok(Fetched { series })
 }
 
