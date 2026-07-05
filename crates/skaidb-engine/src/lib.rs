@@ -354,6 +354,47 @@ mod tests {
     }
 
     #[test]
+    fn users_roles_grants_crud_and_persistence() {
+        let dir = tempdir();
+        {
+            let mut db = Database::open(&dir).unwrap();
+            db.execute("CREATE USER ada PASSWORD 'pencil'").unwrap();
+            db.execute("CREATE ROLE reader").unwrap();
+            db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+            db.execute("GRANT SELECT ON t TO reader").unwrap();
+            db.execute("GRANT ROLE reader TO ada").unwrap();
+            // Duplicate create errors; IF NOT EXISTS doesn't.
+            assert!(db.execute("CREATE USER ada PASSWORD 'x'").is_err());
+            db.execute("CREATE USER IF NOT EXISTS ada PASSWORD 'x'").unwrap();
+        }
+        let mut db = Database::open(&dir).unwrap();
+        // Credential survived (and the IF NOT EXISTS didn't clobber it).
+        let cred = db.auth_user("ada").unwrap();
+        let candidate = skaidb_auth::ScramCredential::new("pencil", &cred.salt, cred.iterations);
+        assert_eq!(candidate.stored_key, cred.stored_key);
+        // Inherited grant resolves.
+        use skaidb_auth::{Object, Privilege};
+        assert!(db.has_privilege("ada", Privilege::Select, &Object::Table("t".into())));
+        assert!(!db.has_privilege("ada", Privilege::Insert, &Object::Table("t".into())));
+        // SHOW GRANTS lists both the grant and the inheritance edge.
+        let rs = rows(db.execute("SHOW GRANTS FOR ada").unwrap());
+        assert!(rs.rows.iter().any(|r| r[1] == Value::String("ROLE".into())));
+        // ALTER changes the password; REVOKE removes access.
+        db.execute("ALTER USER ada PASSWORD 'quill'").unwrap();
+        let cred = db.auth_user("ada").unwrap();
+        let old = skaidb_auth::ScramCredential::new("pencil", &cred.salt, cred.iterations);
+        assert_ne!(old.stored_key, cred.stored_key);
+        db.execute("REVOKE ROLE reader FROM ada").unwrap();
+        assert!(!db.has_privilege("ada", Privilege::Select, &Object::Table("t".into())));
+        // Drops.
+        db.execute("DROP ROLE reader").unwrap();
+        db.execute("DROP USER ada").unwrap();
+        assert!(db.auth_user("ada").is_none());
+        let err = db.execute("DROP ROLE nosuch").unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "{err}");
+    }
+
+    #[test]
     fn where_filtering_and_three_valued_logic() {
         let mut db = Database::open(tempdir()).unwrap();
         db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();

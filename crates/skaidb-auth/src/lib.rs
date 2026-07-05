@@ -8,5 +8,5 @@ pub mod crypto;
 pub mod rbac;
 pub mod scram;
 
-pub use rbac::{Object, Privilege, RbacError, RoleStore};
+pub use rbac::{privilege_from_name, privilege_name, Object, Privilege, RbacError, RoleStore};
 pub use scram::{ScramCredential, DEFAULT_ITERATIONS};

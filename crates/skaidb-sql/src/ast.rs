@@ -50,6 +50,55 @@ pub enum Statement {
     DropDatabase { name: String, if_exists: bool },
     /// `USE [DATABASE] <name>` — switch the session's current database.
     UseDatabase { name: String },
+    /// `CREATE USER [IF NOT EXISTS] u PASSWORD '...'` (or the internal
+    /// `VERIFIER '...'` replication form). A user acts as its own-named
+    /// role; grant other roles to it for more.
+    CreateUser(CreateUser),
+    /// `ALTER USER u PASSWORD '...'`.
+    AlterUser { name: String, password: String },
+    /// `DROP USER [IF EXISTS] u`.
+    DropUser { name: String, if_exists: bool },
+    /// `CREATE ROLE [IF NOT EXISTS] r` (internal `GRANTS '...'` form carries
+    /// whole-role state for replication).
+    CreateRole {
+        name: String,
+        if_not_exists: bool,
+        state: Option<String>,
+    },
+    /// `DROP ROLE [IF EXISTS] r`.
+    DropRole { name: String, if_exists: bool },
+    /// `GRANT <privilege> ON <table|*> TO <role>`.
+    Grant {
+        privilege: String,
+        /// `None` = `ON *` (global).
+        table: Option<String>,
+        to: String,
+    },
+    /// `REVOKE <privilege> ON <table|*> FROM <role>`.
+    Revoke {
+        privilege: String,
+        table: Option<String>,
+        from: String,
+    },
+    /// `GRANT ROLE r TO u` — role inheritance.
+    GrantRole { role: String, to: String },
+    /// `REVOKE ROLE r FROM u`.
+    RevokeRole { role: String, from: String },
+    /// `SHOW GRANTS [FOR <role>]`.
+    ShowGrants { role: Option<String> },
+}
+
+/// `CREATE USER` payload.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateUser {
+    pub name: String,
+    pub if_not_exists: bool,
+    /// Plaintext (client-facing form) — the engine derives and stores a
+    /// SCRAM verifier; the coordinator rewrites to `verifier` form before
+    /// broadcasting, so plaintext never crosses internode links.
+    pub password: Option<String>,
+    /// Encoded verifier (internal replication/replay form).
+    pub verifier: Option<String>,
 }
 
 impl Statement {

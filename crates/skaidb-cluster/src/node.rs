@@ -819,6 +819,24 @@ impl Node {
     }
 
     /// Addresses of all current peers (snapshot, cloned) — never held across I/O.
+    /// RBAC check against the replicated catalog (see engine docs).
+    pub fn has_privilege(
+        &self,
+        role: &str,
+        privilege: skaidb_auth::Privilege,
+        object: &skaidb_auth::Object,
+    ) -> bool {
+        self.local
+            .read()
+            .map(|db| db.has_privilege(role, privilege, object))
+            .unwrap_or(false)
+    }
+
+    /// Stored SCRAM credential for a catalog user.
+    pub fn auth_user(&self, name: &str) -> Option<skaidb_auth::ScramCredential> {
+        self.local.read().ok()?.auth_user(name)
+    }
+
     /// Cluster-wide time-series query at the configured read consistency
     /// (union-merged across members) — the PromQL/HTTP query path.
     pub fn ts_query_replicated(
@@ -2393,8 +2411,23 @@ impl Node {
             return Ok(SessionEffect::UseDatabase(name.clone()));
         }
         // DDL — including CREATE/DROP DATABASE — broadcasts to every member so the
-        // schema and database registry stay identical cluster-wide.
+        // schema and database registry stay identical cluster-wide. User
+        // statements carrying a plaintext password are rewritten to the
+        // encoded-verifier form first, so plaintext never crosses internode
+        // links (which may be token-authenticated but unencrypted).
         if is_ddl(&stmt) {
+            let sql_owned;
+            let sql = match &stmt {
+                Statement::CreateUser(cu) if cu.password.is_some() => {
+                    sql_owned = render_user_verifier_ddl(&cu.name, cu.password.as_deref().unwrap());
+                    &sql_owned
+                }
+                Statement::AlterUser { name, password } => {
+                    sql_owned = render_user_verifier_ddl(name, password);
+                    &sql_owned
+                }
+                _ => sql,
+            };
             self.broadcast_ddl(current_db, sql)?;
             return Ok(SessionEffect::Output(QueryOutput::Ddl));
         }
@@ -3717,6 +3750,15 @@ fn ts_placement_key(labels: &[(String, String)]) -> Vec<u8> {
     key
 }
 
+/// Render a user's DDL in verifier form (derives the same credential the
+/// engine would from the plaintext, so every member stores the same bytes).
+fn render_user_verifier_ddl(name: &str, password: &str) -> String {
+    let salt = skaidb_auth::crypto::sha256(format!("skaidb-user:{name}").as_bytes())[..16].to_vec();
+    let credential =
+        skaidb_auth::ScramCredential::new(password, &salt, skaidb_auth::DEFAULT_ITERATIONS);
+    format!("CREATE USER {name} VERIFIER '{}'", credential.encode())
+}
+
 fn is_ddl(stmt: &Statement) -> bool {
     matches!(
         stmt,
@@ -3731,6 +3773,15 @@ fn is_ddl(stmt: &Statement) -> bool {
             | Statement::AlterTable(_)
             | Statement::CreateDatabase { .. }
             | Statement::DropDatabase { .. }
+            | Statement::CreateUser(_)
+            | Statement::AlterUser { .. }
+            | Statement::DropUser { .. }
+            | Statement::CreateRole { .. }
+            | Statement::DropRole { .. }
+            | Statement::Grant { .. }
+            | Statement::Revoke { .. }
+            | Statement::GrantRole { .. }
+            | Statement::RevokeRole { .. }
     )
 }
 
@@ -5174,6 +5225,60 @@ mod tests {
             let rs = rows(node.execute("SELECT count(value) FROM m").unwrap());
             assert_eq!(rs.rows[0][0], Value::Int(40), "full view after drain");
         }
+    }
+
+    #[test]
+    fn users_and_grants_replicate_across_members() {
+        let q = Consistency::Quorum;
+        let cfg2 = |id: &str, addr: &str, members: &[(NodeId, String)]| NodeConfig {
+            id: NodeId::new(id),
+            internode_addr: addr.to_string(),
+            members: members.to_vec(),
+            replication_factor: 2,
+            vnodes_per_node: 64,
+            read_consistency: q,
+            write_consistency: q,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
+            anti_entropy_interval_secs: 0,
+        };
+        let (a, b) = (free_addr(), free_addr());
+        let m = vec![member("a", &a), member("b", &b)];
+        let na = Node::new(Database::open(temp_dir("aua")).unwrap(), cfg2("a", &a, &m));
+        let nb = Node::new(Database::open(temp_dir("aub")).unwrap(), cfg2("b", &b, &m));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+
+        // User DDL broadcasts (password rewritten to a verifier first).
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        na.execute("CREATE USER bob PASSWORD 'hunter2'").unwrap();
+        na.execute("GRANT SELECT ON t TO bob").unwrap();
+
+        // The peer can authenticate bob and sees his grant.
+        let cred = nb.auth_user("bob").expect("user replicated");
+        let candidate =
+            skaidb_auth::ScramCredential::new("hunter2", &cred.salt, cred.iterations);
+        assert_eq!(candidate.stored_key, cred.stored_key);
+        assert!(nb.has_privilege(
+            "bob",
+            skaidb_auth::Privilege::Select,
+            &skaidb_auth::Object::Table("t".into())
+        ));
+        assert!(!nb.has_privilege(
+            "bob",
+            skaidb_auth::Privilege::Insert,
+            &skaidb_auth::Object::Table("t".into())
+        ));
+
+        // Revocation and drops replicate too.
+        nb.execute("REVOKE SELECT ON t FROM bob").unwrap();
+        assert!(!na.has_privilege(
+            "bob",
+            skaidb_auth::Privilege::Select,
+            &skaidb_auth::Object::Table("t".into())
+        ));
+        na.execute("DROP USER bob").unwrap();
+        assert!(nb.auth_user("bob").is_none());
     }
 
     #[test]

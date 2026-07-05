@@ -195,21 +195,118 @@ impl Parser {
                     Ok(Statement::ShowTables)
                 } else if self.eat_keyword(Keyword::Indexes) {
                     Ok(Statement::ShowIndexes)
+                } else if self.eat_keyword(Keyword::Grants) {
+                    let role = if self.eat_keyword(Keyword::For) {
+                        Some(self.expect_ident()?)
+                    } else {
+                        None
+                    };
+                    Ok(Statement::ShowGrants { role })
                 } else if self.eat_ident_ci("status") {
                     Ok(Statement::ShowStatus)
                 } else if self.eat_ident_ci("databases") {
                     Ok(Statement::ShowDatabases)
                 } else {
-                    Err(self.unexpected("TABLES, INDEXES, STATUS, or DATABASES after SHOW".into()))
+                    Err(self.unexpected(
+                        "TABLES, INDEXES, GRANTS, STATUS, or DATABASES after SHOW".into(),
+                    ))
                 }
             }
+            Token::Keyword(Keyword::Grant) => self.parse_grant(),
+            Token::Keyword(Keyword::Revoke) => self.parse_revoke(),
             _ => Err(self.unexpected("a statement".into())),
+        }
+    }
+
+    /// `GRANT ROLE <r> TO <u>` | `GRANT <priv> ON <table|*> TO <role>`.
+    fn parse_grant(&mut self) -> Result<Statement, ParseError> {
+        self.expect_keyword(Keyword::Grant)?;
+        if self.eat_keyword(Keyword::Role) {
+            let role = self.expect_ident()?;
+            self.expect_keyword(Keyword::To)?;
+            let to = self.expect_ident()?;
+            return Ok(Statement::GrantRole { role, to });
+        }
+        let privilege = self.parse_privilege()?;
+        self.expect_keyword(Keyword::On)?;
+        let table = self.parse_grant_object()?;
+        self.expect_keyword(Keyword::To)?;
+        let to = self.expect_ident()?;
+        Ok(Statement::Grant {
+            privilege,
+            table,
+            to,
+        })
+    }
+
+    /// `REVOKE ROLE <r> FROM <u>` | `REVOKE <priv> ON <table|*> FROM <role>`.
+    fn parse_revoke(&mut self) -> Result<Statement, ParseError> {
+        self.expect_keyword(Keyword::Revoke)?;
+        if self.eat_keyword(Keyword::Role) {
+            let role = self.expect_ident()?;
+            self.expect_keyword(Keyword::From)?;
+            let from = self.expect_ident()?;
+            return Ok(Statement::RevokeRole { role, from });
+        }
+        let privilege = self.parse_privilege()?;
+        self.expect_keyword(Keyword::On)?;
+        let table = self.parse_grant_object()?;
+        self.expect_keyword(Keyword::From)?;
+        let from = self.expect_ident()?;
+        Ok(Statement::Revoke {
+            privilege,
+            table,
+            from,
+        })
+    }
+
+    /// A grantable privilege keyword, canonicalized to lowercase.
+    fn parse_privilege(&mut self) -> Result<String, ParseError> {
+        let name = match self.advance() {
+            Token::Keyword(Keyword::Select) => "select",
+            Token::Keyword(Keyword::Insert) => "insert",
+            Token::Keyword(Keyword::Update) => "update",
+            Token::Keyword(Keyword::Delete) => "delete",
+            Token::Keyword(Keyword::Create) => "create",
+            Token::Keyword(Keyword::Drop) => "drop",
+            Token::Keyword(Keyword::Grant) => "grant",
+            Token::Keyword(Keyword::Admin) => "admin",
+            other => {
+                return Err(ParseError::Other(format!(
+                    "expected a privilege (SELECT/INSERT/UPDATE/DELETE/CREATE/DROP/GRANT/ADMIN), found {other:?}"
+                )))
+            }
+        };
+        Ok(name.to_string())
+    }
+
+    /// `ON <table>` or `ON *` (global).
+    fn parse_grant_object(&mut self) -> Result<Option<String>, ParseError> {
+        if self.eat(&Token::Star) {
+            Ok(None)
+        } else {
+            Ok(Some(self.parse_table_name()?))
+        }
+    }
+
+    fn expect_string(&mut self) -> Result<String, ParseError> {
+        match self.advance() {
+            Token::Str(s) => Ok(s),
+            other => Err(ParseError::Other(format!(
+                "expected a quoted string, found {other:?}"
+            ))),
         }
     }
 
     /// `ALTER TABLE <name> RENAME { TO <new> | COLUMN <from> TO <to> }`.
     fn parse_alter(&mut self) -> Result<Statement, ParseError> {
         self.expect_keyword(Keyword::Alter)?;
+        if self.eat_keyword(Keyword::User) {
+            let name = self.expect_ident()?;
+            self.expect_keyword(Keyword::Password)?;
+            let password = self.expect_string()?;
+            return Ok(Statement::AlterUser { name, password });
+        }
         self.expect_keyword(Keyword::Table)?;
         let name = self.parse_table_name()?;
         self.expect_keyword(Keyword::Rename)?;
@@ -282,6 +379,36 @@ impl Parser {
                 retention_ms,
                 ooo_ms,
             }))
+        } else if self.eat_keyword(Keyword::User) {
+            let if_not_exists = self.parse_if_not_exists()?;
+            let name = self.expect_ident()?;
+            let (mut password, mut verifier) = (None, None);
+            if self.eat_keyword(Keyword::Password) {
+                password = Some(self.expect_string()?);
+            } else if self.eat_keyword(Keyword::Verifier) {
+                verifier = Some(self.expect_string()?);
+            } else {
+                return Err(self.unexpected("PASSWORD or VERIFIER".into()));
+            }
+            Ok(Statement::CreateUser(CreateUser {
+                name,
+                if_not_exists,
+                password,
+                verifier,
+            }))
+        } else if self.eat_keyword(Keyword::Role) {
+            let if_not_exists = self.parse_if_not_exists()?;
+            let name = self.expect_ident()?;
+            let state = if self.eat_keyword(Keyword::Grants) {
+                Some(self.expect_string()?)
+            } else {
+                None
+            };
+            Ok(Statement::CreateRole {
+                name,
+                if_not_exists,
+                state,
+            })
         } else if self.eat_keyword(Keyword::Rollup) {
             // CREATE ROLLUP [IF NOT EXISTS] name ON table BUCKET <dur>
             //   [RETENTION <dur>]
@@ -382,6 +509,14 @@ impl Parser {
             let if_exists = self.parse_if_exists()?;
             let name = self.parse_table_name()?;
             Ok(Statement::DropTable { name, if_exists })
+        } else if self.eat_keyword(Keyword::User) {
+            let if_exists = self.parse_if_exists()?;
+            let name = self.expect_ident()?;
+            Ok(Statement::DropUser { name, if_exists })
+        } else if self.eat_keyword(Keyword::Role) {
+            let if_exists = self.parse_if_exists()?;
+            let name = self.expect_ident()?;
+            Ok(Statement::DropRole { name, if_exists })
         } else if self.eat_keyword(Keyword::Vector) {
             self.expect_keyword(Keyword::Index)?;
             let if_exists = self.parse_if_exists()?;

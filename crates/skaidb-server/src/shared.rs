@@ -8,7 +8,7 @@ use serde_json::{json, Value as Json};
 
 use crate::slowlog::SlowLog;
 
-use skaidb_auth::{Object, Privilege, RoleStore};
+use skaidb_auth::{Object, Privilege};
 use skaidb_cluster::{ClusterStats, Consistency as ClusterConsistency, Node};
 use skaidb_config::Config;
 use skaidb_engine::{
@@ -107,6 +107,25 @@ impl Backend {
         matches!(self, Backend::Cluster(_))
     }
 
+    /// RBAC check against the (replicated) catalog role store.
+    pub fn has_privilege(&self, role: &str, privilege: Privilege, object: &Object) -> bool {
+        match self {
+            Backend::Local(db) => db
+                .read()
+                .map(|d| d.has_privilege(role, privilege, object))
+                .unwrap_or(false),
+            Backend::Cluster(node) => node.has_privilege(role, privilege, object),
+        }
+    }
+
+    /// Stored SCRAM credential for a catalog-managed user.
+    pub fn auth_user(&self, name: &str) -> Option<skaidb_auth::ScramCredential> {
+        match self {
+            Backend::Local(db) => db.read().ok()?.auth_user(name),
+            Backend::Cluster(node) => node.auth_user(name),
+        }
+    }
+
     /// Query time-series samples (the Prometheus HTTP API path): local
     /// store, or union-merged across the cluster.
     pub fn ts_query(
@@ -171,8 +190,6 @@ pub struct Context {
     /// Live-tunable audit/observability settings. Behind a lock so `config set`
     /// on an `observability.*` key takes effect without a restart.
     pub audit: RwLock<AuditSettings>,
-    /// Roles/grants (SPEC §8.2).
-    pub roles: RoleStore,
     /// Connection authentication (SPEC §8.1).
     pub authn: AuthState,
     /// Role used for the REST gateway and anonymous connections.
@@ -253,6 +270,27 @@ impl Context {
 }
 
 /// A reference-counted [`Context`] shared by all handlers.
+impl Context {
+    /// RBAC decision for `role` on `object`: the config superuser is always
+    /// allowed; everything else consults the replicated catalog role store.
+    pub fn allowed(&self, role: &str, privilege: Privilege, object: &Object) -> bool {
+        role == self.superuser_role || self.backend.has_privilege(role, privilege, object)
+    }
+
+    /// Resolve a username to its SCRAM credential and acting role: the
+    /// config superuser first, then catalog-managed users (whose acting
+    /// role is their own name).
+    pub fn lookup_account(&self, username: &str) -> Option<crate::authn::UserAccount> {
+        if let Some(acct) = self.authn.account(username) {
+            return Some(acct);
+        }
+        self.backend.auth_user(username).map(|credential| crate::authn::UserAccount {
+            credential,
+            role: username.to_string(),
+        })
+    }
+}
+
 pub type Shared = Arc<Context>;
 
 /// Pull current storage/cluster statistics from the backend and write them into
@@ -420,7 +458,7 @@ pub fn execute_session_statement_as(
 ) -> Response {
     // Authorization: check the role may perform the statement before executing.
     if let Some((privilege, object)) = parsed.as_ref().ok().and_then(required_privilege) {
-        if !ctx.roles.has_privilege(role, privilege, &object) {
+        if !ctx.allowed(role, privilege, &object) {
             ctx.metrics.incr_authz_denied();
             return Response::Error(format!("permission denied: {privilege:?} on {object:?}"));
         }
@@ -581,6 +619,18 @@ fn required_privilege(stmt: &Statement) -> Option<(Privilege, Object)> {
         Statement::CreateDatabase { .. } => (Privilege::Create, Object::Global),
         Statement::DropDatabase { .. } => (Privilege::Drop, Object::Global),
         Statement::UseDatabase { .. } => return None,
+        // User/role management (and inspecting grants) requires the Grant
+        // privilege cluster-wide; Admin implies it.
+        Statement::CreateUser(_)
+        | Statement::AlterUser { .. }
+        | Statement::DropUser { .. }
+        | Statement::CreateRole { .. }
+        | Statement::DropRole { .. }
+        | Statement::Grant { .. }
+        | Statement::Revoke { .. }
+        | Statement::GrantRole { .. }
+        | Statement::RevokeRole { .. }
+        | Statement::ShowGrants { .. } => (Privilege::Grant, Object::Global),
     })
 }
 

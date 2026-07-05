@@ -16,6 +16,13 @@ const TABLE: &str = "metrics";
 
 /// Decode, map, and append a remote_write body. Returns accepted samples.
 pub fn ingest(ctx: &Shared, role: &str, body: &[u8]) -> Result<usize, String> {
+    if !ctx.allowed(
+        role,
+        skaidb_auth::Privilege::Insert,
+        &skaidb_auth::Object::Table(TABLE.into()),
+    ) {
+        return Err(format!("permission denied: Insert on {TABLE}"));
+    }
     let raw = snap::raw::Decoder::new()
         .decompress_vec(body)
         .map_err(|e| format!("snappy: {e}"))?;

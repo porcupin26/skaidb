@@ -70,20 +70,27 @@ impl AuthState {
         );
     }
 
-    /// Salt and iteration count to advertise in the challenge for `username`.
-    /// Unknown users get a stable decoy salt (avoids trivial user enumeration).
-    pub fn salt_for(&self, username: &str) -> (Vec<u8>, u32) {
-        match self.users.get(username) {
+    /// The config-directory account for `username` (catalog-managed users
+    /// are resolved by the caller via `Context::lookup_account`).
+    pub fn account(&self, username: &str) -> Option<UserAccount> {
+        self.users.get(username).cloned()
+    }
+
+    /// Salt and iteration count to advertise in the challenge for a resolved
+    /// account. Unknown users get a stable decoy salt (avoids trivial user
+    /// enumeration).
+    pub fn salt_for(&self, account: Option<&UserAccount>) -> (Vec<u8>, u32) {
+        match account {
             Some(acct) => (acct.credential.salt.clone(), acct.credential.iterations),
             None => (self.default_salt.clone(), DEFAULT_ITERATIONS),
         }
     }
 
-    /// Verify a plaintext `password` for `username` (used by HTTP Basic auth on
-    /// the REST endpoint). Returns the role on success. Recomputes the SCRAM
+    /// Verify a plaintext `password` against a resolved account (HTTP Basic
+    /// auth). Returns the acting role on success. Recomputes the SCRAM
     /// verifier from the stored salt/iterations and compares stored keys.
-    pub fn verify_password(&self, username: &str, password: &str) -> Option<String> {
-        let acct = self.users.get(username)?;
+    pub fn verify_password(account: Option<&UserAccount>, password: &str) -> Option<String> {
+        let acct = account?;
         let candidate =
             ScramCredential::new(password, &acct.credential.salt, acct.credential.iterations);
         if ct_eq(&candidate.stored_key, &acct.credential.stored_key) {
@@ -103,7 +110,7 @@ impl AuthState {
     /// `anonymous_role`.
     pub fn verify(
         &self,
-        username: &str,
+        account: Option<&UserAccount>,
         auth_message: &[u8],
         client_proof: &[u8; 32],
         anonymous_role: &str,
@@ -114,7 +121,7 @@ impl AuthState {
                 server_signature: [0u8; 32],
             };
         }
-        match self.users.get(username) {
+        match account {
             Some(acct) => match acct.credential.verify(auth_message, client_proof) {
                 Some(server_signature) => AuthResult::Authenticated {
                     role: acct.role.clone(),
@@ -145,7 +152,7 @@ mod tests {
     #[test]
     fn disabled_accepts_anyone() {
         let auth = AuthState::disabled();
-        let r = auth.verify("whoever", b"msg", &[0u8; 32], "anon");
+        let r = auth.verify(auth.account("whoever").as_ref(), b"msg", &[0u8; 32], "anon");
         assert_eq!(
             r,
             AuthResult::Authenticated {
@@ -159,11 +166,12 @@ mod tests {
     fn required_verifies_correct_password() {
         let mut auth = AuthState::required();
         auth.add_user("ada", "pencil", "admin");
-        let (salt, iters) = auth.salt_for("ada");
+        let acct = auth.account("ada");
+        let (salt, iters) = auth.salt_for(acct.as_ref());
         let am = auth_message("ada", "cn", "sn", &salt, iters);
         let proof = scram::client_proof("pencil", &salt, iters, &am);
 
-        match auth.verify("ada", &am, &proof, "anon") {
+        match auth.verify(auth.account("ada").as_ref(), &am, &proof, "anon") {
             AuthResult::Authenticated { role, .. } => assert_eq!(role, "admin"),
             other => panic!("expected auth, got {other:?}"),
         }
@@ -173,17 +181,18 @@ mod tests {
     fn required_rejects_wrong_password_and_unknown_user() {
         let mut auth = AuthState::required();
         auth.add_user("ada", "pencil", "admin");
-        let (salt, iters) = auth.salt_for("ada");
+        let acct = auth.account("ada");
+        let (salt, iters) = auth.salt_for(acct.as_ref());
         let am = auth_message("ada", "cn", "sn", &salt, iters);
 
         let bad = scram::client_proof("WRONG", &salt, iters, &am);
         assert!(matches!(
-            auth.verify("ada", &am, &bad, "anon"),
+            auth.verify(auth.account("ada").as_ref(), &am, &bad, "anon"),
             AuthResult::Denied(_)
         ));
         let any = scram::client_proof("x", &salt, iters, &am);
         assert!(matches!(
-            auth.verify("ghost", &am, &any, "anon"),
+            auth.verify(auth.account("ghost").as_ref(), &am, &any, "anon"),
             AuthResult::Denied(_)
         ));
     }

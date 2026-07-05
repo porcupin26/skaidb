@@ -36,6 +36,35 @@ struct Role {
     inherits: BTreeSet<String>,
 }
 
+/// Canonical lowercase name of a privilege (stable storage/wire form).
+pub fn privilege_name(p: Privilege) -> &'static str {
+    match p {
+        Privilege::Select => "select",
+        Privilege::Insert => "insert",
+        Privilege::Update => "update",
+        Privilege::Delete => "delete",
+        Privilege::Create => "create",
+        Privilege::Drop => "drop",
+        Privilege::Grant => "grant",
+        Privilege::Admin => "admin",
+    }
+}
+
+/// Parse a privilege from its canonical name (case-insensitive).
+pub fn privilege_from_name(s: &str) -> Option<Privilege> {
+    Some(match s.to_ascii_lowercase().as_str() {
+        "select" => Privilege::Select,
+        "insert" => Privilege::Insert,
+        "update" => Privilege::Update,
+        "delete" => Privilege::Delete,
+        "create" => Privilege::Create,
+        "drop" => Privilege::Drop,
+        "grant" => Privilege::Grant,
+        "admin" => Privilege::Admin,
+        _ => return None,
+    })
+}
+
 /// Errors from RBAC operations.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RbacError {
@@ -129,6 +158,40 @@ impl RoleStore {
             .ok_or_else(|| RbacError::NoSuchRole(member.to_string()))?;
         m.inherits.insert(parent.to_string());
         Ok(())
+    }
+
+    /// Remove a role-inheritance edge. Missing role/edge is a no-op.
+    pub fn revoke_role(&mut self, member: &str, parent: &str) {
+        if let Some(m) = self.roles.get_mut(member) {
+            m.inherits.remove(parent);
+        }
+    }
+
+    /// Every `(role, privilege, object)` grant plus `(role, "ROLE", parent)`
+    /// inheritance edge — the `SHOW GRANTS` view.
+    pub fn grants(&self, only: Option<&str>) -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        for (name, role) in &self.roles {
+            if only.is_some_and(|o| o != name) {
+                continue;
+            }
+            for (object, privs) in &role.grants {
+                for p in privs {
+                    out.push((
+                        name.clone(),
+                        privilege_name(*p).to_string(),
+                        match object {
+                            Object::Global => "*".to_string(),
+                            Object::Table(t) => t.clone(),
+                        },
+                    ));
+                }
+            }
+            for parent in &role.inherits {
+                out.push((name.clone(), "ROLE".to_string(), parent.clone()));
+            }
+        }
+        out
     }
 
     /// Whether `role` may perform `privilege` on `object`, following role

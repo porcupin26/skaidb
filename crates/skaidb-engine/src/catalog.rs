@@ -88,6 +88,21 @@ pub struct RollupDef {
     pub bucket_ms: i64,
 }
 
+/// A user principal: its SCRAM verifier (encoded; never plaintext). A user
+/// acts as its own-named role.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UserDef {
+    pub credential: String,
+}
+
+/// A role's grants and inherited roles. `grants` pairs are
+/// `(privilege name, table)` with `None` = global.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AuthRoleDef {
+    pub grants: Vec<(String, Option<String>)>,
+    pub inherits: Vec<String>,
+}
+
 /// The set of all tables and indexes.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Catalog {
@@ -106,6 +121,12 @@ pub struct Catalog {
     /// load with no databases. See [`crate::namespace`].
     #[serde(default)]
     pub databases: std::collections::BTreeSet<String>,
+    /// User principals by name. `default` so older catalogs load.
+    #[serde(default)]
+    pub users: BTreeMap<String, UserDef>,
+    /// RBAC roles by name. `default` so older catalogs load.
+    #[serde(default)]
+    pub auth_roles: BTreeMap<String, AuthRoleDef>,
     /// Per-object DDL version stamps for last-writer-wins schema replication,
     /// keyed by a kind-prefixed name: `d:<db>`, `t:<table>`, `i:<index>`,
     /// `v:<vector index>`. A `dropped` stamp is a tombstone. `default` so older

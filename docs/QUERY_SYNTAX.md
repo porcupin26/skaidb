@@ -61,6 +61,18 @@ CREATE DATABASE [IF NOT EXISTS] <name>
 DROP   DATABASE [IF EXISTS] <name>
 USE    [DATABASE] <name>
 
+-- Users, roles, grants (see Access control note)
+CREATE USER [IF NOT EXISTS] <name> PASSWORD '<password>'
+ALTER  USER <name> PASSWORD '<password>'
+DROP   USER [IF EXISTS] <name>
+CREATE ROLE [IF NOT EXISTS] <name>
+DROP   ROLE [IF EXISTS] <name>
+GRANT  <privilege> ON { <table> | * } TO <role>
+REVOKE <privilege> ON { <table> | * } FROM <role>
+GRANT  ROLE <role> TO <user>
+REVOKE ROLE <role> FROM <user>
+SHOW GRANTS [FOR <role>]
+
 -- Introspection (read-only catalog)
 SHOW TABLES
 SHOW INDEXES
@@ -130,6 +142,19 @@ SHOW DATABASES
   `COMMIT`, and `ROLLBACK` discards them. **Embedded engine only** — in cluster
   mode each statement autocommits and transaction control returns an error (a
   distributed transaction coordinator is future work). DDL is not transactional.
+
+- **Access control.** `<privilege>` is one of `SELECT`, `INSERT`, `UPDATE`,
+  `DELETE`, `CREATE`, `DROP`, `GRANT`, `ADMIN` (`ADMIN` on `*` = superuser;
+  `ADMIN` on a table implies every privilege on it). A **user** authenticates
+  (SCRAM on the binary protocol, HTTP Basic on REST) and acts as its
+  own-named role; `GRANT ROLE r TO u` adds inherited roles. All management
+  statements (and `SHOW GRANTS`) require the `GRANT` privilege cluster-wide.
+  Users/roles persist in the catalog, replicate like other DDL (passwords
+  travel between nodes only as salted SCRAM verifiers, never plaintext), and
+  converge via schema repair. The config-file superuser remains the
+  bootstrap principal. The Prometheus endpoints are covered too:
+  `remote_write` requires `INSERT` and `/api/v1/query*` require `SELECT` on
+  the `metrics` table.
 
 ## Expressions
 

@@ -89,7 +89,7 @@ fn field(body: &str, key: &str) -> Option<String> {
 /// Run `cmd` for `role`. Returns `(http_status, json)`.
 pub fn handle(ctx: &Shared, role: &str, cmd: AdminCmd) -> (u16, Json) {
     // Every admin op (including status) requires cluster-wide Admin.
-    if !ctx.roles.has_privilege(role, Privilege::Admin, &Object::Global) {
+    if !ctx.allowed(role, Privilege::Admin, &Object::Global) {
         ctx.metrics.incr_authz_denied();
         return (403, json!({ "error": "permission denied: Admin on Global" }));
     }

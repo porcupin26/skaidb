@@ -21,7 +21,6 @@ pub mod slowlog;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use skaidb_auth::RoleStore;
 use skaidb_cluster::{Authenticator, Consistency as ClusterConsistency, Node, NodeConfig, NodeId};
 use skaidb_config::{Config, Consistency, InternodeAuth};
 use skaidb_engine::Database;
@@ -153,10 +152,6 @@ pub fn run(
     };
     let db = Database::open_with_options(&config.server.data_dir, storage_opts)?;
 
-    // Bootstrap the configured superuser role (SPEC §8.2).
-    let mut roles = RoleStore::new();
-    roles.create_superuser(&config.auth.superuser);
-
     // Require auth only when SCRAM is enabled and a superuser password is set.
     let auth_required = config.auth.scram_enabled && !config.auth.superuser_password.is_empty();
     let mut authn = if auth_required {
@@ -219,7 +214,6 @@ pub fn run(
         backend,
         metrics,
         audit: RwLock::new(AuditSettings::from(&config.observability)),
-        roles,
         authn,
         superuser_role: config.auth.superuser.clone(),
         admin_lock: Mutex::new(()),
@@ -286,7 +280,6 @@ mod tests {
     use std::net::TcpStream;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use skaidb_auth::{Object, Privilege};
     use skaidb_driver::Client;
     use skaidb_proto::Response;
     use skaidb_types::Value;
@@ -306,13 +299,10 @@ mod tests {
 
     /// Context with auth disabled; anonymous connections act as the superuser.
     fn temp_ctx() -> Shared {
-        let mut roles = RoleStore::new();
-        roles.create_superuser("superuser");
         Arc::new(Context {
             backend: Backend::Local(Box::new(RwLock::new(Database::open(temp_dir()).unwrap()))),
             metrics: Metrics::new(),
             audit: RwLock::new(quiet_audit()),
-            roles,
             authn: AuthState::disabled(),
             superuser_role: "superuser".into(),
             admin_lock: Mutex::new(()),
@@ -681,15 +671,12 @@ mod tests {
 
     /// Context requiring SCRAM auth: user `ada`/`pencil` acting as `admin`.
     fn auth_ctx() -> Shared {
-        let mut roles = RoleStore::new();
-        roles.create_superuser("admin");
         let mut authn = AuthState::required();
         authn.add_user("ada", "pencil", "admin");
         Arc::new(Context {
             backend: Backend::Local(Box::new(RwLock::new(Database::open(temp_dir()).unwrap()))),
             metrics: Metrics::new(),
             audit: RwLock::new(quiet_audit()),
-            roles,
             authn,
             superuser_role: "admin".into(),
             admin_lock: Mutex::new(()),
@@ -718,19 +705,48 @@ mod tests {
     }
 
     #[test]
+    fn sql_created_user_authenticates_and_is_rbac_limited() {
+        use skaidb_driver::Client;
+        // Auth required; superuser is ada (config). She creates a limited
+        // user via SQL, who then logs in over SCRAM and hits RBAC walls.
+        let ctx = auth_ctx();
+        let (addr, _h) = binary::spawn("127.0.0.1:0", ctx).unwrap();
+        let mut su = Client::connect_with(addr, "ada", "pencil").unwrap();
+        su.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        su.execute("INSERT INTO t (id) VALUES (1)").unwrap();
+        su.execute("CREATE USER bob PASSWORD 'hunter2'").unwrap();
+        su.execute("GRANT SELECT ON t TO bob").unwrap();
+
+        // Wrong password rejected; right password in.
+        assert!(Client::connect_with(addr, "bob", "wrong").is_err());
+        let mut bob = Client::connect_with(addr, "bob", "hunter2").unwrap();
+        assert!(matches!(
+            bob.execute("SELECT id FROM t").unwrap(),
+            Response::Rows { .. }
+        ));
+        let err = bob.execute("INSERT INTO t (id) VALUES (2)").unwrap_err();
+        assert!(err.to_string().contains("permission denied"), "{err}");
+        // User management needs Grant, which bob lacks.
+        let err = bob.execute("CREATE USER eve PASSWORD 'x'").unwrap_err();
+        assert!(err.to_string().contains("permission denied"), "{err}");
+
+        // Password rotation invalidates the old secret.
+        su.execute("ALTER USER bob PASSWORD 'correct-horse'").unwrap();
+        assert!(Client::connect_with(addr, "bob", "hunter2").is_err());
+        assert!(Client::connect_with(addr, "bob", "correct-horse").is_ok());
+
+        // Dropped users can't come back.
+        su.execute("DROP USER bob").unwrap();
+        assert!(Client::connect_with(addr, "bob", "correct-horse").is_err());
+    }
+
+    #[test]
     fn rbac_enforced_per_statement() {
         use crate::shared::{execute, execute_as};
-        let mut roles = RoleStore::new();
-        roles.create_superuser("superuser");
-        roles.create_role("reader").unwrap();
-        roles
-            .grant("reader", Privilege::Select, Object::Table("t".into()))
-            .unwrap();
         let ctx: Shared = Arc::new(Context {
             backend: Backend::Local(Box::new(RwLock::new(Database::open(temp_dir()).unwrap()))),
             metrics: Metrics::new(),
             audit: RwLock::new(quiet_audit()),
-            roles,
             authn: AuthState::disabled(),
             superuser_role: "superuser".into(),
             admin_lock: Mutex::new(()),
@@ -740,11 +756,13 @@ mod tests {
             config_path: None,
         });
 
-        // Superuser sets up the table.
+        // Superuser sets up the table, the role, and its grant — via SQL.
         assert_eq!(
             execute(&ctx, "CREATE TABLE t (PRIMARY KEY (id))"),
             Response::Ddl
         );
+        assert_eq!(execute(&ctx, "CREATE ROLE reader"), Response::Ddl);
+        assert_eq!(execute(&ctx, "GRANT SELECT ON t TO reader"), Response::Ddl);
         // Reader may SELECT.
         assert!(matches!(
             execute_as(&ctx, "reader", "SELECT id FROM t"),
@@ -760,13 +778,10 @@ mod tests {
     #[test]
     fn connection_scoped_current_database() {
         use crate::shared::execute_session_as;
-        let mut roles = RoleStore::new();
-        roles.create_superuser("su");
         let ctx: Shared = Arc::new(Context {
             backend: Backend::Local(Box::new(RwLock::new(Database::open(temp_dir()).unwrap()))),
             metrics: Metrics::new(),
             audit: RwLock::new(quiet_audit()),
-            roles,
             authn: AuthState::disabled(),
             superuser_role: "su".into(),
             admin_lock: Mutex::new(()),
@@ -874,12 +889,6 @@ mod tests {
 
     /// A single-node cluster `Context`: superuser has `Admin`, `reader` does not.
     fn cluster_ctx() -> Shared {
-        let mut roles = RoleStore::new();
-        roles.create_superuser("superuser");
-        roles.create_role("reader").unwrap();
-        roles
-            .grant("reader", Privilege::Select, Object::Global)
-            .unwrap();
         let id = "127.0.0.1:0"; // not served — status needs no network
         let cfg = NodeConfig {
             id: NodeId::new(id),
@@ -898,7 +907,6 @@ mod tests {
             backend: Backend::Cluster(node),
             metrics: Metrics::new(),
             audit: RwLock::new(quiet_audit()),
-            roles,
             authn: AuthState::disabled(),
             superuser_role: "superuser".into(),
             admin_lock: Mutex::new(()),

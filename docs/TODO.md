@@ -5,27 +5,17 @@ Pending work only, roughly in priority order. Shipped feature state lives in
 performance-specific items in [PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md);
 history in git.
 
-## 1. Multi-user auth & RBAC management
+## 1. Multi-user auth & RBAC follow-ups
 
-The enforcement plumbing exists (SCRAM/Basic authn; privileges on
-Global/Table objects; role inheritance; per-statement checks incl. prepared
-statements; `/admin/*` gated on `Admin`) — but the only runtime principal is
-the config superuser. Add the management layer:
+Shipped in v0.29.0: `CREATE/ALTER/DROP USER`, `CREATE/DROP ROLE`,
+`GRANT/REVOKE` (privileges and roles), `SHOW GRANTS` — catalog-persisted,
+cluster-replicated (verifier-only on the wire), enforced everywhere
+including the Prometheus endpoints. Remaining:
 
-- SQL surface: `CREATE/ALTER/DROP USER`, `CREATE/DROP ROLE`,
-  `GRANT/REVOKE <priv> ON <table|*> TO <role>`, `GRANT ROLE r TO u`,
-  `SHOW GRANTS` — gated on the (currently unused) `Grant` privilege;
-  `Admin` implies `Grant`.
-- Persistence: users (SCRAM verifiers, never plaintext) + roles/grants in
-  the catalog (serde-default), loaded at open; RoleStore/AuthState become
-  views over catalog state.
-- Cluster replication: user/role DDL broadcasts + schema bootstrap/repair
-  replay with LWW stamps, like table DDL.
-- Close the Prometheus endpoint gaps: `remote_write` checks `Insert` on the
-  metrics table; `/api/v1/query*` checks `Select` (today both only require
-  authentication).
-- Config superuser stays as the bootstrap principal. Docs: README +
-  QUERY_SYNTAX sections.
+- Audit-log entries for auth DDL (logins/denials are already logged).
+- Per-database grant objects (grants are global or per-table today).
+- `SHOW GRANTS` for the current session's own role without the `GRANT`
+  privilege (self-inspection).
 
 ## 2. Time-series follow-ups
 

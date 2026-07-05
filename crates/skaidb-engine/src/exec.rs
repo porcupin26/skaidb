@@ -21,7 +21,8 @@ use skaidb_types::{Document, Value};
 
 use skaidb_tsdb::{Tsdb, TsdbOptions};
 
-use crate::catalog::{Catalog, IndexDef, RollupDef, SchemaVersion, TableDef, TsTableDef, VectorIndexDef};
+use crate::catalog::{AuthRoleDef, Catalog, IndexDef, RollupDef, SchemaVersion, TableDef, TsTableDef, UserDef, VectorIndexDef};
+use skaidb_auth::{privilege_from_name, Object as AuthObject, Privilege as AuthPrivilege, RoleStore, ScramCredential};
 use crate::error::{EngineError, Result};
 use crate::eval::{compare, eval, eval_predicate};
 use crate::namespace::{self, DEFAULT_DATABASE};
@@ -59,6 +60,8 @@ pub struct Database {
     tables: HashMap<String, StorageEngine>,
     /// Time-series stores by table name (the tsdb engine, not the LSM).
     timeseries: HashMap<String, Tsdb>,
+    /// RBAC view rebuilt from the catalog on open and after auth DDL.
+    role_store: RoleStore,
     /// Secondary index storage by index name; entries map an indexed value to a
     /// table primary-key (so a `WHERE path = v` lookup avoids a full scan).
     indexes: HashMap<String, StorageEngine>,
@@ -183,12 +186,14 @@ impl Database {
         }
         let vector_rebuild_ms = rebuild_start.elapsed().as_millis() as u64;
 
+        let role_store = build_role_store(&catalog);
         Ok(Database {
             dir,
             storage_opts: opts,
             catalog,
             tables,
             timeseries,
+            role_store,
             indexes,
             vector_indexes,
             txn: None,
@@ -466,6 +471,9 @@ impl Database {
             Statement::ShowTables => Ok(QueryOutput::Rows(self.show_tables())),
             Statement::ShowIndexes => Ok(QueryOutput::Rows(self.show_indexes())),
             Statement::ShowStatus => Ok(QueryOutput::Rows(self.show_status())),
+            Statement::ShowGrants { role } => {
+                Ok(QueryOutput::Rows(self.show_grants(role.as_deref())))
+            }
             Statement::ShowDatabases => Err(EngineError::Unsupported(
                 "database statements require a multi-database session".into(),
             )),
@@ -517,6 +525,36 @@ impl Database {
             Statement::ShowTables => Ok(QueryOutput::Rows(self.show_tables())),
             Statement::ShowIndexes => Ok(QueryOutput::Rows(self.show_indexes())),
             Statement::ShowStatus => Ok(QueryOutput::Rows(self.show_status())),
+            Statement::CreateUser(cu) => self.create_user(
+                &cu.name,
+                cu.password.as_deref(),
+                cu.verifier.as_deref(),
+                cu.if_not_exists,
+                false,
+            ),
+            Statement::AlterUser { name, password } => {
+                self.create_user(&name, Some(&password), None, false, true)
+            }
+            Statement::DropUser { name, if_exists } => self.drop_user(&name, if_exists),
+            Statement::CreateRole {
+                name,
+                if_not_exists,
+                state,
+            } => self.create_auth_role(&name, state.as_deref(), if_not_exists),
+            Statement::DropRole { name, if_exists } => self.drop_auth_role(&name, if_exists),
+            Statement::Grant {
+                privilege,
+                table,
+                to,
+            } => self.grant(&to, &privilege, table.as_deref()),
+            Statement::Revoke {
+                privilege,
+                table,
+                from,
+            } => self.revoke(&from, &privilege, table.as_deref()),
+            Statement::GrantRole { role, to } => self.grant_role_edge(&to, &role, true),
+            Statement::RevokeRole { role, from } => self.grant_role_edge(&from, &role, false),
+            Statement::ShowGrants { role } => Ok(QueryOutput::Rows(self.show_grants(role.as_deref()))),
             // Database statements span databases and so cannot run against a
             // single engine; the session layer handles them before dispatch.
             Statement::ShowDatabases
@@ -969,6 +1007,232 @@ impl Database {
         self.record_schema(key, hlc, false);
         self.save_catalog()?;
         Ok(QueryOutput::Ddl)
+    }
+
+    // ---- users / roles (RBAC management) ----
+
+    /// `CREATE USER` / `ALTER USER` (`replace`) / verifier replay (upsert
+    /// under LWW). Creates the user's own-named role too.
+    fn create_user(
+        &mut self,
+        name: &str,
+        password: Option<&str>,
+        verifier: Option<&str>,
+        if_not_exists: bool,
+        replace: bool,
+    ) -> Result<QueryOutput> {
+        let exists = self.catalog.users.contains_key(name);
+        // The verifier form is the replication/replay path: always an
+        // upsert (the LWW stamp below is the arbiter). Client-facing forms
+        // get CREATE/ALTER semantics.
+        if verifier.is_none() {
+            if replace && !exists {
+                return Err(EngineError::Constraint(format!("user {name:?} does not exist")));
+            }
+            if !replace && exists {
+                if if_not_exists {
+                    return Ok(QueryOutput::Ddl);
+                }
+                return Err(EngineError::Constraint(format!("user {name:?} already exists")));
+            }
+        }
+        let credential = match (password, verifier) {
+            (Some(pw), _) => {
+                // Deterministic per-user salt (matches the server's existing
+                // scheme; the salt travels inside the encoded verifier).
+                let salt = skaidb_auth::crypto::sha256(format!("skaidb-user:{name}").as_bytes())
+                    [..16]
+                    .to_vec();
+                ScramCredential::new(pw, &salt, skaidb_auth::DEFAULT_ITERATIONS).encode()
+            }
+            (None, Some(v)) => {
+                if ScramCredential::decode(v).is_none() {
+                    return Err(EngineError::Constraint("invalid VERIFIER encoding".into()));
+                }
+                v.to_string()
+            }
+            (None, None) => {
+                return Err(EngineError::Constraint(
+                    "CREATE USER requires PASSWORD or VERIFIER".into(),
+                ))
+            }
+        };
+        let hlc = self.ddl_stamp();
+        let key = format!("usr:{name}");
+        if !self.schema_advances(&key, hlc) {
+            return Ok(QueryOutput::Ddl);
+        }
+        self.catalog
+            .users
+            .insert(name.to_string(), UserDef { credential });
+        // The user's personal role (idempotent; keeps existing grants).
+        self.catalog.auth_roles.entry(name.to_string()).or_default();
+        self.record_schema(key, hlc, false);
+        self.record_schema(format!("rol:{name}"), hlc, false);
+        self.rebuild_role_store();
+        self.save_catalog()?;
+        Ok(QueryOutput::Ddl)
+    }
+
+    fn drop_user(&mut self, name: &str, if_exists: bool) -> Result<QueryOutput> {
+        let hlc = self.ddl_stamp();
+        let key = format!("usr:{name}");
+        if !self.schema_advances(&key, hlc) {
+            return Ok(QueryOutput::Ddl);
+        }
+        if self.catalog.users.remove(name).is_none() && !if_exists {
+            return Err(EngineError::Constraint(format!("user {name:?} does not exist")));
+        }
+        // The personal role drops with the user.
+        self.catalog.auth_roles.remove(name);
+        self.record_schema(key, hlc, true);
+        self.record_schema(format!("rol:{name}"), hlc, true);
+        self.rebuild_role_store();
+        self.save_catalog()?;
+        Ok(QueryOutput::Ddl)
+    }
+
+    /// `CREATE ROLE` (the internal `GRANTS '<state>'` form replaces the
+    /// whole role under a newer stamp — the replication unit).
+    fn create_auth_role(
+        &mut self,
+        name: &str,
+        state: Option<&str>,
+        if_not_exists: bool,
+    ) -> Result<QueryOutput> {
+        let hlc = self.ddl_stamp();
+        let key = format!("rol:{name}");
+        if !self.schema_advances(&key, hlc) {
+            return Ok(QueryOutput::Ddl);
+        }
+        if self.catalog.auth_roles.contains_key(name) && !if_not_exists && state.is_none() {
+            return Err(EngineError::Constraint(format!("role {name:?} already exists")));
+        }
+        let def = match state {
+            Some(enc) => decode_role_state(enc)?,
+            None => self
+                .catalog
+                .auth_roles
+                .get(name)
+                .cloned()
+                .unwrap_or_default(),
+        };
+        self.catalog.auth_roles.insert(name.to_string(), def);
+        self.record_schema(key, hlc, false);
+        self.rebuild_role_store();
+        self.save_catalog()?;
+        Ok(QueryOutput::Ddl)
+    }
+
+    fn drop_auth_role(&mut self, name: &str, if_exists: bool) -> Result<QueryOutput> {
+        if self.catalog.users.contains_key(name) {
+            return Err(EngineError::Constraint(
+                "cannot drop a user's personal role; DROP USER instead".into(),
+            ));
+        }
+        let hlc = self.ddl_stamp();
+        let key = format!("rol:{name}");
+        if !self.schema_advances(&key, hlc) {
+            return Ok(QueryOutput::Ddl);
+        }
+        if self.catalog.auth_roles.remove(name).is_none() && !if_exists {
+            return Err(EngineError::Constraint(format!("role {name:?} does not exist")));
+        }
+        self.record_schema(key, hlc, true);
+        self.rebuild_role_store();
+        self.save_catalog()?;
+        Ok(QueryOutput::Ddl)
+    }
+
+    /// Apply a grant/revoke to `role`, stamping the whole role (the LWW
+    /// replication unit is the role's complete state).
+    fn grant(&mut self, role: &str, privilege: &str, table: Option<&str>) -> Result<QueryOutput> {
+        privilege_from_name(privilege)
+            .ok_or_else(|| EngineError::Constraint(format!("unknown privilege {privilege:?}")))?;
+        let hlc = self.ddl_stamp();
+        let def = self
+            .catalog
+            .auth_roles
+            .get_mut(role)
+            .ok_or_else(|| EngineError::Constraint(format!("role {role:?} does not exist")))?;
+        let entry = (privilege.to_ascii_lowercase(), table.map(str::to_string));
+        if !def.grants.contains(&entry) {
+            def.grants.push(entry);
+        }
+        self.record_schema(format!("rol:{role}"), hlc, false);
+        self.rebuild_role_store();
+        self.save_catalog()?;
+        Ok(QueryOutput::Ddl)
+    }
+
+    fn revoke(&mut self, role: &str, privilege: &str, table: Option<&str>) -> Result<QueryOutput> {
+        let hlc = self.ddl_stamp();
+        let def = self
+            .catalog
+            .auth_roles
+            .get_mut(role)
+            .ok_or_else(|| EngineError::Constraint(format!("role {role:?} does not exist")))?;
+        let entry = (privilege.to_ascii_lowercase(), table.map(str::to_string));
+        def.grants.retain(|g| *g != entry);
+        self.record_schema(format!("rol:{role}"), hlc, false);
+        self.rebuild_role_store();
+        self.save_catalog()?;
+        Ok(QueryOutput::Ddl)
+    }
+
+    /// Add/remove a role-inheritance edge on `member`.
+    fn grant_role_edge(&mut self, member: &str, parent: &str, add: bool) -> Result<QueryOutput> {
+        if add && !self.catalog.auth_roles.contains_key(parent) {
+            return Err(EngineError::Constraint(format!("role {parent:?} does not exist")));
+        }
+        let hlc = self.ddl_stamp();
+        let def = self
+            .catalog
+            .auth_roles
+            .get_mut(member)
+            .ok_or_else(|| EngineError::Constraint(format!("role {member:?} does not exist")))?;
+        if add {
+            if !def.inherits.contains(&parent.to_string()) {
+                def.inherits.push(parent.to_string());
+            }
+        } else {
+            def.inherits.retain(|p| p != parent);
+        }
+        self.record_schema(format!("rol:{member}"), hlc, false);
+        self.rebuild_role_store();
+        self.save_catalog()?;
+        Ok(QueryOutput::Ddl)
+    }
+
+    /// `SHOW GRANTS [FOR role]` as `(role, privilege, object)` rows.
+    pub fn show_grants(&self, role: Option<&str>) -> ResultSet {
+        let rows = self
+            .role_store
+            .grants(role)
+            .into_iter()
+            .map(|(r, p, o)| {
+                vec![Value::String(r), Value::String(p), Value::String(o)]
+            })
+            .collect();
+        ResultSet {
+            columns: vec!["role".into(), "privilege".into(), "object".into()],
+            rows,
+        }
+    }
+
+    fn rebuild_role_store(&mut self) {
+        self.role_store = build_role_store(&self.catalog);
+    }
+
+    /// Whether `role` holds `privilege` on `object` (RBAC view of the
+    /// catalog; the server short-circuits its config superuser first).
+    pub fn has_privilege(&self, role: &str, privilege: AuthPrivilege, object: &AuthObject) -> bool {
+        self.role_store.has_privilege(role, privilege, object)
+    }
+
+    /// The stored SCRAM credential for `name`, if the user exists.
+    pub fn auth_user(&self, name: &str) -> Option<ScramCredential> {
+        ScramCredential::decode(&self.catalog.users.get(name)?.credential)
     }
 
     fn drop_table(&mut self, name: &str, if_exists: bool) -> Result<QueryOutput> {
@@ -1737,6 +2001,20 @@ impl Database {
                 ver(&format!("v:{name}")),
             ));
         }
+        for (name, def) in &self.catalog.users {
+            out.push((
+                DEFAULT_DATABASE.to_string(),
+                format!("CREATE USER {name} VERIFIER '{}'", def.credential),
+                ver(&format!("usr:{name}")),
+            ));
+        }
+        for (name, def) in &self.catalog.auth_roles {
+            out.push((
+                DEFAULT_DATABASE.to_string(),
+                format!("CREATE ROLE {name} GRANTS '{}'", encode_role_state(def)),
+                ver(&format!("rol:{name}")),
+            ));
+        }
         // Tombstones: emit a DROP for every dropped object, with its version.
         for (key, v) in &self.catalog.schema_versions {
             if !v.dropped {
@@ -1762,6 +2040,14 @@ impl Database {
                     let (db, bare) = namespace::split(name);
                     (db.to_string(), format!("DROP VECTOR INDEX IF EXISTS {bare}"))
                 }
+                "usr" => (
+                    DEFAULT_DATABASE.to_string(),
+                    format!("DROP USER IF EXISTS {name}"),
+                ),
+                "rol" => (
+                    DEFAULT_DATABASE.to_string(),
+                    format!("DROP ROLE IF EXISTS {name}"),
+                ),
                 _ => continue,
             };
             out.push((entry.0, entry.1, v.hlc()));
@@ -2439,6 +2725,7 @@ pub fn statement_is_read_only(stmt: &Statement) -> bool {
             | Statement::ShowTables
             | Statement::ShowIndexes
             | Statement::ShowStatus
+            | Statement::ShowGrants { .. }
             | Statement::ShowDatabases
     )
 }
@@ -3339,6 +3626,58 @@ fn rollup_rows(
 
 /// Render the idempotent CREATE DDL for a time-series table definition
 /// (schema replay/bootstrap/repair all share it).
+/// Build the RBAC view from catalog users + roles.
+fn build_role_store(catalog: &Catalog) -> RoleStore {
+    let mut store = RoleStore::new();
+    for name in catalog.auth_roles.keys() {
+        let _ = store.create_role(name);
+    }
+    for (name, def) in &catalog.auth_roles {
+        for (priv_name, table) in &def.grants {
+            if let Some(p) = privilege_from_name(priv_name) {
+                let object = match table {
+                    Some(t) => AuthObject::Table(t.clone()),
+                    None => AuthObject::Global,
+                };
+                let _ = store.grant(name, p, object);
+            }
+        }
+        for parent in &def.inherits {
+            let _ = store.grant_role(name, parent);
+        }
+    }
+    store
+}
+
+/// Encode a role's whole state (`priv@obj;...;+parent;...`) — the internal
+/// replication form carried by `CREATE ROLE ... GRANTS '<state>'`.
+fn encode_role_state(def: &AuthRoleDef) -> String {
+    let mut parts: Vec<String> = def
+        .grants
+        .iter()
+        .map(|(p, t)| format!("{p}@{}", t.as_deref().unwrap_or("*")))
+        .collect();
+    parts.extend(def.inherits.iter().map(|p| format!("+{p}")));
+    parts.join(";")
+}
+
+fn decode_role_state(enc: &str) -> Result<AuthRoleDef> {
+    let mut def = AuthRoleDef::default();
+    for part in enc.split(';').filter(|p| !p.is_empty()) {
+        if let Some(parent) = part.strip_prefix('+') {
+            def.inherits.push(parent.to_string());
+        } else if let Some((p, obj)) = part.split_once('@') {
+            privilege_from_name(p)
+                .ok_or_else(|| EngineError::Constraint(format!("bad role state: {part}")))?;
+            let table = if obj == "*" { None } else { Some(obj.to_string()) };
+            def.grants.push((p.to_string(), table));
+        } else {
+            return Err(EngineError::Constraint(format!("bad role state: {part}")));
+        }
+    }
+    Ok(def)
+}
+
 /// Render the idempotent CREATE ROLLUP DDL.
 fn ts_rollup_ddl(bare: &str, source_bare: &str, bucket_ms: i64, def: &TsTableDef) -> String {
     let retention = def

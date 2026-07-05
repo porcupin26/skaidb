@@ -22,6 +22,36 @@ pub struct ScramCredential {
 }
 
 impl ScramCredential {
+    /// Encode as `iterations:salt_hex:stored_hex:server_hex` — the stable
+    /// storage/replication form (no plaintext material).
+    pub fn encode(&self) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            self.iterations,
+            hex(&self.salt),
+            hex(&self.stored_key),
+            hex(&self.server_key)
+        )
+    }
+
+    /// Decode [`ScramCredential::encode`]'s form.
+    pub fn decode(s: &str) -> Option<ScramCredential> {
+        let mut parts = s.split(':');
+        let iterations: u32 = parts.next()?.parse().ok()?;
+        let salt = unhex(parts.next()?)?;
+        let stored_key: [u8; 32] = unhex(parts.next()?)?.try_into().ok()?;
+        let server_key: [u8; 32] = unhex(parts.next()?)?.try_into().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(ScramCredential {
+            salt,
+            iterations,
+            stored_key,
+            server_key,
+        })
+    }
+
     /// Derive a verifier from a password, salt, and iteration count.
     pub fn new(password: &str, salt: &[u8], iterations: u32) -> ScramCredential {
         let salted = pbkdf2_hmac_sha256(password.as_bytes(), salt, iterations);
@@ -120,6 +150,17 @@ fn from_hex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+
+fn unhex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,3 +208,4 @@ mod tests {
         assert!(!cred.to_storage_string().contains("supersecret"));
     }
 }
+

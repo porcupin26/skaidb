@@ -244,7 +244,8 @@ fn authenticate(
 ) -> Result<String, ()> {
     let start = AuthStart::decode(&read_frame(reader).map_err(|_| ())?).map_err(|_| ())?;
 
-    let (salt, iterations) = ctx.authn.salt_for(&start.username);
+    let account = ctx.lookup_account(&start.username);
+    let (salt, iterations) = ctx.authn.salt_for(account.as_ref());
     let server_nonce = ctx.authn.server_nonce(&start.client_nonce);
     let challenge = AuthChallenge {
         salt: salt.clone(),
@@ -263,7 +264,7 @@ fn authenticate(
     );
 
     match ctx.authn.verify(
-        &start.username,
+        account.as_ref(),
         &am,
         &finish.client_proof,
         &ctx.superuser_role,

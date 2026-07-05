@@ -537,6 +537,7 @@ version = "0.28.1"
 dependencies = [
  "serde",
  "serde_json",
+ "skaidb-auth",
  "skaidb-sql",
  "skaidb-storage",
  "skaidb-tsdb",

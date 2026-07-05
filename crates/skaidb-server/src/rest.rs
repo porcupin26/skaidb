@@ -97,13 +97,25 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) -> io::Result<()> {
     // form body — Grafana uses both).
     let bare_path = req.path.split('?').next().unwrap_or(&req.path).to_string();
     if bare_path.starts_with("/api/v1/") && bare_path != "/api/v1/write" {
-        let role_ok = if ctx.authn.required {
-            basic_auth_role(&ctx, req.authorization.as_deref()).is_some()
+        let role = if ctx.authn.required {
+            match basic_auth_role(&ctx, req.authorization.as_deref()) {
+                Some(role) => role,
+                None => return write_unauthorized(&mut stream),
+            }
         } else {
-            true
+            ctx.superuser_role.clone()
         };
-        if !role_ok {
-            return write_unauthorized(&mut stream);
+        // Reading metrics requires Select on the ingest table.
+        if !ctx.allowed(
+            &role,
+            skaidb_auth::Privilege::Select,
+            &skaidb_auth::Object::Table("metrics".into()),
+        ) {
+            return write_response(
+                &mut stream,
+                403,
+                &json!({"status": "error", "error": "permission denied: Select on metrics"}),
+            );
         }
         // Merge query-string and form-body params (body wins on conflict).
         let mut params = crate::promql::parse_params(
@@ -253,7 +265,7 @@ fn basic_auth_role(ctx: &Shared, authorization: Option<&str>) -> Option<String> 
     let decoded = base64_decode(b64.trim())?;
     let creds = String::from_utf8(decoded).ok()?;
     let (user, pass) = creds.split_once(':')?;
-    ctx.authn.verify_password(user, pass)
+    crate::authn::AuthState::verify_password(ctx.lookup_account(user).as_ref(), pass)
 }
 
 fn write_unauthorized(stream: &mut TcpStream) -> io::Result<()> {

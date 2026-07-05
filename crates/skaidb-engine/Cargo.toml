@@ -13,6 +13,7 @@ workspace = true
 skaidb-types.workspace = true
 skaidb-storage.workspace = true
 skaidb-tsdb.workspace = true
+skaidb-auth.workspace = true
 skaidb-sql.workspace = true
 thiserror.workspace = true
 serde.workspace = true
