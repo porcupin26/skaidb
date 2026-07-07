@@ -293,6 +293,15 @@ const SCAN_PAGE_ROWS: usize = 2_000;
 #[cfg(test)]
 const SCAN_PAGE_ROWS: usize = 8;
 
+/// Rows per local scan page in the topology-change passes (rebalance,
+/// drain, reclaim): bounds the sender's transient memory to one page plus
+/// the in-flight batch, independent of shard size — the same fix that
+/// paged repair and distributed gathers.
+#[cfg(not(test))]
+const MIGRATE_PAGE_ROWS: usize = 2_000;
+#[cfg(test)]
+const MIGRATE_PAGE_ROWS: usize = 8;
+
 /// Why reconciling one table with one peer stopped.
 enum RepairPeerError {
     /// Peer predates the paged scan RPC (rolling upgrade).
@@ -1381,43 +1390,50 @@ impl Node {
         tables.sort();
 
         for table in tables {
-            // Resume handling: a table sorting before the checkpoint's table is
-            // already done; within the checkpoint's table, skip keys <= last sent.
-            let skip_until: Option<Vec<u8>> = match &resume {
+            // Resume handling: a table sorting before the checkpoint's table
+            // is already done; within the checkpoint's table, the page cursor
+            // starts after the last key sent.
+            let mut cursor: Option<Vec<u8>> = match &resume {
                 Some((ct, _)) if &table < ct => continue,
                 Some((ct, lk)) if ct == &table => Some(lk.clone()),
                 _ => None,
             };
 
-            let rows = self
-                .local
-                .read()
-                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
-                .local_scan_versioned_with_tombstones(&table)?;
-            // Keys this node should send for the joiner, in key order.
-            let pending: Vec<(Vec<u8>, Vec<u8>, Hlc, bool)> = rows
-                .into_iter()
-                .filter(|(key, _, _, _)| {
-                    skip_until.as_ref().is_none_or(|lk| key > lk)
-                        && self.replicas_for(key).contains(joiner)
-                        && old_ring.primary_for(key) == Some(self.id.clone())
-                })
-                .collect();
-
-            // Stream in throttled batches — each chunk is one ApplyBatch RPC
-            // (one round-trip + one fsync on the joiner, not one per row) —
+            // Page through the shard (bounded memory regardless of table
+            // size), filter each page to the joiner's keys, and stream those
+            // in throttled batches — each chunk is one ApplyBatch RPC (one
+            // round-trip + one fsync on the joiner, not one per row) —
             // checkpointing after each.
-            for chunk in pending.chunks(batch) {
-                if !self.send_batch(&addr, &table, chunk) {
-                    return Err(EngineError::Cluster(format!(
-                        "rebalance to {joiner}: batch not acked"
-                    )));
+            loop {
+                let page = self
+                    .local
+                    .read()
+                    .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+                    .local_scan_versioned_page(&table, cursor.as_deref(), MIGRATE_PAGE_ROWS)?;
+                let done = page.len() < MIGRATE_PAGE_ROWS;
+                cursor = page.last().map(|(k, _, _, _)| k.clone());
+                let pending: Vec<BatchRow> = page
+                    .into_iter()
+                    .filter(|(key, _, _, _)| {
+                        self.replicas_for(key).contains(joiner)
+                            && old_ring.primary_for(key) == Some(self.id.clone())
+                    })
+                    .collect();
+                for chunk in pending.chunks(batch) {
+                    if !self.send_batch(&addr, &table, chunk) {
+                        return Err(EngineError::Cluster(format!(
+                            "rebalance to {joiner}: batch not acked"
+                        )));
+                    }
+                    if let Some((last_key, _, _, _)) = chunk.last() {
+                        save_migrate_ckpt(&ckpt, &table, last_key);
+                    }
+                    if pause > 0 {
+                        thread::sleep(Duration::from_millis(pause));
+                    }
                 }
-                if let Some((last_key, _, _, _)) = chunk.last() {
-                    save_migrate_ckpt(&ckpt, &table, last_key);
-                }
-                if pause > 0 {
-                    thread::sleep(Duration::from_millis(pause));
+                if done {
+                    break;
                 }
             }
         }
@@ -1452,38 +1468,48 @@ impl Node {
             .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
             .table_names();
         for table in tables {
-            let rows = self
-                .local
-                .read()
-                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
-                .local_scan_versioned_with_tombstones(&table)?;
-            // Group rows by their *new* owner so each destination receives
-            // chunked ApplyBatch RPCs (one round-trip + one fsync per chunk)
-            // instead of a round-trip per row.
-            let mut per_dest: BTreeMap<NodeId, Vec<BatchRow>> = BTreeMap::new();
-            for (key, value, hlc, is_put) in rows {
-                let old = self.replicas_for(&key); // current ring (includes self)
-                for replica in new_ring.replicas_for(&key, rf) {
-                    if old.contains(&replica) {
-                        continue; // that node already holds this row
+            // Page through the shard so drain memory is one page + the
+            // per-destination groups of that page, independent of shard size.
+            let mut cursor: Option<Vec<u8>> = None;
+            loop {
+                let page = self
+                    .local
+                    .read()
+                    .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+                    .local_scan_versioned_page(&table, cursor.as_deref(), MIGRATE_PAGE_ROWS)?;
+                let done = page.len() < MIGRATE_PAGE_ROWS;
+                cursor = page.last().map(|(k, _, _, _)| k.clone());
+                // Group the page's rows by their *new* owner so each
+                // destination receives chunked ApplyBatch RPCs (one
+                // round-trip + one fsync per chunk) instead of one per row.
+                let mut per_dest: BTreeMap<NodeId, Vec<BatchRow>> = BTreeMap::new();
+                for (key, value, hlc, is_put) in page {
+                    let old = self.replicas_for(&key); // current ring (includes self)
+                    for replica in new_ring.replicas_for(&key, rf) {
+                        if old.contains(&replica) {
+                            continue; // that node already holds this row
+                        }
+                        if !addr_of.contains_key(&replica) {
+                            continue;
+                        }
+                        per_dest
+                            .entry(replica)
+                            .or_default()
+                            .push((key.clone(), value.clone(), hlc, is_put));
                     }
-                    if !addr_of.contains_key(&replica) {
-                        continue;
-                    }
-                    per_dest
-                        .entry(replica)
-                        .or_default()
-                        .push((key.clone(), value.clone(), hlc, is_put));
                 }
-            }
-            for (replica, dest_rows) in per_dest {
-                let addr = &addr_of[&replica];
-                for chunk in dest_rows.chunks(batch) {
-                    if !self.send_batch(addr, &table, chunk) {
-                        return Err(EngineError::Cluster(format!(
-                            "drain: write to {replica} not acked"
-                        )));
+                for (replica, dest_rows) in per_dest {
+                    let addr = &addr_of[&replica];
+                    for chunk in dest_rows.chunks(batch) {
+                        if !self.send_batch(addr, &table, chunk) {
+                            return Err(EngineError::Cluster(format!(
+                                "drain: write to {replica} not acked"
+                            )));
+                        }
                     }
+                }
+                if done {
+                    break;
                 }
             }
         }
@@ -1685,21 +1711,30 @@ impl Node {
 
         let mut total = 0;
         for table in tables {
-            let rows = self
-                .local
-                .read()
-                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
-                .local_scan_versioned_with_tombstones(&table)?;
-
-            // Collect unowned keys whose owners confirm a copy at >= our version.
+            // Collect unowned keys whose owners confirm a copy at >= our
+            // version, paging the scan so only keys under consideration (not
+            // whole rows) accumulate.
             let mut confirmed: HashSet<Vec<u8>> = HashSet::new();
-            for (key, _value, hlc, _is_put) in rows {
-                let owners = self.replicas_for(&key);
-                if owners.contains(&self.id) {
-                    continue; // we still own it
+            let mut cursor: Option<Vec<u8>> = None;
+            loop {
+                let page = self
+                    .local
+                    .read()
+                    .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+                    .local_scan_versioned_page(&table, cursor.as_deref(), MIGRATE_PAGE_ROWS)?;
+                let done = page.len() < MIGRATE_PAGE_ROWS;
+                cursor = page.last().map(|(k, _, _, _)| k.clone());
+                for (key, _value, hlc, _is_put) in page {
+                    let owners = self.replicas_for(&key);
+                    if owners.contains(&self.id) {
+                        continue; // we still own it
+                    }
+                    if self.owners_hold(&table, &key, hlc, &owners) {
+                        confirmed.insert(key);
+                    }
                 }
-                if self.owners_hold(&table, &key, hlc, &owners) {
-                    confirmed.insert(key);
+                if done {
+                    break;
                 }
             }
             if confirmed.is_empty() {
@@ -2626,6 +2661,7 @@ impl Node {
                 | Statement::ShowIndexes
                 | Statement::ShowStatus
                 | Statement::ShowDatabases
+                | Statement::ShowGrants { .. }
         ) {
             return self
                 .local
@@ -5563,6 +5599,21 @@ mod tests {
             "bob",
             skaidb_auth::Privilege::Insert,
             &skaidb_auth::Object::Table("t".into())
+        ));
+
+        // SHOW GRANTS answers from the replicated catalog through the
+        // cluster session path, and per-database grants replicate.
+        na.execute("GRANT INSERT ON DATABASE default TO bob").unwrap();
+        let rs = rows(nb.execute("SHOW GRANTS FOR bob").unwrap());
+        assert!(
+            rs.rows.iter().any(|r| r[2] == Value::String("db:default".into())),
+            "got: {:?}",
+            rs.rows
+        );
+        assert!(nb.has_privilege(
+            "bob",
+            skaidb_auth::Privilege::Insert,
+            &skaidb_auth::Object::Database("default".into())
         ));
 
         // Revocation and drops replicate too.

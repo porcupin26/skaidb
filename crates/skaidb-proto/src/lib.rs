@@ -11,4 +11,7 @@ pub mod message;
 
 pub use frame::{begin_frame, finish_frame, read_frame, read_frame_into, write_frame, MAX_FRAME_LEN};
 pub use handshake::{auth_message, AuthChallenge, AuthFinish, AuthOutcome, AuthStart};
-pub use message::{ClientRequest, Consistency, ProtoError, Request, Response, RowsChunkEncoder};
+pub use message::{
+    decode_client_request, decode_tagged_response, encode_tagged_request, tag_response,
+    ClientRequest, Consistency, ProtoError, Request, Response, RowsChunkEncoder,
+};

@@ -107,6 +107,13 @@ const OP_PREPARE: u8 = 2;
 const OP_EXECUTE: u8 = 3;
 const OP_CLOSE: u8 = 4;
 const OP_QUERY_STREAM: u8 = 5;
+/// Wrapper opcode for pipelining: `u8 OP_TAGGED | u32 id | <inner request>`.
+/// The server echoes the id on every frame it sends for this request, so a
+/// client may have any number of tagged requests in flight on one connection
+/// and correlate responses by id rather than by arrival order. Old servers
+/// reject the opcode with an (untagged) [`Response::Error`], which pipelining
+/// clients surface as "server too old".
+const OP_TAGGED: u8 = 6;
 const RESP_ROWS: u8 = 0;
 const RESP_MUTATION: u8 = 1;
 const RESP_DDL: u8 = 2;
@@ -115,6 +122,56 @@ const RESP_PREPARED: u8 = 4;
 const RESP_ROWS_HEADER: u8 = 5;
 const RESP_ROWS_CHUNK: u8 = 6;
 const RESP_ROWS_END: u8 = 7;
+/// Wrapper tag for responses to [`OP_TAGGED`] requests:
+/// `u8 RESP_TAGGED | u32 id | <inner response>`.
+const RESP_TAGGED: u8 = 8;
+
+/// Encode a pipelined (id-tagged) request into `out`:
+/// the [`OP_TAGGED`] wrapper followed by the ordinary request encoding.
+pub fn encode_tagged_request(id: u32, req: &ClientRequest, out: &mut Vec<u8>) {
+    out.push(OP_TAGGED);
+    out.extend_from_slice(&id.to_le_bytes());
+    req.encode_into(out);
+}
+
+/// Decode a request that may carry the pipelining wrapper: returns the id
+/// (`None` for a plain, untagged request) and the inner request. Nested
+/// wrappers are rejected.
+pub fn decode_client_request(buf: &[u8]) -> Result<(Option<u32>, ClientRequest), ProtoError> {
+    if buf.first() == Some(&OP_TAGGED) {
+        if buf.len() < 6 {
+            return Err(ProtoError::Malformed("unexpected end"));
+        }
+        let id = u32::from_le_bytes(buf[1..5].try_into().unwrap());
+        if buf.get(5) == Some(&OP_TAGGED) {
+            return Err(ProtoError::Malformed("nested tagged request"));
+        }
+        Ok((Some(id), ClientRequest::decode(&buf[5..])?))
+    } else {
+        Ok((None, ClientRequest::decode(buf)?))
+    }
+}
+
+/// Begin a tagged response: push the [`RESP_TAGGED`] wrapper; the ordinary
+/// response encoding follows it in the same buffer.
+pub fn tag_response(out: &mut Vec<u8>, id: u32) {
+    out.push(RESP_TAGGED);
+    out.extend_from_slice(&id.to_le_bytes());
+}
+
+/// Decode a response that may carry the pipelining wrapper: returns the
+/// echoed id (`None` for a plain response) and the inner response.
+pub fn decode_tagged_response(buf: &[u8]) -> Result<(Option<u32>, Response), ProtoError> {
+    if buf.first() == Some(&RESP_TAGGED) {
+        if buf.len() < 6 {
+            return Err(ProtoError::Malformed("unexpected end"));
+        }
+        let id = u32::from_le_bytes(buf[1..5].try_into().unwrap());
+        Ok((Some(id), Response::decode(&buf[5..])?))
+    } else {
+        Ok((None, Response::decode(buf)?))
+    }
+}
 
 impl Request {
     /// Encode: `u8 OP_QUERY | u8 consistency | u32 sql_len | sql`.
@@ -577,5 +634,44 @@ mod tests {
     fn decode_rejects_truncated() {
         let bytes = Response::Mutation { affected: 1 }.encode();
         assert!(Response::decode(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn tagged_request_roundtrips_and_rejects_nesting() {
+        let inner = ClientRequest::Query {
+            sql: "SELECT 1".into(),
+            consistency: Consistency::Quorum,
+        };
+        let mut buf = Vec::new();
+        encode_tagged_request(42, &inner, &mut buf);
+        assert_eq!(decode_client_request(&buf).unwrap(), (Some(42), inner));
+
+        // Plain requests pass through untagged.
+        let plain = ClientRequest::Close { id: 1 };
+        assert_eq!(
+            decode_client_request(&plain.encode()).unwrap(),
+            (None, plain)
+        );
+
+        // A wrapper inside a wrapper is malformed.
+        let mut nested = vec![OP_TAGGED, 0, 0, 0, 0];
+        nested.extend_from_slice(&buf);
+        assert!(decode_client_request(&nested).is_err());
+        assert!(decode_client_request(&buf[..5]).is_err());
+    }
+
+    #[test]
+    fn tagged_response_roundtrips() {
+        let inner = Response::Mutation { affected: 3 };
+        let mut buf = Vec::new();
+        tag_response(&mut buf, 7);
+        inner.encode_into(&mut buf);
+        assert_eq!(decode_tagged_response(&buf).unwrap(), (Some(7), inner));
+
+        let plain = Response::Ddl;
+        assert_eq!(
+            decode_tagged_response(&plain.encode()).unwrap(),
+            (None, plain)
+        );
     }
 }

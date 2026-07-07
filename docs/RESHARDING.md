@@ -164,11 +164,11 @@ node.reclaim_cluster()?;  // …and tells every peer to do the same
   (harmless) stale copies. It is also currently a full-table scan with a
   point-read ack-gate per key; fine after a single reshard, heavier on a very
   large dataset.
-- **Migration materializes a table at a time.** The push is throttled, batched,
-  and resumable, but each table's rows are still scanned into memory once per
-  pass (then streamed out in batches). A bounded-memory disk cursor (lazy,
-  range-limited SSTable iteration) would remove that last in-memory step — future
-  work.
+- **Migration memory is bounded.** Rebalance, drain, and reclaim page through
+  each shard (2,000 rows at a time — the same paging as repair and distributed
+  gathers) and stream out in throttled batches, so a topology change against a
+  multi-GB table costs one page plus the in-flight batch, not the shard. The
+  rebalance checkpoint doubles as the page cursor on resume.
 - **Membership has no gossip/consensus.** Data converges via anti-entropy, but
   *membership* changes (`SetMembership`/`Rebalance`/`Drain`) are still best-effort
   broadcasts. The epoch stops a node from regressing to an older ring and

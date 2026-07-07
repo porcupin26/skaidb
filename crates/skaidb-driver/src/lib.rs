@@ -14,8 +14,9 @@ use std::time::{Duration, Instant};
 
 use skaidb_auth::scram;
 use skaidb_proto::{
-    auth_message, read_frame, write_frame, AuthChallenge, AuthFinish, AuthOutcome, AuthStart,
-    ClientRequest, Consistency, ProtoError, Request, Response,
+    auth_message, decode_tagged_response, encode_tagged_request, read_frame, write_frame,
+    AuthChallenge, AuthFinish, AuthOutcome, AuthStart, ClientRequest, Consistency, ProtoError,
+    Request, Response,
 };
 use skaidb_types::Value;
 
@@ -183,6 +184,86 @@ impl Client {
             Response::Error(msg) => Err(DriverError::Server(msg)),
             other => Ok(other),
         }
+    }
+
+    /// Execute a batch of statements **pipelined** at the default
+    /// consistency: all requests are written before any response is read, so
+    /// the whole batch pays one round-trip of link latency instead of one
+    /// per statement. See [`Client::pipeline_with`].
+    pub fn pipeline(&mut self, stmts: &[&str]) -> Result<Vec<Response>, DriverError> {
+        self.pipeline_with(stmts, self.default_consistency)
+    }
+
+    /// Pipelined batch execution at an explicit consistency.
+    ///
+    /// Statements execute on the server serially, in order, with ordinary
+    /// session semantics (a `USE` mid-batch affects the statements after
+    /// it). Responses are correlated by request id, and per-statement
+    /// failures come back **inline** as [`Response::Error`] entries — a
+    /// failed statement does not stop the ones after it. The whole batch is
+    /// retried once on a fresh connection if the node dies mid-flight (same
+    /// idempotency caveat as [`Client::execute_with`]). Servers older than
+    /// the tagged-request opcode fail the batch with "server too old".
+    pub fn pipeline_with(
+        &mut self,
+        stmts: &[&str],
+        consistency: Consistency,
+    ) -> Result<Vec<Response>, DriverError> {
+        if stmts.is_empty() {
+            return Ok(Vec::new());
+        }
+        match self.try_pipeline(stmts, consistency) {
+            Err(DriverError::Io(_)) => {
+                self.reconnect()?;
+                self.try_pipeline(stmts, consistency)
+            }
+            other => other,
+        }
+    }
+
+    /// One pipelined attempt over the current stream (no reconnect).
+    fn try_pipeline(
+        &mut self,
+        stmts: &[&str],
+        consistency: Consistency,
+    ) -> Result<Vec<Response>, DriverError> {
+        // Write every request before reading anything: the requests queue in
+        // the server's receive buffer and are answered back-to-back.
+        let mut buf = Vec::new();
+        for (i, sql) in stmts.iter().enumerate() {
+            buf.clear();
+            encode_tagged_request(
+                i as u32,
+                &ClientRequest::Query {
+                    sql: (*sql).to_string(),
+                    consistency,
+                },
+                &mut buf,
+            );
+            write_frame(&mut self.stream, &buf)?;
+        }
+        let mut out: Vec<Option<Response>> = (0..stmts.len()).map(|_| None).collect();
+        for _ in 0..stmts.len() {
+            let payload = read_frame(&mut self.stream)?;
+            let (id, resp) = decode_tagged_response(&payload)?;
+            let Some(id) = id else {
+                // An untagged response to a tagged request: the server
+                // predates pipelining and answered with a plain error.
+                return Err(DriverError::Server(
+                    "server does not support pipelined requests (upgrade the server)".into(),
+                ));
+            };
+            match out.get_mut(id as usize) {
+                Some(slot @ None) => *slot = Some(resp),
+                _ => {
+                    return Err(DriverError::Server(format!(
+                        "unexpected response id {id} in pipeline"
+                    )))
+                }
+            }
+        }
+        // Every slot filled exactly once (ids 0..n, each seen once).
+        Ok(out.into_iter().map(|r| r.expect("all ids seen")).collect())
     }
 
     /// Parse `sql` (which may contain `?` placeholders) once on the server

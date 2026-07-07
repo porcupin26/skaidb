@@ -6,7 +6,7 @@ was implemented and measured across v0.16.2 – v0.19.0 — the release-by-relea
 record is in git history and [BENCHMARKS.md](BENCHMARKS.md). This document now
 tracks what is deliberately **not** done: open items, nice-to-haves, and
 measured dead ends kept on record so they aren't re-attempted without new
-evidence. Last reviewed: 2026-07-05 (v0.19.0).*
+evidence. Last reviewed: 2026-07-07 (v0.34.0).*
 
 ## Current state (what already holds)
 
@@ -24,6 +24,15 @@ evidence. Last reviewed: 2026-07-05 (v0.19.0).*
 - Row-returning results can stream in ~256 KB chunks (`QueryStream`), and
   distributed full-table gathers + anti-entropy are paged (2,000 rows/page) —
   coordinator memory is O(pages in flight), not O(table).
+- Client connections **pipeline**: id-tagged requests (`OP_TAGGED`) let a
+  client keep any number of requests in flight per connection; the server
+  executes serially in order (session semantics unchanged) and echoes the id
+  on every frame, so a batch pays one round-trip of link latency
+  (`Client::pipeline`). Old servers reject the opcode cleanly.
+- Topology changes are paged: rebalance, drain, and reclaim scan shards
+  2,000 rows at a time (like repair/gathers) — a join or decommission
+  against a multi-GB table holds one page + one in-flight batch, not the
+  shard.
 - `[profile.release]`: `lto = "thin"`, `codegen-units = 1`.
 - Checked and fine: TCP_NODELAY everywhere, pooled internode connections,
   no locks held across network calls, no per-row re-parsing, compact binary
@@ -31,33 +40,27 @@ evidence. Last reviewed: 2026-07-05 (v0.19.0).*
 
 ## Outstanding — worth doing when the workload demands it
 
-1. **Request pipelining on client connections.** One request/response in
-   flight per connection today (streaming chunks within one response shipped
-   in v0.19.0, but not id-tagged concurrent requests). Matters for
-   high-latency links and thin clients; irrelevant on LAN with a connection
-   per thread.
-2. **Paged migration/drain.** Topology changes (`Rebalance`, `Drain`, and the
-   pre-`ScanPage` repair fallback) still materialize one whole table shard in
-   RAM per pass — the same O(table) pattern that OOM-killed 512 MB nodes in
-   the repair and scan paths before they were paged. Page them the same way
-   before running joins/decommissions against multi-GB tables on small nodes.
-3. **Merkle-tree anti-entropy.** Paged repair compares every key each pass;
+1. **Merkle-tree anti-entropy.** Paged repair compares every key each pass;
    a Merkle tree per table would skip identical ranges and make repair cost
    proportional to divergence, not table size.
-4. **Lazy index-order merge for unbounded `ORDER BY`.** `ORDER BY <indexed>`
+2. **Lazy index-order merge for unbounded `ORDER BY`.** `ORDER BY <indexed>`
    without `LIMIT` still materializes the index in order first; a lazy merge
    would stream it. (With `LIMIT` the top-k path already avoids the sort.)
-5. **Per-statement replica/peer snapshot.** `replicas_for` builds a fresh
+3. **Per-statement replica/peer snapshot.** `replicas_for` builds a fresh
    `Vec` per row in batch replication and peer addresses are cloned per
    fan-out site. Measured class: a few small allocations next to an
    fsync + RTT — cleaner CPU profile, no expected throughput change.
-6. **Memtable flush without clones.** Flush streams entries but still clones
+4. **Memtable flush without clones.** Flush streams entries but still clones
    each key/value even though the memtable is dropped right after; a
    consuming iterator would halve the transient flush spike. Background path
    only.
-7. **Vector index persistence.** HNSW graphs are in-memory and rebuilt from
+5. **Vector index persistence.** HNSW graphs are in-memory and rebuilt from
    the table on open (slow for large sets). Persist per-segment graphs
    alongside the LSM (snapshot + mmap), quantized vectors in RAM.
+
+Note: the pre-`ScanPage` repair fallback (used only against peers too old
+to answer `ScanPage` at all) necessarily remains O(table) — the old peer's
+wire protocol has no paging. It never fires between current versions.
 
 ## Deliberately skipped (documented reasons)
 

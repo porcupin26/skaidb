@@ -343,6 +343,45 @@ mod tests {
         }
     }
 
+    /// Pipelined batches: all requests written before any response is read,
+    /// responses correlated by id, per-statement errors inline, session
+    /// state sequential across the batch, and the connection reusable after.
+    #[test]
+    fn pipelined_requests_end_to_end() {
+        let ctx = temp_ctx();
+        let (addr, _h) = binary::spawn("127.0.0.1:0", ctx).unwrap();
+        let mut client = Client::connect(addr).unwrap();
+
+        let responses = client
+            .pipeline(&[
+                "CREATE TABLE t (PRIMARY KEY (id))",
+                "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)",
+                "SELECT nope FROM missing_table",
+                "SELECT id, v FROM t ORDER BY id",
+            ])
+            .unwrap();
+        assert_eq!(responses.len(), 4);
+        assert_eq!(responses[0], Response::Ddl);
+        assert_eq!(responses[1], Response::Mutation { affected: 2 });
+        // The failing statement errors inline without stopping the batch.
+        assert!(matches!(&responses[2], Response::Error(m) if m.contains("does not exist")));
+        match &responses[3] {
+            Response::Rows { rows, .. } => {
+                assert_eq!(rows[0], vec![Value::Int(1), Value::Int(10)]);
+                assert_eq!(rows[1], vec![Value::Int(2), Value::Int(20)]);
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+
+        // The connection stays usable for ordinary (untagged) requests, and
+        // an empty batch is a no-op.
+        assert!(client.pipeline(&[]).unwrap().is_empty());
+        assert!(matches!(
+            client.execute("SELECT id FROM t").unwrap(),
+            Response::Rows { .. }
+        ));
+    }
+
     #[test]
     fn prepared_statements_end_to_end() {
         let ctx = temp_ctx();

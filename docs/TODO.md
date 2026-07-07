@@ -46,9 +46,8 @@ roadmap and benchmarks: [FTS_TODO.md](FTS_TODO.md). Next action there:
 
 ## 3. Other
 
-- **Request pipelining** on client connections (id-tagged concurrent
-  requests; streaming shipped, pipelining didn't) — see
-  PERFORMANCE_AUDIT.md for the rest of the perf backlog.
+- See PERFORMANCE_AUDIT.md for the perf backlog (pipelining and paged
+  migration shipped in v0.34.0).
 - **Grafana route documentation** — a short docs/GRAFANA.md: pointing the
   built-in Prometheus datasource at skaidb (works today), the Infinity/SQL
   recipe as the fallback.

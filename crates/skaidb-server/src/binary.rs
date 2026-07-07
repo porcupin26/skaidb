@@ -5,8 +5,9 @@ use std::net::{TcpListener, TcpStream};
 use std::thread::{self, JoinHandle};
 
 use skaidb_proto::{
-    auth_message, begin_frame, finish_frame, read_frame, read_frame_into, write_frame,
-    AuthChallenge, AuthFinish, AuthOutcome, AuthStart, ClientRequest, Response, RowsChunkEncoder,
+    auth_message, begin_frame, decode_client_request, finish_frame, read_frame, read_frame_into,
+    tag_response, write_frame, AuthChallenge, AuthFinish, AuthOutcome, AuthStart, ClientRequest,
+    Response, RowsChunkEncoder,
 };
 use skaidb_sql::ast::Statement;
 
@@ -94,14 +95,24 @@ fn handle_connection(stream: TcpStream, ctx: Shared) {
         if read_frame_into(&mut reader, &mut inbuf).is_err() {
             return; // disconnect or framing error
         }
-        let response = match ClientRequest::decode(&inbuf) {
+        // Pipelining: a tagged request's id is echoed on every frame the
+        // server sends for it, so a client may keep many requests in flight
+        // and correlate by id. Execution stays serial and in submission
+        // order on this connection (session state — current db, prepared
+        // statements — keeps its sequential semantics); the win is the
+        // eliminated per-request round-trip wait, not reordering.
+        let (tag, request) = match decode_client_request(&inbuf) {
+            Ok((tag, req)) => (tag, Ok(req)),
+            Err(e) => (None, Err(e)),
+        };
+        let response = match request {
             Ok(ClientRequest::Query { sql, consistency }) => {
                 execute_session_as(&ctx, &role, &mut current_db, &sql, Some(consistency))
             }
             Ok(ClientRequest::QueryStream { sql, consistency }) => {
                 let response =
                     execute_session_as(&ctx, &role, &mut current_db, &sql, Some(consistency));
-                if write_streamed(&mut writer, &mut outbuf, response, &ctx).is_err() {
+                if write_streamed(&mut writer, &mut outbuf, response, &ctx, tag).is_err() {
                     return;
                 }
                 continue;
@@ -134,12 +145,18 @@ fn handle_connection(stream: TcpStream, ctx: Shared) {
             Err(e) => Response::Error(format!("protocol error: {e}")),
         };
         begin_frame(&mut outbuf);
+        if let Some(id) = tag {
+            tag_response(&mut outbuf, id);
+        }
         response.encode_into(&mut outbuf);
         // A result set past the frame limit used to fail `finish_frame` and
         // silently drop the connection; answer with a real error instead and
         // point at the way out.
         if outbuf.len() - 4 > skaidb_proto::MAX_FRAME_LEN as usize {
             begin_frame(&mut outbuf);
+            if let Some(id) = tag {
+                tag_response(&mut outbuf, id);
+            }
             Response::Error(format!(
                 "result set exceeds the {} MiB response frame limit; use a streaming query or add LIMIT",
                 skaidb_proto::MAX_FRAME_LEN / (1024 * 1024)
@@ -158,13 +175,21 @@ fn handle_connection(stream: TcpStream, ctx: Shared) {
 /// chunk frames of ~[`STREAM_CHUNK_BYTES`], and an end frame; rows are
 /// consumed (and their heap values freed) as they are encoded, so the peak
 /// cost is the materialized rows plus one chunk — never a second full encoded
-/// copy of the result. Non-row results go out as one ordinary frame.
+/// copy of the result. Non-row results go out as one ordinary frame. Under
+/// pipelining (`tag`), every frame of the stream carries the request id.
 fn write_streamed(
     writer: &mut TcpStream,
     outbuf: &mut Vec<u8>,
     response: Response,
     ctx: &Shared,
+    tag: Option<u32>,
 ) -> io::Result<()> {
+    let begin = |outbuf: &mut Vec<u8>| {
+        begin_frame(outbuf);
+        if let Some(id) = tag {
+            tag_response(outbuf, id);
+        }
+    };
     let send = |writer: &mut TcpStream, outbuf: &mut Vec<u8>| {
         ctx.metrics
             .add_bytes_returned(Endpoint::Binary, (outbuf.len() - 4) as u64);
@@ -174,19 +199,19 @@ fn write_streamed(
     let (columns, rows) = match response {
         Response::Rows { columns, rows } => (columns, rows),
         other => {
-            begin_frame(outbuf);
+            begin(outbuf);
             other.encode_into(outbuf);
             return send(writer, outbuf);
         }
     };
 
-    begin_frame(outbuf);
+    begin(outbuf);
     Response::RowsHeader { columns }.encode_into(outbuf);
     send(writer, outbuf)?;
 
     let mut it = rows.into_iter().peekable();
     while it.peek().is_some() {
-        begin_frame(outbuf);
+        begin(outbuf);
         let mut enc = RowsChunkEncoder::begin(outbuf);
         for row in it.by_ref() {
             enc.push_row(outbuf, &row);
@@ -198,7 +223,7 @@ fn write_streamed(
         send(writer, outbuf)?;
     }
 
-    begin_frame(outbuf);
+    begin(outbuf);
     Response::RowsEnd.encode_into(outbuf);
     send(writer, outbuf)
 }
