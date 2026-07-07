@@ -49,7 +49,14 @@ including the Prometheus endpoints. Remaining:
 - **Validation soak** — 24 h Prometheus remote_write side-by-side with its
   own TSDB, zero-loss comparison (phase-4 exit criterion).
 
-## 3. Other
+## 3. Full-text search
+
+Elasticsearch-class search, SQL-first, Tantivy-cored (Rust Lucene — a JVM
+is a non-starter in a single-binary DB). Full plan, feature matrix, phased
+roadmap and benchmarks: [FTS_TODO.md](FTS_TODO.md). Next action there:
+**phase 0 spike** (Tantivy embedding go/no-go).
+
+## 4. Other
 
 - **Request pipelining** on client connections (id-tagged concurrent
   requests; streaming shipped, pipelining didn't) — see
