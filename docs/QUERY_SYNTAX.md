@@ -67,8 +67,8 @@ ALTER  USER <name> PASSWORD '<password>'
 DROP   USER [IF EXISTS] <name>
 CREATE ROLE [IF NOT EXISTS] <name>
 DROP   ROLE [IF EXISTS] <name>
-GRANT  <privilege> ON { <table> | * } TO <role>
-REVOKE <privilege> ON { <table> | * } FROM <role>
+GRANT  <privilege> ON { <table> | DATABASE <db> | * } TO <role>
+REVOKE <privilege> ON { <table> | DATABASE <db> | * } FROM <role>
 GRANT  ROLE <role> TO <user>
 REVOKE ROLE <role> FROM <user>
 SHOW GRANTS [FOR <role>]
@@ -147,8 +147,14 @@ SHOW DATABASES
   `DELETE`, `CREATE`, `DROP`, `GRANT`, `ADMIN` (`ADMIN` on `*` = superuser;
   `ADMIN` on a table implies every privilege on it). A **user** authenticates
   (SCRAM on the binary protocol, HTTP Basic on REST) and acts as its
-  own-named role; `GRANT ROLE r TO u` adds inherited roles. All management
-  statements (and `SHOW GRANTS`) require the `GRANT` privilege cluster-wide.
+  own-named role; `GRANT ROLE r TO u` adds inherited roles. A grant
+  `ON DATABASE db` covers every table in that database (checked against the
+  session's current database; shown by `SHOW GRANTS` as `db:<name>`). All
+  management statements (and `SHOW GRANTS`) require the `GRANT` privilege
+  cluster-wide — except `SHOW GRANTS FOR <your own role>`, which any
+  authenticated role may run to inspect itself. Auth DDL (user/role/grant
+  changes) is recorded in the identity audit log (the login-log category)
+  with the acting role and a secret-free statement summary.
   Users/roles persist in the catalog, replicate like other DDL (passwords
   travel between nodes only as salted SCRAM verifiers, never plaintext), and
   converge via schema repair. The config-file superuser remains the

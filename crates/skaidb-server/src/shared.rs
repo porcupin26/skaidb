@@ -277,6 +277,15 @@ impl Context {
         role == self.superuser_role || self.backend.has_privilege(role, privilege, object)
     }
 
+    /// RBAC decision for a table living in database `db`: a grant on the
+    /// table itself or on the whole database satisfies the check. (The role
+    /// store matches objects exactly; this is where a table check widens to
+    /// its database.)
+    pub fn allowed_on_table(&self, role: &str, privilege: Privilege, table: &str, db: &str) -> bool {
+        self.allowed(role, privilege, &Object::Table(table.to_string()))
+            || self.allowed(role, privilege, &Object::Database(db.to_string()))
+    }
+
     /// Resolve a username to its SCRAM credential and acting role: the
     /// config superuser first, then catalog-managed users (whose acting
     /// role is their own name).
@@ -456,13 +465,29 @@ pub fn execute_session_statement_as(
     parsed: Result<Statement, ParseError>,
     consistency: Option<ProtoConsistency>,
 ) -> Response {
-    // Authorization: check the role may perform the statement before executing.
-    if let Some((privilege, object)) = parsed.as_ref().ok().and_then(required_privilege) {
-        if !ctx.allowed(role, privilege, &object) {
-            ctx.metrics.incr_authz_denied();
-            return Response::Error(format!("permission denied: {privilege:?} on {object:?}"));
+    // Authorization: check the role may perform the statement before
+    // executing. `SHOW GRANTS FOR <own role>` is self-inspection and needs
+    // no privilege; a grant on the session's database covers its tables.
+    let self_inspection = matches!(
+        parsed.as_ref().ok(),
+        Some(Statement::ShowGrants { role: Some(r) }) if r == role
+    );
+    if !self_inspection {
+        if let Some((privilege, object)) = parsed.as_ref().ok().and_then(required_privilege) {
+            let ok = match &object {
+                Object::Table(t) => ctx.allowed_on_table(role, privilege, t, current_db),
+                _ => ctx.allowed(role, privilege, &object),
+            };
+            if !ok {
+                ctx.metrics.incr_authz_denied();
+                return Response::Error(format!("permission denied: {privilege:?} on {object:?}"));
+            }
         }
     }
+
+    // Auth DDL is audit-logged (secret-free) after execution; summarize now,
+    // before the parse moves into the backend.
+    let auth_summary = parsed.as_ref().ok().and_then(auth_ddl_summary);
 
     let start = Instant::now();
     ctx.metrics.inc_queries_in_flight();
@@ -497,8 +522,45 @@ pub fn execute_session_statement_as(
         _ => None,
     };
     ctx.audit().record(sql, elapsed_ms, err_msg);
+    if let Some(summary) = auth_summary {
+        ctx.audit().log_auth_ddl(role, &summary, err_msg.is_none());
+    }
 
     response
+}
+
+/// A secret-free one-line description of an auth-DDL statement for the
+/// audit log — names and objects only, never passwords or verifiers.
+/// `None` for statements that are not user/role/grant management.
+fn auth_ddl_summary(stmt: &Statement) -> Option<String> {
+    fn obj(o: &skaidb_sql::ast::GrantObject) -> String {
+        use skaidb_sql::ast::GrantObject;
+        match o {
+            GrantObject::Global => "*".to_string(),
+            GrantObject::Table(t) => t.clone(),
+            GrantObject::Database(d) => format!("DATABASE {d}"),
+        }
+    }
+    Some(match stmt {
+        Statement::CreateUser(c) => format!("CREATE USER {}", c.name),
+        Statement::AlterUser { name, .. } => format!("ALTER USER {name} PASSWORD"),
+        Statement::DropUser { name, .. } => format!("DROP USER {name}"),
+        Statement::CreateRole { name, .. } => format!("CREATE ROLE {name}"),
+        Statement::DropRole { name, .. } => format!("DROP ROLE {name}"),
+        Statement::Grant {
+            privilege,
+            object,
+            to,
+        } => format!("GRANT {privilege} ON {} TO {to}", obj(object)),
+        Statement::Revoke {
+            privilege,
+            object,
+            from,
+        } => format!("REVOKE {privilege} ON {} FROM {from}", obj(object)),
+        Statement::GrantRole { role, to } => format!("GRANT ROLE {role} TO {to}"),
+        Statement::RevokeRole { role, from } => format!("REVOKE ROLE {role} FROM {from}"),
+        _ => return None,
+    })
 }
 
 fn record_metrics(

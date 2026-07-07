@@ -175,6 +175,28 @@ impl AuditSettings {
         }
     }
 
+    /// Record an executed auth-DDL statement (user/role/grant management)
+    /// in the identity log (the login sink/category). `summary` must be
+    /// secret-free — the caller renders it from the parsed statement with
+    /// passwords and verifiers omitted.
+    pub fn log_auth_ddl(&self, actor: &str, summary: &str, ok: bool) {
+        if !self.login_log {
+            return;
+        }
+        let line = if self.json {
+            serde_json::json!({
+                "event": "auth_ddl",
+                "actor": actor,
+                "ok": ok,
+                "stmt": summary,
+            })
+            .to_string()
+        } else {
+            format!("[auth-ddl] actor={actor} ok={ok} {summary}")
+        };
+        self.login_sink.write_line(&line);
+    }
+
     /// Record a login outcome per the configured login log (text or JSON).
     pub fn log_login(&self, user: &str, role: Option<&str>, ok: bool) {
         if !self.login_log {

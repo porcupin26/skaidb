@@ -229,12 +229,12 @@ impl Parser {
         }
         let privilege = self.parse_privilege()?;
         self.expect_keyword(Keyword::On)?;
-        let table = self.parse_grant_object()?;
+        let object = self.parse_grant_object()?;
         self.expect_keyword(Keyword::To)?;
         let to = self.expect_ident()?;
         Ok(Statement::Grant {
             privilege,
-            table,
+            object,
             to,
         })
     }
@@ -250,12 +250,12 @@ impl Parser {
         }
         let privilege = self.parse_privilege()?;
         self.expect_keyword(Keyword::On)?;
-        let table = self.parse_grant_object()?;
+        let object = self.parse_grant_object()?;
         self.expect_keyword(Keyword::From)?;
         let from = self.expect_ident()?;
         Ok(Statement::Revoke {
             privilege,
-            table,
+            object,
             from,
         })
     }
@@ -280,12 +280,14 @@ impl Parser {
         Ok(name.to_string())
     }
 
-    /// `ON <table>` or `ON *` (global).
-    fn parse_grant_object(&mut self) -> Result<Option<String>, ParseError> {
+    /// `ON <table>`, `ON DATABASE <db>`, or `ON *` (global).
+    fn parse_grant_object(&mut self) -> Result<GrantObject, ParseError> {
         if self.eat(&Token::Star) {
-            Ok(None)
+            Ok(GrantObject::Global)
+        } else if self.eat_ident_ci("database") {
+            Ok(GrantObject::Database(self.expect_ident()?))
         } else {
-            Ok(Some(self.parse_table_name()?))
+            Ok(GrantObject::Table(self.parse_table_name()?))
         }
     }
 
@@ -1157,6 +1159,38 @@ mod tests {
                 primary_key: vec!["id".into()],
             })
         );
+    }
+
+    #[test]
+    fn parse_grant_objects() {
+        assert_eq!(
+            parse("GRANT SELECT ON t TO reader").unwrap(),
+            Statement::Grant {
+                privilege: "select".into(),
+                object: GrantObject::Table("t".into()),
+                to: "reader".into(),
+            }
+        );
+        assert_eq!(
+            parse("GRANT insert ON DATABASE sales TO writer").unwrap(),
+            Statement::Grant {
+                privilege: "insert".into(),
+                object: GrantObject::Database("sales".into()),
+                to: "writer".into(),
+            }
+        );
+        assert_eq!(
+            parse("REVOKE ADMIN ON * FROM ops").unwrap(),
+            Statement::Revoke {
+                privilege: "admin".into(),
+                object: GrantObject::Global,
+                from: "ops".into(),
+            }
+        );
+        // In grant position `DATABASE` is a contextual keyword, so it needs
+        // a database name after it (a table named `database` can't be the
+        // grant object — same tradeoff as the other contextual keywords).
+        assert!(parse("GRANT SELECT ON database TO reader").is_err());
     }
 
     #[test]

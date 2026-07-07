@@ -5,19 +5,7 @@ Pending work only, roughly in priority order. Shipped feature state lives in
 performance-specific items in [PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md);
 history in git.
 
-## 1. Multi-user auth & RBAC follow-ups
-
-Shipped in v0.29.0: `CREATE/ALTER/DROP USER`, `CREATE/DROP ROLE`,
-`GRANT/REVOKE` (privileges and roles), `SHOW GRANTS` — catalog-persisted,
-cluster-replicated (verifier-only on the wire), enforced everywhere
-including the Prometheus endpoints. Remaining:
-
-- Audit-log entries for auth DDL (logins/denials are already logged).
-- Per-database grant objects (grants are global or per-table today).
-- `SHOW GRANTS` for the current session's own role without the `GRANT`
-  privilege (self-inspection).
-
-## 2. Time-series follow-ups
+## 1. Time-series follow-ups
 
 - **Rollup backfill** — repair-merged (gap-filled) samples don't
   retroactively update rollups (flush-path maintenance only).
@@ -49,14 +37,14 @@ including the Prometheus endpoints. Remaining:
 - **Validation soak** — 24 h Prometheus remote_write side-by-side with its
   own TSDB, zero-loss comparison (phase-4 exit criterion).
 
-## 3. Full-text search
+## 2. Full-text search
 
 Elasticsearch-class search, SQL-first, Tantivy-cored (Rust Lucene — a JVM
 is a non-starter in a single-binary DB). Full plan, feature matrix, phased
 roadmap and benchmarks: [FTS_TODO.md](FTS_TODO.md). Next action there:
 **phase 0 spike** (Tantivy embedding go/no-go).
 
-## 4. Other
+## 3. Other
 
 - **Request pipelining** on client connections (id-tagged concurrent
   requests; streaming shipped, pipelining didn't) — see

@@ -16,10 +16,11 @@ const TABLE: &str = "metrics";
 
 /// Decode, map, and append a remote_write body. Returns accepted samples.
 pub fn ingest(ctx: &Shared, role: &str, body: &[u8]) -> Result<usize, String> {
-    if !ctx.allowed(
+    if !ctx.allowed_on_table(
         role,
         skaidb_auth::Privilege::Insert,
-        &skaidb_auth::Object::Table(TABLE.into()),
+        TABLE,
+        skaidb_engine::DEFAULT_DATABASE,
     ) {
         return Err(format!("permission denied: Insert on {TABLE}"));
     }

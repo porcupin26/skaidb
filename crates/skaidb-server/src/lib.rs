@@ -773,6 +773,115 @@ mod tests {
             Response::Error(m) => assert!(m.contains("permission denied"), "got: {m}"),
             other => panic!("expected denial, got {other:?}"),
         }
+
+        // Per-database grants: SELECT on the session's whole database covers
+        // its tables; a grant on some other database does not.
+        assert_eq!(execute(&ctx, "CREATE ROLE analyst"), Response::Ddl);
+        assert_eq!(
+            execute(&ctx, "GRANT SELECT ON DATABASE default TO analyst"),
+            Response::Ddl
+        );
+        assert!(matches!(
+            execute_as(&ctx, "analyst", "SELECT id FROM t"),
+            Response::Rows { .. }
+        ));
+        match execute_as(&ctx, "analyst", "INSERT INTO t (id) VALUES (2)") {
+            Response::Error(m) => assert!(m.contains("permission denied"), "got: {m}"),
+            other => panic!("expected denial, got {other:?}"),
+        }
+        assert_eq!(execute(&ctx, "CREATE ROLE outsider"), Response::Ddl);
+        assert_eq!(
+            execute(&ctx, "GRANT SELECT ON DATABASE elsewhere TO outsider"),
+            Response::Ddl
+        );
+        match execute_as(&ctx, "outsider", "SELECT id FROM t") {
+            Response::Error(m) => assert!(m.contains("permission denied"), "got: {m}"),
+            other => panic!("expected denial, got {other:?}"),
+        }
+        // The database grant shows with its db: object form.
+        match execute(&ctx, "SHOW GRANTS FOR analyst") {
+            Response::Rows { rows, .. } => assert!(
+                rows.iter().any(|r| r[2] == Value::String("db:default".into())),
+                "got: {rows:?}"
+            ),
+            other => panic!("expected rows, got {other:?}"),
+        }
+
+        // Self-inspection: a role without the Grant privilege may look at its
+        // own grants — and only its own.
+        match execute_as(&ctx, "reader", "SHOW GRANTS FOR reader") {
+            Response::Rows { rows, .. } => {
+                assert!(!rows.is_empty());
+                assert!(rows.iter().all(|r| r[0] == Value::String("reader".into())));
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+        match execute_as(&ctx, "reader", "SHOW GRANTS FOR analyst") {
+            Response::Error(m) => assert!(m.contains("permission denied"), "got: {m}"),
+            other => panic!("expected denial, got {other:?}"),
+        }
+        match execute_as(&ctx, "reader", "SHOW GRANTS") {
+            Response::Error(m) => assert!(m.contains("permission denied"), "got: {m}"),
+            other => panic!("expected denial, got {other:?}"),
+        }
+    }
+
+    /// Auth DDL leaves secret-free audit entries in the identity log.
+    #[test]
+    fn auth_ddl_is_audit_logged_without_secrets() {
+        use crate::shared::execute;
+        let log_path = {
+            let mut p = std::env::temp_dir();
+            p.push(format!("skaidb-auth-audit-{}.log", std::process::id()));
+            let _ = std::fs::remove_file(&p);
+            p
+        };
+        let obs = skaidb_config::ObservabilityConfig {
+            log_file: log_path.display().to_string(),
+            ..Default::default()
+        };
+        let ctx: Shared = Arc::new(Context {
+            backend: Backend::Local(Box::new(RwLock::new(Database::open(temp_dir()).unwrap()))),
+            metrics: Metrics::new(),
+            audit: RwLock::new(crate::audit::AuditSettings::from(&obs)),
+            authn: AuthState::disabled(),
+            superuser_role: "superuser".into(),
+            admin_lock: Mutex::new(()),
+            start: Instant::now(),
+            slow_log: crate::slowlog::SlowLog::new(),
+            config: RwLock::new(Config::default()),
+            config_path: None,
+        });
+
+        assert_eq!(
+            execute(&ctx, "CREATE USER bob PASSWORD 'hunter2secret'"),
+            Response::Ddl
+        );
+        assert_eq!(execute(&ctx, "CREATE ROLE reader"), Response::Ddl);
+        assert_eq!(execute(&ctx, "GRANT ROLE reader TO bob"), Response::Ddl);
+        // A failed auth DDL is recorded too, marked ok=false.
+        assert!(matches!(
+            execute(&ctx, "DROP ROLE ghost"),
+            Response::Error(_)
+        ));
+
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            log.contains("[auth-ddl] actor=superuser ok=true CREATE USER bob"),
+            "got: {log}"
+        );
+        assert!(
+            log.contains("[auth-ddl] actor=superuser ok=true GRANT ROLE reader TO bob"),
+            "got: {log}"
+        );
+        assert!(
+            log.contains("[auth-ddl] actor=superuser ok=false DROP ROLE ghost"),
+            "got: {log}"
+        );
+        // Never the password — not in the auth-ddl line, and masked in the
+        // query log sharing the file.
+        assert!(!log.contains("hunter2secret"), "got: {log}");
+        let _ = std::fs::remove_file(&log_path);
     }
 
     #[test]

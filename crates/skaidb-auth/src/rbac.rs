@@ -28,6 +28,10 @@ pub enum Object {
     Global,
     /// A specific table by name.
     Table(String),
+    /// Every table in one database. The store matches objects exactly; the
+    /// enforcement layer widens a table check to its database (it knows the
+    /// session's database, the store does not).
+    Database(String),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -183,6 +187,7 @@ impl RoleStore {
                         match object {
                             Object::Global => "*".to_string(),
                             Object::Table(t) => t.clone(),
+                            Object::Database(d) => format!("db:{d}"),
                         },
                     ));
                 }
@@ -306,6 +311,34 @@ mod tests {
         s.grant_role("b", "a").unwrap();
         // No privilege granted anywhere → false, and no infinite loop.
         assert!(!s.has_privilege("a", Privilege::Select, &table("t")));
+    }
+
+    #[test]
+    fn database_grants_are_exact_objects() {
+        let mut s = RoleStore::new();
+        s.create_role("analyst").unwrap();
+        s.grant("analyst", Privilege::Select, Object::Database("sales".into()))
+            .unwrap();
+        assert!(s.has_privilege(
+            "analyst",
+            Privilege::Select,
+            &Object::Database("sales".into())
+        ));
+        assert!(!s.has_privilege(
+            "analyst",
+            Privilege::Select,
+            &Object::Database("hr".into())
+        ));
+        // The store matches objects exactly; widening a table check to its
+        // database happens at the enforcement layer.
+        assert!(!s.has_privilege("analyst", Privilege::Select, &table("orders")));
+        // A global grant still covers database objects.
+        s.grant("analyst", Privilege::Insert, Object::Global).unwrap();
+        assert!(s.has_privilege(
+            "analyst",
+            Privilege::Insert,
+            &Object::Database("hr".into())
+        ));
     }
 
     #[test]

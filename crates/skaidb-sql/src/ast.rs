@@ -67,17 +67,16 @@ pub enum Statement {
     },
     /// `DROP ROLE [IF EXISTS] r`.
     DropRole { name: String, if_exists: bool },
-    /// `GRANT <privilege> ON <table|*> TO <role>`.
+    /// `GRANT <privilege> ON <table | DATABASE db | *> TO <role>`.
     Grant {
         privilege: String,
-        /// `None` = `ON *` (global).
-        table: Option<String>,
+        object: GrantObject,
         to: String,
     },
-    /// `REVOKE <privilege> ON <table|*> FROM <role>`.
+    /// `REVOKE <privilege> ON <table | DATABASE db | *> FROM <role>`.
     Revoke {
         privilege: String,
-        table: Option<String>,
+        object: GrantObject,
         from: String,
     },
     /// `GRANT ROLE r TO u` — role inheritance.
@@ -86,6 +85,17 @@ pub enum Statement {
     RevokeRole { role: String, from: String },
     /// `SHOW GRANTS [FOR <role>]`.
     ShowGrants { role: Option<String> },
+}
+
+/// What a `GRANT`/`REVOKE` applies to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantObject {
+    /// `ON *` — the whole cluster.
+    Global,
+    /// `ON <table>`.
+    Table(String),
+    /// `ON DATABASE <db>` — every table in that database.
+    Database(String),
 }
 
 /// `CREATE USER` payload.

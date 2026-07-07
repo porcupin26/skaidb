@@ -592,6 +592,7 @@ mod tests {
             db.execute("CREATE ROLE reader").unwrap();
             db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
             db.execute("GRANT SELECT ON t TO reader").unwrap();
+            db.execute("GRANT INSERT ON DATABASE sales TO reader").unwrap();
             db.execute("GRANT ROLE reader TO ada").unwrap();
             // Duplicate create errors; IF NOT EXISTS doesn't.
             assert!(db.execute("CREATE USER ada PASSWORD 'x'").is_err());
@@ -606,6 +607,12 @@ mod tests {
         use skaidb_auth::{Object, Privilege};
         assert!(db.has_privilege("ada", Privilege::Select, &Object::Table("t".into())));
         assert!(!db.has_privilege("ada", Privilege::Insert, &Object::Table("t".into())));
+        // The database grant survived the reopen with its object intact.
+        assert!(db.has_privilege("ada", Privilege::Insert, &Object::Database("sales".into())));
+        assert!(!db.has_privilege("ada", Privilege::Insert, &Object::Database("hr".into())));
+        // REVOKE on the database object removes exactly it.
+        db.execute("REVOKE INSERT ON DATABASE sales FROM reader").unwrap();
+        assert!(!db.has_privilege("ada", Privilege::Insert, &Object::Database("sales".into())));
         // SHOW GRANTS lists both the grant and the inheritance edge.
         let rs = rows(db.execute("SHOW GRANTS FOR ada").unwrap());
         assert!(rs.rows.iter().any(|r| r[1] == Value::String("ROLE".into())));

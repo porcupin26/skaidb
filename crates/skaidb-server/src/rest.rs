@@ -105,11 +105,13 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) -> io::Result<()> {
         } else {
             ctx.superuser_role.clone()
         };
-        // Reading metrics requires Select on the ingest table.
-        if !ctx.allowed(
+        // Reading metrics requires Select on the ingest table (a grant on
+        // its database also satisfies it).
+        if !ctx.allowed_on_table(
             &role,
             skaidb_auth::Privilege::Select,
-            &skaidb_auth::Object::Table("metrics".into()),
+            "metrics",
+            skaidb_engine::DEFAULT_DATABASE,
         ) {
             return write_response(
                 &mut stream,

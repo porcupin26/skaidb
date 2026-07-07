@@ -544,14 +544,14 @@ impl Database {
             Statement::DropRole { name, if_exists } => self.drop_auth_role(&name, if_exists),
             Statement::Grant {
                 privilege,
-                table,
+                object,
                 to,
-            } => self.grant(&to, &privilege, table.as_deref()),
+            } => self.grant(&to, &privilege, grant_object_key(&object).as_deref()),
             Statement::Revoke {
                 privilege,
-                table,
+                object,
                 from,
-            } => self.revoke(&from, &privilege, table.as_deref()),
+            } => self.revoke(&from, &privilege, grant_object_key(&object).as_deref()),
             Statement::GrantRole { role, to } => self.grant_role_edge(&to, &role, true),
             Statement::RevokeRole { role, from } => self.grant_role_edge(&from, &role, false),
             Statement::ShowGrants { role } => Ok(QueryOutput::Rows(self.show_grants(role.as_deref()))),
@@ -650,6 +650,9 @@ impl Database {
             Statement::ShowTables => Ok(QueryOutput::Rows(self.show_tables_in(current_db))),
             Statement::ShowIndexes => Ok(QueryOutput::Rows(self.show_indexes_in(current_db))),
             Statement::ShowStatus => Ok(QueryOutput::Rows(self.show_status())),
+            Statement::ShowGrants { ref role } => {
+                Ok(QueryOutput::Rows(self.show_grants(role.as_deref())))
+            }
             Statement::Select(_) => {
                 namespace::resolve_statement(&mut stmt, current_db);
                 self.execute_read_statement(stmt)
@@ -3713,6 +3716,19 @@ fn rollup_rows(
 /// Render the idempotent CREATE DDL for a time-series table definition
 /// (schema replay/bootstrap/repair all share it).
 /// Build the RBAC view from catalog users + roles.
+/// The catalog/wire key for a grant object: `None` = global, `db:<name>` =
+/// a database, anything else = a table (table names cannot contain `:`).
+const DB_OBJECT_PREFIX: &str = "db:";
+
+fn grant_object_key(o: &skaidb_sql::ast::GrantObject) -> Option<String> {
+    use skaidb_sql::ast::GrantObject;
+    match o {
+        GrantObject::Global => None,
+        GrantObject::Table(t) => Some(t.clone()),
+        GrantObject::Database(d) => Some(format!("{DB_OBJECT_PREFIX}{d}")),
+    }
+}
+
 fn build_role_store(catalog: &Catalog) -> RoleStore {
     let mut store = RoleStore::new();
     for name in catalog.auth_roles.keys() {
@@ -3722,7 +3738,10 @@ fn build_role_store(catalog: &Catalog) -> RoleStore {
         for (priv_name, table) in &def.grants {
             if let Some(p) = privilege_from_name(priv_name) {
                 let object = match table {
-                    Some(t) => AuthObject::Table(t.clone()),
+                    Some(t) => match t.strip_prefix(DB_OBJECT_PREFIX) {
+                        Some(db) => AuthObject::Database(db.to_string()),
+                        None => AuthObject::Table(t.clone()),
+                    },
                     None => AuthObject::Global,
                 };
                 let _ = store.grant(name, p, object);
