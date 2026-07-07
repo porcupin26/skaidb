@@ -19,11 +19,13 @@ including the Prometheus endpoints. Remaining:
 
 ## 2. Time-series follow-ups
 
-- **Rollup query rewrite** — pick the coarsest rollup satisfying a
-  `time_bucket` query automatically; today queries target the rollup table
-  explicitly.
 - **Rollup backfill** — repair-merged (gap-filled) samples don't
   retroactively update rollups (flush-path maintenance only).
+- **Opportunistic rollup serving within retention** — the v0.32.0 rewrite
+  reads rollups only beyond the retention horizon (where it strictly adds
+  data); serving big in-retention windows from rollups would cut IO but
+  can silently miss repair-backfilled samples until rollup backfill lands.
+  Revisit (opt-in hint or automatic) after backfill.
 - **TS reclaim** — after a reshard, former owners keep stale series copies
   (harmless under union-merge reads); add a reclaim pass like row tables.
 - **Label postings index + regex matchers** — matchers scan the per-block

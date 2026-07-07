@@ -9,7 +9,7 @@ aggregates, and time-bucketed queries.
 > replicate at the configured write consistency; queries union-merge across
 > members at the read consistency; joins/decommissions migrate series like
 > any other data. Shipped in v0.20.0 (storage), v0.21.0 (SQL), v0.22.0
-> (cluster), v0.23.0 (remote_write), v0.24.0 (resharding), v0.25.0 (OOO DDL + stats), v0.26.0 (anti-entropy), v0.27.0 (rollups), v0.28.0 (PromQL API), v0.30.0 (hinted handoff), v0.31.0 (partial-aggregate pushdown).
+> (cluster), v0.23.0 (remote_write), v0.24.0 (resharding), v0.25.0 (OOO DDL + stats), v0.26.0 (anti-entropy), v0.27.0 (rollups), v0.28.0 (PromQL API), v0.30.0 (hinted handoff), v0.31.0 (partial-aggregate pushdown), v0.32.0 (rollup query rewrite).
 
 ## Usage
 
@@ -97,6 +97,14 @@ stored as its own compressed stream. Full grammar and semantics:
   locally: a rollup series has the same labels as its source, so it places
   on the same replica set by construction. Long retention on the rollup +
   short on the source = classic tiered downsampling.
+- **Rollup query rewrite** (v0.32.0): aggregate queries on the **source**
+  table keep answering after raw samples age out — buckets older than the
+  source's `RETENTION` horizon are served from the coarsest rollup whose
+  bucket divides the group's `time_bucket` step, stitched seamlessly with
+  exact source partials for the within-retention part of the window.
+  Covers `count/sum/avg/min/max/first/last`; `rate`-family aggregates need
+  raw samples and never read rollups. Within retention, queries always use
+  source data (exact even where rollups lag repair backfill).
 - **Partial-aggregate pushdown** (v0.31.0): an aggregation whose `WHERE`
   is fully served by the pushdown (a `ts` range plus label `=`/`!=`),
   grouping by labels and/or one `time_bucket`, ships **per-series
@@ -146,8 +154,8 @@ All tracked, with more detail, in [`TODO.md`](TODO.md).
 | PromQL partial gather | `/api/v1/query_range` still ships raw samples; the SQL surface uses the v0.31.0 partial pushdown | open |
 | Self-scrape (`/metrics` → TS table) | remote_write covers external scrapers | later |
 | TS reclaim | after a reshard, former owners keep stale series copies (harmless under union-merge; no `reclaim` pass for TS yet) | with TS anti-entropy |
-| Rollup query rewrite | queries must target the rollup table explicitly; picking the coarsest satisfying rollup automatically is open | open |
 | Rollup backfill/repair | rollups aggregate at flush; repair-merged (gap-filled) samples don't retroactively update them | open |
+| In-retention rollup serving | the rewrite reads rollups only beyond the retention horizon; serving big live windows from rollups awaits backfill | after backfill |
 | PromQL: regex matchers, offset, arithmetic, histogram_quantile | the shipped subset covers selectors, rate/increase/delta, and sum/avg/min/max/count by/without | phase 7 follow-up |
 | Label postings index | matchers scan the per-block series list (fine at moderate cardinality) | with pushdown work |
 | Regex label matchers | only `=` / `!=` push down | with postings |

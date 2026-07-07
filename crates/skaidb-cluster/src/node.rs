@@ -4142,6 +4142,17 @@ impl Cluster for Coordinator {
             .ts_partials_scatter(table, matchers, t0, t1, bucket_ms, self.oc)
     }
 
+    fn ts_rollup_info(&self, table: &str) -> EngineResult<skaidb_engine::TsRollupInfo> {
+        // Rollup registrations replicate with the schema, and the local data
+        // frontier is a sound horizon: it can only lag the cluster's, which
+        // only widens the exactly-served source range.
+        self.node
+            .local
+            .read()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .ts_rollup_info(table)
+    }
+
     fn vector_search(
         &self,
         table: &str,

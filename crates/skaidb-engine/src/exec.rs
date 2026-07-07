@@ -2198,6 +2198,39 @@ impl Database {
             .map_err(|e| EngineError::Timeseries(e.to_string()))
     }
 
+    /// Rollup routing metadata for a time-series table (see
+    /// [`Cluster::ts_rollup_info`]): the retention horizon — the timestamp
+    /// below which source blocks may already be dropped (`max_ts -
+    /// retention`; `None` without a `RETENTION` or on an empty store) — and
+    /// the table's rollups as `(name, bucket_ms)`.
+    pub fn ts_rollup_info(&self, table: &str) -> Result<TsRollupInfo> {
+        let def = self
+            .catalog
+            .timeseries
+            .get(table)
+            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+        let horizon = match def.retention_ms {
+            Some(r) => {
+                let store = self.ts_store(table)?;
+                let max_ts = store.max_ts();
+                // Retention drops only flushed blocks, and rollups only hold
+                // flushed data — so the horizon is capped at the flush
+                // boundary: above it the source is complete (head data is
+                // never dropped) and the rollup may not have it yet.
+                (max_ts != i64::MIN)
+                    .then(|| max_ts.saturating_sub(r).min(store.flushed_through()))
+                    .filter(|h| *h != i64::MIN)
+            }
+            None => None,
+        };
+        let rollups = def
+            .rollups
+            .iter()
+            .map(|r| (r.name.clone(), r.bucket_ms))
+            .collect();
+        Ok((horizon, rollups))
+    }
+
     /// Per-series per-bucket partial aggregates (see [`Cluster::ts_partials`]);
     /// the internode `TsPartials` request answers from this.
     pub fn ts_partials(
@@ -2643,6 +2676,9 @@ impl Database {
 /// Read methods take `&self` so a `SELECT` can execute with shared access to
 /// the underlying storage (concurrent readers); only the write methods need
 /// `&mut self`.
+/// Rollup routing metadata: `(retention horizon, [(rollup name, bucket_ms)])`.
+pub type TsRollupInfo = (Option<i64>, Vec<(String, i64)>);
+
 pub trait Cluster {
     /// Primary-key columns of `table`.
     fn primary_key(&self, table: &str) -> Result<Vec<String>>;
@@ -2727,6 +2763,14 @@ pub trait Cluster {
         Err(EngineError::Unsupported(
             "time-series tables are not available on this backend".into(),
         ))
+    }
+    /// Rollup routing metadata for a time-series table: the retention
+    /// horizon (timestamp below which source blocks may already be dropped;
+    /// `None` = source is complete) and the table's rollups as
+    /// `(name, bucket_ms)`. Lets the executor serve aged buckets from a
+    /// rollup. The default reports no retention and no rollups.
+    fn ts_rollup_info(&self, _table: &str) -> Result<TsRollupInfo> {
+        Ok((None, Vec::new()))
     }
     /// Per-series per-bucket partial aggregates for series matching every
     /// matcher in `[t0, t1]` (`bucket_ms <= 0` = one whole-range bucket).
@@ -3510,6 +3554,10 @@ impl Cluster for LocalCluster<'_> {
     ) -> Result<Vec<(skaidb_tsdb::Labels, Vec<skaidb_tsdb::Sample>)>> {
         self.db.ts_query(table, matchers, t0, t1)
     }
+
+    fn ts_rollup_info(&self, table: &str) -> Result<TsRollupInfo> {
+        self.db.ts_rollup_info(table)
+    }
 }
 
 /// A read-only [`Cluster`] over a shared `&Database` — the seam behind
@@ -3584,6 +3632,10 @@ impl Cluster for LocalRead<'_> {
         t1: i64,
     ) -> Result<Vec<(skaidb_tsdb::Labels, Vec<skaidb_tsdb::Sample>)>> {
         self.db.ts_query(table, matchers, t0, t1)
+    }
+
+    fn ts_rollup_info(&self, table: &str) -> Result<TsRollupInfo> {
+        self.db.ts_rollup_info(table)
     }
 }
 

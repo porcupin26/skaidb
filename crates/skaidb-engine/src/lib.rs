@@ -16,7 +16,7 @@ pub mod vector;
 pub use error::EngineError;
 pub use exec::{
     filter_rows, run, statement_is_read_only, Cluster, Database, DbStats, IndexScanRange,
-    pk_point_key, TableStats,
+    pk_point_key, TableStats, TsRollupInfo,
 };
 pub use skaidb_storage::{Codec, EngineOptions};
 pub use namespace::DEFAULT_DATABASE;
@@ -304,6 +304,85 @@ mod tests {
             rs.rows[1],
             vec![Value::String("b".into()), Value::Int(0), Value::Int(2)]
         );
+    }
+
+    /// Aggregates over windows the source's RETENTION has already dropped
+    /// are served from a satisfying rollup: raw samples are gone, but
+    /// bucketed count/sum/min/max/first/last still answer, and windows
+    /// straddling the horizon stitch rollup + source partials.
+    #[test]
+    fn timeseries_rollup_query_rewrite_serves_aged_buckets() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TIMESERIES TABLE cpu (SERIES KEY (host), RETENTION 1h)")
+            .unwrap();
+        db.execute("CREATE ROLLUP cpu_5m ON cpu BUCKET 5m RETENTION 30d")
+            .unwrap();
+        let (m, h) = (60_000i64, 3_600_000i64);
+        // Ten samples in the first 2h window (0..9m, values 0..9)...
+        for i in 0..10i64 {
+            db.execute(&format!(
+                "INSERT INTO cpu (host, ts, value) VALUES ('a', {}, {})",
+                i * m,
+                i
+            ))
+            .unwrap();
+        }
+        // ...then appends at 4h and 6h: each crosses a block window, so the
+        // older windows flush (maintaining the rollup) and the 6h flush's
+        // retention pass (cutoff 6h - 1h) drops both flushed blocks.
+        db.execute(&format!(
+            "INSERT INTO cpu (host, ts, value) VALUES ('a', {}, 100)",
+            4 * h
+        ))
+        .unwrap();
+        db.execute(&format!(
+            "INSERT INTO cpu (host, ts, value) VALUES ('a', {}, 200)",
+            6 * h
+        ))
+        .unwrap();
+
+        // The premise: raw samples of the first window are gone.
+        let rs = rows(
+            db.execute("SELECT ts, value FROM cpu WHERE ts < 600000 ORDER BY ts")
+                .unwrap(),
+        );
+        assert_eq!(rs.rows.len(), 0, "expected the aged block to be dropped");
+
+        // Bucketed aggregates over the aged window answer from the rollup.
+        let rs = rows(
+            db.execute(
+                "SELECT time_bucket(10m, ts) AS t, count(value), sum(value), min(value), \
+                 max(value), first(value), last(value) FROM cpu WHERE ts < 600000 GROUP BY t",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            rs.rows,
+            vec![vec![
+                Value::Timestamp(0),
+                Value::Int(10),
+                Value::Float(45.0),
+                Value::Float(0.0),
+                Value::Float(9.0),
+                Value::Float(0.0),
+                Value::Float(9.0),
+            ]]
+        );
+
+        // A window straddling the horizon stitches rollup (aged: the first
+        // ten samples and the dropped 4h block) with source (the live 6h
+        // sample): 12 samples, sum 45 + 100 + 200.
+        let rs = rows(
+            db.execute("SELECT count(value), sum(value) FROM cpu WHERE ts >= 0")
+                .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(12), Value::Float(345.0)]]);
+
+        // Change aggregates need raw samples and never route to rollups:
+        // only the live 6h sample remains (a single sample → NULL), exactly
+        // like the raw path.
+        let rs = rows(db.execute("SELECT increase(value) FROM cpu WHERE ts >= 0").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::Null]]);
     }
 
     /// A `label != 'x'` matcher reads a missing label as `""` in the store,

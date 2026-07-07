@@ -287,8 +287,17 @@ WHERE ts >= now() - 6h GROUP BY t;
   (`SELECT ts, value_sum / value_count FROM r30m WHERE host = '...'`).
   `BUCKET` must evenly divide the 2 h storage window. Dropped with
   `DROP TABLE` (dropping the source cascades). Repair-merged samples do not
-  retroactively update rollups; there is no automatic query rewrite yet —
-  query the rollup table directly.
+  retroactively update rollups.
+- **Rollup query rewrite** (v0.32.0): an aggregate query on the **source**
+  table whose window reaches past the source's `RETENTION` horizon answers
+  the aged buckets from the coarsest rollup whose `BUCKET` divides the
+  group's `time_bucket` step, stitched with exact source data for the
+  within-retention part — so long-range dashboards keep working after raw
+  samples age out, without naming the rollup. Applies to
+  `count/sum/avg/min/max/first/last`; `rate`/`increase`/`delta` need raw
+  samples and never read rollups. In the rollup-served region,
+  `first()`/`last()` order series at bucket granularity, and the window
+  edge trims to whole rollup buckets.
 - Not supported on time-series tables: `JOIN`, `UNION`, `NEAREST`,
   transactions.
 

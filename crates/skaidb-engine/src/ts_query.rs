@@ -453,6 +453,10 @@ struct PartialsPlan {
     agg_fields: Vec<String>,
     /// Whether any `last()` aggregate needs the extra per-partial doc.
     needs_last: bool,
+    /// Whether `rate()`/`increase()`/`delta()` appear — those need raw
+    /// samples (rollups don't store within-bucket increase), so they never
+    /// route to a rollup.
+    has_change_aggs: bool,
 }
 
 /// Decide whether `sel` (aliases already resolved) can be answered from
@@ -494,6 +498,7 @@ fn partials_plan(sel: &Select) -> Option<PartialsPlan> {
         group_cols,
         agg_fields: Vec::new(),
         needs_last: false,
+        has_change_aggs: false,
     };
     for item in &sel.items {
         let SelectItem::Expr { expr, .. } = item else { return None };
@@ -550,6 +555,9 @@ fn plan_expr_ok(e: &Expr, plan: &mut PartialsPlan) -> bool {
             }
             if *func == AggFunc::Last {
                 plan.needs_last = true;
+            }
+            if matches!(func, AggFunc::Rate | AggFunc::Increase | AggFunc::Delta) {
+                plan.has_change_aggs = true;
             }
             true
         }
@@ -625,13 +633,27 @@ fn run_partials(
     cluster: &dyn Cluster,
 ) -> Result<Option<ResultSet>> {
     let mut gathered: Vec<(Labels, Vec<TsPartial>)> = Vec::new();
+    // Tiered read: group buckets older than the source's retention horizon
+    // (where blocks may already be dropped) are answered from the coarsest
+    // rollup whose bucket divides the group step; everything newer keeps
+    // exact source partials. The straddling bucket merges both halves
+    // through the ordinary group fold (partials are additive).
+    let mut src_t0 = t0;
+    if !plan.has_change_aggs && !plan.agg_fields.is_empty() {
+        if let Some((rollup, bucket, split)) = rollup_route(&sel.from, plan, t0, cluster)? {
+            gathered.extend(rollup_partials(
+                &rollup, bucket, plan, matchers, t0, t1, split, cluster,
+            )?);
+            src_t0 = split;
+        }
+    }
     if plan.agg_fields.is_empty() {
-        gathered = cluster.ts_partials(&sel.from, matchers, t0, t1, plan.bucket_ms)?;
-    } else {
+        gathered = cluster.ts_partials(&sel.from, matchers, src_t0, t1, plan.bucket_ms)?;
+    } else if src_t0 <= t1 {
         for f in &plan.agg_fields {
             let mut m = matchers.to_vec();
             m.push(Matcher::Eq(FIELD_LABEL.into(), f.clone()));
-            gathered.extend(cluster.ts_partials(&sel.from, &m, t0, t1, plan.bucket_ms)?);
+            gathered.extend(cluster.ts_partials(&sel.from, &m, src_t0, t1, plan.bucket_ms)?);
         }
     }
 
@@ -672,6 +694,136 @@ fn run_partials(
     let mut hide = HashSet::new();
     hide.insert(SERIES_FIELD.to_string());
     project(&rewritten, docs, &hide, true).map(Some)
+}
+
+/// Decide whether (and how) the aged part of `[t0, ..]` routes to a rollup:
+/// the table must have a retention horizon the window reaches past, and a
+/// rollup whose bucket divides the group step (any rollup for whole-range
+/// groups). Returns `(rollup table, its bucket, split)` — group buckets
+/// starting at/after `split` stay on the source.
+fn rollup_route(
+    table: &str,
+    plan: &PartialsPlan,
+    t0: i64,
+    cluster: &dyn Cluster,
+) -> Result<Option<(String, i64, i64)>> {
+    let (horizon, rollups) = cluster.ts_rollup_info(table)?;
+    let Some(h) = horizon else { return Ok(None) };
+    if t0 >= h {
+        return Ok(None); // the source is complete for the whole window
+    }
+    let s = plan.bucket_ms;
+    let best = rollups
+        .into_iter()
+        .filter(|(_, b)| *b > 0 && (s == 0 || s % *b == 0))
+        .max_by_key(|(_, b)| *b);
+    let Some((name, b)) = best else { return Ok(None) };
+    let split = round_up(h, if s > 0 { s } else { b });
+    Ok(Some((name, b, split)))
+}
+
+/// Read a rollup's per-bucket `<field>_{count,sum,min,max,first,last}` rows
+/// over the aged range (whole rollup buckets inside `[t0, min(t1, split-1)]`)
+/// and fold them into group-step partials, `__field__`-labeled like source
+/// partials. Bucket starts stand in for first/last timestamps — exact
+/// ordering within a series, bucket-granular across series.
+#[allow(clippy::too_many_arguments)]
+fn rollup_partials(
+    name: &str,
+    b: i64,
+    plan: &PartialsPlan,
+    matchers: &[Matcher],
+    t0: i64,
+    t1: i64,
+    split: i64,
+    cluster: &dyn Cluster,
+) -> Result<Vec<(Labels, Vec<TsPartial>)>> {
+    let r0 = if t0 == i64::MIN { i64::MIN } else { round_up(t0, b) };
+    let r1 = if t1 >= split - 1 {
+        split - 1
+    } else {
+        round_down(t1 + 1, b) - 1
+    };
+    if r1 < r0 {
+        return Ok(Vec::new());
+    }
+    let s = plan.bucket_ms;
+    const SUFFIXES: [&str; 6] = ["count", "sum", "min", "max", "first", "last"];
+    let mut out = Vec::new();
+    for f in &plan.agg_fields {
+        // series (sans __field__) → rollup-bucket ts → per-suffix values.
+        let mut per: BTreeMap<Labels, BTreeMap<i64, [f64; 6]>> = BTreeMap::new();
+        for (i, suffix) in SUFFIXES.iter().enumerate() {
+            let mut m = matchers.to_vec();
+            m.push(Matcher::Eq(FIELD_LABEL.into(), format!("{f}_{suffix}")));
+            for (labels, samples) in cluster.ts_query(name, &m, r0, r1)? {
+                let base: Labels = labels
+                    .iter()
+                    .filter(|(k, _)| k != FIELD_LABEL)
+                    .cloned()
+                    .collect();
+                let buckets = per.entry(base).or_default();
+                for smp in samples {
+                    buckets.entry(smp.ts).or_insert([f64::NAN; 6])[i] = smp.value;
+                }
+            }
+        }
+        for (base, buckets) in per {
+            let mut partials: Vec<TsPartial> = Vec::new();
+            for (bts, vals) in buckets {
+                if !(vals[0].is_finite() && vals[0] >= 1.0) {
+                    continue; // incomplete row set (no count stream)
+                }
+                let bucket_ts = if s > 0 { bts.div_euclid(s) * s } else { 0 };
+                match partials.last_mut() {
+                    Some(p) if p.bucket_ts == bucket_ts => {
+                        p.count += vals[0] as u64;
+                        p.sum += vals[1];
+                        p.min = p.min.min(vals[2]);
+                        p.max = p.max.max(vals[3]);
+                        // Buckets iterate in time order: first stays put,
+                        // last advances with every row.
+                        p.last_ts = bts;
+                        p.last_val = vals[5];
+                    }
+                    _ => partials.push(TsPartial {
+                        bucket_ts,
+                        count: vals[0] as u64,
+                        sum: vals[1],
+                        min: vals[2],
+                        max: vals[3],
+                        first_ts: bts,
+                        first_val: vals[4],
+                        last_ts: bts,
+                        last_val: vals[5],
+                        // Change aggregates never route to rollups.
+                        increase: 0.0,
+                    }),
+                }
+            }
+            if partials.is_empty() {
+                continue;
+            }
+            let mut labels = base;
+            labels.push((FIELD_LABEL.to_string(), f.clone()));
+            labels.sort();
+            out.push((labels, partials));
+        }
+    }
+    Ok(out)
+}
+
+fn round_up(v: i64, step: i64) -> i64 {
+    let f = v.div_euclid(step) * step;
+    if f == v {
+        v
+    } else {
+        f + step
+    }
+}
+
+fn round_down(v: i64, step: i64) -> i64 {
+    v.div_euclid(step) * step
 }
 
 /// Synthesize the documents the rewritten aggregates fold over: per partial,

@@ -438,6 +438,21 @@ impl Tsdb {
             disk_bytes,
         }
     }
+
+    /// The newest appended timestamp (`i64::MIN` when empty). Retention
+    /// drops are relative to this data frontier, so `max_ts - retention` is
+    /// the horizon below which blocks may already be gone.
+    pub fn max_ts(&self) -> i64 {
+        self.inner.lock().expect("tsdb lock").head.max_ts
+    }
+
+    /// Everything below this boundary is durable in immutable blocks
+    /// (`i64::MIN` before the first flush). Data above it lives in the head
+    /// and is never touched by retention; data below it is what rollups have
+    /// aggregated and what retention may drop.
+    pub fn flushed_through(&self) -> i64 {
+        self.inner.lock().expect("tsdb lock").flushed_through
+    }
 }
 
 fn dir_size(dir: &Path) -> std::io::Result<u64> {
