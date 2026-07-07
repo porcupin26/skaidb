@@ -22,6 +22,7 @@ pub use skaidb_storage::{Codec, EngineOptions};
 pub use namespace::DEFAULT_DATABASE;
 pub use result::{QueryOutput, ResultSet, SessionEffect};
 pub use session::Session;
+pub use ts_query::{ts_partialize, TsPartial};
 
 #[cfg(test)]
 mod tests {
@@ -200,6 +201,156 @@ mod tests {
         }
         let rs = rows(db.execute("SELECT increase(value) FROM reqs").unwrap());
         assert_eq!(rs.rows[0][0], Value::Float(13.0));
+    }
+
+    /// The partial-aggregate path must be indistinguishable from the raw
+    /// path: every eligible query is re-run with `AND 1 = 1` appended (a
+    /// residual no pushdown consumes, forcing raw samples) and the results
+    /// compared row for row.
+    #[test]
+    fn timeseries_partials_match_raw_path() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TIMESERIES TABLE cpu (SERIES KEY (host, core))")
+            .unwrap();
+        // Two hosts × two cores; value is a counter with a reset on host a,
+        // temp exists only on host a (absent-field aggregates).
+        for (host, core, ts, v) in [
+            ("a", "0", 0, 0.0),
+            ("a", "0", 15_000, 40.0),
+            ("a", "0", 30_000, 10.0), // reset
+            ("a", "0", 75_000, 25.0),
+            ("a", "1", 0, 5.0),
+            ("a", "1", 45_000, 20.0),
+            ("b", "0", 15_000, 100.0),
+            ("b", "0", 60_000, 160.0),
+        ] {
+            let extra = if host == "a" {
+                format!(", temp) VALUES ('{host}', '{core}', {ts}, {v}, {t})", t = v / 2.0)
+            } else {
+                format!(") VALUES ('{host}', '{core}', {ts}, {v})")
+            };
+            db.execute(&format!("INSERT INTO cpu (host, core, ts, value{extra}"))
+                .unwrap();
+        }
+        for (eligible, raw) in [
+            (
+                "SELECT time_bucket(1m, ts) AS t, host, count(value), sum(value), avg(value), \
+                 min(value), max(value) FROM cpu WHERE ts >= 0 GROUP BY t, host ORDER BY t, host",
+                "SELECT time_bucket(1m, ts) AS t, host, count(value), sum(value), avg(value), \
+                 min(value), max(value) FROM cpu WHERE ts >= 0 AND 1 = 1 GROUP BY t, host \
+                 ORDER BY t, host",
+            ),
+            (
+                "SELECT time_bucket(1m, ts) AS t, rate(value), increase(value), delta(value) \
+                 FROM cpu WHERE host = 'a' GROUP BY t ORDER BY t",
+                "SELECT time_bucket(1m, ts) AS t, rate(value), increase(value), delta(value) \
+                 FROM cpu WHERE host = 'a' AND 1 = 1 GROUP BY t ORDER BY t",
+            ),
+            (
+                "SELECT host, first(value), last(value), first(temp), last(temp) FROM cpu \
+                 WHERE ts >= 0 GROUP BY host ORDER BY host",
+                "SELECT host, first(value), last(value), first(temp), last(temp) FROM cpu \
+                 WHERE ts >= 0 AND 1 = 1 GROUP BY host ORDER BY host",
+            ),
+            (
+                // Absent field on host b: count 0, everything else NULL.
+                "SELECT host, count(temp), sum(temp), avg(temp) FROM cpu WHERE ts >= 0 \
+                 GROUP BY host ORDER BY host",
+                "SELECT host, count(temp), sum(temp), avg(temp) FROM cpu WHERE ts >= 0 AND 1 = 1 \
+                 GROUP BY host ORDER BY host",
+            ),
+            (
+                "SELECT core, max(value) - min(value) AS spread FROM cpu WHERE host != 'b' \
+                 GROUP BY core HAVING count(value) > 1 ORDER BY spread DESC LIMIT 1",
+                "SELECT core, max(value) - min(value) AS spread FROM cpu WHERE host != 'b' \
+                 AND 1 = 1 GROUP BY core HAVING count(value) > 1 ORDER BY spread DESC LIMIT 1",
+            ),
+            (
+                "SELECT max(value) FROM cpu WHERE ts >= 15000 AND ts < 60000",
+                "SELECT max(value) FROM cpu WHERE ts >= 15000 AND ts < 60000 AND 1 = 1",
+            ),
+            (
+                // Mixed fields: the value stream materializes host b's group,
+                // where count(temp) must be 0, not NULL.
+                "SELECT host, count(temp), count(value) FROM cpu WHERE ts >= 0 \
+                 GROUP BY host ORDER BY host",
+                "SELECT host, count(temp), count(value) FROM cpu WHERE ts >= 0 AND 1 = 1 \
+                 GROUP BY host ORDER BY host",
+            ),
+        ] {
+            let fast = rows(db.execute(eligible).unwrap());
+            let slow = rows(db.execute(raw).unwrap());
+            assert_eq!(fast.columns, slow.columns, "{eligible}");
+            assert_eq!(fast.rows, slow.rows, "{eligible}");
+        }
+
+        // Spot-check hard numbers through the partials path: host a core 0 in
+        // bucket 0 rises 0→40, resets to 10 (increase 50); a group that
+        // exists via another field counts an absent field as 0, not NULL.
+        let rs = rows(
+            db.execute(
+                "SELECT increase(value) FROM cpu WHERE host = 'a' AND core = '0' AND ts < 60000",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows[0][0], Value::Float(50.0));
+        let rs = rows(
+            db.execute(
+                "SELECT host, count(temp), count(value) FROM cpu GROUP BY host ORDER BY host",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            rs.rows[1],
+            vec![Value::String("b".into()), Value::Int(0), Value::Int(2)]
+        );
+    }
+
+    /// A `label != 'x'` matcher reads a missing label as `""` in the store,
+    /// but SQL residual semantics drop the row (`NULL != 'x'` is not true).
+    /// The partials path must reproduce that for dynamically-labeled series
+    /// (remote_write-style ingest, where labels beyond the series key exist).
+    #[test]
+    fn timeseries_partials_missing_label_semantics() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TIMESERIES TABLE m (SERIES KEY (name))")
+            .unwrap();
+        // One series with a `zone` label, one without (direct append, the
+        // remote_write path).
+        db.ts_append(
+            "m",
+            &[
+                (
+                    vec![
+                        ("__field__".into(), "value".into()),
+                        ("name".into(), "up".into()),
+                        ("zone".into(), "us".into()),
+                    ],
+                    1000,
+                    1.0,
+                ),
+                (
+                    vec![
+                        ("__field__".into(), "value".into()),
+                        ("name".into(), "up".into()),
+                    ],
+                    1000,
+                    5.0,
+                ),
+            ],
+        )
+        .unwrap();
+        // zone != 'eu' must exclude the zone-less series in both paths.
+        let eligible = rows(
+            db.execute("SELECT sum(value) FROM m WHERE zone != 'eu' GROUP BY name")
+                .unwrap(),
+        );
+        let raw = rows(
+            db.execute("SELECT sum(value) FROM m WHERE zone != 'eu' AND 1 = 1 GROUP BY name")
+                .unwrap(),
+        );
+        assert_eq!(eligible.rows, raw.rows);
+        assert_eq!(eligible.rows, vec![vec![Value::Float(1.0)]]);
     }
 
     #[test]

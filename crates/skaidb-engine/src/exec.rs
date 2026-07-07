@@ -2198,6 +2198,22 @@ impl Database {
             .map_err(|e| EngineError::Timeseries(e.to_string()))
     }
 
+    /// Per-series per-bucket partial aggregates (see [`Cluster::ts_partials`]);
+    /// the internode `TsPartials` request answers from this.
+    pub fn ts_partials(
+        &self,
+        table: &str,
+        matchers: &[skaidb_tsdb::Matcher],
+        t0: i64,
+        t1: i64,
+        bucket_ms: i64,
+    ) -> Result<Vec<(skaidb_tsdb::Labels, Vec<crate::ts_query::TsPartial>)>> {
+        Ok(crate::ts_query::ts_partialize(
+            self.ts_query(table, matchers, t0, t1)?,
+            bucket_ms,
+        ))
+    }
+
     /// `SHOW TABLES`: the catalog's tables and their primary keys, in name
     /// order. Time-series tables list their implicit `(series key, ts)` key.
     pub fn show_tables(&self) -> ResultSet {
@@ -2712,6 +2728,24 @@ pub trait Cluster {
             "time-series tables are not available on this backend".into(),
         ))
     }
+    /// Per-series per-bucket partial aggregates for series matching every
+    /// matcher in `[t0, t1]` (`bucket_ms <= 0` = one whole-range bucket).
+    /// A cluster implementation ships partials instead of raw samples and
+    /// answers each series from one replica; the default derives them from
+    /// [`Cluster::ts_query`].
+    fn ts_partials(
+        &self,
+        table: &str,
+        matchers: &[skaidb_tsdb::Matcher],
+        t0: i64,
+        t1: i64,
+        bucket_ms: i64,
+    ) -> Result<Vec<(skaidb_tsdb::Labels, Vec<crate::ts_query::TsPartial>)>> {
+        Ok(crate::ts_query::ts_partialize(
+            self.ts_query(table, matchers, t0, t1)?,
+            bucket_ms,
+        ))
+    }
 }
 
 /// Whether `stmt` only reads — i.e. it can run through the shared-access entry
@@ -2871,7 +2905,7 @@ fn run_nearest_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> 
 }
 
 /// Whether the query is in aggregate/grouped mode.
-fn is_grouped(sel: &Select) -> bool {
+pub(crate) fn is_grouped(sel: &Select) -> bool {
     sel.items.iter().any(|it| match it {
         SelectItem::Expr { expr, .. } => contains_aggregate(expr),
         SelectItem::Wildcard => false,
@@ -4043,7 +4077,7 @@ fn contains_aggregate(expr: &Expr) -> bool {
 }
 
 /// Default output column name for an expression.
-fn expr_name(expr: &Expr) -> String {
+pub(crate) fn expr_name(expr: &Expr) -> String {
     match expr {
         Expr::Column(path) => path.clone(),
         Expr::Aggregate { func, .. } => match func {

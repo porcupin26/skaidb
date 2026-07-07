@@ -19,11 +19,6 @@ including the Prometheus endpoints. Remaining:
 
 ## 2. Time-series follow-ups
 
-- **Partial-aggregate pushdown** — cluster TS queries ship raw matching
-  samples to the coordinator; push per-series per-bucket partials
-  (count/sum/min/max/first/last/increase) to the nodes and pick one
-  replica's answer per series. Cuts transfer ~RF× and more for wide
-  aggregations feeding Grafana.
 - **Rollup query rewrite** — pick the coarsest rollup satisfying a
   `time_bucket` query automatically; today queries target the rollup table
   explicitly.
@@ -38,6 +33,10 @@ including the Prometheus endpoints. Remaining:
   arithmetic, `histogram_quantile`; then the node-exporter dashboard
   panel-by-panel diff against a real Prometheus (the original phase-7 exit
   criterion).
+- **PromQL partial gather** — the `/api/v1` evaluator still ships raw
+  samples cluster-wide (its per-step lookback windows don't align with
+  fixed buckets); teach `query_range` to reuse the v0.31.0 partial
+  gather for step-aligned windows.
 - **Self-scrape** — `observability.self_scrape` ingesting the node's own
   `/metrics` into the TS store.
 - **`memory_target` integration** — TS head memory isn't part of the

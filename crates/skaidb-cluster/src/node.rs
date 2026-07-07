@@ -1159,6 +1159,100 @@ impl Node {
             .collect())
     }
 
+    /// Partial-aggregate pushdown gather: every member computes per-series
+    /// per-bucket partials locally and each `(series, bucket)` is answered by
+    /// the responder that saw the most samples for it (replicas converge via
+    /// quorum writes, handoff and repair, so the fullest view is the series'
+    /// answer — raw-sample queries keep the union-merge). Requires the
+    /// read-consistency number of responders.
+    fn ts_partials_scatter(
+        &self,
+        table: &str,
+        matchers: &[skaidb_tsdb::Matcher],
+        t0: i64,
+        t1: i64,
+        bucket_ms: i64,
+        oc: Option<Consistency>,
+    ) -> EngineResult<Vec<(skaidb_tsdb::Labels, Vec<skaidb_engine::TsPartial>)>> {
+        let mut merged: BTreeMap<skaidb_tsdb::Labels, BTreeMap<i64, skaidb_engine::TsPartial>> =
+            BTreeMap::new();
+        let mut absorb = |series: Vec<(skaidb_tsdb::Labels, Vec<skaidb_engine::TsPartial>)>| {
+            for (labels, partials) in series {
+                let entry = merged.entry(labels).or_default();
+                for p in partials {
+                    match entry.get(&p.bucket_ts) {
+                        Some(have) if have.count >= p.count => {}
+                        _ => {
+                            entry.insert(p.bucket_ts, p);
+                        }
+                    }
+                }
+            }
+        };
+        let mut responders = 0usize;
+        {
+            let db = self
+                .local
+                .read()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
+            absorb(db.ts_partials(table, matchers, t0, t1, bucket_ms)?);
+            responders += 1;
+        }
+        let wire_matchers: Vec<(bool, String, String)> = matchers
+            .iter()
+            .map(|m| match m {
+                skaidb_tsdb::Matcher::Eq(k, v) => (false, k.clone(), v.clone()),
+                skaidb_tsdb::Matcher::Ne(k, v) => (true, k.clone(), v.clone()),
+            })
+            .collect();
+        let addrs = self.peer_addrs();
+        let shards = scatter(&addrs, |addr| {
+            self.counters.peer_requests.fetch_add(1, Ordering::Relaxed);
+            match self.pool.call(
+                addr,
+                &Request::TsPartials {
+                    table: table.to_string(),
+                    matchers: wire_matchers.clone(),
+                    t0,
+                    t1,
+                    bucket: bucket_ms,
+                },
+            ) {
+                Ok(Response::TsPartials { series }) => Some(series),
+                _ => {
+                    self.counters.peer_errors.fetch_add(1, Ordering::Relaxed);
+                    None
+                }
+            }
+        });
+        for shard in shards.into_iter().flatten() {
+            absorb(
+                shard
+                    .into_iter()
+                    .map(|(labels, partials)| {
+                        (labels, partials.iter().map(partial_from_wire).collect())
+                    })
+                    .collect(),
+            );
+            responders += 1;
+        }
+        let needed = oc
+            .unwrap_or(self.cfg.read_consistency)
+            .required(self.member_count());
+        if responders < needed {
+            self.counters
+                .read_quorum_failures
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(EngineError::Cluster(format!(
+                "read quorum not met: {responders}/{needed} members responded"
+            )));
+        }
+        Ok(merged
+            .into_iter()
+            .map(|(labels, partials)| (labels, partials.into_values().collect()))
+            .collect())
+    }
+
     fn peer_addrs(&self) -> Vec<String> {
         self.topo
             .read()
@@ -2268,6 +2362,38 @@ impl Node {
                     Ok(series) => Response::TsSummaries { series },
                     Err(e) => Response::Err(e.to_string()),
                 },
+                Err(_) => Response::Err("local lock poisoned".into()),
+            },
+            Request::TsPartials {
+                table,
+                matchers,
+                t0,
+                t1,
+                bucket,
+            } => match self.local.read() {
+                Ok(db) => {
+                    let matchers: Vec<skaidb_tsdb::Matcher> = matchers
+                        .into_iter()
+                        .map(|(negated, k, v)| {
+                            if negated {
+                                skaidb_tsdb::Matcher::Ne(k, v)
+                            } else {
+                                skaidb_tsdb::Matcher::Eq(k, v)
+                            }
+                        })
+                        .collect();
+                    match db.ts_partials(&table, &matchers, t0, t1, bucket) {
+                        Ok(series) => Response::TsPartials {
+                            series: series
+                                .into_iter()
+                                .map(|(labels, partials)| {
+                                    (labels, partials.iter().map(partial_to_wire).collect())
+                                })
+                                .collect(),
+                        },
+                        Err(e) => Response::Err(e.to_string()),
+                    }
+                }
                 Err(_) => Response::Err("local lock poisoned".into()),
             },
             Request::LocalGet { table, key } => match self.local.read() {
@@ -3809,6 +3935,39 @@ fn ts_placement_key(labels: &[(String, String)]) -> Vec<u8> {
     key
 }
 
+/// Engine partial → wire tuple (see [`internode::TsPartialRow`]).
+fn partial_to_wire(p: &skaidb_engine::TsPartial) -> internode::TsPartialRow {
+    (
+        p.bucket_ts,
+        p.count,
+        p.sum,
+        p.min,
+        p.max,
+        p.first_ts,
+        p.first_val,
+        p.last_ts,
+        p.last_val,
+        p.increase,
+    )
+}
+
+/// Wire tuple → engine partial (see [`internode::TsPartialRow`]).
+fn partial_from_wire(r: &internode::TsPartialRow) -> skaidb_engine::TsPartial {
+    let (bucket_ts, count, sum, min, max, first_ts, first_val, last_ts, last_val, increase) = *r;
+    skaidb_engine::TsPartial {
+        bucket_ts,
+        count,
+        sum,
+        min,
+        max,
+        first_ts,
+        first_val,
+        last_ts,
+        last_val,
+        increase,
+    }
+}
+
 /// Render a user's DDL in verifier form (derives the same credential the
 /// engine would from the plaintext, so every member stores the same bytes).
 fn render_user_verifier_ddl(name: &str, password: &str) -> String {
@@ -3969,6 +4128,18 @@ impl Cluster for Coordinator {
         t1: i64,
     ) -> EngineResult<Vec<(skaidb_tsdb::Labels, Vec<skaidb_tsdb::Sample>)>> {
         self.node.ts_scatter(table, matchers, t0, t1, self.oc)
+    }
+
+    fn ts_partials(
+        &self,
+        table: &str,
+        matchers: &[skaidb_tsdb::Matcher],
+        t0: i64,
+        t1: i64,
+        bucket_ms: i64,
+    ) -> EngineResult<Vec<(skaidb_tsdb::Labels, Vec<skaidb_engine::TsPartial>)>> {
+        self.node
+            .ts_partials_scatter(table, matchers, t0, t1, bucket_ms, self.oc)
     }
 
     fn vector_search(
@@ -5463,6 +5634,30 @@ mod tests {
         assert!(matches!(r, Response::Ack));
         let rs = rows(nb.execute("SELECT value FROM cpu WHERE host = 'z'").unwrap());
         assert_eq!(rs.rows, vec![vec![Value::Float(7.0)]]);
+
+        // Partial-aggregate pushdown answers each series from its fullest
+        // responder: the 'z' sample lives on one member only, yet grouped
+        // aggregates via any coordinator see it.
+        let rs = rows(
+            nb.execute("SELECT sum(value), count(value) FROM cpu WHERE host = 'z'")
+                .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Float(7.0), Value::Int(1)]]);
+        let rs = rows(
+            nc.execute(
+                "SELECT time_bucket(1m, ts) AS t, host, max(value) FROM cpu \
+                 GROUP BY t, host ORDER BY t, host",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            rs.rows[0],
+            vec![
+                Value::Timestamp(0),
+                Value::String("x".into()),
+                Value::Float(30.0)
+            ]
+        );
 
         // Append-only holds in cluster mode too.
         let err = nb.execute("UPDATE cpu SET value = 1 WHERE host = 'x'").unwrap_err();

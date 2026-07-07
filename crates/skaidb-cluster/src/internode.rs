@@ -84,6 +84,17 @@ pub enum Request {
     TsSummary {
         table: String,
     },
+    /// The peer's per-series per-bucket partial aggregates for series
+    /// matching every matcher in `[t0, t1]` (`bucket <= 0` = one whole-range
+    /// bucket) — the partial-aggregate pushdown that ships bucket summaries
+    /// instead of raw samples. Answered with [`Response::TsPartials`].
+    TsPartials {
+        table: String,
+        matchers: Vec<(bool, String, String)>,
+        t0: i64,
+        t1: i64,
+        bucket: i64,
+    },
     /// Like [`Request::LocalScan`] but pushes a `WHERE` filter to the node: it
     /// returns only rows matching `filter` (plus all tombstones, for LWW), so a
     /// non-indexed scan ships far less than the whole shard.
@@ -216,6 +227,11 @@ pub enum Response {
     TsSummaries {
         series: Vec<TsSummaryRow>,
     },
+    /// Reply to [`Request::TsPartials`]: this node's matching series with
+    /// their per-bucket partial aggregates.
+    TsPartials {
+        series: TsPartialsData,
+    },
 }
 
 /// A versioned row on the wire: `(key, value, hlc, is_put)` — the shape shared
@@ -228,6 +244,12 @@ pub type TsRow = (Vec<(String, String)>, i64, f64);
 pub type TsSeriesData = Vec<(Vec<(String, String)>, Vec<(i64, f64)>)>;
 /// One anti-entropy summary row: `(labels, deduped count, checksum)`.
 pub type TsSummaryRow = (Vec<(String, String)>, u64, u64);
+/// One bucket partial on the wire: `(bucket_ts, count, sum, min, max,
+/// first_ts, first_val, last_ts, last_val, increase)` — the
+/// `skaidb_engine::TsPartial` fields in order.
+pub type TsPartialRow = (i64, u64, f64, f64, f64, i64, f64, i64, f64, f64);
+/// Per-series partials on the wire: `(labels, [partial])`.
+pub type TsPartialsData = Vec<(Vec<(String, String)>, Vec<TsPartialRow>)>;
 
 /// Errors decoding an internode message.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -259,6 +281,7 @@ const REQ_TSAPPEND: u8 = 20;
 const REQ_TSQUERY: u8 = 21;
 const REQ_TSMERGE: u8 = 22;
 const REQ_TSSUMMARY: u8 = 23;
+const REQ_TSPARTIALS: u8 = 24;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
@@ -271,6 +294,7 @@ const RES_SCHEMA: u8 = 7;
 const RES_NODESTATUS: u8 = 8;
 const RES_TSSERIES: u8 = 9;
 const RES_TSSUMMARIES: u8 = 10;
+const RES_TSPARTIALS: u8 = 11;
 
 impl Request {
     pub fn encode(&self) -> Vec<u8> {
@@ -356,6 +380,25 @@ impl Request {
             Request::TsSummary { table } => {
                 o.push(REQ_TSSUMMARY);
                 put_str(o, table);
+            }
+            Request::TsPartials {
+                table,
+                matchers,
+                t0,
+                t1,
+                bucket,
+            } => {
+                o.push(REQ_TSPARTIALS);
+                put_str(o, table);
+                o.extend_from_slice(&(matchers.len() as u32).to_le_bytes());
+                for (negated, k, v) in matchers {
+                    o.push(u8::from(*negated));
+                    put_str(o, k);
+                    put_str(o, v);
+                }
+                o.extend_from_slice(&t0.to_le_bytes());
+                o.extend_from_slice(&t1.to_le_bytes());
+                o.extend_from_slice(&bucket.to_le_bytes());
             }
             Request::FilteredScan { table, filter } => {
                 o.push(REQ_FSCAN);
@@ -490,6 +533,24 @@ impl Request {
                 Request::TsMerge { table, rows }
             }
             REQ_TSSUMMARY => Request::TsSummary { table: c.string()? },
+            REQ_TSPARTIALS => {
+                let table = c.string()?;
+                let n = c.u32()? as usize;
+                let mut matchers = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let negated = c.u8()? != 0;
+                    let k = c.string()?;
+                    let v = c.string()?;
+                    matchers.push((negated, k, v));
+                }
+                Request::TsPartials {
+                    table,
+                    matchers,
+                    t0: c.u64()? as i64,
+                    t1: c.u64()? as i64,
+                    bucket: c.u64()? as i64,
+                }
+            }
             REQ_FSCAN => Request::FilteredScan {
                 table: c.string()?,
                 filter: c.expr()?,
@@ -648,6 +709,26 @@ impl Response {
                     }
                 }
             }
+            Response::TsPartials { series } => {
+                o.push(RES_TSPARTIALS);
+                o.extend_from_slice(&(series.len() as u32).to_le_bytes());
+                for (labels, partials) in series {
+                    put_labels(o, labels);
+                    o.extend_from_slice(&(partials.len() as u32).to_le_bytes());
+                    for (bucket_ts, count, sum, min, max, fts, fval, lts, lval, inc) in partials {
+                        o.extend_from_slice(&bucket_ts.to_le_bytes());
+                        o.extend_from_slice(&count.to_le_bytes());
+                        o.extend_from_slice(&sum.to_bits().to_le_bytes());
+                        o.extend_from_slice(&min.to_bits().to_le_bytes());
+                        o.extend_from_slice(&max.to_bits().to_le_bytes());
+                        o.extend_from_slice(&fts.to_le_bytes());
+                        o.extend_from_slice(&fval.to_bits().to_le_bytes());
+                        o.extend_from_slice(&lts.to_le_bytes());
+                        o.extend_from_slice(&lval.to_bits().to_le_bytes());
+                        o.extend_from_slice(&inc.to_bits().to_le_bytes());
+                    }
+                }
+            }
         }
     }
 
@@ -738,6 +819,30 @@ impl Response {
                     series.push((labels, count, checksum));
                 }
                 Response::TsSummaries { series }
+            }
+            RES_TSPARTIALS => {
+                let n = c.u32()? as usize;
+                let mut series = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let labels = c.labels()?;
+                    let m = c.u32()? as usize;
+                    let mut partials = Vec::with_capacity(m);
+                    for _ in 0..m {
+                        let bucket_ts = c.u64()? as i64;
+                        let count = c.u64()?;
+                        let sum = f64::from_bits(c.u64()?);
+                        let min = f64::from_bits(c.u64()?);
+                        let max = f64::from_bits(c.u64()?);
+                        let fts = c.u64()? as i64;
+                        let fval = f64::from_bits(c.u64()?);
+                        let lts = c.u64()? as i64;
+                        let lval = f64::from_bits(c.u64()?);
+                        let inc = f64::from_bits(c.u64()?);
+                        partials.push((bucket_ts, count, sum, min, max, fts, fval, lts, lval, inc));
+                    }
+                    series.push((labels, partials));
+                }
+                Response::TsPartials { series }
             }
             _ => return Err(WireError::Malformed("unknown response op")),
         })
@@ -1309,6 +1414,20 @@ mod tests {
                 t0: i64::MIN,
                 t1: i64::MAX,
             },
+            Request::TsPartials {
+                table: "cpu".into(),
+                matchers: vec![(false, "__field__".into(), "value".into())],
+                t0: 0,
+                t1: 3_600_000,
+                bucket: 60_000,
+            },
+            Request::TsPartials {
+                table: "cpu".into(),
+                matchers: vec![],
+                t0: i64::MIN,
+                t1: i64::MAX,
+                bucket: 0,
+            },
             Request::FilteredScan {
                 table: "t".into(),
                 filter: Expr::Binary {
@@ -1408,6 +1527,18 @@ mod tests {
                     (
                         vec![("host".into(), "a".into())],
                         vec![(1000, 0.5), (2000, f64::MAX)],
+                    ),
+                    (vec![], vec![]),
+                ],
+            },
+            Response::TsPartials {
+                series: vec![
+                    (
+                        vec![("__field__".into(), "value".into()), ("host".into(), "a".into())],
+                        vec![
+                            (0, 4, 90.0, 0.0, 45.0, 0, 0.0, 45_000, 45.0, 45.0),
+                            (60_000, 1, 60.0, 60.0, 60.0, 60_000, 60.0, 60_000, 60.0, 0.0),
+                        ],
                     ),
                     (vec![], vec![]),
                 ],

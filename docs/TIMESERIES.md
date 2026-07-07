@@ -9,7 +9,7 @@ aggregates, and time-bucketed queries.
 > replicate at the configured write consistency; queries union-merge across
 > members at the read consistency; joins/decommissions migrate series like
 > any other data. Shipped in v0.20.0 (storage), v0.21.0 (SQL), v0.22.0
-> (cluster), v0.23.0 (remote_write), v0.24.0 (resharding), v0.25.0 (OOO DDL + stats), v0.26.0 (anti-entropy), v0.27.0 (rollups), v0.28.0 (PromQL API).
+> (cluster), v0.23.0 (remote_write), v0.24.0 (resharding), v0.25.0 (OOO DDL + stats), v0.26.0 (anti-entropy), v0.27.0 (rollups), v0.28.0 (PromQL API), v0.30.0 (hinted handoff), v0.31.0 (partial-aggregate pushdown).
 
 ## Usage
 
@@ -97,6 +97,20 @@ stored as its own compressed stream. Full grammar and semantics:
   locally: a rollup series has the same labels as its source, so it places
   on the same replica set by construction. Long retention on the rollup +
   short on the source = classic tiered downsampling.
+- **Partial-aggregate pushdown** (v0.31.0): an aggregation whose `WHERE`
+  is fully served by the pushdown (a `ts` range plus label `=`/`!=`),
+  grouping by labels and/or one `time_bucket`, ships **per-series
+  per-bucket partials** (count/sum/min/max/first/last/increase) from each
+  member instead of raw samples, and answers each `(series, bucket)` from
+  the responder that saw the most samples for it. All the supported
+  aggregates — `count/sum/avg/min/max/first/last/rate/increase/delta`,
+  `HAVING`, `ORDER BY`, `LIMIT` included — fold from the partials with
+  identical semantics (equivalence-tested against the raw path). Cuts
+  coordinator transfer ~RF× and more for wide Grafana-style aggregations;
+  anything ineligible (residual predicates, `COUNT(*)`, computed aggregate
+  arguments) transparently uses the raw union-merge path. The PromQL
+  endpoint still gathers raw samples (its lookback windows aren't
+  bucket-aligned; see TODO).
 - **Hinted handoff** (v0.30.0): a replica unreachable during an append
   gets its batch buffered on the coordinator (bounded per peer) and
   replayed via the gap-filling merge as soon as it's reachable — brief
@@ -129,7 +143,7 @@ All tracked, with more detail, in [`TODO.md`](TODO.md).
 
 | Gap | Notes | Planned |
 |---|---|---|
-| **Partial-aggregate pushdown** | cluster queries ship matching raw samples to the coordinator; per-node partial aggregation (sum/count per bucket, per-series rate segments) would cut transfer for wide aggregations | open |
+| PromQL partial gather | `/api/v1/query_range` still ships raw samples; the SQL surface uses the v0.31.0 partial pushdown | open |
 | Self-scrape (`/metrics` → TS table) | remote_write covers external scrapers | later |
 | TS reclaim | after a reshard, former owners keep stale series copies (harmless under union-merge; no `reclaim` pass for TS yet) | with TS anti-entropy |
 | Rollup query rewrite | queries must target the rollup table explicitly; picking the coarsest satisfying rollup automatically is open | open |

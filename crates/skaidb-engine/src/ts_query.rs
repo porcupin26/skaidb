@@ -11,13 +11,13 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use skaidb_sql::ast::{BinaryOp, Expr, Insert, Select, SelectItem};
-use skaidb_tsdb::{Labels, Matcher};
+use skaidb_sql::ast::{AggArg, AggFunc, BinaryOp, Expr, Insert, Select, SelectItem};
+use skaidb_tsdb::{Labels, Matcher, Sample};
 use skaidb_types::{Document, Value};
 
 use crate::error::{EngineError, Result};
 use crate::eval::{as_int_ms, eval, eval_predicate};
-use crate::exec::{project, Cluster};
+use crate::exec::{expr_name, is_grouped, project, Cluster};
 use crate::result::{QueryOutput, ResultSet};
 
 /// The reserved label carrying a sample's field name.
@@ -131,6 +131,17 @@ pub(crate) fn run_ts_select(
     let mut matchers: Vec<Matcher> = Vec::new();
     if let Some(filter) = &sel.filter {
         extract_pushdown(filter, series_key, &mut t0, &mut t1, &mut matchers);
+    }
+
+    // Partial-aggregate pushdown: an aggregation whose WHERE is entirely
+    // served by the pushdown gathers per-series per-bucket partials from the
+    // cluster (one replica's answer per series) instead of raw samples. Any
+    // failure or dynamically detected ineligibility falls back to the raw
+    // path below, which is authoritative.
+    if let Some(plan) = partials_plan(sel) {
+        if let Ok(Some(rs)) = run_partials(sel, &plan, &matchers, t0, t1, cluster) {
+            return Ok(rs);
+        }
     }
 
     // Which value fields does the query touch? `None` = all (wildcard, or
@@ -357,6 +368,455 @@ fn flip(op: BinaryOp) -> BinaryOp {
     }
 }
 
+/// One bucket's pre-aggregated summary of one series (docs/TODO.md
+/// partial-aggregate pushdown): everything the supported SQL aggregates need,
+/// so a cluster query ships one row per (series, bucket) instead of raw
+/// samples. `increase` is the counter-reset-aware within-bucket increase and
+/// is meaningful only when `count >= 2` (`rate`/`delta` derive from it and
+/// the first/last pairs at fold time).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TsPartial {
+    pub bucket_ts: i64,
+    pub count: u64,
+    pub sum: f64,
+    pub min: f64,
+    pub max: f64,
+    pub first_ts: i64,
+    pub first_val: f64,
+    pub last_ts: i64,
+    pub last_val: f64,
+    pub increase: f64,
+}
+
+/// Fold time-ordered per-series samples into per-bucket partials.
+/// `bucket_ms <= 0` means one whole-range bucket (`bucket_ts` 0). Buckets
+/// floor like SQL `time_bucket` (`div_euclid`).
+pub fn ts_partialize(
+    series: Vec<(Labels, Vec<Sample>)>,
+    bucket_ms: i64,
+) -> Vec<(Labels, Vec<TsPartial>)> {
+    let mut out = Vec::with_capacity(series.len());
+    for (labels, samples) in series {
+        let mut partials: Vec<TsPartial> = Vec::new();
+        for s in samples {
+            let bucket_ts = if bucket_ms > 0 {
+                s.ts.div_euclid(bucket_ms) * bucket_ms
+            } else {
+                0
+            };
+            match partials.last_mut() {
+                Some(p) if p.bucket_ts == bucket_ts => {
+                    p.count += 1;
+                    p.sum += s.value;
+                    p.min = p.min.min(s.value);
+                    p.max = p.max.max(s.value);
+                    // Counter increase: a drop is a reset — the counter
+                    // restarted, so the new value is its own contribution.
+                    p.increase += if s.value >= p.last_val {
+                        s.value - p.last_val
+                    } else {
+                        s.value
+                    };
+                    p.last_ts = s.ts;
+                    p.last_val = s.value;
+                }
+                _ => partials.push(TsPartial {
+                    bucket_ts,
+                    count: 1,
+                    sum: s.value,
+                    min: s.value,
+                    max: s.value,
+                    first_ts: s.ts,
+                    first_val: s.value,
+                    last_ts: s.ts,
+                    last_val: s.value,
+                    increase: 0.0,
+                }),
+            }
+        }
+        if !partials.is_empty() {
+            out.push((labels, partials));
+        }
+    }
+    out
+}
+
+/// What an eligible aggregation pushes down (see [`partials_plan`]).
+struct PartialsPlan {
+    /// Group `time_bucket` step; 0 = no bucketing (whole range per group).
+    bucket_ms: i64,
+    /// The group-by `time_bucket` expression, verbatim.
+    bucket_expr: Option<Expr>,
+    /// Label columns grouped by.
+    group_cols: Vec<String>,
+    /// Distinct fields the aggregates read (empty = pure label grouping).
+    agg_fields: Vec<String>,
+    /// Whether any `last()` aggregate needs the extra per-partial doc.
+    needs_last: bool,
+}
+
+/// Decide whether `sel` (aliases already resolved) can be answered from
+/// per-series per-bucket partials with semantics identical to the raw path:
+/// an aggregate/grouped query whose WHERE is entirely consumed by the
+/// pushdown, grouping by labels and at most one `time_bucket(step, ts)`, with
+/// every aggregate a supported function over a plain field and every bare
+/// column reference a group key. Anything else returns `None` (raw path).
+fn partials_plan(sel: &Select) -> Option<PartialsPlan> {
+    if !is_grouped(sel) || sel.items.iter().any(|i| matches!(i, SelectItem::Wildcard)) {
+        return None;
+    }
+    if let Some(f) = &sel.filter {
+        if !fully_pushable(f) {
+            return None;
+        }
+    }
+    let mut bucket_ms = 0i64;
+    let mut bucket_expr: Option<Expr> = None;
+    let mut group_cols: Vec<String> = Vec::new();
+    for g in &sel.group_by {
+        match g {
+            Expr::Column(c) if c != "ts" && !c.contains('.') && !c.starts_with("__") => {
+                group_cols.push(c.clone())
+            }
+            e => {
+                let step = bucket_step(e)?;
+                if bucket_expr.is_some() {
+                    return None;
+                }
+                bucket_ms = step;
+                bucket_expr = Some(e.clone());
+            }
+        }
+    }
+    let mut plan = PartialsPlan {
+        bucket_ms,
+        bucket_expr,
+        group_cols,
+        agg_fields: Vec::new(),
+        needs_last: false,
+    };
+    for item in &sel.items {
+        let SelectItem::Expr { expr, .. } = item else { return None };
+        if !plan_expr_ok(expr, &mut plan) {
+            return None;
+        }
+    }
+    if let Some(h) = &sel.having {
+        if !plan_expr_ok(h, &mut plan) {
+            return None;
+        }
+    }
+    for o in &sel.order_by {
+        if !plan_expr_ok(&o.expr, &mut plan) {
+            return None;
+        }
+    }
+    Some(plan)
+}
+
+/// `time_bucket(<positive const step>, ts)` → the step in ms.
+fn bucket_step(e: &Expr) -> Option<i64> {
+    let Expr::Func { name, args } = e else { return None };
+    if name != "time_bucket" || args.len() != 2 {
+        return None;
+    }
+    if !matches!(&args[1], Expr::Column(c) if c == "ts") {
+        return None;
+    }
+    let step = const_ms(&args[0])?;
+    (step > 0).then_some(step)
+}
+
+/// Validate one output/HAVING/ORDER BY expression for the partials plan,
+/// collecting aggregate fields. Bare columns must be group keys; `ts` may
+/// appear only as the group's `time_bucket` expression.
+fn plan_expr_ok(e: &Expr, plan: &mut PartialsPlan) -> bool {
+    if plan.bucket_expr.as_ref() == Some(e) {
+        return true;
+    }
+    match e {
+        Expr::Aggregate { func, arg } => {
+            let AggArg::Expr(inner) = arg else {
+                return false; // COUNT(*) falls back
+            };
+            let Expr::Column(f) = inner.as_ref() else {
+                return false; // computed aggregate args fall back
+            };
+            if f == "ts" || f.contains('.') || f.starts_with("__") {
+                return false;
+            }
+            if !plan.agg_fields.contains(f) {
+                plan.agg_fields.push(f.clone());
+            }
+            if *func == AggFunc::Last {
+                plan.needs_last = true;
+            }
+            true
+        }
+        Expr::Column(c) => c != "ts" && plan.group_cols.contains(c),
+        Expr::Literal(_) => true,
+        Expr::Parameter(_) => false,
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => plan_expr_ok(expr, plan),
+        Expr::Binary { left, right, .. } => {
+            plan_expr_ok(left, plan) && plan_expr_ok(right, plan)
+        }
+        Expr::Func { args, .. } => args.iter().all(|a| plan_expr_ok(a, plan)),
+    }
+}
+
+/// Whether the whole WHERE is consumed by [`extract_pushdown`] — an AND-tree
+/// of `ts` range comparisons against integral constants and label `=`/`!=`
+/// string constants — so skipping the residual re-application is sound
+/// (given the series-level label-presence filter applied at fold time).
+fn fully_pushable(e: &Expr) -> bool {
+    match e {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => fully_pushable(left) && fully_pushable(right),
+        Expr::Binary { op, left, right } => {
+            let (col, op, rhs) = match (left.as_ref(), right.as_ref()) {
+                (Expr::Column(c), rhs) if !expr_has_columns(rhs) => (c, *op, rhs),
+                (lhs, Expr::Column(c)) if !expr_has_columns(lhs) => (c, flip(*op), lhs),
+                _ => return false,
+            };
+            if col == "ts" {
+                // A fractional bound truncates in the pushdown (the raw
+                // path's residual would fix it up) — not exactly servable.
+                let Ok(v) = eval(rhs, &Document::new()) else {
+                    return false;
+                };
+                if let Value::Float(f) = &v {
+                    if f.fract() != 0.0 {
+                        return false;
+                    }
+                }
+                as_int_ms(&v).is_some()
+                    && matches!(
+                        op,
+                        BinaryOp::GtEq
+                            | BinaryOp::Gt
+                            | BinaryOp::LtEq
+                            | BinaryOp::Lt
+                            | BinaryOp::Eq
+                    )
+            } else if !col.contains('.') && !col.starts_with("__") {
+                matches!(op, BinaryOp::Eq | BinaryOp::NotEq)
+                    && matches!(eval(rhs, &Document::new()), Ok(Value::String(_)))
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Execute the partials plan: gather per-series per-bucket partials at the
+/// read consistency, verify the dynamic eligibility conditions, synthesize
+/// partial documents, and run the aggregate-rewritten query over them.
+/// `Ok(None)` = dynamically ineligible (caller falls back to raw samples).
+fn run_partials(
+    sel: &Select,
+    plan: &PartialsPlan,
+    matchers: &[Matcher],
+    t0: i64,
+    t1: i64,
+    cluster: &dyn Cluster,
+) -> Result<Option<ResultSet>> {
+    let mut gathered: Vec<(Labels, Vec<TsPartial>)> = Vec::new();
+    if plan.agg_fields.is_empty() {
+        gathered = cluster.ts_partials(&sel.from, matchers, t0, t1, plan.bucket_ms)?;
+    } else {
+        for f in &plan.agg_fields {
+            let mut m = matchers.to_vec();
+            m.push(Matcher::Eq(FIELD_LABEL.into(), f.clone()));
+            gathered.extend(cluster.ts_partials(&sel.from, &m, t0, t1, plan.bucket_ms)?);
+        }
+    }
+
+    // Dynamic eligibility: a grouped-by column that is actually a field, or
+    // an aggregated field that is actually a label, has per-sample semantics
+    // partials cannot reproduce — fall back to the raw path.
+    for (labels, _) in &gathered {
+        for (k, v) in labels {
+            if k == FIELD_LABEL {
+                if plan.group_cols.contains(v) {
+                    return Ok(None);
+                }
+            } else if plan.agg_fields.contains(k) {
+                return Ok(None);
+            }
+        }
+    }
+
+    // The raw path's residual WHERE drops rows whose series lacks a label the
+    // filter compares (`NULL = 'x'` / `NULL != 'x'` are not true), while the
+    // store matches a missing label as `""`. Reproduce the residual: every
+    // matcher-referenced label must exist on the series.
+    let matcher_keys: Vec<&String> = matchers
+        .iter()
+        .map(|m| match m {
+            Matcher::Eq(k, _) | Matcher::Ne(k, _) => k,
+        })
+        .filter(|k| *k != FIELD_LABEL)
+        .collect();
+    gathered.retain(|(labels, _)| {
+        matcher_keys
+            .iter()
+            .all(|k| labels.iter().any(|(lk, _)| lk == *k))
+    });
+
+    let docs = partial_docs(gathered, &plan.agg_fields, plan.needs_last);
+    let rewritten = rewrite_partials(sel);
+    let mut hide = HashSet::new();
+    hide.insert(SERIES_FIELD.to_string());
+    project(&rewritten, docs, &hide, true).map(Some)
+}
+
+/// Synthesize the documents the rewritten aggregates fold over: per partial,
+/// one doc at `first_ts` carrying the summed/extremal fields (with explicit
+/// zero counts for the query's other fields, so `COUNT` of an absent field
+/// stays 0, not NULL), plus — when `last()` is used — one doc at `last_ts`
+/// carrying the last value, so `last()` stays an argmax over `ts`. Docs are
+/// ordered like the raw path (series id, then time) so first/last
+/// tie-breaking matches.
+fn partial_docs(
+    gathered: Vec<(Labels, Vec<TsPartial>)>,
+    agg_fields: &[String],
+    needs_last: bool,
+) -> Vec<Document> {
+    let mut streams: Vec<(Vec<u8>, Labels, String, Vec<TsPartial>)> = gathered
+        .into_iter()
+        .map(|(labels, partials)| {
+            let field = labels
+                .iter()
+                .find(|(k, _)| k == FIELD_LABEL)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| "value".into());
+            let series: Labels = labels
+                .iter()
+                .filter(|(k, _)| k != FIELD_LABEL)
+                .cloned()
+                .collect();
+            (series_id(&series), series, field, partials)
+        })
+        .collect();
+    streams.sort_by(|a, b| (&a.0, &a.3.first().map(|p| p.bucket_ts)).cmp(&(&b.0, &b.3.first().map(|p| p.bucket_ts))));
+
+    let mut docs = Vec::new();
+    for (_, series, field, partials) in &streams {
+        for p in partials {
+            let mut d = Document::new();
+            for (k, v) in series {
+                d.insert(k.clone(), Value::String(v.clone()));
+            }
+            d.insert("ts", Value::Timestamp(p.first_ts));
+            for g in agg_fields {
+                let n = if g == field { p.count as i64 } else { 0 };
+                d.insert(format!("__pcnt_{g}"), Value::Int(n));
+            }
+            if agg_fields.contains(field) {
+                d.insert(format!("__psum_{field}"), Value::Float(p.sum));
+                d.insert(format!("__pmin_{field}"), Value::Float(p.min));
+                d.insert(format!("__pmax_{field}"), Value::Float(p.max));
+                d.insert(format!("__pfirst_{field}"), Value::Float(p.first_val));
+                if p.count >= 2 {
+                    d.insert(format!("__pinc_{field}"), Value::Float(p.increase));
+                    d.insert(
+                        format!("__pdel_{field}"),
+                        Value::Float(p.last_val - p.first_val),
+                    );
+                    let span_secs = (p.last_ts - p.first_ts) as f64 / 1000.0;
+                    if span_secs > 0.0 {
+                        d.insert(
+                            format!("__prate_{field}"),
+                            Value::Float(p.increase / span_secs),
+                        );
+                    }
+                }
+            }
+            docs.push(d);
+            if needs_last && agg_fields.contains(field) {
+                let mut d2 = Document::new();
+                for (k, v) in series {
+                    d2.insert(k.clone(), Value::String(v.clone()));
+                }
+                d2.insert("ts", Value::Timestamp(p.last_ts));
+                d2.insert(format!("__plast_{field}"), Value::Float(p.last_val));
+                docs.push(d2);
+            }
+        }
+    }
+    docs
+}
+
+/// Rewrite the select to fold partial docs: the WHERE is gone (fully served
+/// by the gather), unaliased items keep their raw-path column names, and
+/// every aggregate becomes its partial-field equivalent.
+fn rewrite_partials(sel: &Select) -> Select {
+    let mut out = sel.clone();
+    out.filter = None;
+    for item in &mut out.items {
+        if let SelectItem::Expr { expr, alias } = item {
+            if alias.is_none() {
+                *alias = Some(expr_name(expr));
+            }
+            rewrite_aggs(expr);
+        }
+    }
+    if let Some(h) = &mut out.having {
+        rewrite_aggs(h);
+    }
+    for o in &mut out.order_by {
+        rewrite_aggs(&mut o.expr);
+    }
+    out
+}
+
+fn rewrite_aggs(e: &mut Expr) {
+    match e {
+        Expr::Aggregate { func, arg } => {
+            let AggArg::Expr(inner) = arg else { return };
+            let Expr::Column(f) = inner.as_ref() else { return };
+            let (func, f) = (*func, f.clone());
+            let agg = |func: AggFunc, prefix: &str| Expr::Aggregate {
+                func,
+                arg: AggArg::Expr(Box::new(Expr::Column(format!("{prefix}{f}")))),
+            };
+            *e = match func {
+                AggFunc::Count => agg(AggFunc::Sum, "__pcnt_"),
+                AggFunc::Sum => agg(AggFunc::Sum, "__psum_"),
+                // avg = Σsum / Σcount (all field values are non-null floats,
+                // so the raw path's denominator is exactly Σcount).
+                AggFunc::Avg => Expr::Binary {
+                    op: BinaryOp::Div,
+                    left: Box::new(agg(AggFunc::Sum, "__psum_")),
+                    right: Box::new(agg(AggFunc::Sum, "__pcnt_")),
+                },
+                AggFunc::Min => agg(AggFunc::Min, "__pmin_"),
+                AggFunc::Max => agg(AggFunc::Max, "__pmax_"),
+                AggFunc::First => agg(AggFunc::First, "__pfirst_"),
+                AggFunc::Last => agg(AggFunc::Last, "__plast_"),
+                AggFunc::Rate => agg(AggFunc::Sum, "__prate_"),
+                AggFunc::Increase => agg(AggFunc::Sum, "__pinc_"),
+                AggFunc::Delta => agg(AggFunc::Sum, "__pdel_"),
+            };
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => rewrite_aggs(expr),
+        Expr::Binary { left, right, .. } => {
+            rewrite_aggs(left);
+            rewrite_aggs(right);
+        }
+        Expr::Func { args, .. } => {
+            for a in args {
+                rewrite_aggs(a);
+            }
+        }
+        Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) => {}
+    }
+}
+
 /// Value-field names the query references (columns that are not labels, not
 /// `ts`, not dotted). `None` = query all fields (wildcard or none named).
 fn referenced_fields(sel: &Select, series_key: &[String]) -> Option<Vec<String>> {
@@ -397,4 +857,113 @@ fn referenced_fields(sel: &Select, series_key: &[String]) -> Option<Vec<String>>
         return None;
     }
     Some(fields)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(ts: i64, value: f64) -> Sample {
+        Sample { ts, value }
+    }
+
+    fn labels() -> Labels {
+        vec![
+            ("__field__".into(), "value".into()),
+            ("host".into(), "a".into()),
+        ]
+    }
+
+    #[test]
+    fn partialize_buckets_and_summaries() {
+        let series = vec![(
+            labels(),
+            vec![
+                sample(0, 10.0),
+                sample(15_000, 25.0),
+                sample(45_000, 5.0), // counter reset: contributes 5, not -20
+                sample(60_000, 7.0), // next bucket
+            ],
+        )];
+        let out = ts_partialize(series, 60_000);
+        assert_eq!(out.len(), 1);
+        let partials = &out[0].1;
+        assert_eq!(partials.len(), 2);
+        let p = &partials[0];
+        assert_eq!((p.bucket_ts, p.count), (0, 3));
+        assert_eq!((p.sum, p.min, p.max), (40.0, 5.0, 25.0));
+        assert_eq!((p.first_ts, p.first_val), (0, 10.0));
+        assert_eq!((p.last_ts, p.last_val), (45_000, 5.0));
+        assert_eq!(p.increase, 20.0); // +15, then reset → +5
+        let p = &partials[1];
+        assert_eq!((p.bucket_ts, p.count, p.sum), (60_000, 1, 7.0));
+        assert_eq!(p.increase, 0.0);
+    }
+
+    #[test]
+    fn partialize_whole_range_and_negative_ts() {
+        let series = vec![(labels(), vec![sample(-70_000, 1.0), sample(10_000, 3.0)])];
+        // bucket 0 → one whole-range partial.
+        let out = ts_partialize(series.clone(), 0);
+        assert_eq!(out[0].1.len(), 1);
+        assert_eq!(out[0].1[0].count, 2);
+        // Negative timestamps floor like time_bucket (div_euclid).
+        let out = ts_partialize(series, 60_000);
+        assert_eq!(out[0].1[0].bucket_ts, -120_000);
+        assert_eq!(out[0].1[1].bucket_ts, 0);
+    }
+
+    fn parsed(sql: &str) -> Select {
+        match skaidb_sql::parse(sql).unwrap() {
+            skaidb_sql::ast::Statement::Select(sel) => resolve_output_aliases(&sel),
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn partials_plan_accepts_the_canonical_shapes() {
+        let plan = partials_plan(&parsed(
+            "SELECT time_bucket(1m, ts) AS t, host, avg(value), max(value) \
+             FROM cpu WHERE ts >= 0 AND host = 'a' GROUP BY t, host ORDER BY t",
+        ))
+        .expect("eligible");
+        assert_eq!(plan.bucket_ms, 60_000);
+        assert_eq!(plan.group_cols, vec!["host".to_string()]);
+        assert_eq!(plan.agg_fields, vec!["value".to_string()]);
+        assert!(!plan.needs_last);
+
+        // No bucket, label-only grouping, HAVING over aggregates, last().
+        let plan = partials_plan(&parsed(
+            "SELECT host, sum(value), last(value) FROM cpu WHERE host != 'b' \
+             GROUP BY host HAVING count(value) > 1",
+        ))
+        .expect("eligible");
+        assert_eq!(plan.bucket_ms, 0);
+        assert!(plan.needs_last);
+
+        // Ungrouped aggregate over the whole range.
+        assert!(partials_plan(&parsed("SELECT max(value) FROM cpu")).is_some());
+    }
+
+    #[test]
+    fn partials_plan_rejects_what_needs_raw_samples() {
+        for sql in [
+            // COUNT(*) counts merged (series, ts) rows across fields.
+            "SELECT count(*) FROM cpu GROUP BY host",
+            // Residual WHERE (field comparison / OR) must see raw rows.
+            "SELECT max(value) FROM cpu WHERE value > 5",
+            "SELECT max(value) FROM cpu WHERE host = 'a' OR host = 'b'",
+            // Grouping by raw ts or a computed aggregate argument.
+            "SELECT count(value) FROM cpu GROUP BY ts",
+            "SELECT sum(value * 2) FROM cpu GROUP BY host",
+            // A bare column that is not a group key.
+            "SELECT core, max(value) FROM cpu GROUP BY host",
+            // ts outside the group's time_bucket.
+            "SELECT time_bucket(2m, ts), max(value) FROM cpu GROUP BY time_bucket(1m, ts)",
+            // Not an aggregate query at all.
+            "SELECT ts, value FROM cpu WHERE host = 'a'",
+        ] {
+            assert!(partials_plan(&parsed(sql)).is_none(), "{sql}");
+        }
+    }
 }

@@ -166,8 +166,10 @@ Implemented end-to-end and tested (202 tests):
   RETENTION 30d)` stores samples in a Prometheus-style engine
   (Gorilla-compressed chunks, ~1–1.5 B/sample, ≥2M samples/s ingest) with
   `time_bucket()` bucketing and counter-aware `rate()`/`increase()`
-  aggregates. Distributed: series place on the ring and replicate; queries
-  union-merge across members — see [docs/TIMESERIES.md](docs/TIMESERIES.md)
+  aggregates. Distributed: series place on the ring and replicate; raw
+  queries union-merge across members while eligible aggregations push
+  **per-series per-bucket partials** down to the nodes instead of shipping
+  raw samples — see [docs/TIMESERIES.md](docs/TIMESERIES.md)
 - **leaderless replication**: consistent-hash placement; every node serves reads
   and writes; **tunable write consistency** (`ONE`/`QUORUM`/`ALL`) where weaker
   levels ack early and replicate the rest in the background, and a coordinated
