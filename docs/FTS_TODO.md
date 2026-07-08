@@ -391,10 +391,21 @@ fleet-verified — the TS cadence)
     when one index holds every row; sharded corpora use the correct
     gather-and-sort fallback (per-shard sorted scatter merge is future
     work, needs a wire addition).
+  - [x] Term suggester: `SUGGEST '<text>' ON <index> [COLUMN <col>]
+    [LIMIT n]` — per-token "did you mean" from the term dictionary via
+    Levenshtein automata (distance ≤ 2, closest first, doc-freq ranked
+    within a distance; input analyzed with the column's query-time
+    pipeline). Completion/search-as-you-type stays the documented
+    edge_ngram + MATCH_PREFIX pattern (no separate FST structure needed).
+  - [x] more_like_this: `MORE_LIKE_THIS(col, '<like text>')` predicate on
+    tantivy's MLT query (permissive defaults: min_term_freq 1,
+    min_doc_freq 2, max 25 query terms — ES's min_term_freq=2 default
+    silently empties short like-texts). Composes with AND/OR/NOT and
+    ranked retrieval like the rest of the family.
   - [ ] search_after cursor beyond keyset pagination (decide if the SQL
     surface warrants more than ORDER BY + range + LIMIT).
-  - [ ] Term + completion suggesters, synonyms with hot-reload,
-    more_like_this.
+  - [ ] Synonyms with hot-reload (needs an `ALTER SEARCH INDEX` DDL design
+    for mutating options; query-time expansion so no reindex).
 - [ ] **Phase 8 — ES-compatible REST subset (decision checkpoint)**:
   `_search` (query DSL JSON: the §2 ✱ queries + aggs), `_bulk`, `_mapping`
   read-only — enough for existing ES client libraries and log shippers, not

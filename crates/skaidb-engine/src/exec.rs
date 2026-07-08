@@ -999,6 +999,86 @@ impl Database {
         Ok(Some(out))
     }
 
+    /// [`Database::suggest_cmd`] on the exclusive path: commit pending
+    /// index writes first so a suggestion right after an insert sees it
+    /// (read-your-writes, like searches on the write path).
+    fn suggest_cmd_mut(
+        &mut self,
+        index: &str,
+        text: &str,
+        column: Option<&str>,
+        limit: u64,
+    ) -> Result<ResultSet> {
+        if let Some(live) = self.search_indexes.get_mut(index) {
+            live.commit_if_dirty()?;
+        }
+        self.suggest_cmd(index, text, column, limit)
+    }
+
+    /// `SUGGEST '<text>' ON <index>` — term suggestions ("did you mean")
+    /// from the index's dictionary. `column` defaults to the index's sole
+    /// text column; several text columns require an explicit `COLUMN`.
+    /// Served from the local shard's last-committed state.
+    fn suggest_cmd(
+        &self,
+        index: &str,
+        text: &str,
+        column: Option<&str>,
+        limit: u64,
+    ) -> Result<ResultSet> {
+        let def = self
+            .catalog
+            .search_indexes
+            .get(index)
+            .ok_or_else(|| EngineError::IndexNotFound(index.to_string()))?;
+        let live = self
+            .search_indexes
+            .get(index)
+            .ok_or_else(|| EngineError::IndexNotFound(index.to_string()))?;
+        let column = match column {
+            Some(c) => c.to_string(),
+            None => {
+                let (cfg, _) = SearchIndexConfig::from_declaration(&def.paths, &def.options)?;
+                let mut texty = cfg.fields.iter().filter(|f| {
+                    matches!(
+                        f.ftype,
+                        skaidb_fts::FieldType::Text | skaidb_fts::FieldType::Keyword
+                    )
+                });
+                match (texty.next(), texty.next()) {
+                    (Some(only), None) => only.path.clone(),
+                    _ => {
+                        return Err(EngineError::Type(
+                            "SUGGEST needs COLUMN <col> when the index covers several text \
+                             columns"
+                                .into(),
+                        ))
+                    }
+                }
+            }
+        };
+        let suggestions = live.index.suggest(&column, text, limit as usize)?;
+        Ok(ResultSet::new(
+            vec![
+                "input".into(),
+                "suggestion".into(),
+                "distance".into(),
+                "doc_freq".into(),
+            ],
+            suggestions
+                .into_iter()
+                .map(|s| {
+                    vec![
+                        Value::String(s.input),
+                        Value::String(s.term),
+                        Value::Int(s.distance as i64),
+                        Value::Int(s.doc_freq as i64),
+                    ]
+                })
+                .collect(),
+        ))
+    }
+
     /// A snippet generator for `query` over `column`, from the index
     /// serving the query — the cluster coordinator highlights re-read rows
     /// with this after the scatter merge.
@@ -1141,6 +1221,14 @@ impl Database {
             Statement::Select(sel) => {
                 run_select(&sel, &LocalRead { db: self }).map(QueryOutput::Rows)
             }
+            Statement::Suggest {
+                text,
+                index,
+                column,
+                limit,
+            } => self
+                .suggest_cmd(&index, &text, column.as_deref(), limit)
+                .map(QueryOutput::Rows),
             Statement::ShowTables => Ok(QueryOutput::Rows(self.show_tables())),
             Statement::ShowIndexes => Ok(QueryOutput::Rows(self.show_indexes())),
             Statement::ShowStatus => Ok(QueryOutput::Rows(self.show_status())),
@@ -1196,6 +1284,14 @@ impl Database {
                 self.drop_search_index(&name, if_exists)
             }
             Statement::RebuildSearchIndex { name } => self.rebuild_search_index_cmd(&name),
+            Statement::Suggest {
+                text,
+                index,
+                column,
+                limit,
+            } => self
+                .suggest_cmd_mut(&index, &text, column.as_deref(), limit)
+                .map(QueryOutput::Rows),
             Statement::AlterTable(alt) => self.alter_table(alt),
             Statement::Begin => self.begin(),
             Statement::Commit => self.commit(),
@@ -1331,7 +1427,7 @@ impl Database {
             Statement::ShowGrants { ref role } => {
                 Ok(QueryOutput::Rows(self.show_grants(role.as_deref())))
             }
-            Statement::Select(_) => {
+            Statement::Select(_) | Statement::Suggest { .. } => {
                 namespace::resolve_statement(&mut stmt, current_db);
                 self.execute_read_statement(stmt)
                     .map_err(|e| namespace::humanize_error(e, current_db))
@@ -3686,6 +3782,7 @@ pub fn statement_is_read_only(stmt: &Statement) -> bool {
     matches!(
         stmt,
         Statement::Select(_)
+            | Statement::Suggest { .. }
             | Statement::ShowTables
             | Statement::ShowIndexes
             | Statement::ShowStatus
@@ -3843,7 +3940,14 @@ fn run_nearest_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> 
 fn is_search_func(name: &str) -> bool {
     matches!(
         name,
-        "match" | "match_phrase" | "match_prefix" | "fuzzy" | "wildcard" | "regexp" | "search"
+        "match"
+            | "match_phrase"
+            | "match_prefix"
+            | "fuzzy"
+            | "wildcard"
+            | "regexp"
+            | "more_like_this"
+            | "search"
     )
 }
 
@@ -3894,7 +3998,8 @@ fn collect_search_fields(query: &SearchQuery, out: &mut Vec<String>) {
         | SearchQuery::Fuzzy { field, .. }
         | SearchQuery::Prefix { field, .. }
         | SearchQuery::Wildcard { field, .. }
-        | SearchQuery::Regexp { field, .. } => {
+        | SearchQuery::Regexp { field, .. }
+        | SearchQuery::MoreLikeThis { field, .. } => {
             if let Some(f) = field {
                 if !out.contains(f) {
                     out.push(f.clone());
@@ -4106,6 +4211,17 @@ fn search_query_from_func(name: &str, args: &[Expr]) -> Result<SearchQuery> {
             Ok(SearchQuery::Regexp {
                 field: Some(column(col, "REGEXP(column, 'pattern')")?),
                 pattern: text(q, "REGEXP(column, 'pattern')")?,
+            })
+        }
+        "more_like_this" => {
+            let [col, q] = args else {
+                return Err(EngineError::Type(
+                    "MORE_LIKE_THIS(column, 'text') takes exactly two arguments".into(),
+                ));
+            };
+            Ok(SearchQuery::MoreLikeThis {
+                field: Some(column(col, "MORE_LIKE_THIS(column, 'text')")?),
+                text: text(q, "MORE_LIKE_THIS(column, 'text')")?,
             })
         }
         "search" => {

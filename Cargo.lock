@@ -1151,10 +1151,12 @@ dependencies = [
 name = "skaidb-fts"
 version = "0.42.0"
 dependencies = [
+ "levenshtein_automata",
  "serde",
  "serde_json",
  "skaidb-types",
  "tantivy",
+ "tantivy-fst",
  "tempfile",
  "thiserror",
  "unicode-segmentation",

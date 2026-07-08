@@ -695,6 +695,9 @@ fn required_privilege(stmt: &Statement) -> Option<(Privilege, Object)> {
         Statement::DropSearchIndex { .. } => (Privilege::Drop, Object::Global),
         // A rebuild rewrites index data, so gate it like index creation.
         Statement::RebuildSearchIndex { .. } => (Privilege::Create, Object::Global),
+        // Suggestions read the index's term dictionary — a read, gated
+        // like SELECT (the dictionary derives from table rows).
+        Statement::Suggest { .. } => (Privilege::Select, Object::Global),
         Statement::AlterTable(a) => (Privilege::Create, Object::Table(a.name.clone())),
         // Transaction control affects writes; gate it like a global write.
         Statement::Begin | Statement::Commit | Statement::Rollback => {

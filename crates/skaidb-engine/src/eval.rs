@@ -99,7 +99,8 @@ fn eval_func(name: &str, args: &[Expr], row: &Document) -> Result<Value> {
         }
         // Search predicates are consumed by the search planner; one reaching
         // scalar evaluation sits in a position the index cannot serve.
-        "match" | "match_phrase" | "match_prefix" | "fuzzy" | "wildcard" | "regexp" | "search" => {
+        "match" | "match_phrase" | "match_prefix" | "fuzzy" | "wildcard" | "regexp"
+        | "more_like_this" | "search" => {
             Err(EngineError::Type(format!(
                 "{name}() must appear in the WHERE clause of a search query, composed only \
                  with AND/OR/NOT"

@@ -9,6 +9,7 @@
 //!
 //! [`commit`]: SearchIndex::commit
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -808,6 +809,106 @@ impl SearchIndex {
         }
     }
 
+    /// Term suggestions ("did you mean") for each token of `text` against
+    /// one text column's term dictionary: terms within Levenshtein
+    /// distance ≤ 2, closest first, ranked by document frequency within a
+    /// distance, at most `limit` per input token.
+    pub fn suggest(
+        &self,
+        column: &str,
+        text: &str,
+        limit: usize,
+    ) -> Result<Vec<Suggestion>, FtsError> {
+        use levenshtein_automata::LevenshteinAutomatonBuilder;
+        use tantivy_fst::Automaton;
+
+        /// `levenshtein_automata::DFA` as a tantivy-fst automaton (the
+        /// same shim tantivy's own fuzzy query uses internally).
+        struct Dfa(levenshtein_automata::DFA);
+        impl Automaton for Dfa {
+            type State = u32;
+            fn start(&self) -> u32 {
+                self.0.initial_state()
+            }
+            fn is_match(&self, state: &u32) -> bool {
+                matches!(
+                    self.0.distance(*state),
+                    levenshtein_automata::Distance::Exact(_)
+                )
+            }
+            fn can_match(&self, state: &u32) -> bool {
+                *state != levenshtein_automata::SINK_STATE
+            }
+            fn accept(&self, state: &u32, byte: u8) -> u32 {
+                self.0.transition(*state, byte)
+            }
+        }
+
+        let rt = self
+            .runtimes
+            .iter()
+            .find(|r| r.path == column && r.ftype.is_texty())
+            .ok_or_else(|| {
+                FtsError::Config(format!(
+                    "SUGGEST needs a text column covered by the index, got '{column}'"
+                ))
+            })?;
+        // Tokens through the column's query-time analyzer, so casing and
+        // stemming match what the dictionary holds.
+        let mut analyzer = rt.query_analyzer.build();
+        let mut stream = analyzer.token_stream(text);
+        let mut tokens = Vec::new();
+        while let Some(token) = stream.next() {
+            tokens.push(token.text.clone());
+        }
+
+        let builder = LevenshteinAutomatonBuilder::new(2, true);
+        let searcher = self.reader.searcher();
+        let mut out = Vec::new();
+        for token in tokens {
+            // term → (distance, doc_freq summed across segments).
+            let mut candidates: HashMap<String, (u8, u64)> = HashMap::new();
+            let dfa = builder.build_dfa(&token);
+            for segment in searcher.segment_readers() {
+                let inverted = segment.inverted_index(rt.field)?;
+                let mut terms = inverted
+                    .terms()
+                    .search(Dfa(builder.build_dfa(&token)))
+                    .into_stream()
+                    .map_err(|e| FtsError::Engine(format!("term dictionary: {e}")))?;
+                while let Some((bytes, info)) = terms.next() {
+                    let Ok(term) = std::str::from_utf8(bytes) else {
+                        continue;
+                    };
+                    let distance = match dfa.eval(term.as_bytes()) {
+                        levenshtein_automata::Distance::Exact(d) => d,
+                        levenshtein_automata::Distance::AtLeast(d) => d,
+                    };
+                    let entry = candidates.entry(term.to_string()).or_insert((distance, 0));
+                    entry.1 += info.doc_freq as u64;
+                }
+            }
+            candidates.remove(&token); // the input itself is not a suggestion
+            let mut ranked: Vec<(String, u8, u64)> = candidates
+                .into_iter()
+                .map(|(term, (d, freq))| (term, d, freq))
+                .collect();
+            // Closest first, most common within a distance, then lexical
+            // for determinism.
+            ranked.sort_by(|a, b| a.1.cmp(&b.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
+            ranked.truncate(limit);
+            for (term, distance, doc_freq) in ranked {
+                out.push(Suggestion {
+                    input: token.clone(),
+                    term,
+                    distance,
+                    doc_freq,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     /// Build a [`Highlighter`] for `query` over one text column: snippets of
     /// row text with the query's matching terms marked. Built once per query
     /// per column, then applied to each hit's authoritative row text.
@@ -864,6 +965,19 @@ impl SearchIndex {
 /// `(key, sort value)` pairs from [`SearchIndex::search_sorted`],
 /// best-first.
 pub type SortedHits = Vec<(Vec<u8>, Value)>;
+
+/// One term suggestion from [`SearchIndex::suggest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Suggestion {
+    /// The analyzed input token the suggestion is for.
+    pub input: String,
+    /// A dictionary term within edit distance 2 of the input.
+    pub term: String,
+    /// Levenshtein distance from the input.
+    pub distance: u8,
+    /// Documents containing the suggested term.
+    pub doc_freq: u64,
+}
 
 /// Generates highlighted snippets of row text for one (query, column) pair
 /// (from [`SearchIndex::highlighter`]).
@@ -1606,6 +1720,52 @@ mod tests {
             }],
         };
         assert!(idx.aggregate(&matches("body", "red"), &bad).unwrap().is_none());
+    }
+
+    #[test]
+    fn suggest_and_more_like_this() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = config(&["body"], &[]);
+        let mut idx = open(tmp.path(), &cfg);
+        let docs = [
+            "the rust database engine",
+            "rust database internals",
+            "a database for rust services",
+            "cooking rustic bread at home",
+            "bread baking basics",
+        ];
+        for (i, body) in docs.iter().enumerate() {
+            idx.put(&[i as u8], &text_doc(&[("body", body)]), wm(i as u64 + 1))
+                .unwrap();
+        }
+        idx.commit().unwrap();
+
+        // "databsae" (transposition) → "database" (distance 2, freq 3).
+        let suggestions = idx.suggest("body", "databsae", 3).unwrap();
+        assert!(!suggestions.is_empty());
+        assert_eq!(suggestions[0].term, "database");
+        assert_eq!(suggestions[0].doc_freq, 3);
+        // Multi-token input suggests per token; unknown column errors.
+        let multi = idx.suggest("body", "rst bred", 2).unwrap();
+        assert!(multi.iter().any(|s| s.input == "rst" && s.term == "rust"));
+        assert!(multi.iter().any(|s| s.input == "bred" && s.term == "bread"));
+        assert!(idx.suggest("nope", "x", 3).is_err());
+
+        // MORE_LIKE_THIS: docs sharing the like-text's distinctive terms
+        // rank; the bread docs don't match a database-flavored like-text.
+        let hits = idx
+            .search_top(
+                &SearchQuery::MoreLikeThis {
+                    field: Some("body".into()),
+                    text: "rust database engine".into(),
+                },
+                10,
+            )
+            .unwrap();
+        assert!(hits.len() >= 3, "{hits:?}");
+        let keys: Vec<u8> = hits.iter().map(|h| h.key[0]).collect();
+        assert!(keys.contains(&0) && keys.contains(&1) && keys.contains(&2));
+        assert!(!keys.contains(&4)); // "bread baking basics" shares nothing
     }
 
     #[test]

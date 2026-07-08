@@ -29,6 +29,14 @@ pub enum Statement {
     /// `REBUILD SEARCH INDEX name` — discard the index data and re-index
     /// every row of the table (recovery / anti-entropy escape hatch).
     RebuildSearchIndex { name: String },
+    /// `SUGGEST '<text>' ON <index> [COLUMN <col>] [LIMIT n]` — term
+    /// suggestions ("did you mean") from the index's term dictionary.
+    Suggest {
+        text: String,
+        index: String,
+        column: Option<String>,
+        limit: u64,
+    },
     AlterTable(AlterTable),
     Insert(Insert),
     Select(Select),
@@ -161,6 +169,7 @@ impl Statement {
             Statement::CreateSearchIndex(c) => f(&mut c.name),
             Statement::DropSearchIndex { name, .. } => f(name),
             Statement::RebuildSearchIndex { name } => f(name),
+            Statement::Suggest { index, .. } => f(index),
             _ => {}
         }
     }

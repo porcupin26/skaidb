@@ -149,6 +149,13 @@ returned.
 **Multi-field scoring** is dis-max (a row scores as its best field, ES
 `best_fields`), with per-column boosts applied.
 
+**Similarity & suggestions**: `MORE_LIKE_THIS(col, 'like text')` finds
+textually similar rows (the like-text's most distinctive terms by
+in-index IDF, OR-ed — permissive defaults so short like-texts work).
+`SUGGEST '<text>' ON <index>` returns per-token "did you mean" terms from
+the index dictionary (Levenshtein ≤ 2, doc-frequency ranked); completion
+/search-as-you-type is the `edge_ngram` + `MATCH_PREFIX` pattern.
+
 **Highlighting**: `HIGHLIGHT(col [, max_chars])` in the projection returns
 the best-scoring snippet of the column's text (default 150 chars) with
 matching terms wrapped in `<b>…</b>` (HTML-escaped otherwise, empty string

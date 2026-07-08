@@ -53,6 +53,12 @@ pub enum SearchQuery {
         field: Option<String>,
         pattern: String,
     },
+    /// Rows textually similar to `text` (ES `more_like_this`): the like-
+    /// text's most distinctive terms (by in-index IDF) OR-ed together.
+    MoreLikeThis {
+        field: Option<String>,
+        text: String,
+    },
     /// Query-string mini-language over the default fields
     /// (`title:"rust db" +performance -draft`).
     QueryString(String),
@@ -268,6 +274,30 @@ pub(crate) fn build_query(
             per_field_union(fields.resolve(field)?, |rt| {
                 Some(regex_query(rt.field, pattern)).transpose()
             })
+        }
+        SearchQuery::MoreLikeThis { field, text } => {
+            // Tantivy's MLT picks the like-text's most distinctive terms
+            // by in-index document frequency. Defaults lean permissive
+            // (ES's min_term_freq=2 silently empties short like-texts):
+            // every term of the text counts, terms in < 2 docs or > 25
+            // total are dropped.
+            let field_values: Vec<(Field, Vec<tantivy::schema::OwnedValue>)> = fields
+                .resolve(field)?
+                .into_iter()
+                .map(|rt| {
+                    (
+                        rt.field,
+                        vec![tantivy::schema::OwnedValue::Str(text.clone())],
+                    )
+                })
+                .collect();
+            Ok(Box::new(
+                tantivy::query::MoreLikeThisQuery::builder()
+                    .with_min_term_frequency(1)
+                    .with_min_doc_frequency(2)
+                    .with_max_query_terms(25)
+                    .with_document_fields(field_values),
+            ))
         }
         SearchQuery::QueryString(text) => {
             // Text fields are the defaults for bare terms; typed fields

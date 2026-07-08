@@ -307,6 +307,17 @@ WHERE (MATCH(body, 'rust') OR MATCH(title, 'rust'))
   - `MATCH_PREFIX(<col>, '<prefix>')` — term prefix.
   - `WILDCARD(<col>, '<pattern>')` — `*` any run, `?` any one char.
   - `REGEXP(<col>, '<pattern>')` — regular expression.
+- **`MORE_LIKE_THIS(<col>, '<like text>')`** — rows textually similar to
+  the given text: its most distinctive terms (by in-index document
+  frequency; terms in fewer than 2 docs are ignored, at most 25 terms)
+  OR-ed together. Composes like the other predicates.
+- **`SUGGEST '<text>' ON <index> [COLUMN <col>] [LIMIT n]`** — a
+  standalone statement returning "did you mean" term suggestions
+  (`input`, `suggestion`, `distance`, `doc_freq` — closest first, most
+  frequent within a distance, at most `n` per input token, default 5).
+  `COLUMN` is required when the index covers several text columns. For
+  search-as-you-type completion, use an `edge_ngram` analyzer with
+  `MATCH_PREFIX` instead.
 - `<col>` may also be a declared `.keyword` twin (`title.keyword`, exact
   original string) or a `copy_to` composite field. Text predicates on a
   numeric/date/bool column error.

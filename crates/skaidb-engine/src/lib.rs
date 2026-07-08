@@ -2112,6 +2112,53 @@ mod tests {
     }
 
     #[test]
+    fn search_suggest_and_more_like_this() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE notes (PRIMARY KEY (id))").unwrap();
+        db.execute("CREATE SEARCH INDEX notes_fts ON notes (body)").unwrap();
+        db.execute(
+            "INSERT INTO notes (id, body) VALUES \
+             (1, 'the rust database engine'), \
+             (2, 'rust database internals'), \
+             (3, 'a database for rust services'), \
+             (4, 'cooking rustic bread at home'), \
+             (5, 'bread baking basics')",
+        )
+        .unwrap();
+
+        // SUGGEST: term-dictionary "did you mean", default column (the
+        // index's only text column), ranked closest-then-most-common.
+        let rs = rows(db.execute("SUGGEST 'databsae' ON notes_fts").unwrap());
+        assert_eq!(
+            rs.columns,
+            vec!["input", "suggestion", "distance", "doc_freq"]
+        );
+        assert_eq!(rs.rows[0][1], Value::String("database".into()));
+        assert_eq!(rs.rows[0][3], Value::Int(3));
+        // Explicit column + LIMIT; the read-only path serves it too.
+        let rs = rows(
+            db.execute_read("SUGGEST 'bred' ON notes_fts COLUMN body LIMIT 1")
+                .unwrap(),
+        );
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][1], Value::String("bread".into()));
+        // Unknown index errors.
+        assert!(db.execute("SUGGEST 'x' ON nope_fts").is_err());
+
+        // MORE_LIKE_THIS: similar docs rank, unrelated ones don't.
+        let rs = rows(
+            db.execute(
+                "SELECT id FROM notes WHERE MORE_LIKE_THIS(body, 'rust database engine') \
+                 ORDER BY score() DESC LIMIT 5",
+            )
+            .unwrap(),
+        );
+        let got = ids(rs);
+        assert!(got.contains(&1) && got.contains(&2) && got.contains(&3), "{got:?}");
+        assert!(!got.contains(&5), "{got:?}");
+    }
+
+    #[test]
     fn search_order_by_fast_field() {
         let mut db = agg_db();
         // Index-ordered top-k over a numeric fast field, both directions.

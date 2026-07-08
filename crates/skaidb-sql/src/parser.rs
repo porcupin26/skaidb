@@ -176,6 +176,44 @@ impl Parser {
             let name = self.expect_ident()?;
             return Ok(Statement::RebuildSearchIndex { name });
         }
+        // `SUGGEST '<text>' ON <index> [COLUMN <col>] [LIMIT n]` — term
+        // suggestions from a search index (SUGGEST is contextual).
+        if self.peek_ident_ci("suggest") {
+            self.advance();
+            let text = match self.advance() {
+                Token::Str(s) => s,
+                other => {
+                    return Err(ParseError::Other(format!(
+                        "SUGGEST expects a quoted input string, found {other:?}"
+                    )))
+                }
+            };
+            self.expect_keyword(Keyword::On)?;
+            let index = self.expect_ident()?;
+            let column = if self.eat_keyword(Keyword::Column) {
+                Some(self.parse_path()?)
+            } else {
+                None
+            };
+            let limit = if self.eat_keyword(Keyword::Limit) {
+                match self.advance() {
+                    Token::Int(n) if n > 0 => n as u64,
+                    other => {
+                        return Err(ParseError::Other(format!(
+                            "SUGGEST LIMIT expects a positive integer, found {other:?}"
+                        )))
+                    }
+                }
+            } else {
+                5
+            };
+            return Ok(Statement::Suggest {
+                text,
+                index,
+                column,
+                limit,
+            });
+        }
         match self.peek() {
             Token::Keyword(Keyword::Select) => self.parse_select().map(Statement::Select),
             Token::Keyword(Keyword::Insert) => self.parse_insert().map(Statement::Insert),
