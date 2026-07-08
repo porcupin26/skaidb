@@ -7,16 +7,18 @@ This documents the **shipped** state; the plan and pending phases live in
 [FTS_TODO.md](FTS_TODO.md), and the SQL grammar in
 [QUERY_SYNTAX.md](QUERY_SYNTAX.md#full-text-search-match--search).
 
-Status: **phase 5 (ingest performance)** — phases 1–4 (single-node core:
-DDL, index maintenance on put/delete, `score()`, top-k pushdown, crash
+Status: **phase 6 (aggregations)** — phases 1–5 (single-node core: DDL,
+index maintenance on put/delete, `score()`, top-k pushdown, crash
 recovery, rebuild; analysis & mappings: analyzer registry, per-column
 configuration, typed fast fields, `.keyword` twins, `copy_to`; query DSL:
 the full predicate family `MATCH`/`MATCH_PHRASE`/`MATCH_PREFIX`/`FUZZY`/
 `WILDCARD`/`REGEXP`/`SEARCH`, AND/OR/NOT composition, dis-max multi-field
 scoring, `HIGHLIGHT()` snippets; cluster: scatter-gather top-k,
-per-replica indexes, topology continuity) plus the **bulk ingest path**
-(one index pass + one refresh check per statement batch) and the writer
-heap budgeted under `memory_target`.
+per-replica indexes, topology continuity; performance: bulk ingest path,
+writer heap under `memory_target` — benchmarked vs Elasticsearch, see
+[BENCHMARKS.md](BENCHMARKS.md)) plus **aggregations**: GROUP BY and
+aggregate functions over search queries, with an exact fast-field facet
+pushdown.
 
 ## Using it
 
@@ -152,6 +154,38 @@ the best-scoring snippet of the column's text (default 150 chars) with
 matching terms wrapped in `<b>…</b>` (HTML-escaped otherwise, empty string
 when the column didn't match). Stemming is respected — a query for
 `jumping` highlights `jumps`. Only valid together with a search predicate.
+
+## Aggregations
+
+Search queries combine with GROUP BY and aggregates like any other SQL:
+
+```sql
+SELECT region, COUNT(*), SUM(units), AVG(price) FROM sales
+WHERE MATCH(product, 'widget') GROUP BY region;
+
+SELECT COUNT(*), MAX(price) FROM sales
+WHERE SEARCH('+widget -clearance');   -- one global row
+```
+
+Two serving paths produce identical results:
+
+- **Fast-field pushdown** (no row materialization): when the GROUP BY is a
+  single declared `keyword` column (or absent) and the items are that
+  column plus `COUNT(*)`/`COUNT(col)`/`SUM`/`AVG`/`MIN`/`MAX` over
+  declared numeric columns, the facets compute inside the index over fast
+  fields (Tantivy aggregations, ES's own machinery).
+- **Row fallback**: any other shape — text-column grouping, `time_bucket`
+  buckets, residual predicates, HAVING, ORDER BY — gathers the matching
+  rows (deduped by key at the coordinator, so correct at any replication
+  factor) and runs the ordinary grouped executor.
+
+SQL semantics hold on both paths: rows missing the group column form the
+NULL group, `SUM` over no values is NULL (ES-style aggregations would say
+0), and metric types follow the column declarations (`SUM` of a `long` is
+an integer). The pushdown is **exact or declined** — on a truncated bucket
+list or any count mismatch it silently falls back rather than
+approximate. Cluster mode pushes down when one index holds every row
+(single node, or RF ≥ member count); sharded corpora take the fallback.
 
 ## Architecture
 

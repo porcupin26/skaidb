@@ -1957,6 +1957,153 @@ mod tests {
             .is_err());
     }
 
+    // ---- phase 6: aggregations over search queries ----
+
+    /// `sales(id, product text, region keyword, units long, price double)`
+    /// with a search index covering all of it.
+    fn agg_db() -> Database {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE sales (PRIMARY KEY (id))").unwrap();
+        db.execute(
+            "CREATE SEARCH INDEX sales_fts ON sales (product, region, units, price) WITH (\
+             region.type = 'keyword', units.type = 'long', price.type = 'double')",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO sales (id, product, region, units, price) VALUES \
+             (1, 'red widget',  'east', 10, 2.5), \
+             (2, 'blue widget', 'east', 20, 4.0), \
+             (3, 'red gadget',  'west', 5,  1.0), \
+             (4, 'red widget',  'west', 7,  3.5), \
+             (5, 'blue gadget', 'east', 2,  9.9)",
+        )
+        .unwrap();
+        // Row 6 has no region: SQL's NULL group.
+        db.execute("INSERT INTO sales (id, product, units) VALUES (6, 'red thing', 100)")
+            .unwrap();
+        db
+    }
+
+    /// Sort grouped output rows by their first column for order-insensitive
+    /// comparison (GROUP BY output order is unspecified).
+    fn sorted_groups(rs: ResultSet) -> Vec<Vec<Value>> {
+        let mut rows = rs.rows;
+        rows.sort_by_key(|r| r[0].encode_key());
+        rows
+    }
+
+    #[test]
+    fn search_group_by_pushdown_matches_fallback() {
+        let mut db = agg_db();
+        // The pushdown shape: keyword GROUP BY + simple metrics.
+        let sql = "SELECT region, COUNT(*), SUM(units), AVG(price), MAX(units) \
+                   FROM sales WHERE MATCH(product, 'red') GROUP BY region";
+        let pushed = sorted_groups(rows(db.execute(sql).unwrap()));
+        // Rows 1, 3, 4, 6 match 'red': east {1}, west {3,4}, NULL {6}.
+        assert_eq!(pushed.len(), 3);
+        assert_eq!(
+            pushed[0],
+            vec![
+                Value::Null,
+                Value::Int(1),
+                Value::Int(100),
+                Value::Null, // row 6 has no price → SQL NULL, not 0
+                Value::Int(100),
+            ]
+        );
+        assert_eq!(
+            pushed[1],
+            vec![
+                Value::String("east".into()),
+                Value::Int(1),
+                Value::Int(10),
+                Value::Float(2.5),
+                Value::Int(10),
+            ]
+        );
+        assert_eq!(
+            pushed[2],
+            vec![
+                Value::String("west".into()),
+                Value::Int(2),
+                Value::Int(12),
+                Value::Float(2.25),
+                Value::Int(7),
+            ]
+        );
+        // The same statement with HAVING takes the row-materialization
+        // fallback — identical values for the surviving groups.
+        let fell = sorted_groups(rows(
+            db.execute(
+                "SELECT region, COUNT(*), SUM(units), AVG(price), MAX(units) \
+                 FROM sales WHERE MATCH(product, 'red') GROUP BY region \
+                 HAVING COUNT(*) >= 1",
+            )
+            .unwrap(),
+        ));
+        assert_eq!(pushed, fell);
+    }
+
+    #[test]
+    fn search_global_aggregates_and_fallback_shapes() {
+        let mut db = agg_db();
+        // No GROUP BY: one global row over the match set.
+        let rs = rows(
+            db.execute(
+                "SELECT COUNT(*), MIN(price), MAX(price) FROM sales \
+                 WHERE MATCH(product, 'widget')",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            rs.rows,
+            vec![vec![Value::Int(3), Value::Float(2.5), Value::Float(4.0)]]
+        );
+        // GROUP BY over an analyzed text column can't push down exactly —
+        // the fallback still answers it (grouping by the raw doc value).
+        let rs = rows(
+            db.execute(
+                "SELECT product, COUNT(*) FROM sales \
+                 WHERE MATCH(product, 'widget') GROUP BY product",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            sorted_groups(rs),
+            vec![
+                vec![Value::String("blue widget".into()), Value::Int(1)],
+                vec![Value::String("red widget".into()), Value::Int(2)],
+            ]
+        );
+        // Residual predicates force the fallback too, and stay correct.
+        let rs = rows(
+            db.execute(
+                "SELECT region, SUM(units) FROM sales \
+                 WHERE MATCH(product, 'widget') AND price > 2.6 GROUP BY region",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            sorted_groups(rs),
+            vec![
+                vec![Value::String("east".into()), Value::Int(20)],
+                vec![Value::String("west".into()), Value::Int(7)],
+            ]
+        );
+        // Aggregate ORDER BY + LIMIT run through the grouped executor.
+        let rs = rows(
+            db.execute(
+                "SELECT region, COUNT(*) AS n FROM sales WHERE MATCH(product, 'red') \
+                 GROUP BY region ORDER BY COUNT(*) DESC LIMIT 1",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            rs.rows,
+            vec![vec![Value::String("west".into()), Value::Int(2)]]
+        );
+    }
+
     #[test]
     fn search_refresh_tick_commits_idle_writes() {
         // Write-path refresh checks only run on the next write: with no

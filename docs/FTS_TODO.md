@@ -329,11 +329,30 @@ fleet-verified — the TS cadence)
     worst case).
   - [ ] Merge-policy tuning on LXC-class disks: the win over ES leaves no
     urgency; revisit if an ingest-heavy workload surfaces merge stalls.
-- [ ] **Phase 6 — aggregations/facets**: terms/range/histogram/
-  date_histogram/cardinality/top_hits over fast fields, exposed through SQL
-  (GROUP BY over indexed columns pushes to per-shard facet partials, merged
-  at the coordinator — reuse the TS partial-merge shape). Exit: agg parity +
-  perf vs ES on the logs track.
+- [ ] **Phase 6 — aggregations/facets** (core shipped):
+  - [x] Grouped/aggregate search SELECTs work everywhere:
+    `SELECT region, COUNT(*), SUM(units) … WHERE MATCH(…) GROUP BY region`.
+    Two serving paths with identical output: an **exact fast-field
+    pushdown** (tantivy aggregations: terms buckets over declared keyword
+    columns + count/value_count/sum/avg/min/max over numeric fast fields,
+    one global row when no GROUP BY), and the **row-materialization
+    fallback** (matching rows gathered — deduped by key at the coordinator,
+    correct at any RF — then the ordinary grouped executor). SQL semantics
+    enforced in the pushdown: missing group values form the NULL group,
+    `SUM` over no values is NULL (not ES's 0), metric types follow column
+    declarations (`SUM` of a `long` is an Int).
+  - [x] Exact-or-bail discipline: the pushdown declines (→ fallback) on
+    text-column grouping, synthetic columns, residual predicates,
+    HAVING/ORDER BY/OFFSET, truncated bucket lists (`sum_other_doc_count`),
+    or a bucketed-vs-total mismatch — it never approximates.
+  - [x] Cluster gate: pushdown serves locally when one index holds every
+    row (single node, or RF ≥ members); sharded corpora take the fallback.
+  - [ ] Sharded per-shard partials (needs per-key ownership filters — e.g.
+    a ring-hash fast field — to avoid double-counting replicas).
+  - [ ] histogram/date_histogram pushdown (`time_bucket` GROUP BY works
+    today via the fallback), cardinality (HLL++), top_hits.
+  - [ ] **Exit**: agg parity + perf vs ES on the logs track (bench-pair
+    campaign, same setup as the phase-5 exit).
 - [ ] **Phase 7 — search UX extras**: search_after, fast-field sort,
   term + completion suggesters, synonyms with hot-reload, more_like_this.
 - [ ] **Phase 8 — ES-compatible REST subset (decision checkpoint)**:

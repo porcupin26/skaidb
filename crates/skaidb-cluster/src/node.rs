@@ -4366,6 +4366,29 @@ impl Cluster for Coordinator {
             .search_commit_if_dirty(table, query, k, filter, highlights)
     }
 
+    fn search_aggregate(
+        &mut self,
+        table: &str,
+        query: &skaidb_fts::SearchQuery,
+        agg: &skaidb_fts::AggRequest,
+    ) -> EngineResult<Option<Vec<skaidb_fts::AggRow>>> {
+        // Exact pushdown needs one index that holds every row: a sole
+        // member, or RF ≥ members (each node replicates the whole table).
+        // Sharded corpora (RF < members) decline — per-shard partials
+        // would double-count replicated rows; the coordinator falls back
+        // to the deduped row gather. Partial-merge with per-key ownership
+        // filters is future work (docs/FTS_TODO.md phase 6).
+        let members = self.node.member_count();
+        if members > 1 && self.node.cfg.replication_factor < members {
+            return Ok(None);
+        }
+        self.node
+            .local
+            .write()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .search_aggregate(table, query, agg)
+    }
+
     fn matching_rows(
         &self,
         table: &str,
@@ -5243,6 +5266,58 @@ mod tests {
             assert!(
                 matches!(&row[1], Value::String(s) if s.contains("<b>roasted</b>")),
                 "snippet: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn distributed_search_aggregates() {
+        // rf=1 over three members: the exact-pushdown gate declines
+        // (per-shard partials would need ownership filters), so grouped
+        // search SELECTs take the coordinator fallback — matching rows are
+        // gathered (deduped by key) and aggregated there. Completeness of
+        // the groups proves the cross-shard gather.
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let na = Node::new(Database::open(temp_dir("fagg-a")).unwrap(), rf1("a", &a, &members));
+        let nb = Node::new(Database::open(temp_dir("fagg-b")).unwrap(), rf1("b", &b, &members));
+        let nc = Node::new(Database::open(temp_dir("fagg-c")).unwrap(), rf1("c", &c, &members));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        nc.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE s (PRIMARY KEY (id))").unwrap();
+        na.execute(
+            "CREATE SEARCH INDEX s_fts ON s (product, region, units) WITH (\
+             region.type = 'keyword', units.type = 'long')",
+        )
+        .unwrap();
+        for i in 1..=30 {
+            let region = if i % 2 == 0 { "east" } else { "west" };
+            na.execute(&format!(
+                "INSERT INTO s (id, product, region, units) VALUES ({i}, 'widget number {i}', '{region}', {i})"
+            ))
+            .unwrap();
+        }
+
+        for coord in [&na, &nb, &nc] {
+            let rs = rows(
+                coord
+                    .execute(
+                        "SELECT region, COUNT(*), SUM(units) FROM s \
+                         WHERE MATCH(product, 'widget') GROUP BY region",
+                    )
+                    .unwrap(),
+            );
+            let mut got = rs.rows;
+            got.sort_by_key(|r| r[0].encode_key());
+            assert_eq!(
+                got,
+                vec![
+                    // east: 15 even ids summing to 240; west: 15 odd = 225.
+                    vec![Value::String("east".into()), Value::Int(15), Value::Int(240)],
+                    vec![Value::String("west".into()), Value::Int(15), Value::Int(225)],
+                ]
             );
         }
     }

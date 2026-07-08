@@ -52,6 +52,55 @@ pub struct Watermark {
     pub logical: u32,
 }
 
+/// A grouped-facet request the engine pushes into the index (phase 6):
+/// terms buckets over one **keyword fast-field** column — or one global
+/// row — with metrics over numeric fast fields. Serializable so the
+/// cluster layer can ship it to peers.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AggRequest {
+    /// Keyword column to bucket by; `None` = a single global row.
+    pub group_by: Option<String>,
+    pub metrics: Vec<AggMetric>,
+}
+
+/// One metric within an [`AggRequest`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AggMetric {
+    pub func: AggMetricFunc,
+    /// The numeric column the metric reads; `None` only for `Count`
+    /// (`COUNT(*)` reads the bucket's doc count).
+    pub column: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AggMetricFunc {
+    /// `COUNT(*)` — bucket doc count.
+    Count,
+    /// `COUNT(col)` — number of present values.
+    ValueCount,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+/// One aggregation result bucket. Values come back as engine [`Value`]s
+/// typed by the column declarations (a `SUM` over a `long` column is an
+/// `Int`, matching what the row-materialization path computes), `Null`
+/// where SQL says NULL — no values in the bucket, including `SUM`, which
+/// SQL nulls but ES-style aggregations report as 0.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggRow {
+    /// Bucket key (`String` for a keyword bucket); `Null` for the global
+    /// row and for rows missing the group column (SQL's NULL group).
+    pub key: skaidb_types::Value,
+    /// Docs in the bucket.
+    pub count: u64,
+    /// One entry per requested metric, in request order.
+    pub metrics: Vec<skaidb_types::Value>,
+}
+
 /// One search result: the row's primary-key bytes and its BM25 score.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchHit {

@@ -23,7 +23,8 @@ use tantivy::{DateTime, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDo
 
 use crate::query::{build_query, FieldRuntime, QueryFields};
 use crate::{
-    analyzer, Analyzer, FieldType, FtsError, SearchHit, SearchIndexConfig, SearchQuery, Watermark,
+    analyzer, AggMetricFunc, AggRequest, AggRow, Analyzer, FieldType, FtsError, SearchHit,
+    SearchIndexConfig, SearchQuery, Watermark,
 };
 
 /// Reserved field holding the row's primary-key bytes.
@@ -411,6 +412,177 @@ impl SearchIndex {
             }
         }
         Ok(keys)
+    }
+
+    /// Exact fast-field aggregation over the rows matching `query`
+    /// (docs/FTS_TODO.md phase 6), or `Ok(None)` when this index cannot
+    /// serve the request **exactly** — unsupported column types, or a
+    /// truncated terms bucket list — and the caller must fall back to
+    /// materializing rows. Missing group values bucket under a sentinel
+    /// and come back as `key: None` (SQL's NULL group); `SUM` over zero
+    /// values is `None` (SQL), not 0 (ES).
+    pub fn aggregate(
+        &self,
+        query: &SearchQuery,
+        req: &AggRequest,
+    ) -> Result<Option<Vec<AggRow>>, FtsError> {
+        use tantivy::aggregation::agg_req::Aggregations;
+        use tantivy::aggregation::{AggContextParams, AggregationCollector};
+        use tantivy::collector::Count;
+
+        /// Rows missing the group column bucket here (returned as key None).
+        const MISSING: &str = "\u{0}__skaidb_missing__";
+        /// Exactness bound on distinct group keys; more buckets → fall back.
+        const MAX_BUCKETS: usize = 65_536;
+
+        // Only **declared** columns qualify — synthetic `.keyword` twins and
+        // `copy_to` targets are not document paths, so the row-materialization
+        // fallback could not compute the same result and outputs must agree.
+        let ftype_of = |col: &str| {
+            self.columns
+                .iter()
+                .find(|c| c.path == col)
+                .map(|c| c.ftype)
+        };
+        if let Some(col) = &req.group_by {
+            if ftype_of(col) != Some(FieldType::Keyword) {
+                return Ok(None); // only keyword fast fields bucket exactly
+            }
+        }
+        // Metric sub-requests: m{i} per metric (+ a value-count companion
+        // for SUM, to null it over empty value sets).
+        let mut metric_aggs = serde_json::Map::new();
+        for (i, metric) in req.metrics.iter().enumerate() {
+            let Some(col) = &metric.column else {
+                continue; // Count reads doc_count
+            };
+            if !matches!(ftype_of(col), Some(FieldType::Long | FieldType::Double)) {
+                return Ok(None);
+            }
+            let name = match metric.func {
+                AggMetricFunc::Count => continue,
+                AggMetricFunc::ValueCount => "value_count",
+                AggMetricFunc::Sum => "sum",
+                AggMetricFunc::Avg => "avg",
+                AggMetricFunc::Min => "min",
+                AggMetricFunc::Max => "max",
+            };
+            metric_aggs.insert(
+                format!("m{i}"),
+                serde_json::json!({ name: {"field": col} }),
+            );
+            if metric.func == AggMetricFunc::Sum {
+                metric_aggs.insert(
+                    format!("m{i}n"),
+                    serde_json::json!({"value_count": {"field": col}}),
+                );
+            }
+        }
+        let request = match &req.group_by {
+            Some(col) => serde_json::json!({
+                "g": {
+                    "terms": {"field": col, "size": MAX_BUCKETS, "missing": MISSING},
+                    "aggs": metric_aggs,
+                }
+            }),
+            None => serde_json::Value::Object(metric_aggs),
+        };
+        let aggs: Aggregations = serde_json::from_value(request)
+            .map_err(|e| FtsError::Engine(format!("agg request: {e}")))?;
+        let collector = AggregationCollector::from_aggs(
+            aggs,
+            AggContextParams {
+                tokenizers: self.index.tokenizers().clone(),
+                ..Default::default()
+            },
+        );
+
+        let q = build_query(
+            &self.index,
+            &QueryFields {
+                fields: &self.runtimes,
+            },
+            query,
+        )?;
+        let searcher = self.reader.searcher();
+        let (total, results) = searcher.search(&q, &(Count, collector))?;
+        let results = serde_json::to_value(results)
+            .map_err(|e| FtsError::Engine(format!("agg result: {e}")))?;
+
+        // Extract one metric row from a bucket (or the root) object, typing
+        // each value by the metric's declared column (so the pushdown's
+        // output is indistinguishable from the row-materialization path's).
+        let metrics_of = |obj: &serde_json::Value, count: u64| -> Vec<Value> {
+            req.metrics
+                .iter()
+                .enumerate()
+                .map(|(i, metric)| {
+                    let raw = obj[format!("m{i}")]["value"].as_f64();
+                    match metric.func {
+                        AggMetricFunc::Count => Value::Int(count as i64),
+                        AggMetricFunc::ValueCount => {
+                            Value::Int(raw.unwrap_or(0.0) as i64)
+                        }
+                        AggMetricFunc::Sum
+                            if obj[format!("m{i}n")]["value"].as_f64() == Some(0.0) =>
+                        {
+                            Value::Null
+                        }
+                        AggMetricFunc::Avg => raw.map_or(Value::Null, Value::Float),
+                        AggMetricFunc::Sum | AggMetricFunc::Min | AggMetricFunc::Max => {
+                            match raw {
+                                None => Value::Null,
+                                Some(v)
+                                    if metric.column.as_deref().and_then(ftype_of)
+                                        == Some(FieldType::Long) =>
+                                {
+                                    Value::Int(v as i64)
+                                }
+                                Some(v) => Value::Float(v),
+                            }
+                        }
+                    }
+                })
+                .collect()
+        };
+
+        match &req.group_by {
+            None => Ok(Some(vec![AggRow {
+                key: Value::Null,
+                count: total as u64,
+                metrics: metrics_of(&results, total as u64),
+            }])),
+            Some(_) => {
+                let g = &results["g"];
+                if g["sum_other_doc_count"].as_u64().unwrap_or(0) != 0 {
+                    return Ok(None); // truncated: not exact, fall back
+                }
+                let Some(buckets) = g["buckets"].as_array() else {
+                    return Ok(None);
+                };
+                let mut rows = Vec::with_capacity(buckets.len());
+                let mut bucketed = 0u64;
+                for bucket in buckets {
+                    let count = bucket["doc_count"].as_u64().unwrap_or(0);
+                    bucketed += count;
+                    let key = match bucket["key"].as_str() {
+                        Some(MISSING) | None => Value::Null,
+                        Some(k) => Value::String(k.to_string()),
+                    };
+                    rows.push(AggRow {
+                        key,
+                        count,
+                        metrics: metrics_of(bucket, count),
+                    });
+                }
+                // Exactness cross-check: every matching doc must be in some
+                // bucket (guards against silent drops).
+                if bucketed != total as u64 {
+                    return Ok(None);
+                }
+                Ok(Some(rows))
+            }
+        }
     }
 
     /// Build a [`Highlighter`] for `query` over one text column: snippets of
@@ -1088,6 +1260,103 @@ mod tests {
             ]))
             .unwrap();
         assert_eq!(hits, vec![b"k2".to_vec()]);
+    }
+
+    #[test]
+    fn aggregate_terms_buckets_and_metrics() {
+        use crate::AggMetric;
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = config(
+            &["body", "category", "price"],
+            &[("category.type", "keyword"), ("price.type", "double")],
+        );
+        let mut idx = open(tmp.path(), &cfg);
+        let put = |idx: &mut SearchIndex, key: &[u8], body: &str, cat: Option<&str>, price: f64, w| {
+            let mut pairs = vec![
+                ("body", Value::String(body.into())),
+                ("price", Value::Float(price)),
+            ];
+            if let Some(cat) = cat {
+                pairs.push(("category", Value::String(cat.into())));
+            }
+            idx.put(key, &doc(&pairs), wm(w)).unwrap();
+        };
+        put(&mut idx, b"k1", "red apple", Some("fruit"), 10.0, 1);
+        put(&mut idx, b"k2", "green apple", Some("fruit"), 20.0, 2);
+        put(&mut idx, b"k3", "red brick", Some("building"), 5.0, 3);
+        put(&mut idx, b"k4", "red roof", None, 7.0, 4); // NULL group
+        idx.commit().unwrap();
+
+        let req = AggRequest {
+            group_by: Some("category".into()),
+            metrics: vec![
+                AggMetric {
+                    func: AggMetricFunc::Count,
+                    column: None,
+                },
+                AggMetric {
+                    func: AggMetricFunc::Sum,
+                    column: Some("price".into()),
+                },
+            ],
+        };
+        let mut rows = idx
+            .aggregate(&matches("body", "red"), &req)
+            .unwrap()
+            .expect("exact");
+        rows.sort_by(|a, b| a.key.encode_key().cmp(&b.key.encode_key()));
+        assert_eq!(rows.len(), 3);
+        let flat: Vec<(Value, u64, Value)> = rows
+            .iter()
+            .map(|r| (r.key.clone(), r.count, r.metrics[1].clone()))
+            .collect();
+        assert!(flat.contains(&(Value::Null, 1, Value::Float(7.0)))); // NULL group
+        assert!(flat.contains(&(Value::String("building".into()), 1, Value::Float(5.0))));
+        assert!(flat.contains(&(Value::String("fruit".into()), 1, Value::Float(10.0))));
+
+        // Global (no GROUP BY): one row over the whole match set.
+        let global = AggRequest {
+            group_by: None,
+            metrics: vec![
+                AggMetric {
+                    func: AggMetricFunc::Count,
+                    column: None,
+                },
+                AggMetric {
+                    func: AggMetricFunc::Max,
+                    column: Some("price".into()),
+                },
+                AggMetric {
+                    func: AggMetricFunc::Avg,
+                    column: Some("price".into()),
+                },
+            ],
+        };
+        let rows = idx
+            .aggregate(&matches("body", "apple"), &global)
+            .unwrap()
+            .expect("exact");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].count, 2);
+        assert_eq!(rows[0].metrics[1], Value::Float(20.0));
+        assert_eq!(rows[0].metrics[2], Value::Float(15.0));
+
+        // Unsupported shapes bail to the fallback, never approximate:
+        // grouping by an analyzed text column...
+        let bad = AggRequest {
+            group_by: Some("body".into()),
+            metrics: vec![],
+        };
+        assert!(idx.aggregate(&matches("body", "red"), &bad).unwrap().is_none());
+        // ...or a metric over a non-numeric column.
+        let bad = AggRequest {
+            group_by: Some("category".into()),
+            metrics: vec![AggMetric {
+                func: AggMetricFunc::Sum,
+                column: Some("body".into()),
+            }],
+        };
+        assert!(idx.aggregate(&matches("body", "red"), &bad).unwrap().is_none());
     }
 
     #[test]

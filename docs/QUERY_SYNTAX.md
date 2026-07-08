@@ -326,9 +326,14 @@ WHERE (MATCH(body, 'rust') OR MATCH(title, 'rust'))
   unspecified order.
 - The named column(s) must be covered by a search index on the table —
   errors if none exists. Query text may be a bind parameter (`?`).
-- Cannot combine with `JOIN`, `UNION`, aggregates/`GROUP BY`, `DISTINCT`, or
-  `NEAREST`. Residual `WHERE` conditions, `LIMIT`, and `OFFSET` apply
-  normally, post-search.
+- **Aggregates / `GROUP BY` work over search queries**
+  (`SELECT region, COUNT(*) … WHERE MATCH(…) GROUP BY region`) — simple
+  keyword-column groupings with `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` push down
+  as exact fast-field facets; every other shape (HAVING, `time_bucket`,
+  text-column grouping, residual predicates) aggregates the gathered
+  matching rows. See [SEARCH.md](SEARCH.md#aggregations).
+- Cannot combine with `JOIN`, `UNION`, `DISTINCT`, or `NEAREST`. Residual
+  `WHERE` conditions, `LIMIT`, and `OFFSET` apply normally, post-search.
 - **Visibility:** writes become searchable within `refresh_ms` (default
   1 s, Elasticsearch-style near-real-time); on the single-node write path a
   search after a write sees it immediately. The index is derived data — the

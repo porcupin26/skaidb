@@ -47,13 +47,17 @@ roadmap and benchmarks: [FTS_TODO.md](FTS_TODO.md). Phases 0–5 are done,
 identical 2 GB containers; table + caveats in
 [BENCHMARKS.md](BENCHMARKS.md), which also flushed out and fixed the
 missing background NRT refresher). Shipped state in
-[SEARCH.md](SEARCH.md). All exits are met: the ES perf A/B (phase 5), the
-parity suite at 98.5% strict top-10 overlap (phase 3, after the UAX §29
-tokenizer swap), and the fleet smoke + cluster scatter leg on the v0.39
-test cluster (phase 4 — kill/rejoin convergence included, scatter well
-under the ≤ 10 ms p99 budget). Remaining niceties: explain/cross_fields
-(phase 3, minor), merge-policy tuning if stalls ever surface. Next
-action: **phase 6** (aggregations/facets).
+[SEARCH.md](SEARCH.md). All phase 0–5 exits are met: the ES perf A/B
+(phase 5), the parity suite at 98.5% strict top-10 overlap (phase 3,
+after the UAX §29 tokenizer swap), and the fleet smoke + cluster scatter
+leg on the v0.39 test cluster (phase 4 — kill/rejoin convergence
+included). The phase-6 aggregation core has shipped (GROUP BY/aggregates
+over search queries; exact fast-field facet pushdown with a
+row-materialization fallback correct at any RF). Remaining: phase-6
+extras (histogram pushdown, cardinality, top_hits, sharded partials, ES
+logs-track exit bench), explain/cross_fields (phase 3, minor). Next
+action: phase-6 extras or **phase 7** (search UX: search_after, sort,
+suggesters, synonyms).
 
 ## 3. Other
 

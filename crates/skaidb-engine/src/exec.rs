@@ -890,6 +890,38 @@ impl Database {
         self.search_local(table, query, k)
     }
 
+    /// Exact fast-field aggregation over the local index (read-your-writes:
+    /// pending index writes commit first). `Ok(None)` = the index cannot
+    /// serve this request exactly; the caller falls back to rows.
+    pub fn search_aggregate(
+        &mut self,
+        table: &str,
+        query: &SearchQuery,
+        agg: &skaidb_fts::AggRequest,
+    ) -> Result<Option<Vec<skaidb_fts::AggRow>>> {
+        let name = self.search_index_for_query(table, query)?;
+        if let Some(live) = self.search_indexes.get_mut(&name) {
+            live.commit_if_dirty()?;
+        }
+        self.search_aggregate_read(table, query, agg)
+    }
+
+    /// [`Database::search_aggregate`] over the last-committed index state
+    /// (the shared/read-only path).
+    pub fn search_aggregate_read(
+        &self,
+        table: &str,
+        query: &SearchQuery,
+        agg: &skaidb_fts::AggRequest,
+    ) -> Result<Option<Vec<skaidb_fts::AggRow>>> {
+        let name = self.search_index_for_query(table, query)?;
+        let live = self
+            .search_indexes
+            .get(&name)
+            .ok_or(EngineError::IndexNotFound(name))?;
+        Ok(live.index.aggregate(query, agg)?)
+    }
+
     /// A snippet generator for `query` over `column`, from the index
     /// serving the query — the cluster coordinator highlights re-read rows
     /// with this after the scatter merge.
@@ -3471,6 +3503,20 @@ pub trait Cluster {
             "full-text search is not supported on this deployment".into(),
         ))
     }
+    /// Exact fast-field aggregation pushdown for a grouped search SELECT
+    /// (docs/FTS_TODO.md phase 6), or `Ok(None)` when this deployment or
+    /// request shape cannot serve it **exactly** — the caller falls back to
+    /// materializing the matching rows and aggregating those. The default
+    /// (and any deployment whose local index does not hold every row)
+    /// declines.
+    fn search_aggregate(
+        &mut self,
+        _table: &str,
+        _query: &SearchQuery,
+        _agg: &skaidb_fts::AggRequest,
+    ) -> Result<Option<Vec<skaidb_fts::AggRow>>> {
+        Ok(None)
+    }
     /// Write `doc` under `key` in `table` (and maintain indexes/replicas).
     fn put(&mut self, table: &str, key: &[u8], doc: &Document) -> Result<()>;
     /// Write a whole statement's rows in one call. Implementations may batch
@@ -3994,11 +4040,6 @@ fn run_search_select(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSe
             "MATCH()/SEARCH() cannot be combined with JOIN or UNION".into(),
         ));
     }
-    if is_grouped(sel) || sel.having.is_some() {
-        return Err(EngineError::Unsupported(
-            "MATCH()/SEARCH() cannot be combined with aggregates or GROUP BY".into(),
-        ));
-    }
     if sel.distinct {
         return Err(EngineError::Unsupported(
             "MATCH()/SEARCH() cannot be combined with DISTINCT".into(),
@@ -4020,6 +4061,23 @@ fn run_search_select(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSe
         1 => queries.pop().expect("len checked"),
         _ => SearchQuery::All(queries),
     };
+    // Aggregates / GROUP BY over a search (phase 6): push exact fast-field
+    // facets into the index when the shape and deployment allow; otherwise
+    // materialize the matching rows (deduped by key at the coordinator, so
+    // correct at any replication factor) and run the ordinary grouped
+    // projection over them.
+    if is_grouped(sel) {
+        if residual.is_none() {
+            if let Some((agg, outs)) = map_search_aggregate(sel) {
+                if let Some(rows) = cluster.search_aggregate(&sel.from, &query, &agg)? {
+                    return finish_agg_pushdown(sel, rows, &outs);
+                }
+            }
+        }
+        let hits = cluster.search(&sel.from, &query, None, &residual, &[])?;
+        let docs: Vec<Document> = hits.into_iter().map(|(_, doc, _)| doc).collect();
+        return select_aggregate(sel, docs, true);
+    }
     // ORDER BY: absent (predicate-only), or exactly `score() DESC` with a
     // LIMIT (the index cannot rank without a bound).
     let k = match sel.order_by.as_slice() {
@@ -4048,6 +4106,107 @@ fn run_search_select(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSe
     // `project` with `finalize` applies the ORDER BY (score() reads the
     // injected `_score`) and the OFFSET/LIMIT page.
     project(sel, docs, &HashSet::new(), true)
+}
+
+/// What each select item of an agg-pushdown query reads from an
+/// [`skaidb_fts::AggRow`].
+enum AggOut {
+    /// The GROUP BY column — the bucket key.
+    GroupKey,
+    /// The i-th requested metric.
+    Metric(usize),
+}
+
+/// Map a grouped search SELECT onto an exact fast-field [`AggRequest`],
+/// when its shape allows: at most one plain-column GROUP BY, and items
+/// that are the group column or simple aggregates
+/// (`COUNT(*)`/`COUNT(col)`/`SUM`/`AVG`/`MIN`/`MAX` over a column).
+/// HAVING/ORDER BY/OFFSET force the row-materialization path instead —
+/// the fallback computes them with the ordinary grouped executor.
+fn map_search_aggregate(sel: &Select) -> Option<(skaidb_fts::AggRequest, Vec<AggOut>)> {
+    if sel.having.is_some() || !sel.order_by.is_empty() || sel.offset.is_some() {
+        return None;
+    }
+    let group_by = match sel.group_by.as_slice() {
+        [] => None,
+        [Expr::Column(c)] => Some(c.clone()),
+        _ => return None,
+    };
+    let mut metrics = Vec::new();
+    let mut outs = Vec::with_capacity(sel.items.len());
+    for item in &sel.items {
+        let SelectItem::Expr { expr, .. } = item else {
+            return None;
+        };
+        match expr {
+            Expr::Column(c) if Some(c) == group_by.as_ref() => outs.push(AggOut::GroupKey),
+            Expr::Aggregate { func, arg } => {
+                let metric = match (func, arg) {
+                    (AggFunc::Count, AggArg::Star) => skaidb_fts::AggMetric {
+                        func: skaidb_fts::AggMetricFunc::Count,
+                        column: None,
+                    },
+                    (func, AggArg::Expr(e)) => {
+                        let Expr::Column(col) = &**e else {
+                            return None;
+                        };
+                        let mfunc = match func {
+                            AggFunc::Count => skaidb_fts::AggMetricFunc::ValueCount,
+                            AggFunc::Sum => skaidb_fts::AggMetricFunc::Sum,
+                            AggFunc::Avg => skaidb_fts::AggMetricFunc::Avg,
+                            AggFunc::Min => skaidb_fts::AggMetricFunc::Min,
+                            AggFunc::Max => skaidb_fts::AggMetricFunc::Max,
+                            // Time-series aggregates never push into a
+                            // search index.
+                            _ => return None,
+                        };
+                        skaidb_fts::AggMetric {
+                            func: mfunc,
+                            column: Some(col.clone()),
+                        }
+                    }
+                    _ => return None,
+                };
+                outs.push(AggOut::Metric(metrics.len()));
+                metrics.push(metric);
+            }
+            _ => return None,
+        }
+    }
+    Some((skaidb_fts::AggRequest { group_by, metrics }, outs))
+}
+
+/// Turn pushed-down aggregation rows into the SELECT's result set (columns
+/// named like the grouped executor names them; LIMIT applied — group order
+/// is unspecified, exactly as on the fallback path).
+fn finish_agg_pushdown(
+    sel: &Select,
+    rows: Vec<skaidb_fts::AggRow>,
+    outs: &[AggOut],
+) -> Result<ResultSet> {
+    let columns: Vec<String> = sel
+        .items
+        .iter()
+        .map(|item| match item {
+            SelectItem::Wildcard => unreachable!("wildcard never maps to a pushdown"),
+            SelectItem::Expr { expr, alias } => alias.clone().unwrap_or_else(|| expr_name(expr)),
+        })
+        .collect();
+    let mut out: Vec<Vec<Value>> = rows
+        .into_iter()
+        .map(|row| {
+            outs.iter()
+                .map(|o| match o {
+                    AggOut::GroupKey => row.key.clone(),
+                    AggOut::Metric(i) => row.metrics[*i].clone(),
+                })
+                .collect()
+        })
+        .collect();
+    if let Some(limit) = sel.limit {
+        out.truncate(limit as usize);
+    }
+    Ok(ResultSet { columns, rows: out })
 }
 
 /// The `HIGHLIGHT(column [, max_chars])` requests in a search SELECT's
@@ -4691,6 +4850,15 @@ impl Cluster for LocalCluster<'_> {
             .search_commit_if_dirty(table, query, k, filter, highlights)
     }
 
+    fn search_aggregate(
+        &mut self,
+        table: &str,
+        query: &SearchQuery,
+        agg: &skaidb_fts::AggRequest,
+    ) -> Result<Option<Vec<skaidb_fts::AggRow>>> {
+        self.db.search_aggregate(table, query, agg)
+    }
+
     fn put(&mut self, table: &str, key: &[u8], doc: &Document) -> Result<()> {
         if self.put_row(table, key, doc)? {
             self.db.search_refresh(table)?;
@@ -4818,6 +4986,15 @@ impl Cluster for LocalRead<'_> {
         // Shared access: serve the last-committed index state (NRT — at most
         // `refresh_ms` stale) rather than committing pending writes.
         self.db.search_read(table, query, k, filter, highlights)
+    }
+
+    fn search_aggregate(
+        &mut self,
+        table: &str,
+        query: &SearchQuery,
+        agg: &skaidb_fts::AggRequest,
+    ) -> Result<Option<Vec<skaidb_fts::AggRow>>> {
+        self.db.search_aggregate_read(table, query, agg)
     }
 
     fn put(&mut self, _table: &str, _key: &[u8], _doc: &Document) -> Result<()> {
