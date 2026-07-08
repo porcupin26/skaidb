@@ -57,7 +57,13 @@
   </section>
 
   <section id="tab-query" hidden>
-    <div class="card wide">
+    <div class="qlayout">
+    <div class="card qschema">
+      <h2>schema <button id="q-schema-refresh" class="ghost">refresh</button></h2>
+      <div id="q-schema"></div>
+      <p class="muted" id="q-schema-note" hidden></p>
+    </div>
+    <div class="card qmain">
       <div class="qbar">
         <select id="q-canned">
           <option value="">canned…</option>
@@ -86,6 +92,7 @@
       <p id="q-error" class="error" hidden></p>
       <p id="q-banner" class="muted" hidden></p>
       <div id="q-results" class="results"></div>
+    </div>
     </div>
   </section>
 

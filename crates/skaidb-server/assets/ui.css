@@ -59,7 +59,8 @@ nav#tabs button {
 }
 nav#tabs button.active { color: var(--ink); background: var(--panel); border-color: var(--line); }
 table { border-collapse: collapse; width: 100%; }
-table.kv td { padding: 4px 0; border-bottom: 1px solid var(--line); }
+table.kv { table-layout: fixed; }
+table.kv td { padding: 4px 8px 4px 0; border-bottom: 1px solid var(--line); overflow: hidden; }
 table.kv td:first-child { color: var(--muted); width: 45%; }
 table.kv tr:last-child td { border-bottom: none; }
 #members th, #members td {
@@ -67,6 +68,18 @@ table.kv tr:last-child td { border-bottom: none; }
   font-variant-numeric: tabular-nums;
 }
 #members th { color: var(--muted); font-weight: 600; font-size: 12px; }
+.qlayout { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+.qschema { flex: 0 1 220px; min-width: 180px; }
+.qmain { flex: 1 1 480px; min-width: 0; }
+.qdb { margin: 6px 0 2px; font-weight: 600; font-size: 13px; }
+.qdb .muted { font-weight: 400; }
+.qtable {
+  display: block; width: 100%; text-align: left; background: none;
+  border: none; color: var(--accent); padding: 2px 0 2px 12px;
+  font: 13px/1.4 ui-monospace, "SF Mono", Consolas, monospace; cursor: pointer;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.qtable:hover { text-decoration: underline; }
 .qbar { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
 select {
   font: inherit; color: inherit; background: var(--bg);
@@ -92,10 +105,17 @@ textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 }
 .results td.null { color: var(--muted); font-style: italic; }
 .results b { color: var(--accent); }
-.spark { vertical-align: middle; opacity: 0.9; }
-.valspark {
-  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+/* The canvas raster is 120x22; CSS scales it down when the cell is
+   narrower so it can never spill out of its card. */
+.spark {
+  vertical-align: middle; opacity: 0.9;
+  width: 120px; max-width: 55%; height: 22px; flex: 0 1 auto;
 }
+.valspark {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; min-width: 0;
+}
+.valspark > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ok { color: var(--ok); }
 .bad { color: var(--error); }
 .error { color: var(--error); font-size: 13px; }

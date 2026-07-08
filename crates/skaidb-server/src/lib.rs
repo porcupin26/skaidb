@@ -787,6 +787,57 @@ mod tests {
         assert_eq!(status, 500, "{body}");
     }
 
+    /// `GET /ui/schema` returns only what the role may see: the superuser
+    /// sees everything; a role with one table grant sees that table (and
+    /// its database) and nothing else.
+    #[test]
+    fn ui_schema_filters_by_role() {
+        let ctx = temp_ctx();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx.clone()).unwrap();
+        let post = |sql: &str| {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            let head = format!(
+                "POST /query HTTP/1.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                sql.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(sql.as_bytes()).unwrap();
+            let mut resp = String::new();
+            stream.read_to_string(&mut resp).unwrap();
+            resp
+        };
+        post("CREATE TABLE open_t (PRIMARY KEY (id))");
+        post("CREATE TABLE secret_t (PRIMARY KEY (id))");
+        post("CREATE DATABASE other");
+        post(r#"{"sql": "CREATE TABLE hidden_t (PRIMARY KEY (id))", "db": "other"}"#);
+        post("CREATE ROLE viewer");
+        post("GRANT SELECT ON open_t TO viewer");
+
+        // Superuser (auth disabled): everything.
+        let get = |path: &str| {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream
+                .write_all(format!("GET {path} HTTP/1.1\r\nConnection: close\r\n\r\n").as_bytes())
+                .unwrap();
+            let mut resp = String::new();
+            stream.read_to_string(&mut resp).unwrap();
+            resp
+        };
+        let resp = get("/ui/schema");
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        for name in ["open_t", "secret_t", "hidden_t", "\"name\":\"other\""] {
+            assert!(resp.contains(name), "missing {name}: {resp}");
+        }
+
+        // A table-granted role: its table and database only.
+        let (status, body) = crate::ui::schema_json(&ctx, "viewer");
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("open_t"), "{body}");
+        assert!(!body.contains("secret_t"), "{body}");
+        assert!(!body.contains("hidden_t"), "{body}");
+        assert!(!body.contains("\"name\":\"other\""), "{body}");
+    }
+
     /// The query console's per-request session database: `{"sql", "db"}`
     /// runs the statement with `db` current (the stateless gateway carries
     /// no session), and a bad name errors like `USE` would.

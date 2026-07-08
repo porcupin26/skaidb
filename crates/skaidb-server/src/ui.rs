@@ -9,7 +9,7 @@
 //! request, so `config set ui.enabled false` 404s the whole prefix
 //! immediately — indistinguishable from a build without a UI.
 
-use serde_json::json;
+use serde_json::{json, Value as Json};
 
 use crate::shared::Shared;
 
@@ -70,6 +70,67 @@ pub fn try_route(ctx: &Shared, path: &str) -> Option<Asset> {
         },
     };
     Some(asset)
+}
+
+/// The schema visible to `role` — databases and their tables, filtered by
+/// the same RBAC check `/query` enforces (`Select` on the table, satisfied
+/// by a table, database, or global grant, following role inheritance). A
+/// database with no visible tables still appears if the role holds a
+/// database-level (or global) grant on it. Serves `GET /ui/schema`
+/// (authenticated; the route in rest.rs resolves `role` first).
+pub fn schema_json(ctx: &Shared, role: &str) -> (u16, String) {
+    use skaidb_proto::Response;
+
+    let run = |sql: &str, db: &str| -> Result<Vec<Vec<skaidb_types::Value>>, String> {
+        let mut current_db = db.to_string();
+        match crate::shared::execute_session_as(ctx, role, &mut current_db, sql, None) {
+            Response::Rows { rows, .. } => Ok(rows),
+            Response::Error(e) => Err(e),
+            other => Err(format!("unexpected response: {other:?}")),
+        }
+    };
+
+    let databases = match run("SHOW DATABASES", skaidb_engine::DEFAULT_DATABASE) {
+        Ok(rows) => rows,
+        Err(e) => return (500, json!({"error": e}).to_string()),
+    };
+    let mut out = Vec::new();
+    for row in databases {
+        let Some(skaidb_types::Value::String(db)) = row.first() else {
+            continue;
+        };
+        let tables = match run("SHOW TABLES", db) {
+            Ok(rows) => rows,
+            Err(_) => continue, // e.g. dropped concurrently
+        };
+        let visible: Vec<Json> = tables
+            .iter()
+            .filter_map(|row| match (row.first(), row.get(1)) {
+                (Some(skaidb_types::Value::String(table)), pk) => ctx
+                    .allowed_on_table(role, skaidb_auth::Privilege::Select, table, db)
+                    .then(|| {
+                        json!({
+                            "name": table,
+                            "primary_key": pk.map(|v| v.to_json()).unwrap_or(Json::Null),
+                        })
+                    }),
+                _ => None,
+            })
+            .collect();
+        let db_granted = ctx.allowed(
+            role,
+            skaidb_auth::Privilege::Select,
+            &skaidb_auth::Object::Database(db.clone()),
+        ) || ctx.allowed(
+            role,
+            skaidb_auth::Privilege::Select,
+            &skaidb_auth::Object::Global,
+        );
+        if !visible.is_empty() || db_granted {
+            out.push(json!({"name": db, "tables": visible}));
+        }
+    }
+    (200, json!({"databases": out}).to_string())
 }
 
 /// What the login screen needs before any authenticated call can succeed.

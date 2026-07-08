@@ -143,7 +143,10 @@ function showTab(name) {
   const authFail = (e) => { if (e instanceof AuthError) logout(); };
   if (name === "config") loadConfig().catch(authFail);
   if (name === "admin") loadSlow().catch(authFail);
-  if (name === "query") $("q-sql").focus();
+  if (name === "query") {
+    loadSchema().catch(authFail);
+    $("q-sql").focus();
+  }
 }
 
 document.querySelector("#tabs").addEventListener("click", (ev) => {
@@ -338,6 +341,54 @@ $("q-canned").addEventListener("change", (ev) => {
   runQuery();
 });
 
+// ---- schema browser (RBAC-filtered server-side via /ui/schema) ----
+async function loadSchema() {
+  const note = $("q-schema-note");
+  note.hidden = true;
+  let schema;
+  try {
+    schema = await api("GET", "/ui/schema");
+  } catch (e) {
+    if (e instanceof AuthError) return logout();
+    note.textContent = e.message;
+    note.hidden = false;
+    return;
+  }
+  const box = $("q-schema");
+  box.textContent = "";
+  const databases = schema.databases || [];
+  for (const db of databases) {
+    const head = document.createElement("div");
+    head.className = "qdb";
+    head.textContent = db.name + " ";
+    const count = document.createElement("span");
+    count.className = "muted";
+    count.textContent = `(${db.tables.length})`;
+    head.append(count);
+    box.append(head);
+    for (const table of db.tables) {
+      const btn = document.createElement("button");
+      btn.className = "qtable";
+      btn.type = "button";
+      btn.textContent = table.name;
+      btn.title = `${db.name}.${table.name} — primary key: ${table.primary_key ?? "?"}`;
+      btn.addEventListener("click", () => {
+        currentDb = db.name;
+        $("q-db").textContent = `db: ${currentDb}`;
+        $("q-sql").value = `SELECT * FROM ${table.name} LIMIT 100`;
+        $("q-sql").focus();
+      });
+      box.append(btn);
+    }
+  }
+  if (!databases.length) {
+    note.textContent = "no databases visible to this role";
+    note.hidden = false;
+  }
+}
+
+$("q-schema-refresh").addEventListener("click", loadSchema);
+
 $("q-history-sel").addEventListener("change", (ev) => {
   if (!ev.target.value) return;
   $("q-sql").value = ev.target.value;
@@ -423,7 +474,7 @@ function withSpark(text, values) {
 }
 
 function fmtBytes(n) {
-  if (n < 1024) return `${n} B`;
+  if (n < 1024) return `${Math.round(n)} B`;
   const units = ["KB", "MB", "GB", "TB"];
   let i = -1;
   do { n /= 1024; i++; } while (n >= 1024 && i < units.length - 1);
@@ -702,6 +753,7 @@ function logout() {
   $("cfg-sections").textContent = "";
   $("ad-slow").querySelector("tbody").textContent = "";
   $("ad-result").textContent = "";
+  $("q-schema").textContent = "";
   showTab("status");
   show("login");
 }

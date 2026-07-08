@@ -71,6 +71,25 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) -> io::Result<()> {
             "/status" => {
                 return write_response(&mut stream, 200, &status_json(&ctx));
             }
+            // The RBAC-filtered schema browser: authenticated, unlike the
+            // static assets — resolve the role first, then answer with only
+            // what it may see. Same live ui.enabled gate as the rest.
+            "/ui/schema" => {
+                let enabled = ctx.config.read().map(|cfg| cfg.ui.enabled).unwrap_or(false);
+                if !enabled {
+                    return write_response(&mut stream, 404, &json!({"error": "not found"}));
+                }
+                let role = if ctx.authn.required {
+                    match basic_auth_role(&ctx, req.authorization.as_deref()) {
+                        Some(role) => role,
+                        None => return write_unauthorized(&mut stream),
+                    }
+                } else {
+                    ctx.superuser_role.clone()
+                };
+                let (status, body) = crate::ui::schema_json(&ctx, &role);
+                return write_json_body(&mut stream, status, &body);
+            }
             // The embedded web UI: static shell + /ui/meta. Gated on the
             // live `ui.enabled` config inside try_route (404 when off).
             path => {

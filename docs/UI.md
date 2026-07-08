@@ -16,7 +16,11 @@ http://127.0.0.1:7080/ui
   ring membership, replication factor, consistency levels, hints,
   resharding) cards, plus a members table with configured-vs-ring
   discrepancies. Auto-refreshes every 5 s.
-- **query** — SQL console. Ctrl/⌘+Enter runs, Alt+↑/↓ cycles history
+- **query** — SQL console with a **schema browser**: databases and tables
+  the logged-in role may read (`GET /ui/schema`, filtered server-side by
+  the same RBAC check `/query` enforces — table, database, and global
+  grants, role inheritance included); clicking a table targets its
+  database and pre-fills a `SELECT`. Ctrl/⌘+Enter runs, Alt+↑/↓ cycles history
   (kept in `localStorage`, statements only — never results or
   credentials), canned-statement and history dropdowns, CSV/JSON export,
   client-measured latency. Results render escaped; FTS `HIGHLIGHT()`
