@@ -147,6 +147,7 @@ function showTab(name) {
     loadSchema().catch(authFail);
     $("q-sql").focus();
   }
+  if (name === "search") populateSearchTables();
 }
 
 document.querySelector("#tabs").addEventListener("click", (ev) => {
@@ -279,9 +280,12 @@ async function runQuery() {
   lastResult = null;
   $("q-results").textContent = "";
   $("q-banner").hidden = true;
+  $("q-chart").hidden = true;
+  $("q-chart").textContent = "";
   if (result && Array.isArray(result.columns)) {
     lastResult = result;
     renderRows(result.columns, result.rows);
+    renderChart(result.columns, result.rows);
     $("q-meta").textContent = `${result.rows.length} row${result.rows.length === 1 ? "" : "s"} · ${ms} ms`;
   } else if (result && result.affected !== undefined) {
     $("q-meta").textContent = `${result.affected} affected · ${ms} ms`;
@@ -395,6 +399,171 @@ $("q-history-sel").addEventListener("change", (ev) => {
   ev.target.value = "";
   $("q-sql").focus();
 });
+
+// ---- search tab (FTS playground, SUGGEST, ES tester) ----
+function sqlQuote(s) {
+  return "'" + s.replaceAll("'", "''") + "'";
+}
+
+// Run a built statement through the query console (one rendering path:
+// highlight tokens, exports, history all behave like a typed query).
+function runInConsole(sql) {
+  $("q-sql").value = sql;
+  showTab("query");
+  runQuery();
+}
+
+$("s-run").addEventListener("click", () => {
+  const table = $("s-table").value;
+  const col = $("s-col").value.trim();
+  const mode = $("s-mode").value;
+  const text = $("s-text").value;
+  const limit = Math.max(1, parseInt($("s-limit").value, 10) || 10);
+  if (!table || !text || (mode !== "SEARCH" && !col)) return;
+  const pred = mode === "SEARCH"
+    ? `SEARCH(${sqlQuote(text)})`
+    : `${mode}(${col}, ${sqlQuote(text)})`;
+  const hl = col ? `, HIGHLIGHT(${col}) AS snippet` : "";
+  runInConsole(
+    `SELECT *${hl} FROM ${table} WHERE ${pred} ORDER BY score() DESC LIMIT ${limit}`,
+  );
+});
+
+$("sg-run").addEventListener("click", () => {
+  const index = $("sg-index").value.trim();
+  const text = $("sg-text").value;
+  if (index && text) runInConsole(`SUGGEST ${sqlQuote(text)} ON ${index}`);
+});
+
+async function populateSearchTables() {
+  let schema;
+  try {
+    schema = await api("GET", "/ui/schema");
+  } catch {
+    return;
+  }
+  const sel = $("s-table");
+  const current = sel.value;
+  sel.textContent = "";
+  const head = document.createElement("option");
+  head.value = "";
+  head.textContent = "table…";
+  sel.append(head);
+  for (const db of schema.databases || []) {
+    for (const table of db.tables) {
+      // The playground runs in the console session, which targets
+      // `currentDb` — list that database's tables.
+      if (db.name !== currentDb) continue;
+      const opt = document.createElement("option");
+      opt.value = table.name;
+      opt.textContent = table.name;
+      sel.append(opt);
+    }
+  }
+  sel.value = current;
+}
+
+$("es-send").addEventListener("click", async () => {
+  const method = $("es-method").value;
+  const path = $("es-path").value.trim();
+  const body = $("es-body").value.trim();
+  const err = $("es-error");
+  const out = $("es-out");
+  err.hidden = true;
+  out.hidden = true;
+  if (!path.startsWith("/")) {
+    err.textContent = "path must start with /";
+    err.hidden = false;
+    return;
+  }
+  try {
+    const resp = await api(method, path, body === "" ? "{}" : body);
+    out.textContent = JSON.stringify(resp, null, 2);
+    out.hidden = false;
+  } catch (e) {
+    if (e instanceof AuthError) return logout();
+    err.textContent = e.message;
+    err.hidden = false;
+  }
+});
+
+// ---- result mini chart (time series in the console) ----
+const CHART_COLORS = ["#2563eb", "#16a34a", "#d97706", "#dc2626", "#7c3aed", "#0891b2"];
+
+// A line chart when the result looks like a time series: a numeric
+/// column named like time plus at least one other numeric column.
+function renderChart(columns, rows) {
+  const box = $("q-chart");
+  box.hidden = true;
+  box.textContent = "";
+  if (rows.length < 2) return;
+  const timeIdx = columns.findIndex((c) =>
+    ["ts", "t", "time", "bucket", "timestamp"].includes(c.toLowerCase()));
+  if (timeIdx < 0 || typeof rows[0][timeIdx] !== "number") return;
+  const numericIdx = columns
+    .map((_, i) => i)
+    .filter((i) => i !== timeIdx && rows.some((r) => typeof r[i] === "number"));
+  if (!numericIdx.length) return;
+
+  const points = rows
+    .filter((r) => typeof r[timeIdx] === "number")
+    .slice()
+    .sort((a, b) => a[timeIdx] - b[timeIdx]);
+  const t0 = points[0][timeIdx];
+  const t1 = points[points.length - 1][timeIdx];
+  if (t1 === t0) return;
+
+  const canvas = document.createElement("canvas");
+  const width = Math.max(320, Math.min(box.parentElement.clientWidth || 800, 1100));
+  canvas.width = width;
+  canvas.height = 160;
+  const g = canvas.getContext("2d");
+  const pad = { l: 8, r: 8, t: 8, b: 8 };
+  let vmin = Infinity;
+  let vmax = -Infinity;
+  for (const i of numericIdx) {
+    for (const r of points) {
+      if (typeof r[i] === "number") {
+        vmin = Math.min(vmin, r[i]);
+        vmax = Math.max(vmax, r[i]);
+      }
+    }
+  }
+  if (vmin === vmax) {
+    vmin -= 1;
+    vmax += 1;
+  }
+  const x = (t) => pad.l + ((t - t0) / (t1 - t0)) * (width - pad.l - pad.r);
+  const y = (v) => canvas.height - pad.b - ((v - vmin) / (vmax - vmin)) * (canvas.height - pad.t - pad.b);
+  numericIdx.forEach((idx, series) => {
+    g.strokeStyle = CHART_COLORS[series % CHART_COLORS.length];
+    g.lineWidth = 1.5;
+    g.beginPath();
+    let started = false;
+    for (const r of points) {
+      if (typeof r[idx] !== "number") continue;
+      if (started) g.lineTo(x(r[timeIdx]), y(r[idx]));
+      else {
+        g.moveTo(x(r[timeIdx]), y(r[idx]));
+        started = true;
+      }
+    }
+    g.stroke();
+  });
+  const legend = document.createElement("p");
+  legend.className = "muted";
+  numericIdx.forEach((idx, series) => {
+    const chip = document.createElement("span");
+    chip.style.color = CHART_COLORS[series % CHART_COLORS.length];
+    chip.textContent = `— ${columns[idx]}  `;
+    legend.append(chip);
+  });
+  const range = document.createElement("span");
+  range.textContent = `(${+vmin.toPrecision(6)} … ${+vmax.toPrecision(6)})`;
+  legend.append(range);
+  box.append(canvas, legend);
+  box.hidden = false;
+}
 
 // ---- stats tab ----
 const STATS_INTERVAL_MS = 5000;
@@ -754,6 +923,10 @@ function logout() {
   $("ad-slow").querySelector("tbody").textContent = "";
   $("ad-result").textContent = "";
   $("q-schema").textContent = "";
+  $("q-chart").textContent = "";
+  $("q-chart").hidden = true;
+  $("es-out").textContent = "";
+  $("es-out").hidden = true;
   showTab("status");
   show("login");
 }

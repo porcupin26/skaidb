@@ -21,6 +21,8 @@ http://127.0.0.1:7080/ui
   the same RBAC check `/query` enforces — table, database, and global
   grants, role inheritance included); clicking a table targets its
   database and pre-fills a `SELECT`. Ctrl/⌘+Enter runs, Alt+↑/↓ cycles history
+  — and when a result looks like a time series (a `ts`/`time`/`bucket`
+  column plus numeric columns), a line chart renders above the table
   (kept in `localStorage`, statements only — never results or
   credentials), canned-statement and history dropdowns, CSV/JSON export,
   client-measured latency. Results render escaped; FTS `HIGHLIGHT()`
@@ -28,6 +30,12 @@ http://127.0.0.1:7080/ui
   `<b>`/`</b>` tokens. Display is capped at 1000 rows with a visible
   banner suggesting a `LIMIT`. `USE <db>` is tracked client-side and sent
   per request (`POST /query` accepts an optional `"db"` JSON key).
+- **search** — the FTS playground: pick a table/column/predicate
+  (`MATCH`/`MATCH_PHRASE`/`FUZZY`/`WILDCARD`/`REGEXP`/`MORE_LIKE_THIS`/
+  `SEARCH`), and it builds the SQL (with `score()` + `HIGHLIGHT()`) and
+  runs it in the query console; a `SUGGEST` tester; and an
+  Elasticsearch-subset request tester (method + path + JSON body →
+  pretty-printed response, same auth as everything else).
 - **stats** — queries/s, mean latency, rows scanned/s, bytes returned/s
   with canvas sparklines (5 s samples, 5 min window), storage/cache/WAL
   counters, and per-table / per-search-index breakdowns from

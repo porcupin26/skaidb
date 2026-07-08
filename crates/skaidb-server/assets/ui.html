@@ -30,6 +30,7 @@
   <nav id="tabs">
     <button data-tab="status" class="active">status</button>
     <button data-tab="query">query</button>
+    <button data-tab="search">search</button>
     <button data-tab="stats">stats</button>
     <button data-tab="config" hidden>config</button>
     <button data-tab="admin" hidden>admin</button>
@@ -91,8 +92,60 @@
       </div>
       <p id="q-error" class="error" hidden></p>
       <p id="q-banner" class="muted" hidden></p>
+      <div id="q-chart" hidden></div>
       <div id="q-results" class="results"></div>
     </div>
+    </div>
+  </section>
+
+  <section id="tab-search" hidden>
+    <div class="cards">
+      <div class="card wide">
+        <h2>full-text search playground</h2>
+        <div class="qbar">
+          <select id="s-table"><option value="">table…</option></select>
+          <input id="s-col" placeholder="column (empty for SEARCH mode)" size="22">
+          <select id="s-mode">
+            <option>MATCH</option>
+            <option>MATCH_PHRASE</option>
+            <option>MATCH_PREFIX</option>
+            <option>FUZZY</option>
+            <option>WILDCARD</option>
+            <option>REGEXP</option>
+            <option>MORE_LIKE_THIS</option>
+            <option value="SEARCH">SEARCH (query string)</option>
+          </select>
+        </div>
+        <div class="qbar">
+          <input id="s-text" placeholder="query text" style="flex:1">
+          <input id="s-limit" value="10" size="3">
+          <button id="s-run">search</button>
+        </div>
+        <p class="muted">Builds the SQL (with <code>score()</code> and
+        <code>HIGHLIGHT()</code>), runs it in the query console, and jumps
+        there — results, exports, and history behave exactly like a typed
+        query.</p>
+      </div>
+      <div class="card">
+        <h2>suggest ("did you mean")</h2>
+        <div class="qbar">
+          <input id="sg-index" placeholder="search index" size="14">
+          <input id="sg-text" placeholder="text" style="flex:1">
+          <button id="sg-run">suggest</button>
+        </div>
+      </div>
+      <div class="card wide">
+        <h2>elasticsearch-subset tester</h2>
+        <div class="qbar">
+          <select id="es-method"><option>POST</option><option>GET</option></select>
+          <input id="es-path" placeholder="/{index}/_search" style="flex:1">
+          <button id="es-send">send</button>
+        </div>
+        <textarea id="es-body" rows="6" spellcheck="false"
+          placeholder='{"query":{"match":{"body":"quick fox"}},"highlight":{"fields":{"body":{}}}}'></textarea>
+        <p id="es-error" class="error" hidden></p>
+        <pre id="es-out" class="results" hidden></pre>
+      </div>
     </div>
   </section>
 

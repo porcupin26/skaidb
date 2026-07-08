@@ -93,9 +93,12 @@ extras below.
 
 ## Web UI
 
-- [ ] **[ui] Phase 5+ extras (demand-driven)**: FTS playground
-  (query + highlight + SUGGEST tester), TS mini graphs from the query
-  console, ES-subset request tester.
+- [x] **[ui] Phase 5+ extras** — shipped: search tab with the FTS
+  playground (predicate builder → runs in the query console with
+  score/HIGHLIGHT), SUGGEST tester, and an ES-subset request tester
+  (method/path/body → pretty JSON); the query console draws a line
+  chart when a result looks like a time series (a ts/time/bucket
+  column + numeric columns); plus the RBAC-filtered schema browser.
 
 ## Other
 
