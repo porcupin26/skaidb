@@ -110,6 +110,8 @@ hardening, and tracked extras.
 
 - [ ] **[perf]** See PERFORMANCE_AUDIT.md for the perf backlog
   (pipelining and paged migration shipped in v0.34.0).
-- [ ] **[docs] Grafana route documentation** — a short docs/GRAFANA.md:
-  pointing the built-in Prometheus datasource at skaidb (works today),
-  the Infinity/SQL recipe as the fallback.
+- [x] **[docs] Grafana route documentation** — [GRAFANA.md](GRAFANA.md):
+  built-in Prometheus datasource pointed at the node (verified
+  buildinfo/labels endpoints live), remote_write ingestion config, the
+  PromQL v1 subset boundaries, Infinity/SQL fallback with dialect-correct
+  time-series SQL.
