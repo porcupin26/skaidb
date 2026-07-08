@@ -125,6 +125,215 @@ function renderMembers(status) {
   }
 }
 
+// ---- tabs ----
+function showTab(name) {
+  for (const btn of document.querySelectorAll("#tabs button")) {
+    btn.classList.toggle("active", btn.dataset.tab === name);
+  }
+  for (const section of document.querySelectorAll("main#app-view > section")) {
+    section.hidden = section.id !== `tab-${name}`;
+  }
+}
+
+document.querySelector("#tabs").addEventListener("click", (ev) => {
+  const tab = ev.target.dataset?.tab;
+  if (tab) showTab(tab);
+});
+
+// ---- query console ----
+let currentDb = "default";
+let lastResult = null; // {columns, rows} of the last SELECT, for exports
+let history = [];
+let histIdx = -1; // cursor for Alt+arrow cycling (-1 = live input)
+const MAX_HISTORY = 100;
+const MAX_RENDER = 1000;
+
+try { history = JSON.parse(localStorage.getItem("skaidb-query-history")) || []; } catch { history = []; }
+
+function pushHistory(sql) {
+  if (history[0] === sql) return;
+  history.unshift(sql);
+  history.length = Math.min(history.length, MAX_HISTORY);
+  localStorage.setItem("skaidb-query-history", JSON.stringify(history));
+  renderHistorySelect();
+}
+
+function renderHistorySelect() {
+  const sel = $("q-history-sel");
+  sel.textContent = "";
+  const head = document.createElement("option");
+  head.value = "";
+  head.textContent = "history…";
+  sel.append(head);
+  for (const sql of history) {
+    const opt = document.createElement("option");
+    opt.value = sql;
+    opt.textContent = sql.length > 80 ? sql.slice(0, 77) + "…" : sql;
+    sel.append(opt);
+  }
+}
+
+// FTS HIGHLIGHT() snippets carry literal <b>…</b> marks. Render them by
+// splitting on those two known tokens — everything else stays text, so no
+// other markup in the value can ever become HTML.
+function renderCell(td, text) {
+  if (text.includes("<b>") && text.includes("</b>")) {
+    let bold = false;
+    for (const part of text.split(/(<\/?b>)/)) {
+      if (part === "<b>") bold = true;
+      else if (part === "</b>") bold = false;
+      else if (part !== "") {
+        if (bold) {
+          const b = document.createElement("b");
+          b.textContent = part;
+          td.append(b);
+        } else {
+          td.append(part);
+        }
+      }
+    }
+  } else {
+    td.textContent = text;
+  }
+}
+
+function renderRows(columns, rows) {
+  const box = $("q-results");
+  box.textContent = "";
+  const table = document.createElement("table");
+  const thead = document.createElement("thead");
+  const hr = document.createElement("tr");
+  for (const c of columns) {
+    const th = document.createElement("th");
+    th.textContent = c;
+    hr.append(th);
+  }
+  thead.append(hr);
+  const tbody = document.createElement("tbody");
+  for (const row of rows.slice(0, MAX_RENDER)) {
+    const tr = document.createElement("tr");
+    for (const v of row) {
+      const td = document.createElement("td");
+      if (v === null) {
+        td.textContent = "NULL";
+        td.className = "null";
+      } else if (typeof v === "object") {
+        td.textContent = JSON.stringify(v);
+      } else {
+        renderCell(td, String(v));
+      }
+      tr.append(td);
+    }
+    tbody.append(tr);
+  }
+  table.append(thead, tbody);
+  box.append(table);
+  const banner = $("q-banner");
+  if (rows.length > MAX_RENDER) {
+    banner.textContent = `showing the first ${MAX_RENDER} of ${rows.length} rows — add a LIMIT to keep responses small`;
+    banner.hidden = false;
+  } else {
+    banner.hidden = true;
+  }
+}
+
+async function runQuery() {
+  const sql = $("q-sql").value.trim().replace(/;+\s*$/, "");
+  if (!sql) return;
+  const err = $("q-error");
+  err.hidden = true;
+  $("q-meta").textContent = "running…";
+  const t0 = performance.now();
+  let result;
+  try {
+    result = await api("POST", "/query", JSON.stringify({ sql, db: currentDb }));
+  } catch (e) {
+    if (e instanceof AuthError) return logout();
+    $("q-meta").textContent = "";
+    err.textContent = e.message;
+    err.hidden = false;
+    return;
+  }
+  const ms = Math.round(performance.now() - t0);
+  pushHistory(sql);
+  histIdx = -1;
+  const use = sql.match(/^use\s+("?)([A-Za-z_][\w$]*)\1$/i);
+  if (use) {
+    currentDb = use[2];
+    $("q-db").textContent = `db: ${currentDb}`;
+  }
+  lastResult = null;
+  $("q-results").textContent = "";
+  $("q-banner").hidden = true;
+  if (result && Array.isArray(result.columns)) {
+    lastResult = result;
+    renderRows(result.columns, result.rows);
+    $("q-meta").textContent = `${result.rows.length} row${result.rows.length === 1 ? "" : "s"} · ${ms} ms`;
+  } else if (result && result.affected !== undefined) {
+    $("q-meta").textContent = `${result.affected} affected · ${ms} ms`;
+  } else {
+    $("q-meta").textContent = `ok · ${ms} ms`;
+  }
+  $("q-csv").hidden = $("q-json").hidden = !lastResult;
+}
+
+function download(name, type, content) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([content], { type }));
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function csvEscape(v) {
+  const s = v === null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
+  return /[",\n]/.test(s) ? `"${s.replaceAll('"', '""')}"` : s;
+}
+
+$("q-csv").addEventListener("click", () => {
+  if (!lastResult) return;
+  const lines = [lastResult.columns.map(csvEscape).join(",")];
+  for (const row of lastResult.rows) lines.push(row.map(csvEscape).join(","));
+  download("skaidb-result.csv", "text/csv", lines.join("\n") + "\n");
+});
+
+$("q-json").addEventListener("click", () => {
+  if (!lastResult) return;
+  const objects = lastResult.rows.map((row) =>
+    Object.fromEntries(lastResult.columns.map((c, i) => [c, row[i]])));
+  download("skaidb-result.json", "application/json", JSON.stringify(objects, null, 2));
+});
+
+$("q-run").addEventListener("click", runQuery);
+
+$("q-sql").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) {
+    ev.preventDefault();
+    runQuery();
+  } else if (ev.altKey && (ev.key === "ArrowUp" || ev.key === "ArrowDown")) {
+    ev.preventDefault();
+    if (!history.length) return;
+    histIdx = ev.key === "ArrowUp"
+      ? Math.min(histIdx + 1, history.length - 1)
+      : Math.max(histIdx - 1, -1);
+    $("q-sql").value = histIdx === -1 ? "" : history[histIdx];
+  }
+});
+
+$("q-canned").addEventListener("change", (ev) => {
+  if (!ev.target.value) return;
+  $("q-sql").value = ev.target.value;
+  ev.target.value = "";
+  runQuery();
+});
+
+$("q-history-sel").addEventListener("change", (ev) => {
+  if (!ev.target.value) return;
+  $("q-sql").value = ev.target.value;
+  ev.target.value = "";
+  $("q-sql").focus();
+});
+
 function fmtDuration(secs) {
   const d = Math.floor(secs / 86400), h = Math.floor((secs % 86400) / 3600),
         m = Math.floor((secs % 3600) / 60);
@@ -152,8 +361,16 @@ function logout() {
   clearInterval(refreshTimer);
   $("login-pass").value = "";
   $("login-error").hidden = true;
+  // Drop anything fetched with the old credentials from the screen.
+  lastResult = null;
+  $("q-results").textContent = "";
+  $("q-meta").textContent = "";
+  $("q-csv").hidden = $("q-json").hidden = true;
+  showTab("status");
   show("login");
 }
+
+renderHistorySelect();
 
 $("login-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();

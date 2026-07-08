@@ -161,11 +161,20 @@ doc as phases land.
   from `endpoints` + the `configured_not_in_ring` /
   `ring_not_configured` discrepancy lists. `\ui [on|off]` landed in
   skaidbsh. Cluster-side visual check rides the next release rollout.
-- [ ] **Phase 2 — query console**: editor, results table, errors,
+- [x] **Phase 2 — query console**: editor, results table, errors,
   history, exports, canned statements. Exit: FTS (`MATCH`/`HIGHLIGHT`),
   TS, and plain relational queries all render correctly incl. the
   highlight-token renderer; RBAC denials surface as clean inline errors
   (verified with a read-only role).
+  *Shipped notes*: `USE` awareness is client-side — the console tracks
+  the current db and sends it per request as `{"sql", "db"}`, a new
+  optional JSON key on `POST /query` (the stateless gateway runs the
+  statement with that session db; bad names fail like `USE`). Ctrl/⌘+
+  Enter runs, Alt+↑/↓ cycles history (localStorage, statements only,
+  cap 100), canned-statement + history dropdowns, CSV/JSON export via
+  Blob download, display capped at 1000 rows with a visible add-a-LIMIT
+  banner, results cleared on logout. Server test covers the `db` key;
+  browser-side RBAC/readonly check rides the cluster verification.
 - [ ] **Phase 3 — stats dashboards**: storage/FTS/TS/cluster panels with
   auto-refresh + sparklines. Exit: numbers cross-checked against
   `SHOW STATUS` and `/metrics` on the test cluster under load.

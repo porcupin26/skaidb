@@ -661,6 +661,41 @@ mod tests {
         assert!(get("/ui").starts_with("HTTP/1.1 200"));
     }
 
+    /// The query console's per-request session database: `{"sql", "db"}`
+    /// runs the statement with `db` current (the stateless gateway carries
+    /// no session), and a bad name errors like `USE` would.
+    #[test]
+    fn rest_query_db_parameter() {
+        let ctx = temp_ctx();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
+        let post = |body: &str| -> String {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            let head = format!(
+                "POST /query HTTP/1.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(body.as_bytes()).unwrap();
+            let mut resp = String::new();
+            stream.read_to_string(&mut resp).unwrap();
+            resp
+        };
+
+        post(r#"{"sql": "CREATE DATABASE app"}"#);
+        post(r#"{"sql": "CREATE TABLE t (PRIMARY KEY (id))", "db": "app"}"#);
+        post(r#"{"sql": "INSERT INTO t (id, v) VALUES (1, 'in-app')", "db": "app"}"#);
+
+        // Visible with db=app, absent from the default database.
+        let resp = post(r#"{"sql": "SELECT v FROM t", "db": "app"}"#);
+        assert!(resp.contains("in-app"), "{resp}");
+        let resp = post(r#"{"sql": "SELECT v FROM t"}"#);
+        assert!(resp.contains("does not exist"), "{resp}");
+
+        // A bad database name errors cleanly.
+        let resp = post(r#"{"sql": "SELECT 1 FROM t", "db": "nope"}"#);
+        assert!(resp.starts_with("HTTP/1.1 400") || resp.contains("error"), "{resp}");
+    }
+
     #[test]
     fn remote_write_end_to_end() {
         let ctx = temp_ctx();

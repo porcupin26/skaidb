@@ -75,6 +75,7 @@ Query over REST:
 curl -X POST 127.0.0.1:7080/query -d "CREATE TABLE users (PRIMARY KEY (id))"
 curl -X POST 127.0.0.1:7080/query -d "INSERT INTO users (id, name) VALUES (1, 'ada')"
 curl -X POST 127.0.0.1:7080/query -d '{"sql":"SELECT * FROM users"}'
+curl -X POST 127.0.0.1:7080/query -d '{"sql":"SELECT * FROM t", "db":"mydb"}'  # per-request session db
 curl 127.0.0.1:7080/metrics
 ```
 

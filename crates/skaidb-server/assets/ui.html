@@ -29,6 +29,7 @@
 <main id="app-view" hidden>
   <nav id="tabs">
     <button data-tab="status" class="active">status</button>
+    <button data-tab="query">query</button>
   </nav>
 
   <section id="tab-status">
@@ -50,6 +51,39 @@
       </div>
     </div>
     <p class="muted" id="status-refreshed"></p>
+  </section>
+
+  <section id="tab-query" hidden>
+    <div class="card wide">
+      <div class="qbar">
+        <select id="q-canned">
+          <option value="">canned…</option>
+          <option>SHOW TABLES</option>
+          <option>SHOW DATABASES</option>
+          <option>SHOW INDEXES</option>
+          <option>SHOW SEARCH INDEXES</option>
+          <option>SHOW STATUS</option>
+          <option>SHOW GRANTS</option>
+        </select>
+        <select id="q-history-sel">
+          <option value="">history…</option>
+        </select>
+        <span class="spacer"></span>
+        <span id="q-db" class="badge">db: default</span>
+      </div>
+      <textarea id="q-sql" rows="5" spellcheck="false"
+        placeholder="SELECT … (Ctrl+Enter or ⌘Enter to run; Alt+↑/↓ for history)"></textarea>
+      <div class="qbar">
+        <button id="q-run">run</button>
+        <span id="q-meta" class="muted"></span>
+        <span class="spacer"></span>
+        <button id="q-csv" class="ghost" hidden>export csv</button>
+        <button id="q-json" class="ghost" hidden>export json</button>
+      </div>
+      <p id="q-error" class="error" hidden></p>
+      <p id="q-banner" class="muted" hidden></p>
+      <div id="q-results" class="results"></div>
+    </div>
   </section>
 </main>
 

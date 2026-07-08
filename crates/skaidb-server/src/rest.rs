@@ -216,8 +216,17 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) -> io::Result<()> {
         ctx.superuser_role.clone()
     };
 
-    let sql = extract_sql(&String::from_utf8_lossy(&req.body));
-    let response = execute_as(&ctx, &role, &sql);
+    let (sql, db) = extract_sql(&String::from_utf8_lossy(&req.body));
+    let response = match db {
+        // A caller-supplied session database (the gateway itself is
+        // stateless): `{"sql": "...", "db": "..."}`. Wrong names fail
+        // exactly like `USE <db>` would.
+        Some(db) => {
+            let mut current_db = db;
+            crate::shared::execute_session_as(&ctx, &role, &mut current_db, &sql, None)
+        }
+        None => execute_as(&ctx, &role, &sql),
+    };
     let (status, payload) = response_to_json(response);
     // Serialize the payload exactly once: the same string feeds both the
     // bytes-returned metric and the wire.
@@ -334,16 +343,20 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 /// Accept either a raw SQL body or `{"sql": "..."}`.
-fn extract_sql(body: &str) -> String {
+fn extract_sql(body: &str) -> (String, Option<String>) {
     let trimmed = body.trim();
     if trimmed.starts_with('{') {
         if let Ok(Json::Object(map)) = serde_json::from_str::<Json>(trimmed) {
             if let Some(Json::String(sql)) = map.get("sql") {
-                return sql.clone();
+                let db = match map.get("db") {
+                    Some(Json::String(db)) if !db.is_empty() => Some(db.clone()),
+                    _ => None,
+                };
+                return (sql.clone(), db);
             }
         }
     }
-    trimmed.to_string()
+    (trimmed.to_string(), None)
 }
 
 /// A low-privilege, unauthenticated topology snapshot — ring/epoch/members,
