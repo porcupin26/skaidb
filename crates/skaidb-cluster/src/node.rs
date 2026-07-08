@@ -3097,26 +3097,18 @@ impl Node {
     }
 
     /// The buffered half of [`Node::apply_batch_local`]: append + apply every
-    /// row under one write-lock acquisition, returning the last row's commit
-    /// point so the caller can overlap the single fsync with peer round-trips.
+    /// row under one write-lock acquisition (and one search-index refresh
+    /// check for the whole batch), returning the last row's commit point so
+    /// the caller can overlap the single fsync with peer round-trips.
     fn apply_batch_buffered(
         &self,
         table: &str,
         rows: &[BatchRow],
     ) -> EngineResult<Option<(WalCommit, Arc<WalSync>)>> {
-        let mut db = self
-            .local
+        self.local
             .write()
-            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
-        let mut last = None;
-        for (key, value, hlc, is_put) in rows {
-            last = Some(if *is_put {
-                db.apply_put_buffered(table, key, value.clone(), *hlc)?
-            } else {
-                db.apply_delete_buffered(table, key, *hlc)?
-            });
-        }
-        Ok(last)
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .apply_batch_buffered(table, rows)
     }
 
     /// Point-read `key` from its replica set, resolving by last-writer-wins,

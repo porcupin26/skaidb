@@ -54,11 +54,20 @@ pub struct EngineOptions {
     /// `0` disables it. Recent data is already served from the memtable, so this
     /// only helps reads of keys that have been flushed to SSTables.
     pub read_cache_capacity: usize,
+    /// Tantivy writer heap per full-text search index (bytes). Consumed by
+    /// the engine layer, not storage — carried here so the one options bag
+    /// the server assembles reaches `Database::open`. Sized from
+    /// `memory_target` when one is set.
+    pub search_writer_heap_bytes: usize,
 }
 
 /// Default read-cache size (entries). Modest so it can't dominate a small node's
 /// RAM; only populated by reads that fall through to SSTables.
 pub const DEFAULT_READ_CACHE_CAPACITY: usize = 16_384;
+
+/// Default full-text writer heap per index (peak RSS during a bulk build is
+/// ≈ 1.5× the heap — measured in the phase-0 spike).
+pub const DEFAULT_SEARCH_WRITER_HEAP: usize = 64 * 1024 * 1024;
 
 impl Default for EngineOptions {
     fn default() -> Self {
@@ -69,6 +78,7 @@ impl Default for EngineOptions {
             compression: Codec::Lz4,
             bottom_compression: Codec::Brotli,
             read_cache_capacity: DEFAULT_READ_CACHE_CAPACITY,
+            search_writer_heap_bytes: DEFAULT_SEARCH_WRITER_HEAP,
         }
     }
 }

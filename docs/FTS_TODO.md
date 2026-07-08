@@ -280,11 +280,30 @@ fleet-verified — the TS cadence)
     repair copies flow through the apply path so the index follows.
   - [ ] Fleet smoke on the 3-node test cluster (rides the next release
     rollout).
-- [ ] **Phase 5 — NRT + ingest performance**: refresh-interval config, bulk
-  ingest path (index once per statement batch, not per row), writer memory
-  budget under `memory_target`, merge-policy tuning; first full ingest+query
-  bench vs ES on the bench fleet. Exit: targets in §4 met or gaps
-  root-caused with a plan.
+- [ ] **Phase 5 — NRT + ingest performance** (code core shipped, fleet
+  bench pending):
+  - [x] Bulk ingest path: one search-index pass and one NRT refresh check
+    per statement batch instead of per row, on the single-node `put_batch`,
+    the replicated `apply_batch` (engine-side now), and the async
+    replication frames — an index commit can no longer fire mid-batch.
+    Dev-box sanity (100 k-row synthetic corpus, `fts_bench`): batched
+    ingest ≈ 126 k rows/s with the index live vs ≈ 81 k rows/s per-row;
+    backfill ≈ 154 k rows/s; ranked top-10 ≈ 1.2 ms p50.
+  - [x] Writer memory under `memory_target`: per-index Tantivy writer heap
+    = budget/8 clamped [16 MB, 64 MB] (peak RSS ≈ 1.5× heap, phase-0
+    spike), wired through `EngineOptions::search_writer_heap_bytes`;
+    default stays 64 MB when no target is set. Search reads cost no
+    budget — segments are mmap'd and evictable.
+  - [x] Refresh-interval config shipped in phases 1–2 (`refresh_ms`); the
+    write path checks it per statement, peers commit-if-dirty on scatter.
+  - [x] `skaidb-engine/examples/fts_bench` — ingest + query latency bench
+    over the real SQL path (the ES A/B uses this shape on the fleet).
+  - [ ] Merge-policy tuning on LXC-class disks (wants fleet bench data
+    first — no speculative knobs).
+  - [ ] **Exit**: full ingest+query bench vs ES on the bench fleet (§4
+    targets met or gaps root-caused). Corpora: wiki abstracts +
+    search-benchmark-game queries; ES in identical containers, warmed page
+    cache, shared-network confounds checked.
 - [ ] **Phase 6 — aggregations/facets**: terms/range/histogram/
   date_histogram/cardinality/top_hits over fast fields, exposed through SQL
   (GROUP BY over indexed columns pushes to per-shard facet partials, merged

@@ -22,7 +22,7 @@ mod error;
 
 pub use cache::CacheStats;
 pub use compress::Codec;
-pub use engine::{Engine, EngineOptions, EngineStats, KeyStats, DEFAULT_FLUSH_THRESHOLD_BYTES};
+pub use engine::{Engine, EngineOptions, EngineStats, KeyStats, DEFAULT_FLUSH_THRESHOLD_BYTES, DEFAULT_SEARCH_WRITER_HEAP};
 pub use error::{Result, StorageError};
 pub use hlc::{Hlc, HlcClock};
 pub use memtable::{Memtable, VersionValue};

@@ -13,6 +13,15 @@
 /// block caches, WAL buffers, connections, and compaction scratch.
 const MEMTABLE_SHARE: u64 = 4; // budget / 4
 const READ_CACHE_SHARE: u64 = 2; // budget / 2
+const SEARCH_WRITER_SHARE: u64 = 8; // budget / 8 per search index
+
+/// Bounds on the derived per-index search writer heap. The floor is
+/// Tantivy's practical minimum; the ceiling is the fixed default — a bigger
+/// heap mostly buys bulk-build speed, and peak RSS runs ≈ 1.5× the heap
+/// (phase-0 spike). Search reads cost no budget: segments are mmap'd and
+/// evictable.
+const SEARCH_WRITER_MIN: u64 = 16 * 1024 * 1024;
+const SEARCH_WRITER_MAX: u64 = 64 * 1024 * 1024;
 
 /// Assumed bytes per read-cache entry (key + value + map overhead) when
 /// converting the cache's byte share into an entry capacity. Conservative for
@@ -31,6 +40,8 @@ pub struct MemoryPlan {
     pub budget: u64,
     pub memtable_bytes: u64,
     pub read_cache_entries: u64,
+    /// Tantivy writer heap per full-text search index (bytes).
+    pub search_writer_bytes: u64,
 }
 
 /// Resolve a `memory_target` setting into a plan. Empty/`"off"` → `None`
@@ -57,10 +68,13 @@ pub fn resolve(target: &str) -> Result<Option<MemoryPlan>, String> {
 fn plan(budget: u64) -> MemoryPlan {
     let memtable_bytes = (budget / MEMTABLE_SHARE).clamp(MEMTABLE_MIN, MEMTABLE_MAX);
     let read_cache_entries = (budget / READ_CACHE_SHARE) / ASSUMED_ENTRY_BYTES;
+    let search_writer_bytes =
+        (budget / SEARCH_WRITER_SHARE).clamp(SEARCH_WRITER_MIN, SEARCH_WRITER_MAX);
     MemoryPlan {
         budget,
         memtable_bytes,
         read_cache_entries,
+        search_writer_bytes,
     }
 }
 

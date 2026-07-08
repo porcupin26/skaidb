@@ -42,14 +42,15 @@ history in git.
 Elasticsearch-class search, SQL-first, Tantivy-cored (Rust Lucene — a JVM
 is a non-starter in a single-binary DB). Full plan, feature matrix, phased
 roadmap and benchmarks: [FTS_TODO.md](FTS_TODO.md). Phases 0–2 are done
-(Tantivy spike; single-node core; analysis & mappings parity), and the
-phase-3 (query DSL: pattern predicates, AND/OR/NOT composition, dis-max,
-`HIGHLIGHT()`) and phase-4 (cluster: scatter-gather top-k, per-replica
-indexes, topology-change continuity) cores have shipped — shipped state in
-[SEARCH.md](SEARCH.md). Remaining: phase-4 fleet smoke (next release
-rollout); phase-3 explain/cross_fields and the ES side-by-side parity
-suite (needs the bench fleet). Next action: **phase 5** (NRT + ingest
-performance, first full bench vs ES).
+(Tantivy spike; single-node core; analysis & mappings parity); the phase-3
+(query DSL), phase-4 (cluster scatter-gather), and phase-5 (bulk ingest
+path, writer heap under `memory_target`) cores have shipped — shipped
+state in [SEARCH.md](SEARCH.md). Remaining and all wanting the bench
+fleet / test cluster: the ES ingest+query A/B (phase-5 exit, +
+merge-policy tuning from its data), the ES parity suite + explain/
+cross_fields (phase 3), and the fleet smoke (phase 4). Next action:
+either the **fleet bench campaign** (ES containers on p225, wiki corpus)
+or **phase 6** (aggregations/facets) if staying in code.
 
 ## 3. Other
 

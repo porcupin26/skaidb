@@ -18,7 +18,7 @@ pub use exec::{
     filter_rows, run, statement_is_read_only, Cluster, Database, DbStats, IndexScanRange,
     pk_point_key, TableStats, TsRollupInfo,
 };
-pub use skaidb_storage::{Codec, EngineOptions};
+pub use skaidb_storage::{Codec, EngineOptions, DEFAULT_SEARCH_WRITER_HEAP};
 pub use namespace::DEFAULT_DATABASE;
 pub use result::{QueryOutput, ResultSet, SessionEffect};
 pub use session::Session;

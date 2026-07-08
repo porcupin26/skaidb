@@ -7,15 +7,16 @@ This documents the **shipped** state; the plan and pending phases live in
 [FTS_TODO.md](FTS_TODO.md), and the SQL grammar in
 [QUERY_SYNTAX.md](QUERY_SYNTAX.md#full-text-search-match--search).
 
-Status: **phase 4 (cluster)** — phases 1–3 (single-node core: DDL, index
-maintenance on put/delete, `score()`, top-k pushdown, crash recovery,
-rebuild; analysis & mappings: analyzer registry, per-column configuration,
-typed fast fields, `.keyword` twins, `copy_to`; query DSL: the full
-predicate family `MATCH`/`MATCH_PHRASE`/`MATCH_PREFIX`/`FUZZY`/`WILDCARD`/
-`REGEXP`/`SEARCH`, AND/OR/NOT composition, dis-max multi-field scoring,
-`HIGHLIGHT()` snippets) plus **distributed search**: scatter-gather top-k
-across the cluster, per-replica local indexes over replicated writes, and
-index continuity through join/decommission/rebalance/repair.
+Status: **phase 5 (ingest performance)** — phases 1–4 (single-node core:
+DDL, index maintenance on put/delete, `score()`, top-k pushdown, crash
+recovery, rebuild; analysis & mappings: analyzer registry, per-column
+configuration, typed fast fields, `.keyword` twins, `copy_to`; query DSL:
+the full predicate family `MATCH`/`MATCH_PHRASE`/`MATCH_PREFIX`/`FUZZY`/
+`WILDCARD`/`REGEXP`/`SEARCH`, AND/OR/NOT composition, dis-max multi-field
+scoring, `HIGHLIGHT()` snippets; cluster: scatter-gather top-k,
+per-replica indexes, topology continuity) plus the **bulk ingest path**
+(one index pass + one refresh check per statement batch) and the writer
+heap budgeted under `memory_target`.
 
 ## Using it
 
@@ -164,9 +165,17 @@ when the column didn't match). Stemming is respected — a query for
   clean shutdown with uncommitted index writes, loses nothing. There is
   deliberately no commit-on-shutdown: the replay path runs on every open,
   keeping recovery constantly exercised.
-- **Storage layout**: Tantivy segments live under `<data_dir>/fts/<index>/`
-  (mmap'd for search; the writer heap is bounded, 64 MB in phase 1 —
-  `memory_target` integration is phase 5).
+- **Storage layout**: Tantivy segments live under `<data_dir>/fts/<index>/`,
+  mmap'd for search (evictable pages — reads cost no memory budget). The
+  writer heap is bounded per index: 64 MB by default, or `memory_target`/8
+  clamped to [16 MB, 64 MB] when a budget is set (peak RSS during a bulk
+  build ≈ 1.5× the heap).
+- **Bulk ingest**: a multi-row statement (and a replicated batch, including
+  the async replication frames) feeds every search index in one pass with a
+  single NRT refresh check at the end — an index commit never fires
+  mid-batch. Dev-box reference (100 k-row synthetic corpus,
+  `skaidb-engine/examples/fts_bench`): ≈ 126 k rows/s ingest with the index
+  live (batched) vs ≈ 81 k rows/s per-row; ranked top-10 ≈ 1.2 ms p50.
 - **Query pushdown**: `ORDER BY score() DESC LIMIT k` retrieves top-k
   directly from the index (early-terminated, no scan). Residual `WHERE`
   conditions are applied after the authoritative row re-read, with

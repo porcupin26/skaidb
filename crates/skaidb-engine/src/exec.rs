@@ -124,9 +124,6 @@ impl LiveSearchIndex {
     }
 }
 
-/// Tantivy writer heap per search index. Phase 5 ties this into the server's
-/// `memory_target` instead of a fixed size.
-const FTS_WRITER_HEAP: usize = 64 * 1024 * 1024;
 
 /// An [`Hlc`] as the search crate's engine-agnostic watermark.
 fn hlc_to_watermark(hlc: Hlc) -> Watermark {
@@ -263,12 +260,13 @@ impl Database {
             let (cfg, refresh_ms) =
                 SearchIndexConfig::from_declaration(&def.paths, &def.options)?;
             let idx_dir = fts_dir(&dir, name);
-            let mut index = match SearchIndex::open(&idx_dir, &cfg, FTS_WRITER_HEAP) {
+            let heap = opts.search_writer_heap_bytes;
+            let mut index = match SearchIndex::open(&idx_dir, &cfg, heap) {
                 Ok(index) => index,
                 // NeedsRebuild or any other open failure: start from scratch.
                 Err(_) => {
                     let _ = std::fs::remove_dir_all(&idx_dir);
-                    SearchIndex::open(&idx_dir, &cfg, FTS_WRITER_HEAP)?
+                    SearchIndex::open(&idx_dir, &cfg, heap)?
                 }
             };
             if let Some(engine) = tables.get(&def.table) {
@@ -474,7 +472,7 @@ impl Database {
         // the same name must not leak into the new one) and backfill.
         let idx_dir = fts_dir(&self.dir, &c.name);
         let _ = std::fs::remove_dir_all(&idx_dir);
-        let mut index = SearchIndex::open(&idx_dir, &cfg, FTS_WRITER_HEAP)?;
+        let mut index = SearchIndex::open(&idx_dir, &cfg, self.storage_opts.search_writer_heap_bytes)?;
         let engine = self
             .tables
             .get(&c.table)
@@ -542,7 +540,7 @@ impl Database {
         self.search_indexes.remove(name); // drop the writer before the files
         let idx_dir = fts_dir(&self.dir, name);
         let _ = std::fs::remove_dir_all(&idx_dir);
-        let mut index = SearchIndex::open(&idx_dir, &cfg, FTS_WRITER_HEAP)?;
+        let mut index = SearchIndex::open(&idx_dir, &cfg, self.storage_opts.search_writer_heap_bytes)?;
         if let Some(engine) = self.tables.get(&def.table) {
             for (row_key, bytes, row_hlc) in engine.scan_versioned()? {
                 if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
@@ -706,9 +704,11 @@ impl Database {
             .collect()
     }
 
-    /// Maintain every search index on `table` for a written row, then commit
-    /// any index whose NRT refresh interval elapsed.
-    fn maintain_search_put(
+    /// Index one written row in every search index on `table`, without the
+    /// NRT refresh check — statement-batch callers refresh once per batch
+    /// via [`Database::search_refresh`] (the phase-5 bulk-ingest path)
+    /// instead of per row.
+    fn search_put_unrefreshed(
         &mut self,
         table: &str,
         doc: &Document,
@@ -718,22 +718,51 @@ impl Database {
         for name in self.search_indexes_on(table) {
             if let Some(live) = self.search_indexes.get_mut(&name) {
                 live.index.put(key, doc, hlc_to_watermark(hlc))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove one deleted row from every search index on `table`; see
+    /// [`Database::search_put_unrefreshed`].
+    fn search_del_unrefreshed(&mut self, table: &str, key: &[u8], hlc: Hlc) -> Result<()> {
+        for name in self.search_indexes_on(table) {
+            if let Some(live) = self.search_indexes.get_mut(&name) {
+                live.index.delete(key, hlc_to_watermark(hlc));
+            }
+        }
+        Ok(())
+    }
+
+    /// One NRT refresh check for every search index on `table`: commit an
+    /// index whose refresh interval elapsed since its last commit.
+    pub(crate) fn search_refresh(&mut self, table: &str) -> Result<()> {
+        for name in self.search_indexes_on(table) {
+            if let Some(live) = self.search_indexes.get_mut(&name) {
                 live.maybe_refresh()?;
             }
         }
         Ok(())
     }
 
+    /// Maintain every search index on `table` for a written row, then commit
+    /// any index whose NRT refresh interval elapsed.
+    fn maintain_search_put(
+        &mut self,
+        table: &str,
+        doc: &Document,
+        key: &[u8],
+        hlc: Hlc,
+    ) -> Result<()> {
+        self.search_put_unrefreshed(table, doc, key, hlc)?;
+        self.search_refresh(table)
+    }
+
     /// Maintain every search index on `table` for a deleted row; see
     /// [`Database::maintain_search_put`].
     fn maintain_search_del(&mut self, table: &str, key: &[u8], hlc: Hlc) -> Result<()> {
-        for name in self.search_indexes_on(table) {
-            if let Some(live) = self.search_indexes.get_mut(&name) {
-                live.index.delete(key, hlc_to_watermark(hlc));
-                live.maybe_refresh()?;
-            }
-        }
-        Ok(())
+        self.search_del_unrefreshed(table, key, hlc)?;
+        self.search_refresh(table)
     }
 
     /// Resolve the search index serving `query` on `table`: the index that
@@ -3205,6 +3234,20 @@ impl Database {
         bytes: Vec<u8>,
         hlc: Hlc,
     ) -> Result<(WalCommit, Arc<WalSync>)> {
+        let out = self.apply_put_row_buffered(table, key, bytes, hlc)?;
+        self.search_refresh(table)?;
+        Ok(out)
+    }
+
+    /// The row half of [`Database::apply_put_buffered`], without the NRT
+    /// refresh check (batch callers refresh once per batch).
+    fn apply_put_row_buffered(
+        &mut self,
+        table: &str,
+        key: &[u8],
+        bytes: Vec<u8>,
+        hlc: Hlc,
+    ) -> Result<(WalCommit, Arc<WalSync>)> {
         let doc = match Value::decode(&bytes)
             .map_err(|e| EngineError::Constraint(format!("corrupt replicated row: {e}")))?
         {
@@ -3224,12 +3267,25 @@ impl Database {
             self.index_put(&name, &path, &doc, key)?;
         }
         self.maintain_vectors_put(table, &doc, key);
-        self.maintain_search_put(table, &doc, key, hlc)?;
+        self.search_put_unrefreshed(table, &doc, key, hlc)?;
         Ok((commit, handle))
     }
 
     /// Buffered replicated delete (no fsync); see [`Database::apply_put_buffered`].
     pub fn apply_delete_buffered(
+        &mut self,
+        table: &str,
+        key: &[u8],
+        hlc: Hlc,
+    ) -> Result<(WalCommit, Arc<WalSync>)> {
+        let out = self.apply_delete_row_buffered(table, key, hlc)?;
+        self.search_refresh(table)?;
+        Ok(out)
+    }
+
+    /// The row half of [`Database::apply_delete_buffered`], without the NRT
+    /// refresh check.
+    fn apply_delete_row_buffered(
         &mut self,
         table: &str,
         key: &[u8],
@@ -3252,8 +3308,30 @@ impl Database {
             }
         }
         self.maintain_vectors_del(table, key);
-        self.maintain_search_del(table, key, hlc)?;
+        self.search_del_unrefreshed(table, key, hlc)?;
         Ok((commit, handle))
+    }
+
+    /// A whole replicated batch, buffered: every row appended + applied +
+    /// index-maintained under **one** NRT refresh check (the phase-5
+    /// bulk-ingest path — an index commit can no longer fire mid-batch),
+    /// returning the last row's commit point + sync handle. Row shape:
+    /// `(key, value, hlc, is_put)`; `is_put == false` is a tombstone.
+    pub fn apply_batch_buffered(
+        &mut self,
+        table: &str,
+        rows: &[(Vec<u8>, Vec<u8>, Hlc, bool)],
+    ) -> Result<Option<(WalCommit, Arc<WalSync>)>> {
+        let mut last = None;
+        for (key, value, hlc, is_put) in rows {
+            last = Some(if *is_put {
+                self.apply_put_row_buffered(table, key, value.clone(), *hlc)?
+            } else {
+                self.apply_delete_row_buffered(table, key, *hlc)?
+            });
+        }
+        self.search_refresh(table)?;
+        Ok(last)
     }
 
     // ---- helpers ----
@@ -4512,6 +4590,32 @@ impl<'a> LocalCluster<'a> {
         }
         &self.index_memo[table]
     }
+
+    /// The row half of [`Cluster::put`] for this executor: everything except
+    /// the search-index refresh check, which the caller runs once per
+    /// statement. Returns `false` when the write was buffered into an open
+    /// transaction (nothing reached the indexes yet).
+    fn put_row(&mut self, table: &str, key: &[u8], doc: &Document) -> Result<bool> {
+        // Buffer the write when a transaction is open (flushed on COMMIT).
+        if let Some(txn) = self.db.txn.as_mut() {
+            txn.writes
+                .insert((table.to_string(), key.to_vec()), Some(doc.clone()));
+            return Ok(false);
+        }
+        self.table_indexes(table);
+        let engine = self.db.table_engine_mut(table)?;
+        let (hlc, commit) = engine.put_deferred(key, Value::encode_document(doc))?;
+        self.pending
+            .insert(format!("t:{table}"), (engine.wal_sync_handle(), commit));
+        for (name, paths) in &self.index_memo[table] {
+            if let Some(sync) = self.db.index_put_deferred(name, paths, doc, key)? {
+                self.pending.insert(format!("i:{name}"), sync);
+            }
+        }
+        self.db.maintain_vectors_put(table, doc, key);
+        self.db.search_put_unrefreshed(table, doc, key, hlc)?;
+        Ok(true)
+    }
 }
 
 impl Cluster for LocalCluster<'_> {
@@ -4568,24 +4672,22 @@ impl Cluster for LocalCluster<'_> {
     }
 
     fn put(&mut self, table: &str, key: &[u8], doc: &Document) -> Result<()> {
-        // Buffer the write when a transaction is open (flushed on COMMIT).
-        if let Some(txn) = self.db.txn.as_mut() {
-            txn.writes
-                .insert((table.to_string(), key.to_vec()), Some(doc.clone()));
-            return Ok(());
+        if self.put_row(table, key, doc)? {
+            self.db.search_refresh(table)?;
         }
-        self.table_indexes(table);
-        let engine = self.db.table_engine_mut(table)?;
-        let (hlc, commit) = engine.put_deferred(key, Value::encode_document(doc))?;
-        self.pending
-            .insert(format!("t:{table}"), (engine.wal_sync_handle(), commit));
-        for (name, paths) in &self.index_memo[table] {
-            if let Some(sync) = self.db.index_put_deferred(name, paths, doc, key)? {
-                self.pending.insert(format!("i:{name}"), sync);
-            }
+        Ok(())
+    }
+
+    fn put_batch(&mut self, table: &str, rows: &[(Vec<u8>, Document)]) -> Result<()> {
+        // The whole statement indexes under one NRT refresh check (the
+        // phase-5 bulk-ingest path) instead of one per row.
+        let mut wrote = false;
+        for (key, doc) in rows {
+            wrote |= self.put_row(table, key, doc)?;
         }
-        self.db.maintain_vectors_put(table, doc, key);
-        self.db.maintain_search_put(table, doc, key, hlc)?;
+        if wrote {
+            self.db.search_refresh(table)?;
+        }
         Ok(())
     }
 

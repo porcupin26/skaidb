@@ -131,15 +131,19 @@ pub fn run(
     // memory limit when set to "auto".
     let mut flush_threshold_bytes = (config.storage.memtable_size_mb.max(1) as usize) * 1024 * 1024;
     let mut read_cache_capacity = config.storage.read_cache_entries as usize;
+    let mut search_writer_heap_bytes = skaidb_engine::DEFAULT_SEARCH_WRITER_HEAP;
     match memory::resolve(&config.storage.memory_target) {
         Ok(Some(plan)) => {
             flush_threshold_bytes = plan.memtable_bytes as usize;
             read_cache_capacity = plan.read_cache_entries as usize;
+            search_writer_heap_bytes = plan.search_writer_bytes as usize;
             skaidb_types::slog!(
-                "skaidb: storage memory target {} MB (memtable {} MB, read cache {} entries)",
+                "skaidb: storage memory target {} MB (memtable {} MB, read cache {} entries, \
+                 search writer {} MB/index)",
                 plan.budget / (1024 * 1024),
                 plan.memtable_bytes / (1024 * 1024),
-                plan.read_cache_entries
+                plan.read_cache_entries,
+                plan.search_writer_bytes / (1024 * 1024)
             );
         }
         Ok(None) => {}
@@ -148,6 +152,7 @@ pub fn run(
     let storage_opts = skaidb_engine::EngineOptions {
         flush_threshold_bytes,
         read_cache_capacity,
+        search_writer_heap_bytes,
         ..Default::default()
     };
     let db = Database::open_with_options(&config.server.data_dir, storage_opts)?;
