@@ -1645,11 +1645,18 @@ mod tests {
             .execute("SELECT id FROM articles WHERE MATCH(body, 'quick') ORDER BY score() DESC")
             .unwrap_err();
         assert!(err.to_string().contains("requires LIMIT"), "{err}");
-        // Only score() DESC can order a search.
+        // Column ordering works (phase 7 — falls back to gather-and-sort
+        // for a non-fast column like the row id); score() ordering stays
+        // DESC-only.
+        let rs = rows(
+            db.execute("SELECT id FROM articles WHERE MATCH(body, 'quick') ORDER BY id LIMIT 5")
+                .unwrap(),
+        );
+        assert_eq!(ids(rs), vec![1, 2]);
         let err = db
-            .execute("SELECT id FROM articles WHERE MATCH(body, 'quick') ORDER BY id LIMIT 5")
+            .execute("SELECT id FROM articles WHERE MATCH(body, 'quick') ORDER BY score() ASC LIMIT 5")
             .unwrap_err();
-        assert!(err.to_string().contains("ORDER BY score() DESC"), "{err}");
+        assert!(err.to_string().contains("score() DESC"), "{err}");
     }
 
     #[test]
@@ -2102,6 +2109,84 @@ mod tests {
             rs.rows,
             vec![vec![Value::String("west".into()), Value::Int(2)]]
         );
+    }
+
+    #[test]
+    fn search_order_by_fast_field() {
+        let mut db = agg_db();
+        // Index-ordered top-k over a numeric fast field, both directions.
+        let rs = rows(
+            db.execute(
+                "SELECT id, price FROM sales WHERE MATCH(product, 'widget') \
+                 ORDER BY price DESC LIMIT 2",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            rs.rows,
+            vec![
+                vec![Value::Int(2), Value::Float(4.0)],
+                vec![Value::Int(4), Value::Float(3.5)],
+            ]
+        );
+        let rs = rows(
+            db.execute(
+                "SELECT id FROM sales WHERE MATCH(product, 'widget') \
+                 ORDER BY price ASC LIMIT 1",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(1)]]);
+        // Keyword ordering + residual filter (over-fetch discipline). Rows
+        // 3 and 4 tie on region — either may fill the second slot.
+        let rs = rows(
+            db.execute(
+                "SELECT id, region FROM sales WHERE MATCH(product, 'red') \
+                 AND units < 50 ORDER BY region ASC LIMIT 2",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows[0], vec![Value::Int(1), Value::String("east".into())]);
+        assert_eq!(rs.rows[1][1], Value::String("west".into()));
+        // OFFSET pages through the ordered result.
+        let rs = rows(
+            db.execute(
+                "SELECT id FROM sales WHERE MATCH(product, 'widget') \
+                 ORDER BY price DESC LIMIT 1 OFFSET 1",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(4)]]);
+        // Rows missing the sort column exist for 'red' (row 6 has no
+        // price): the pushdown declines and the fallback orders with SQL
+        // NULL placement — NULLS FIRST on DESC.
+        let rs = rows(
+            db.execute(
+                "SELECT id FROM sales WHERE MATCH(product, 'red') \
+                 ORDER BY price DESC LIMIT 2",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(6)], vec![Value::Int(4)]]);
+        // Multi-key orderings run through the generic fallback; score()
+        // ordering stays DESC-only.
+        let rs = rows(
+            db.execute(
+                "SELECT id FROM sales WHERE MATCH(product, 'widget') \
+                 ORDER BY region ASC, price DESC LIMIT 3",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            rs.rows,
+            vec![vec![Value::Int(2)], vec![Value::Int(1)], vec![Value::Int(4)]]
+        );
+        assert!(db
+            .execute(
+                "SELECT id FROM sales WHERE MATCH(product, 'widget') \
+                 ORDER BY score() ASC LIMIT 2"
+            )
+            .is_err());
     }
 
     #[test]

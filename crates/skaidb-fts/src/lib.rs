@@ -17,7 +17,7 @@ mod index;
 mod query;
 
 pub use analyzer::Analyzer;
-pub use index::{Highlighter, SearchIndex, SearchIndexStats};
+pub use index::{Highlighter, SearchIndex, SearchIndexStats, SortedHits};
 pub use query::SearchQuery;
 
 /// Errors surfaced by the search crate. Engine code maps these onto
@@ -114,6 +114,15 @@ pub struct AggRow {
     pub count: u64,
     /// One entry per requested metric, in request order.
     pub metrics: Vec<skaidb_types::Value>,
+}
+
+/// A fast-field sort for top-k retrieval (SQL
+/// `ORDER BY <col> [DESC] LIMIT k` over a search query).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SortSpec {
+    /// A declared fast-field column (keyword/long/double/bool/date).
+    pub column: String,
+    pub descending: bool,
 }
 
 /// One search result: the row's primary-key bytes and its BM25 score.

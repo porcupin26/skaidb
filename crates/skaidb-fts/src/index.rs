@@ -392,6 +392,139 @@ impl SearchIndex {
         Ok(hits)
     }
 
+    /// Top-k retrieval ordered by a declared fast-field column instead of
+    /// BM25 (`ORDER BY <col> [DESC] LIMIT k`), as `(key, sort value)`
+    /// pairs, best-first. `Ok(None)` when the index cannot serve it with
+    /// the engine's exact SQL ordering — an undeclared/non-fast column, or
+    /// **any matching row missing the sort column**: SQL puts NULLs first
+    /// on DESC while the index sorts them last, so mixed data falls back
+    /// to the row path rather than reorder.
+    pub fn search_sorted(
+        &self,
+        query: &SearchQuery,
+        sort: &crate::SortSpec,
+        k: usize,
+    ) -> Result<Option<SortedHits>, FtsError> {
+        use tantivy::aggregation::agg_req::Aggregations;
+        use tantivy::aggregation::{AggContextParams, AggregationCollector};
+        use tantivy::collector::Count;
+        use tantivy::Order;
+
+        let Some(col) = self.columns.iter().find(|c| c.path == sort.column) else {
+            return Ok(None);
+        };
+        let q = build_query(
+            &self.index,
+            &QueryFields {
+                fields: &self.runtimes,
+            },
+            query,
+        )?;
+        let order = if sort.descending {
+            Order::Desc
+        } else {
+            Order::Asc
+        };
+        let searcher = self.reader.searcher();
+        // A value_count on the sort column rides along: when it is short of
+        // the match total, some matching rows lack the column (SQL NULLs) —
+        // decline (see above).
+        let count_req: Aggregations = serde_json::from_value(serde_json::json!({
+            "n": {"value_count": {"field": sort.column}}
+        }))
+        .map_err(|e| FtsError::Engine(format!("agg request: {e}")))?;
+        let counter = AggregationCollector::from_aggs(
+            count_req,
+            AggContextParams {
+                tokenizers: self.index.tokenizers().clone(),
+                ..Default::default()
+            },
+        );
+        let top = TopDocs::with_limit(k.max(1));
+        // One search per declared type; each arm yields (value, address).
+        let (total, values, hits): (usize, serde_json::Value, Vec<(Value, tantivy::DocAddress)>) =
+            match col.ftype {
+                FieldType::Long => {
+                    let (t, v, h) = searcher.search(
+                        &q,
+                        &(Count, counter, top.order_by_fast_field::<i64>(&sort.column, order)),
+                    )?;
+                    let h = h
+                        .into_iter()
+                        .map(|(v, a)| (v.map_or(Value::Null, Value::Int), a))
+                        .collect();
+                    (t, serde_json::to_value(v).unwrap_or_default(), h)
+                }
+                FieldType::Double => {
+                    let (t, v, h) = searcher.search(
+                        &q,
+                        &(Count, counter, top.order_by_fast_field::<f64>(&sort.column, order)),
+                    )?;
+                    let h = h
+                        .into_iter()
+                        .map(|(v, a)| (v.map_or(Value::Null, Value::Float), a))
+                        .collect();
+                    (t, serde_json::to_value(v).unwrap_or_default(), h)
+                }
+                FieldType::Bool => {
+                    let (t, v, h) = searcher.search(
+                        &q,
+                        &(Count, counter, top.order_by_fast_field::<bool>(&sort.column, order)),
+                    )?;
+                    let h = h
+                        .into_iter()
+                        .map(|(v, a)| (v.map_or(Value::Null, Value::Bool), a))
+                        .collect();
+                    (t, serde_json::to_value(v).unwrap_or_default(), h)
+                }
+                FieldType::Date => {
+                    let (t, v, h) = searcher.search(
+                        &q,
+                        &(
+                            Count,
+                            counter,
+                            top.order_by_fast_field::<tantivy::DateTime>(&sort.column, order),
+                        ),
+                    )?;
+                    let h = h
+                        .into_iter()
+                        .map(|(v, a)| {
+                            (
+                                v.map_or(Value::Null, |d| {
+                                    Value::Timestamp(d.into_timestamp_millis())
+                                }),
+                                a,
+                            )
+                        })
+                        .collect();
+                    (t, serde_json::to_value(v).unwrap_or_default(), h)
+                }
+                FieldType::Keyword => {
+                    let (t, v, h) = searcher.search(
+                        &q,
+                        &(Count, counter, top.order_by_string_fast_field(&sort.column, order)),
+                    )?;
+                    let h = h
+                        .into_iter()
+                        .map(|(v, a)| (v.map_or(Value::Null, Value::String), a))
+                        .collect();
+                    (t, serde_json::to_value(v).unwrap_or_default(), h)
+                }
+                FieldType::Text => return Ok(None),
+            };
+        if values["n"]["value"].as_f64().unwrap_or(-1.0) != total as f64 {
+            return Ok(None); // matching rows missing the sort column
+        }
+        let mut out = Vec::with_capacity(hits.len());
+        for (value, addr) in hits {
+            let doc: TantivyDocument = searcher.doc(addr)?;
+            if let Some(key) = doc.get_first(self.key_field).and_then(|v| v.as_bytes()) {
+                out.push((key.to_vec(), value));
+            }
+        }
+        Ok(Some(out))
+    }
+
     /// Unranked search: the keys of every matching row (for `MATCH` used as
     /// a pure predicate, no `ORDER BY score()`).
     pub fn search_keys(&self, query: &SearchQuery) -> Result<Vec<Vec<u8>>, FtsError> {
@@ -727,6 +860,10 @@ impl SearchIndex {
         }
     }
 }
+
+/// `(key, sort value)` pairs from [`SearchIndex::search_sorted`],
+/// best-first.
+pub type SortedHits = Vec<(Vec<u8>, Value)>;
 
 /// Generates highlighted snippets of row text for one (query, column) pair
 /// (from [`SearchIndex::highlighter`]).
@@ -1469,6 +1606,62 @@ mod tests {
             }],
         };
         assert!(idx.aggregate(&matches("body", "red"), &bad).unwrap().is_none());
+    }
+
+    #[test]
+    fn search_sorted_by_fast_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = config(
+            &["body", "category", "price"],
+            &[("category.type", "keyword"), ("price.type", "double")],
+        );
+        let mut idx = open(tmp.path(), &cfg);
+        for (i, (cat, price)) in [("b", 10.0), ("a", 30.0), ("c", 20.0)].iter().enumerate() {
+            let mut d = Document::default();
+            d.insert("body", Value::String("red thing".into()));
+            d.insert("category", Value::String((*cat).into()));
+            d.insert("price", Value::Float(*price));
+            idx.put(&[i as u8], &d, wm(i as u64 + 1)).unwrap();
+        }
+        idx.commit().unwrap();
+        let q = matches("body", "red");
+
+        // Numeric sort, both directions, top-k.
+        let desc = idx
+            .search_sorted(&q, &crate::SortSpec { column: "price".into(), descending: true }, 2)
+            .unwrap()
+            .expect("servable");
+        assert_eq!(
+            desc.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(),
+            vec![Value::Float(30.0), Value::Float(20.0)]
+        );
+        let asc = idx
+            .search_sorted(&q, &crate::SortSpec { column: "price".into(), descending: false }, 3)
+            .unwrap()
+            .expect("servable");
+        assert_eq!(asc[0].1, Value::Float(10.0));
+
+        // Keyword sort.
+        let by_cat = idx
+            .search_sorted(&q, &crate::SortSpec { column: "category".into(), descending: false }, 3)
+            .unwrap()
+            .expect("servable");
+        assert_eq!(by_cat[0].1, Value::String("a".into()));
+
+        // A matching row missing the sort column → decline (SQL NULL
+        // ordering differs from the index's), as does a text column.
+        let mut d = Document::default();
+        d.insert("body", Value::String("red uncosted".into()));
+        idx.put(b"x", &d, wm(9)).unwrap();
+        idx.commit().unwrap();
+        assert!(idx
+            .search_sorted(&q, &crate::SortSpec { column: "price".into(), descending: true }, 2)
+            .unwrap()
+            .is_none());
+        assert!(idx
+            .search_sorted(&q, &crate::SortSpec { column: "body".into(), descending: true }, 2)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

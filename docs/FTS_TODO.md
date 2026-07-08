@@ -378,8 +378,23 @@ fleet-verified — the TS cadence)
   - [ ] top_hits (wants a SQL surface — window functions or a dedicated
     per-group-top-k clause); approximate HLL cardinality as an opt-in
     function if COUNT(DISTINCT)'s exact bail ever hurts.
-- [ ] **Phase 7 — search UX extras**: search_after, fast-field sort,
-  term + completion suggesters, synonyms with hot-reload, more_like_this.
+- [ ] **Phase 7 — search UX extras** (in progress):
+  - [x] Fast-field sort: `ORDER BY <col> [ASC|DESC] LIMIT k` over search
+    queries. Index-ordered top-k pushdown for declared fast columns
+    (keyword/long/double/bool/date) with the residual-filter over-fetch
+    discipline; **any** other ordering (multi-key, expressions, non-fast
+    columns) works via gather-and-sort through the ordinary executor.
+    Exact-or-decline: rows missing the sort column make the pushdown
+    decline (SQL NULLs sort first on DESC, the index sorts them last) —
+    detected by a value_count riding the same search. Keyset pagination =
+    ORDER BY fast column + a residual range predicate. Cluster: pushdown
+    when one index holds every row; sharded corpora use the correct
+    gather-and-sort fallback (per-shard sorted scatter merge is future
+    work, needs a wire addition).
+  - [ ] search_after cursor beyond keyset pagination (decide if the SQL
+    surface warrants more than ORDER BY + range + LIMIT).
+  - [ ] Term + completion suggesters, synonyms with hot-reload,
+    more_like_this.
 - [ ] **Phase 8 — ES-compatible REST subset (decision checkpoint)**:
   `_search` (query DSL JSON: the §2 ✱ queries + aggs), `_bulk`, `_mapping`
   read-only — enough for existing ES client libraries and log shippers, not

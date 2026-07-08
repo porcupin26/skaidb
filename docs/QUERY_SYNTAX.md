@@ -321,10 +321,15 @@ WHERE (MATCH(body, 'rust') OR MATCH(title, 'rust'))
   of the column's text (default 150 chars), matches wrapped in `<b>…</b>`
   (HTML-escaped otherwise; empty string if the column didn't match). Only
   valid together with a search predicate.
-- **`ORDER BY score() DESC LIMIT k`** pushes top-k retrieval into the index
-  (no full scan). It is the only `ORDER BY` form allowed with search
-  predicates, and requires `LIMIT`. Without `ORDER BY`, matches return in
-  unspecified order.
+- **`ORDER BY score() DESC LIMIT k`** pushes BM25 top-k retrieval into the
+  index (no full scan); it requires `LIMIT`, and `score()` orders only
+  descending. Without `ORDER BY`, matches return in unspecified order.
+- **`ORDER BY <col> [ASC|DESC]`** also works with search predicates: a
+  single declared fast-field column with `LIMIT` retrieves index-ordered
+  top-k directly; any other ordering (multi-key, expressions, non-fast
+  columns) gathers the matches and sorts through the ordinary executor.
+  Keyset pagination: `ORDER BY <col> LIMIT k` plus a residual range
+  predicate (`AND col > <last>`).
 - The named column(s) must be covered by a search index on the table —
   errors if none exists. Query text may be a bind parameter (`?`).
 - **Aggregates / `GROUP BY` work over search queries**

@@ -264,8 +264,12 @@ values (not bare integers) in date columns for consistent typing.
 - Search predicates compose with `AND`/`OR`/`NOT` among themselves; mixing
   them with ordinary conditions under `OR`/`NOT` is rejected (top-level
   `AND` with ordinary conditions works — they filter the hits).
-- `ORDER BY score() DESC` is the only ordering usable with search
-  predicates and requires `LIMIT`.
+- `ORDER BY score()` orders descending only (and requires `LIMIT`).
+  Column orderings work: declared fast-field columns with `LIMIT` retrieve
+  index-ordered top-k (declining to an exact gather-and-sort when matching
+  rows lack the sort column — SQL NULL placement differs from the
+  index's); anything else gathers and sorts through the ordinary
+  executor.
 - No `JOIN`, `UNION`, aggregates/`GROUP BY`, `DISTINCT`, or `NEAREST` in
   the same query.
 - Per-shard BM25 statistics (like Elasticsearch's default); a global-stats

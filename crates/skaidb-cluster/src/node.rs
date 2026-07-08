@@ -4366,6 +4366,29 @@ impl Cluster for Coordinator {
             .search_commit_if_dirty(table, query, k, filter, highlights)
     }
 
+    fn search_sorted(
+        &mut self,
+        table: &str,
+        query: &skaidb_fts::SearchQuery,
+        sort: &skaidb_fts::SortSpec,
+        k: usize,
+        filter: &Option<Expr>,
+        highlights: &[(String, usize)],
+    ) -> EngineResult<Option<Vec<(Vec<u8>, Document)>>> {
+        // Index-ordered top-k needs one index holding every row; sharded
+        // corpora fall back to the coordinator's gather-and-sort (scatter
+        // with per-shard sort merge is future work).
+        let members = self.node.member_count();
+        if members > 1 && self.node.cfg.replication_factor < members {
+            return Ok(None);
+        }
+        self.node
+            .local
+            .write()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .search_sorted(table, query, sort, k, filter, highlights)
+    }
+
     fn search_aggregate(
         &mut self,
         table: &str,

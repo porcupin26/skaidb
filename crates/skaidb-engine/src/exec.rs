@@ -922,6 +922,83 @@ impl Database {
         Ok(live.index.aggregate(query, agg)?)
     }
 
+    /// Fast-field-ordered top-k over the local index (read-your-writes),
+    /// resolving hits to rows with the residual-filter over-fetch
+    /// discipline. `Ok(None)` = the index cannot serve this ordering
+    /// exactly; the caller falls back.
+    pub fn search_sorted(
+        &mut self,
+        table: &str,
+        query: &SearchQuery,
+        sort: &skaidb_fts::SortSpec,
+        k: usize,
+        filter: &Option<Expr>,
+        highlights: &[(String, usize)],
+    ) -> Result<Option<SortedSearchRows>> {
+        let name = self.search_index_for_query(table, query)?;
+        if let Some(live) = self.search_indexes.get_mut(&name) {
+            live.commit_if_dirty()?;
+        }
+        self.search_sorted_read(table, query, sort, k, filter, highlights)
+    }
+
+    /// [`Database::search_sorted`] over the last-committed index state.
+    pub fn search_sorted_read(
+        &self,
+        table: &str,
+        query: &SearchQuery,
+        sort: &skaidb_fts::SortSpec,
+        k: usize,
+        filter: &Option<Expr>,
+        highlights: &[(String, usize)],
+    ) -> Result<Option<SortedSearchRows>> {
+        let name = self.search_index_for_query(table, query)?;
+        let live = self
+            .search_indexes
+            .get(&name)
+            .ok_or(EngineError::IndexNotFound(name))?;
+        let table_engine = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+        let fetch = if filter.is_some() {
+            k.saturating_mul(4).max(k + 16)
+        } else {
+            k
+        };
+        let Some(hits) = live.index.search_sorted(query, sort, fetch)? else {
+            return Ok(None);
+        };
+        let highlighters = highlights
+            .iter()
+            .map(|(col, max_chars)| {
+                let h = live.index.highlighter(query, col, *max_chars)?;
+                Ok((col.as_str(), h))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut out = Vec::new();
+        for (key, _) in hits {
+            let Some(bytes) = table_engine.get(&key)? else {
+                continue;
+            };
+            let Ok(Value::Document(mut doc)) = Value::decode(&bytes) else {
+                continue;
+            };
+            if !matches_filter(filter, &doc)? {
+                continue;
+            }
+            for (col, h) in &highlighters {
+                let snippet = h.snippet_doc(&doc, col);
+                doc.insert(format!("_highlight_{col}"), Value::String(snippet));
+            }
+            out.push((key, doc));
+            if out.len() >= k {
+                break;
+            }
+        }
+        Ok(Some(out))
+    }
+
     /// A snippet generator for `query` over `column`, from the index
     /// serving the query — the cluster coordinator highlights re-read rows
     /// with this after the scatter merge.
@@ -3517,6 +3594,23 @@ pub trait Cluster {
     ) -> Result<Option<Vec<skaidb_fts::AggRow>>> {
         Ok(None)
     }
+    /// Fast-field-ordered top-k search (`ORDER BY <col> LIMIT k`,
+    /// phase 7): the `k` best rows by the sort column, best-first, or
+    /// `Ok(None)` when the deployment or column cannot serve the exact SQL
+    /// ordering — the caller falls back to gathering every match and
+    /// sorting generically. The default declines; multi-member scatter for
+    /// this path is future work (the fallback stays correct at any RF).
+    fn search_sorted(
+        &mut self,
+        _table: &str,
+        _query: &SearchQuery,
+        _sort: &skaidb_fts::SortSpec,
+        _k: usize,
+        _filter: &Option<Expr>,
+        _highlights: &[(String, usize)],
+    ) -> Result<Option<SortedSearchRows>> {
+        Ok(None)
+    }
     /// Write `doc` under `key` in `table` (and maintain indexes/replicas).
     fn put(&mut self, table: &str, key: &[u8], doc: &Document) -> Result<()>;
     /// Write a whole statement's rows in one call. Implementations may batch
@@ -4078,8 +4172,11 @@ fn run_search_select(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSe
         let docs: Vec<Document> = hits.into_iter().map(|(_, doc, _)| doc).collect();
         return select_aggregate(sel, docs, true);
     }
-    // ORDER BY: absent (predicate-only), or exactly `score() DESC` with a
-    // LIMIT (the index cannot rank without a bound).
+    // ORDER BY: absent (predicate-only), exactly `score() DESC LIMIT k`
+    // (BM25 top-k in the index), or any other ordering (phase 7) — a
+    // single plain fast-field column with LIMIT tries the index-ordered
+    // pushdown, everything else gathers every match and sorts through the
+    // ordinary executor.
     let k = match sel.order_by.as_slice() {
         [] => None,
         [key] if key.descending && is_score_call(&key.expr) => {
@@ -4088,10 +4185,35 @@ fn run_search_select(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSe
             })?;
             Some(sel.offset.unwrap_or(0).saturating_add(limit) as usize)
         }
-        _ => {
-            return Err(EngineError::Unsupported(
-                "search queries support only ORDER BY score() DESC".into(),
-            ))
+        order => {
+            if order.iter().any(|ok| expr_has_func(&ok.expr, &|n| n == "score")) {
+                return Err(EngineError::Unsupported(
+                    "score() ordering must be exactly ORDER BY score() DESC".into(),
+                ));
+            }
+            let highlights = collect_highlights(sel)?;
+            if let ([key], Some(limit)) = (order, sel.limit) {
+                if let Expr::Column(col) = &key.expr {
+                    let want = sel.offset.unwrap_or(0).saturating_add(limit) as usize;
+                    let sort = skaidb_fts::SortSpec {
+                        column: col.clone(),
+                        descending: key.descending,
+                    };
+                    if let Some(hits) = cluster.search_sorted(
+                        &sel.from, &query, &sort, want, &residual, &highlights,
+                    )? {
+                        let docs = hits.into_iter().map(|(_, d)| d).collect();
+                        // The generic sort in `project` re-orders the
+                        // already-bounded gather identically (the pushdown
+                        // declined if NULL ordering could diverge).
+                        return project(sel, docs, &HashSet::new(), true);
+                    }
+                }
+            }
+            // Fallback: every matching row, ordered by the executor.
+            let hits = cluster.search(&sel.from, &query, None, &residual, &highlights)?;
+            let docs: Vec<Document> = hits.into_iter().map(|(_, d, _)| d).collect();
+            return project(sel, docs, &HashSet::new(), true);
         }
     };
     let highlights = collect_highlights(sel)?;
@@ -4107,6 +4229,9 @@ fn run_search_select(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSe
     // injected `_score`) and the OFFSET/LIMIT page.
     project(sel, docs, &HashSet::new(), true)
 }
+
+/// `(key, doc)` rows from a fast-field-ordered search, best-first.
+pub type SortedSearchRows = Vec<(Vec<u8>, Document)>;
 
 /// What each select item of an agg-pushdown query reads from an
 /// [`skaidb_fts::AggRow`].
@@ -4887,6 +5012,19 @@ impl Cluster for LocalCluster<'_> {
         self.db.search_aggregate(table, query, agg)
     }
 
+    fn search_sorted(
+        &mut self,
+        table: &str,
+        query: &SearchQuery,
+        sort: &skaidb_fts::SortSpec,
+        k: usize,
+        filter: &Option<Expr>,
+        highlights: &[(String, usize)],
+    ) -> Result<Option<SortedSearchRows>> {
+        self.db
+            .search_sorted(table, query, sort, k, filter, highlights)
+    }
+
     fn put(&mut self, table: &str, key: &[u8], doc: &Document) -> Result<()> {
         if self.put_row(table, key, doc)? {
             self.db.search_refresh(table)?;
@@ -5023,6 +5161,19 @@ impl Cluster for LocalRead<'_> {
         agg: &skaidb_fts::AggRequest,
     ) -> Result<Option<Vec<skaidb_fts::AggRow>>> {
         self.db.search_aggregate_read(table, query, agg)
+    }
+
+    fn search_sorted(
+        &mut self,
+        table: &str,
+        query: &SearchQuery,
+        sort: &skaidb_fts::SortSpec,
+        k: usize,
+        filter: &Option<Expr>,
+        highlights: &[(String, usize)],
+    ) -> Result<Option<SortedSearchRows>> {
+        self.db
+            .search_sorted_read(table, query, sort, k, filter, highlights)
     }
 
     fn put(&mut self, _table: &str, _key: &[u8], _doc: &Document) -> Result<()> {
