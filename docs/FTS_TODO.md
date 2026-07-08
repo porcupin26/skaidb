@@ -250,13 +250,19 @@ fleet-verified — the TS cadence)
     `SnippetGenerator` per (query, column) applied to the authoritative row
     text at hit-resolve time, `_highlight_<col>` injected like `_score`
     (cluster-ready: travels with the hit doc).
+  - [x] **Exit met** (2026-07-08): 400-query suite (term/AND/OR/phrase ×
+    100) side-by-side vs ES 8.14.3 on the 280 k-article corpus — **98.5%
+    strict top-10 overlap, 99.8% tie-tolerant**, per-query hit counts
+    equal. Getting there required replacing the simple tokenizer with a
+    **UAX §29 Unicode word tokenizer** in the standard-based pipelines
+    (the first run scored 89.2%; tokenization was nearly all of the gap).
+    The tokenizer registers under a versioned name (`.u1`), so existing
+    indexes schema-mismatch on open and rebuild from the table
+    automatically. Residual ~1.5% is fieldnorm quantization on near-ties;
+    documented in BENCHMARKS.md.
   - [ ] `multi_match` `cross_fields` mode (best_fields is the shipped
     default).
   - [ ] Per-hit score explain.
-  - [ ] **Exit**: curated 100-query suite side-by-side vs ES — same result
-    *sets* (top-k overlap ≥ 95%, scoring-order differences documented).
-    Needs the ES container on the bench fleet; fold into the phase-5 bench
-    setup.
 - [ ] **Phase 4 — cluster** (core shipped, fleet smoke pending):
   - [x] Per-replica local indexes over replicated writes: the replicated
     apply paths (`apply_put`/`apply_delete` + batched variants) maintain

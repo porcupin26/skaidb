@@ -265,6 +265,19 @@ writes never became visible to read-only searches. Fixed with a background
 refresher tick in the server (v0.39); the probe then measured 43–1,197 ms,
 inside the refresh_ms + tick bound.
 
+**Result-set parity** (the docs/FTS_TODO.md phase-3 exit, same corpus and
+queries): mean top-10 overlap per query against ES initially measured
+89.2% — score traces put nearly all of the divergence in tokenization
+(skaidb's `standard` split on every non-alphanumeric; ES uses Unicode word
+segmentation, so postings, phrase adjacency, and length norms differed).
+Replacing the simple tokenizer with a UAX §29 word tokenizer (v0.39)
+brought it to **98.5% strict top-10 overlap / 99.8% with tie tolerance**
+(each engine's top-10 within the other's top-15) across
+term/AND/OR/phrase, with per-query hit counts matching ES exactly and no
+measurable query-latency cost. The remaining ~1.5% is BM25 fieldnorm
+quantization flipping near-tied docs at the cutoff. Run it:
+`fts_bench.py parity <skaidb:7080> <es:9200> <data_dir>`.
+
 Reproduce: `bench/clients/fts_corpus.py` (corpus + query generation from a
 MediaWiki dump) and `bench/clients/fts_bench.py`
 (`fts_bench.py <skaidb|es> <addr> <setup|ingest|query|nrt> <data_dir>`).

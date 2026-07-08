@@ -11,9 +11,10 @@ use std::fmt;
 
 use tantivy::tokenizer::{
     AsciiFoldingFilter, Language, LowerCaser, NgramTokenizer, RawTokenizer, RemoveLongFilter,
-    SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer, WhitespaceTokenizer,
+    Stemmer, StopWordFilter, TextAnalyzer, Token, TokenStream, Tokenizer, WhitespaceTokenizer,
 };
 use tantivy::Index;
+use unicode_segmentation::{UnicodeSegmentation, UnicodeWordIndices};
 
 use crate::FtsError;
 
@@ -24,12 +25,65 @@ const MAX_TOKEN_LEN: usize = 255;
 /// Ngram sizes above this produce pathological index blowup.
 const MAX_NGRAM: usize = 32;
 
+/// UAX §29 word tokenizer — the same Unicode segmentation Elasticsearch's
+/// `standard` analyzer uses, so `dog's` stays one token and CJK/accented
+/// boundaries match. Replaced tantivy's `SimpleTokenizer` (split on every
+/// non-alphanumeric) after the phase-3 parity suite traced most of the
+/// result-set divergence vs ES to tokenization.
+#[derive(Debug, Clone, Default)]
+struct UnicodeWordTokenizer {
+    token: Token,
+}
+
+struct UnicodeWordTokenStream<'a> {
+    words: UnicodeWordIndices<'a>,
+    token: &'a mut Token,
+}
+
+impl Tokenizer for UnicodeWordTokenizer {
+    type TokenStream<'a> = UnicodeWordTokenStream<'a>;
+
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> UnicodeWordTokenStream<'a> {
+        self.token.reset();
+        UnicodeWordTokenStream {
+            words: text.unicode_word_indices(),
+            token: &mut self.token,
+        }
+    }
+}
+
+impl TokenStream for UnicodeWordTokenStream<'_> {
+    fn advance(&mut self) -> bool {
+        // `unicode_word_indices` yields only word-like segments (skipping
+        // whitespace/punctuation), which is exactly the `standard` contract.
+        match self.words.next() {
+            Some((offset, word)) => {
+                self.token.position = self.token.position.wrapping_add(1);
+                self.token.offset_from = offset;
+                self.token.offset_to = offset + word.len();
+                self.token.text.clear();
+                self.token.text.push_str(word);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn token(&self) -> &Token {
+        self.token
+    }
+
+    fn token_mut(&mut self) -> &mut Token {
+        self.token
+    }
+}
+
 /// A named analysis pipeline. `parse`/`Display` round-trip the spec string
 /// stored in the catalog (`'english'`, `'edge_ngram(2,15)'`, ...).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Analyzer {
-    /// Word split + lowercase (the default; ES `standard` minus Unicode
-    /// segmentation subtleties — see docs/SEARCH.md).
+    /// Unicode word split (UAX §29, like ES `standard`) + lowercase (the
+    /// default).
     Standard,
     /// `standard` + ASCII folding (`café` → `cafe`), for accent-insensitive
     /// matching without stemming.
@@ -122,14 +176,25 @@ impl Analyzer {
 
     /// The tokenizer name this analyzer registers under — namespaced so we
     /// never collide with Tantivy's built-ins, unique per spec so different
-    /// parameters coexist in one index.
+    /// parameters coexist in one index. The name is persisted in the index
+    /// schema, so **changing a pipeline's output must change its name**:
+    /// the schema then mismatches on open and the index rebuilds from the
+    /// table instead of silently mixing token streams.
     pub(crate) fn tokenizer_name(&self) -> String {
-        format!("skaidb.{self}")
+        match self {
+            // `.u1`: the standard-based pipelines switched from simple
+            // (split on non-alphanumeric) to UAX §29 Unicode-word
+            // tokenization (v0.39, phase-3 ES parity).
+            Analyzer::Standard | Analyzer::Folding | Analyzer::Language(_) => {
+                format!("skaidb.{self}.u1")
+            }
+            _ => format!("skaidb.{self}"),
+        }
     }
 
     pub(crate) fn build(&self) -> TextAnalyzer {
         let standard = || {
-            TextAnalyzer::builder(SimpleTokenizer::default())
+            TextAnalyzer::builder(UnicodeWordTokenizer::default())
                 .filter(RemoveLongFilter::limit(MAX_TOKEN_LEN))
                 .filter(LowerCaser)
                 .dynamic()
@@ -230,10 +295,9 @@ mod tests {
     }
 
     /// Conformance fixtures: the token streams Elasticsearch produces for
-    /// its reference sentence with the equivalent analyzer. One documented
-    /// divergence — ES `standard` uses Unicode word segmentation and keeps
-    /// `dog's` whole; our simple tokenizer splits on the apostrophe (noted
-    /// in docs/SEARCH.md).
+    /// its reference sentence with the equivalent analyzer — identical
+    /// since the UAX §29 tokenizer landed (`dog's` stays one token, like
+    /// ES `standard`).
     #[test]
     fn standard_analyzer_conformance() {
         assert_eq!(
@@ -241,20 +305,21 @@ mod tests {
                 &Analyzer::Standard,
                 "The 2 QUICK Brown-Foxes jumped over the lazy dog's bone."
             ),
-            ["the", "2", "quick", "brown", "foxes", "jumped", "over", "the", "lazy", "dog", "s",
+            ["the", "2", "quick", "brown", "foxes", "jumped", "over", "the", "lazy", "dog's",
              "bone"]
         );
     }
 
     #[test]
     fn english_analyzer_conformance() {
-        // ES `english` for the same sentence: stopwords dropped, stemmed.
+        // ES `english` for the same sentence: stopwords dropped, stemmed,
+        // possessive removed by the Snowball stemmer.
         assert_eq!(
             tokens(
                 &Analyzer::parse("english").unwrap(),
                 "The 2 QUICK Brown-Foxes jumped over the lazy dog's bone."
             ),
-            ["2", "quick", "brown", "fox", "jump", "over", "lazi", "dog", "s", "bone"]
+            ["2", "quick", "brown", "fox", "jump", "over", "lazi", "dog", "bone"]
         );
     }
 

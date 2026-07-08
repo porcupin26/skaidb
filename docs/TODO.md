@@ -47,10 +47,11 @@ roadmap and benchmarks: [FTS_TODO.md](FTS_TODO.md). Phases 0–5 are done,
 identical 2 GB containers; table + caveats in
 [BENCHMARKS.md](BENCHMARKS.md), which also flushed out and fixed the
 missing background NRT refresher). Shipped state in
-[SEARCH.md](SEARCH.md). Remaining: the cluster scatter-overhead leg +
-phase-4 fleet smoke (test cluster, once on ≥ v0.38), the ES parity suite
-+ explain/cross_fields (phase 3), merge-policy tuning if merge stalls
-ever surface. Next action: **phase 6** (aggregations/facets).
+[SEARCH.md](SEARCH.md). The phase-3 parity exit is met too (98.5% strict
+top-10 overlap vs ES after the UAX §29 tokenizer swap). Remaining: the
+cluster scatter-overhead leg + phase-4 fleet smoke (test cluster, once on
+≥ v0.39), explain/cross_fields (phase 3, minor), merge-policy tuning if
+merge stalls ever surface. Next action: **phase 6** (aggregations/facets).
 
 ## 3. Other
 

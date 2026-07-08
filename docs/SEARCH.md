@@ -63,10 +63,12 @@ DROP SEARCH INDEX articles_fts;
 Set the index default with `analyzer = '...'`, or per column with
 `<column>.analyzer = '...'`:
 
-- `standard` — word split + lowercase (the default). One documented
-  divergence from Elasticsearch's `standard`: ES uses Unicode word
-  segmentation and keeps `dog's` whole; our simple tokenizer splits on the
-  apostrophe (`dog`, `s`).
+- `standard` — Unicode word split (UAX §29, the same segmentation ES's
+  `standard` uses: `dog's` stays one token) + lowercase (the default).
+  Measured at 98.5% strict top-10 result-set overlap with ES on a 280 k
+  article corpus (see [BENCHMARKS.md](BENCHMARKS.md)). Indexes built
+  before v0.39 (simple tokenizer) rebuild from the table automatically on
+  first open.
 - `folding` — `standard` + ASCII folding (`café` → `cafe`) for
   accent-insensitive matching without stemming.
 - **Languages** (standard + stopwords where a list exists + Snowball

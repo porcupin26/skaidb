@@ -128,15 +128,26 @@ def q(text):
 
 
 class Es:
-    def __init__(self, addr):
+    """Persistent HTTP client (used for Elasticsearch, and for skaidb's
+    REST gateway in the parity check — pass `basic` credentials there)."""
+
+    def __init__(self, addr, basic=None):
         host, port = addr.rsplit(":", 1)
         self.conn = http.client.HTTPConnection(host, int(port), timeout=120)
+        self.headers = {}
+        if basic:
+            import base64
+
+            token = base64.b64encode(basic.encode()).decode()
+            self.headers["Authorization"] = f"Basic {token}"
 
     def call(self, method, path, body=None, ctype="application/json"):
         payload = None
         if body is not None:
             payload = body if isinstance(body, (bytes, str)) else json.dumps(body)
-        self.conn.request(method, path, body=payload, headers={"Content-Type": ctype})
+        self.conn.request(
+            method, path, body=payload, headers={"Content-Type": ctype, **self.headers}
+        )
         resp = self.conn.getresponse()
         data = resp.read()
         if resp.status >= 300 and not (method == "DELETE" and resp.status == 404):
@@ -174,7 +185,80 @@ def run_queries(label, queries, run_one):
     )
 
 
+def parity(skaidb_addr, es_addr, data_dir):
+    """Result-set parity (docs/FTS_TODO.md phase-3 exit): run the same
+    query sets on both engines, compare top-10 id sets per query, report
+    mean overlap per class. skaidb over REST (easy JSON ids), ES as usual.
+    Overlap = |A∩B| / min(|A|,|B|) so a class where both engines find
+    fewer than 10 hits isn't penalized for the shorter list."""
+    user = os.environ.get("SKAIDB_USER", "skaidb")
+    password = os.environ.get("SKAIDB_PASSWORD", "skaidbClu5ter")
+    rest = Es(skaidb_addr, basic=f"{user}:{password}")  # skaidb REST gateway
+    es = Es(es_addr)
+    queries = json.load(open(f"{data_dir}/queries.json"))
+
+    def skaidb_ids(where, k):
+        out = rest.call(
+            "POST", "/query",
+            f"SELECT id FROM articles WHERE {where} ORDER BY score() DESC LIMIT {k}",
+        )
+        return [row[0] for row in out["rows"]]
+
+    def es_ids(query, k):
+        out = es.call("POST", "/articles/_search",
+                      {"size": k, "_source": False, "query": query})
+        return [int(h["_id"]) for h in out["hits"]["hits"]]
+
+    classes = {
+        "term": [(f"MATCH(body, {q(w)})", {"match": {"body": w}}) for w in queries["term"]],
+        "and": [(
+            f"SEARCH('+body:{a} +body:{b}')",
+            {"bool": {"must": [{"match": {"body": a}}, {"match": {"body": b}}]}},
+        ) for a, b in queries["and"]],
+        "or": [(f"MATCH(body, {q(a + ' ' + b)})", {"match": {"body": f"{a} {b}"}})
+               for a, b in queries["or"]],
+        "phrase": [(f"MATCH_PHRASE(body, {q(p)})", {"match_phrase": {"body": p}})
+                   for p in queries["phrase"]],
+    }
+    grand, grand_tie = [], []
+    for label, pairs in classes.items():
+        overlaps, tie_overlaps, low = [], [], 0
+        for where, query in pairs:
+            a15, b15 = skaidb_ids(where, 15), es_ids(query, 15)
+            a10, b10 = set(a15[:10]), set(b15[:10])
+            if not a10 and not b10:
+                overlaps.append(1.0)
+                tie_overlaps.append(1.0)
+                continue
+            denom = min(len(a10), len(b10)) or max(len(a10), len(b10))
+            ov = len(a10 & b10) / denom
+            overlaps.append(ov)
+            low += ov < 0.8
+            # Tie-tolerant containment: each engine's top-10 found within
+            # the other's top-15 — separates genuinely missing results
+            # from near-tied docs flipping order at the k=10 cutoff.
+            contain = (
+                len(a10 & set(b15)) + len(b10 & set(a15))
+            ) / max(1, len(a10) + len(b10))
+            tie_overlaps.append(contain)
+        mean = sum(overlaps) / len(overlaps)
+        tie = sum(tie_overlaps) / len(tie_overlaps)
+        grand.extend(overlaps)
+        grand_tie.extend(tie_overlaps)
+        print(
+            f"  {label:<8} strict@10 {mean*100:5.1f}%   @10-in-15 {tie*100:5.1f}%"
+            f"   (<80% strict on {low}/{len(overlaps)})"
+        )
+    print(
+        f"  overall  strict@10 {sum(grand)/len(grand)*100:5.1f}%"
+        f"   @10-in-15 {sum(grand_tie)/len(grand_tie)*100:5.1f}%"
+    )
+
+
 def main():
+    if sys.argv[1] == "parity":
+        parity(sys.argv[2], sys.argv[3], sys.argv[4])
+        return
     system, addr, phase, data_dir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
     batch = int(sys.argv[5]) if len(sys.argv) > 5 else 1000
 

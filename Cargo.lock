@@ -1157,6 +1157,7 @@ dependencies = [
  "tantivy",
  "tempfile",
  "thiserror",
+ "unicode-segmentation",
 ]
 
 [[package]]
