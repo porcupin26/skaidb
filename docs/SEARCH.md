@@ -219,6 +219,35 @@ RF ≥ member count); sharded corpora take the fallback. One typing nuance:
 while the fallback preserves each row's stored type — store timestamp
 values (not bare integers) in date columns for consistent typing.
 
+## ES-compatible REST subset
+
+The REST endpoint speaks enough Elasticsearch for existing ES client
+libraries and log shippers (not Kibana). An ES "index" is a skaidb
+**table**; its `SEARCH INDEX` is the mapping; `_id` maps to the table's
+single-column primary key (stored as a string, auto-generated when a bulk
+action omits it). Pre-create the table + search index; the subset does
+not auto-create.
+
+```
+POST /{index}/_bulk      index / create / delete NDJSON actions
+POST /{index}/_search    query DSL: match, match_phrase, prefix, wildcard,
+                         regexp, fuzzy, term, terms, range, exists, bool,
+                         query_string, more_like_this; from/size, sort
+                         (incl. _score), _source on/off, highlight, exact
+                         totals; aggs: terms, date_histogram (+ sum/avg/
+                         min/max/value_count/cardinality sub-aggs)
+POST /{index}/_count     exact match count
+GET  /{index}/_mapping   the search-index declaration as ES properties
+```
+
+Everything translates to the same SQL statements documented above and
+runs through the ordinary session path — HTTP Basic auth, RBAC, cluster
+routing, and all pushdowns apply unchanged. Limits: `bool.should` beside
+`must`/`filter` (optional-scoring) is rejected; a single sort key;
+clients that hard-check the `X-elastic-product` header need that check
+disabled. `cardinality` is skaidb's **exact** `COUNT(DISTINCT)`, not an
+HLL approximation.
+
 ## Architecture
 
 - **`skaidb-fts` crate** wraps Tantivy behind an engine-agnostic API
