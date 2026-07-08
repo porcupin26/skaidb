@@ -290,6 +290,38 @@ Reproduce: `bench/clients/fts_corpus.py` (corpus + query generation from a
 MediaWiki dump) and `bench/clients/fts_bench.py`
 (`fts_bench.py <skaidb|es> <addr> <setup|ingest|query|nrt> <data_dir>`).
 
+### Aggregations (logs track, v0.41)
+
+The phase-6 exit: a 500 k-doc synthetic http_logs-shape corpus
+(`bench/clients/fts_logs_corpus.py` — request line text, keyword
+method/status, long bytes, date ts), same containers and procedure as
+above, 20 MATCH-filtered aggregation queries per class, warm runs:
+
+|                                     | skaidb 0.41 | Elasticsearch 8.14.3 |
+|-------------------------------------|------------:|---------------------:|
+| ingest (docs/s)                     |  **34,400** |  20,500 (15,400 cold) |
+| terms buckets p50 (ms)              |    **0.6** |                  6.8 |
+| date_histogram p50 (ms)             |    **1.5** |                 10.4 |
+| global stats p50 (ms)               |    **2.1** |                  6.3 |
+| COUNT(DISTINCT) p50 (ms)            |    **0.5** (exact) |     4.4 (approx.) |
+| grouped multi-metric p50 (ms)       |        276 |             **10.4** |
+
+**Result parity: 80/80 aggregation queries identical** (bucket sets,
+counts, sums, averages; skaidb's `COUNT(DISTINCT)` is exact where ES's
+cardinality is HLL-approximate).
+
+The grouped multi-metric row is the interesting one — and it's the row
+that made this benchmark worth running. The first pass pushed grouped
+`SUM`/`AVG` into Tantivy sub-aggregations and the parity check caught
+**silently wrong sums on minority buckets** (counts exact, sums ~40% low):
+an upstream tantivy 0.26.1 bug where `CachedSubAggs::flush_local` drops
+small buckets' cached doc ids uncollected on periodic flushes (triggered
+by merged segments > 2048 docs). No count-based exactness check can see
+it. skaidb now declines that pushdown shape — grouped queries push down
+only when every metric reads the bucket's doc count, and per-bucket
+metrics take the exact row-materialization fallback (the 276 ms above,
+~29 k rows per query). The gap closes when the upstream fix lands.
+
 ## Reproducing
 
 skaidb's load generator is in-tree:

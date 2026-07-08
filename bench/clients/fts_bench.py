@@ -255,9 +255,117 @@ def parity(skaidb_addr, es_addr, data_dir):
     )
 
 
+AGG_CLASSES = ["terms", "stats", "hist", "global", "distinct"]
+
+
+def agg_sql(cls, term):
+    """skaidb SQL for one aggregation class over one MATCH filter term."""
+    m = f"MATCH(msg, '{term}')"
+    return {
+        "terms": f"SELECT method, COUNT(*) FROM logs WHERE {m} GROUP BY method",
+        "stats": f"SELECT status, COUNT(*), SUM(bytes), AVG(bytes) FROM logs WHERE {m} GROUP BY status",
+        "hist": f"SELECT time_bucket(1h, ts), COUNT(*) FROM logs WHERE {m} GROUP BY time_bucket(1h, ts)",
+        "global": f"SELECT COUNT(*), MIN(bytes), MAX(bytes), AVG(bytes) FROM logs WHERE {m}",
+        "distinct": f"SELECT COUNT(DISTINCT method) FROM logs WHERE {m}",
+    }[cls]
+
+
+def agg_es(cls, term):
+    """The equivalent ES request body (size 0, exact totals)."""
+    base = {"size": 0, "track_total_hits": True, "query": {"match": {"msg": term}}}
+    aggs = {
+        "terms": {"g": {"terms": {"field": "method", "size": 100}}},
+        "stats": {
+            "g": {
+                "terms": {"field": "status", "size": 100},
+                "aggs": {
+                    "s": {"sum": {"field": "bytes"}},
+                    "a": {"avg": {"field": "bytes"}},
+                },
+            }
+        },
+        "hist": {"g": {"date_histogram": {"field": "ts", "fixed_interval": "1h"}}},
+        "global": {"b": {"stats": {"field": "bytes"}}},
+        "distinct": {"c": {"cardinality": {"field": "method"}}},
+    }[cls]
+    return {**base, "aggs": aggs}
+
+
+def logs_agg_parity(skaidb_addr, es_addr, data_dir):
+    """Aggregation result parity on the logs corpus: identical buckets,
+    counts, sums (avg to 1e-9 rel). ES cardinality is approximate by
+    design — reported, not asserted."""
+    user = os.environ.get("SKAIDB_USER", "skaidb")
+    password = os.environ.get("SKAIDB_PASSWORD", "skaidbClu5ter")
+    rest = Es(skaidb_addr, basic=f"{user}:{password}")
+    es = Es(es_addr)
+    terms = json.load(open(f"{data_dir}/agg_queries.json"))["terms"]
+
+    def sk(sql):
+        return rest.call("POST", "/query", sql)["rows"]
+
+    mismatches = 0
+    for term in terms:
+        # terms + stats: bucket key → numbers.
+        for cls, keyidx in [("terms", 0), ("stats", 0)]:
+            a = {r[keyidx]: r[1:] for r in sk(agg_sql(cls, term))}
+            out = es.call("POST", "/articles/_search".replace("articles", "logs"),
+                          agg_es(cls, term))
+            b = {}
+            for bucket in out["aggregations"]["g"]["buckets"]:
+                row = [bucket["doc_count"]]
+                if cls == "stats":
+                    row += [bucket["s"]["value"], bucket["a"]["value"]]
+                b[bucket["key"]] = row
+            if set(a) != set(b):
+                mismatches += 1
+                print(f"  MISMATCH {cls}/{term}: keys {sorted(a)} vs {sorted(b)}")
+                continue
+            for k in a:
+                av, bv = a[k], b[k]
+                ok = av[0] == bv[0]
+                if cls == "stats":
+                    ok = ok and abs(av[1] - bv[1]) < 1e-6 * max(1, abs(bv[1]))
+                    ok = ok and abs(av[2] - bv[2]) < 1e-9 * max(1, abs(bv[2]))
+                if not ok:
+                    mismatches += 1
+                    print(f"  MISMATCH {cls}/{term}/{k}: {av} vs {bv}")
+        # date histogram: ts → count (ES emits gap buckets with count 0).
+        a = {r[0]: r[1] for r in sk(agg_sql("hist", term))}
+        out = es.call("POST", "/logs/_search", agg_es("hist", term))
+        b = {
+            int(bucket["key"]): bucket["doc_count"]
+            for bucket in out["aggregations"]["g"]["buckets"]
+            if bucket["doc_count"] > 0
+        }
+        if a != b:
+            mismatches += 1
+            print(f"  MISMATCH hist/{term}: {len(a)} vs {len(b)} buckets")
+        # global stats + exact count.
+        row = sk(agg_sql("global", term))[0]
+        out = es.call("POST", "/logs/_search", agg_es("global", term))
+        stats = out["aggregations"]["b"]
+        total = out["hits"]["total"]["value"]
+        if row[0] != total or row[1] != stats["min"] or row[2] != stats["max"] \
+           or abs(row[3] - stats["avg"]) > 1e-9 * max(1, abs(stats["avg"])):
+            mismatches += 1
+            print(f"  MISMATCH global/{term}: {row} vs {total} {stats}")
+        # distinct: skaidb exact vs ES approximate — report only.
+        exact = sk(agg_sql("distinct", term))[0][0]
+        approx = es.call("POST", "/logs/_search", agg_es("distinct", term))
+        approx = approx["aggregations"]["c"]["value"]
+        if exact != approx:
+            print(f"  note: distinct/{term}: skaidb exact {exact}, ES approx {approx}")
+    checked = len(terms) * 4
+    print(f"parity: {checked - mismatches}/{checked} aggregation queries identical")
+
+
 def main():
     if sys.argv[1] == "parity":
         parity(sys.argv[2], sys.argv[3], sys.argv[4])
+        return
+    if sys.argv[1] == "logparity":
+        logs_agg_parity(sys.argv[2], sys.argv[3], sys.argv[4])
         return
     system, addr, phase, data_dir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
     batch = int(sys.argv[5]) if len(sys.argv) > 5 else 1000
@@ -327,6 +435,45 @@ def main():
             resp = skaidb_execute(sock, "SELECT COUNT(*) FROM articles")
             print(f"skaidb count frame: {len(resp)} bytes (nonzero = rows present)")
 
+        elif phase == "logsetup":
+            try:
+                skaidb_execute(sock, "DROP SEARCH INDEX IF EXISTS logs_fts")
+                skaidb_execute(sock, "DROP TABLE IF EXISTS logs")
+            except RuntimeError:
+                pass
+            skaidb_execute(sock, "CREATE TABLE logs (PRIMARY KEY (id))")
+            skaidb_execute(
+                sock,
+                "CREATE SEARCH INDEX logs_fts ON logs (msg, method, status, bytes, ts) \
+                 WITH (method.type = 'keyword', status.type = 'keyword', \
+                       bytes.type = 'long', ts.type = 'date')",
+            )
+            print("skaidb: logs table + search index ready")
+
+        elif phase == "logingest":
+            docs = [json.loads(l) for l in open(f"{data_dir}/logs.jsonl")]
+            t0 = time.perf_counter()
+            for i in range(0, len(docs), batch):
+                chunk = docs[i : i + batch]
+                values = ",".join(
+                    f"({d['id']}, {q(d['msg'])}, '{d['method']}', '{d['status']}', "
+                    f"{d['bytes']}, {d['ts']})"
+                    for d in chunk
+                )
+                skaidb_execute(
+                    sock,
+                    f"INSERT INTO logs (id, msg, method, status, bytes, ts) VALUES {values}",
+                )
+            secs = time.perf_counter() - t0
+            print(f"skaidb logs ingest: {len(docs)} docs in {secs:.1f}s = {len(docs)/secs:,.0f} docs/s")
+
+        elif phase == "logagg":
+            terms = json.load(open(f"{data_dir}/agg_queries.json"))["terms"]
+            for cls in AGG_CLASSES:
+                run_queries(cls, terms, lambda t, c=cls: (
+                    skaidb_row_count(skaidb_execute(sock, agg_sql(c, t)))
+                ))
+
     elif system == "es":
         es = Es(addr)
 
@@ -392,6 +539,51 @@ def main():
         elif phase == "count":
             out = es.call("GET", "/articles/_count")
             print(f"es count: {out['count']}")
+
+        elif phase == "logsetup":
+            es.call("DELETE", "/logs")
+            es.call(
+                "PUT",
+                "/logs",
+                {
+                    "settings": {"number_of_shards": 1, "number_of_replicas": 0},
+                    "mappings": {
+                        "properties": {
+                            "msg": {"type": "text"},
+                            "method": {"type": "keyword"},
+                            "status": {"type": "keyword"},
+                            "bytes": {"type": "long"},
+                            "ts": {"type": "date", "format": "epoch_millis"},
+                        }
+                    },
+                },
+            )
+            print("es: logs index ready")
+
+        elif phase == "logingest":
+            docs = [json.loads(l) for l in open(f"{data_dir}/logs.jsonl")]
+            t0 = time.perf_counter()
+            for i in range(0, len(docs), batch):
+                chunk = docs[i : i + batch]
+                lines = []
+                for d in chunk:
+                    lines.append(json.dumps({"index": {"_id": d["id"]}}))
+                    lines.append(json.dumps({k: d[k] for k in
+                                             ("msg", "method", "status", "bytes", "ts")}))
+                out = es.call("POST", "/logs/_bulk", "\n".join(lines) + "\n",
+                              ctype="application/x-ndjson")
+                if out.get("errors"):
+                    raise RuntimeError("bulk errors")
+            secs = time.perf_counter() - t0
+            print(f"es logs ingest: {len(docs)} docs in {secs:.1f}s = {len(docs)/secs:,.0f} docs/s")
+
+        elif phase == "logagg":
+            terms = json.load(open(f"{data_dir}/agg_queries.json"))["terms"]
+            for cls in AGG_CLASSES:
+                run_queries(cls, terms, lambda t, c=cls: (
+                    len(es.call("POST", "/logs/_search", agg_es(c, t))
+                        .get("aggregations", {}).get("g", {}).get("buckets", []) or [0])
+                ))
 
     else:
         sys.exit(f"unknown system {system}")

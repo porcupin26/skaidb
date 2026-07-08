@@ -169,18 +169,21 @@ WHERE SEARCH('+widget -clearance');   -- one global row
 
 Two serving paths produce identical results:
 
-- **Fast-field pushdown** (no row materialization): when the GROUP BY is a
-  single declared `keyword` column, a `time_bucket(step, col)` over a
-  declared `date` column (a fixed-interval date histogram), or absent, and
-  the items are the group expression plus
-  `COUNT(*)`/`COUNT(col)`/`COUNT(DISTINCT col)`/`SUM`/`AVG`/`MIN`/`MAX`
-  over declared columns, the facets compute inside the index over fast
-  fields (Tantivy aggregations, ES's own machinery). `COUNT(DISTINCT)` is
-  **exact** — a nested terms-bucket count, never an HLL approximation.
-- **Row fallback**: any other shape — text-column grouping, residual
-  predicates, HAVING, ORDER BY — gathers the matching rows (deduped by
-  key at the coordinator, so correct at any replication factor) and runs
-  the ordinary grouped executor.
+- **Fast-field pushdown** (no row materialization): global aggregates
+  (`COUNT(*)`/`COUNT(col)`/`COUNT(DISTINCT col)`/`SUM`/`AVG`/`MIN`/`MAX`
+  over declared columns, no GROUP BY), and grouped **counts** — a single
+  declared `keyword` column or a `time_bucket(step, col)` over a declared
+  `date` column (fixed-interval date histogram) with `COUNT(*)` — compute
+  inside the index over fast fields (Tantivy aggregations).
+  `COUNT(DISTINCT)` is **exact** — a terms-bucket count, never an HLL
+  approximation. Grouped **per-bucket metrics** deliberately do not push
+  down: tantivy 0.26.1 has a sub-aggregation data-loss bug (small buckets
+  lose metric input on periodic flushes while their doc counts stay
+  exact — found by our parity benchmark, guarded until fixed upstream).
+- **Row fallback**: everything else — grouped metrics, text-column
+  grouping, residual predicates, HAVING, ORDER BY — gathers the matching
+  rows (deduped by key at the coordinator, so correct at any replication
+  factor) and runs the ordinary grouped executor.
 
 SQL semantics hold on both paths: rows missing the group column form the
 NULL group, `SUM` over no values is NULL (ES-style aggregations would say

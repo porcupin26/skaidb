@@ -358,13 +358,26 @@ fleet-verified — the TS cadence)
     only), **exact** on both paths: HashSet on the row fallback, nested
     terms-bucket count in the pushdown (bails on truncation rather than
     approximate à la HLL; keyword and numeric columns).
+  - [x] **Exit met** (2026-07-08): 500 k-doc logs-track A/B vs ES 8.14.3 —
+    **80/80 aggregation queries identical**; ingest 34.4 k docs/s vs
+    20.5 k warm; terms/histogram/global/distinct p50 0.5–2.1 ms vs ES
+    4.4–10.4 ms. Full table in docs/BENCHMARKS.md.
+  - [x] **Upstream tantivy 0.26.1 bug found by the exit bench** (the
+    parity check caught silently wrong grouped sums): `CachedSubAggs::
+    flush_local` (aggregation/cached_sub_aggs.rs) drops sub-aggregation
+    doc ids for buckets below a size threshold on periodic flushes (every
+    2048 cached docs — merged segments trigger it), so minority buckets
+    lose ~60% of their metric input while doc counts stay exact.
+    **Guarded**: grouped requests push down only when every metric is a
+    doc count; per-bucket metrics (grouped SUM/AVG/MIN/MAX/COUNT(col)/
+    COUNT(DISTINCT)) take the exact row fallback (~276 ms vs 10 ms on the
+    logs track — the one class ES currently wins). TODO: file the issue
+    upstream (quickwit-oss/tantivy) and lift the guard when fixed.
   - [ ] Sharded per-shard partials (needs per-key ownership filters — e.g.
     a ring-hash fast field — to avoid double-counting replicas).
   - [ ] top_hits (wants a SQL surface — window functions or a dedicated
     per-group-top-k clause); approximate HLL cardinality as an opt-in
     function if COUNT(DISTINCT)'s exact bail ever hurts.
-  - [ ] **Exit**: agg parity + perf vs ES on the logs track (bench-pair
-    campaign, same setup as the phase-5 exit).
 - [ ] **Phase 7 — search UX extras**: search_after, fast-field sort,
   term + completion suggesters, synonyms with hot-reload, more_like_this.
 - [ ] **Phase 8 — ES-compatible REST subset (decision checkpoint)**:

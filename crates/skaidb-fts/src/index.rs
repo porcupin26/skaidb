@@ -457,6 +457,26 @@ impl SearchIndex {
             }
             _ => {}
         }
+        // UPSTREAM BUG GUARD (tantivy 0.26.1): sub-aggregations under a
+        // bucket aggregation silently lose data — `CachedSubAggs::
+        // flush_local` (src/aggregation/cached_sub_aggs.rs) only collects
+        // buckets above a size threshold on periodic flushes (every 2048
+        // cached docs, so it triggers on merged segments), then `clear()`s
+        // the skipped buckets' cached doc ids. Bucket doc_counts stay
+        // exact (tracked separately), so no exactness check can catch it —
+        // the phase-6 logs benchmark did (sums ~40% low on minority
+        // buckets). Until it is fixed upstream, grouped requests push down
+        // only when every metric reads the bucket's doc count; per-bucket
+        // metrics take the row-materialization fallback. Root-level
+        // metrics (no parent bucket) don't use the cache and stay safe.
+        if req.group_by.is_some()
+            && req
+                .metrics
+                .iter()
+                .any(|m| m.func != AggMetricFunc::Count)
+        {
+            return Ok(None);
+        }
         // Metric sub-requests: m{i} per metric (+ a value-count companion
         // for SUM, to null it over empty value sets).
         let mut metric_aggs = serde_json::Map::new();
@@ -1357,32 +1377,40 @@ mod tests {
         put(&mut idx, b"k4", "red roof", None, 7.0, 4); // NULL group
         idx.commit().unwrap();
 
+        // Grouped + COUNT(*) only: the safe pushdown envelope (per-bucket
+        // metric sub-aggregations are declined — see the upstream-bug guard
+        // in `aggregate`).
         let req = AggRequest {
             group_by: Some(crate::AggGroupBy::Keyword("category".into())),
-            metrics: vec![
-                AggMetric {
-                    func: AggMetricFunc::Count,
-                    column: None,
-                },
-                AggMetric {
-                    func: AggMetricFunc::Sum,
-                    column: Some("price".into()),
-                },
-            ],
+            metrics: vec![AggMetric {
+                func: AggMetricFunc::Count,
+                column: None,
+            }],
         };
-        let mut rows = idx
+        let rows = idx
             .aggregate(&matches("body", "red"), &req)
             .unwrap()
             .expect("exact");
-        rows.sort_by(|a, b| a.key.encode_key().cmp(&b.key.encode_key()));
-        assert_eq!(rows.len(), 3);
-        let flat: Vec<(Value, u64, Value)> = rows
-            .iter()
-            .map(|r| (r.key.clone(), r.count, r.metrics[1].clone()))
-            .collect();
-        assert!(flat.contains(&(Value::Null, 1, Value::Float(7.0)))); // NULL group
-        assert!(flat.contains(&(Value::String("building".into()), 1, Value::Float(5.0))));
-        assert!(flat.contains(&(Value::String("fruit".into()), 1, Value::Float(10.0))));
+        let flat: Vec<(Value, u64)> = rows.iter().map(|r| (r.key.clone(), r.count)).collect();
+        assert_eq!(flat.len(), 3);
+        assert!(flat.contains(&(Value::Null, 1))); // NULL group
+        assert!(flat.contains(&(Value::String("building".into()), 1)));
+        assert!(flat.contains(&(Value::String("fruit".into()), 1)));
+
+        // Grouped requests with per-bucket metrics decline (tantivy
+        // 0.26.1's CachedSubAggs drops sub-agg input for small buckets on
+        // periodic flushes) — the caller's row fallback serves them.
+        let grouped_metrics = AggRequest {
+            group_by: Some(crate::AggGroupBy::Keyword("category".into())),
+            metrics: vec![AggMetric {
+                func: AggMetricFunc::Sum,
+                column: Some("price".into()),
+            }],
+        };
+        assert!(idx
+            .aggregate(&matches("body", "red"), &grouped_metrics)
+            .unwrap()
+            .is_none());
 
         // Global (no GROUP BY): one row over the whole match set.
         let global = AggRequest {
@@ -1478,8 +1506,8 @@ mod tests {
                 interval_ms: HOUR,
             }),
             metrics: vec![AggMetric {
-                func: AggMetricFunc::Sum,
-                column: Some("v".into()),
+                func: AggMetricFunc::Count,
+                column: None,
             }],
         };
         let rows = idx
@@ -1488,14 +1516,11 @@ mod tests {
             .expect("exact");
         // Buckets are hour-floored ms timestamps; gap-filling empty buckets
         // (hour +2) are dropped, matching SQL GROUP BY.
-        let flat: Vec<(Value, u64, Value)> = rows
-            .iter()
-            .map(|r| (r.key.clone(), r.count, r.metrics[0].clone()))
-            .collect();
+        let flat: Vec<(Value, u64)> = rows.iter().map(|r| (r.key.clone(), r.count)).collect();
         assert_eq!(flat.len(), 3, "{flat:?}");
-        assert!(flat.contains(&(Value::Timestamp(floor), 2, Value::Int(3))));
-        assert!(flat.contains(&(Value::Timestamp(floor + HOUR), 1, Value::Int(4))));
-        assert!(flat.contains(&(Value::Timestamp(floor + 3 * HOUR), 1, Value::Int(8))));
+        assert!(flat.contains(&(Value::Timestamp(floor), 2)));
+        assert!(flat.contains(&(Value::Timestamp(floor + HOUR), 1)));
+        assert!(flat.contains(&(Value::Timestamp(floor + 3 * HOUR), 1)));
 
         // A matching row without the date column would vanish from the
         // histogram while the fallback groups it under NULL — the

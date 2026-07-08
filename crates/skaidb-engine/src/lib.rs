@@ -2163,14 +2163,14 @@ mod tests {
             ))
             .unwrap();
         }
-        // Pushdown: date-histogram buckets, keys typed as timestamps (a
-        // `date` column's semantics). Documented typing nuance: integer-
-        // stored ts values come back Int from the row-fallback path
-        // (`time_bucket` preserves its input type per row) but Timestamp
-        // from the pushdown — the same instants either way.
+        // COUNT-only histogram: the safe pushdown envelope. Keys are typed
+        // as timestamps (a `date` column's semantics). Documented typing
+        // nuance: integer-stored ts values come back Int from the
+        // row-fallback path (`time_bucket` preserves its input type per
+        // row) but Timestamp from the pushdown — the same instants.
         let rs = rows(
             db.execute(
-                "SELECT time_bucket(1h, ts), COUNT(*), SUM(v) FROM events \
+                "SELECT time_bucket(1h, ts), COUNT(*) FROM events \
                  WHERE MATCH(msg, 'alert') GROUP BY time_bucket(1h, ts)",
             )
             .unwrap(),
@@ -2178,18 +2178,18 @@ mod tests {
         assert_eq!(
             sorted_groups(rs),
             vec![
-                vec![Value::Timestamp(floor), Value::Int(2), Value::Int(3)],
-                vec![Value::Timestamp(floor + HOUR), Value::Int(1), Value::Int(4)],
-                vec![Value::Timestamp(floor + 3 * HOUR), Value::Int(1), Value::Int(8)],
+                vec![Value::Timestamp(floor), Value::Int(2)],
+                vec![Value::Timestamp(floor + HOUR), Value::Int(1)],
+                vec![Value::Timestamp(floor + 3 * HOUR), Value::Int(1)],
             ]
         );
-        // The fallback (HAVING) computes the same buckets and numbers,
-        // Int-keyed for these integer-stored rows.
+        // Grouped per-bucket metrics take the row fallback (the tantivy
+        // 0.26.1 sub-aggregation data-loss bug makes that pushdown unsafe
+        // — see the guard in skaidb-fts): Int-keyed here, values exact.
         let rs = rows(
             db.execute(
                 "SELECT time_bucket(1h, ts), COUNT(*), SUM(v) FROM events \
-                 WHERE MATCH(msg, 'alert') GROUP BY time_bucket(1h, ts) \
-                 HAVING COUNT(*) >= 1",
+                 WHERE MATCH(msg, 'alert') GROUP BY time_bucket(1h, ts)",
             )
             .unwrap(),
         );
