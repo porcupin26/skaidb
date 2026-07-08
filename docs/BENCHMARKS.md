@@ -249,6 +249,14 @@ skaidb was stable across both.
 Both §4 single-node targets hold on this hardware: query latency ≤ ES on
 every class, ingest ≥ ES bulk.
 
+**Cluster leg** (3-node test cluster on v0.39, RF=3 QUORUM, 1 GB nodes,
+60 k docs): ingest 3,053 docs/s through one coordinator (every row
+replicated ×3), ranked top-10 scatter queries p50 2–3 ms / p99
+2.9–7.6 ms (term/AND/OR) — the scatter adds well under the ≤ 10 ms p99
+budget over single-node. NRT visibility 149 ms cluster-wide. Kill -9 on a
+member left searches complete, a quorum write during the outage landed,
+and the rejoined node served the converged result set.
+
 Caveats, honestly: part of the per-query gap is protocol — ES answers
 JSON-over-HTTP (its only surface), skaidb its binary protocol; both are
 each system's canonical path, but they are not equal-cost framing. A 1 GB

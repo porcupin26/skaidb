@@ -284,8 +284,12 @@ fleet-verified — the TS cadence)
     reclaims); revisit in phase 9 if it bothers anyone.
   - [x] Anti-entropy: open-time watermark replay covers restart divergence;
     repair copies flow through the apply path so the index follows.
-  - [ ] Fleet smoke on the 3-node test cluster (rides the next release
-    rollout).
+  - [x] **Fleet smoke passed** (2026-07-08, test cluster on v0.39.0,
+    upgraded live from 0.34.0 — catalog migration included): 60 k wiki
+    docs at RF=3/QUORUM (3,053 docs/s through one coordinator), identical
+    hit counts from every coordinator, NRT 149 ms cluster-wide;
+    kill -9 one node → searches stay complete, a quorum write during the
+    outage lands, and the rejoined node serves the converged result.
 - [ ] **Phase 5 — NRT + ingest performance** (code core shipped, fleet
   bench pending):
   - [x] Bulk ingest path: one search-index pass and one NRT refresh check
@@ -317,10 +321,14 @@ fleet-verified — the TS cadence)
     (query ≤ ES every class, ingest ≥ ES bulk). Full table + caveats
     (protocol framing, 1 GB ES heap) in docs/BENCHMARKS.md; harness in
     `bench/clients/fts_{corpus,bench}.py`.
+  - [x] Cluster scatter leg (2026-07-08, 3-node test cluster, RF=3,
+    60 k docs): ranked top-10 p50 2–3 ms / p99 2.9–7.6 ms on
+    term/AND/OR from both coordinators tried, vs ~1.2–1.9 ms p99
+    single-node — scatter adds well under the §4 ≤ 10 ms p99 budget
+    (phrase p99 hit 11 ms once, within noise of its single-node 13 ms
+    worst case).
   - [ ] Merge-policy tuning on LXC-class disks: the win over ES leaves no
     urgency; revisit if an ingest-heavy workload surfaces merge stalls.
-  - [ ] Cluster scatter overhead leg (§4's ≤ 10 ms p99 over single-node) on
-    the 3-node test cluster once it runs ≥ v0.38.
 - [ ] **Phase 6 — aggregations/facets**: terms/range/histogram/
   date_histogram/cardinality/top_hits over fast fields, exposed through SQL
   (GROUP BY over indexed columns pushes to per-shard facet partials, merged
