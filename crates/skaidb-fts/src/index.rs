@@ -30,6 +30,12 @@ use crate::{
 
 /// Reserved field holding the row's primary-key bytes.
 const KEY_FIELD: &str = "_key";
+/// The cluster placement hash of `_key` (`skaidb_types::ring_hash`), stored
+/// per document as an indexed fast field so a sharded scatter can restrict
+/// any query to the ranges of hash space this node primarily owns. Adding
+/// it was a schema change: pre-existing indexes schema-mismatch on open and
+/// rebuild from their tables automatically.
+const RING_FIELD: &str = "_ring";
 
 /// Tantivy rejects writer heaps below ~15 MB; clamp so tiny `memory_target`
 /// configurations still work.
@@ -66,6 +72,7 @@ pub struct SearchIndex {
     writer: IndexWriter,
     reader: IndexReader,
     key_field: Field,
+    ring_field: Field,
     /// Write-side view: one entry per declared column.
     columns: Vec<IndexedColumn>,
     /// Query-side view: declared columns plus `.keyword` twins and
@@ -111,11 +118,32 @@ fn keyword_options() -> TextOptions {
         .set_fast(None)
 }
 
+/// A filter matching documents whose `_ring` hash falls in any of the
+/// inclusive `[start, end]` arcs (a node's primary-owned key-space).
+fn ring_arcs_query(field: Field, arcs: &[(u64, u64)]) -> Box<dyn tantivy::query::Query> {
+    use tantivy::query::{BooleanQuery, Occur, Query, RangeQuery};
+    let clauses: Vec<(Occur, Box<dyn Query>)> = arcs
+        .iter()
+        .map(|&(start, end)| {
+            let q: Box<dyn Query> = Box::new(RangeQuery::new(
+                std::ops::Bound::Included(Term::from_field_u64(field, start)),
+                std::ops::Bound::Included(Term::from_field_u64(field, end)),
+            ));
+            (Occur::Should, q)
+        })
+        .collect();
+    Box::new(BooleanQuery::new(clauses))
+}
+
 fn build_schema(config: &SearchIndexConfig) -> Schema {
     let mut builder = Schema::builder();
     builder.add_bytes_field(
         KEY_FIELD,
         BytesOptions::default().set_indexed().set_stored(),
+    );
+    builder.add_u64_field(
+        RING_FIELD,
+        NumericOptions::default().set_indexed().set_fast(),
     );
     let numeric = || NumericOptions::default().set_indexed().set_fast();
     for fc in &config.fields {
@@ -223,6 +251,7 @@ impl SearchIndex {
         analyzer::register(&index, used.into_iter());
 
         let key_field = schema.get_field(KEY_FIELD).expect("schema owns _key");
+        let ring_field = schema.get_field(RING_FIELD).expect("schema owns _ring");
         let field_of = |path: &str| schema.get_field(path).expect("schema owns declared field");
 
         let mut columns = Vec::with_capacity(config.fields.len());
@@ -259,6 +288,7 @@ impl SearchIndex {
             writer,
             reader,
             key_field,
+            ring_field,
             columns,
             runtimes,
             pending_watermark: None,
@@ -294,6 +324,7 @@ impl SearchIndex {
             .delete_term(Term::from_field_bytes(self.key_field, key));
         let mut tdoc = TantivyDocument::default();
         tdoc.add_bytes(self.key_field, key);
+        tdoc.add_u64(self.ring_field, skaidb_types::ring_hash(key));
         let mut any = false;
         for col in &self.columns {
             if let Some(value) = doc.get_path(&col.path) {
@@ -575,10 +606,15 @@ impl SearchIndex {
     /// materializing rows. Missing group values bucket under a sentinel
     /// and come back as `key: None` (SQL's NULL group); `SUM` over zero
     /// values is `None` (SQL), not 0 (ES).
+    /// `ownership`: inclusive `[start, end]` ranges of the placement hash —
+    /// when set, only documents whose `_ring` value falls inside one of the
+    /// arcs count. A sharded scatter passes each node its primary arcs so
+    /// every key is aggregated by exactly one replica.
     pub fn aggregate(
         &self,
         query: &SearchQuery,
         req: &AggRequest,
+        ownership: Option<&[(u64, u64)]>,
     ) -> Result<Option<Vec<AggRow>>, FtsError> {
         use tantivy::aggregation::agg_req::Aggregations;
         use tantivy::aggregation::{AggContextParams, AggregationCollector};
@@ -722,7 +758,7 @@ impl SearchIndex {
             },
         );
 
-        let q = build_query(
+        let mut q = build_query(
             &self.index,
             &QueryFields {
                 fields: &self.runtimes,
@@ -730,6 +766,12 @@ impl SearchIndex {
             },
             query,
         )?;
+        if let Some(arcs) = ownership {
+            q = Box::new(tantivy::query::BooleanQuery::new(vec![
+                (tantivy::query::Occur::Must, q),
+                (tantivy::query::Occur::Must, ring_arcs_query(self.ring_field, arcs)),
+            ]));
+        }
         let searcher = self.reader.searcher();
         let (total, results) = searcher.search(&q, &(Count, collector))?;
         let results = serde_json::to_value(results)
@@ -1217,6 +1259,50 @@ mod tests {
             field: Some(field.into()),
             text: text.into(),
         }
+    }
+
+    /// The ownership filter: aggregate over explicit `_ring` arcs counts
+    /// exactly the documents whose key hash falls inside them — the full
+    /// arc equals unfiltered, complementary arcs tile the doc set.
+    #[test]
+    fn aggregate_ownership_arcs_partition_documents() {
+        use crate::AggMetric;
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = config(&["body"], &[]);
+        let mut idx = open(tmp.path(), &cfg);
+        let n = 40u64;
+        for i in 0..n {
+            let key = format!("k{i}");
+            let mut doc = Document::new();
+            doc.0.insert("body".into(), skaidb_types::Value::String("event".into()));
+            idx.put(key.as_bytes(), &doc, wm(i)).unwrap();
+        }
+        idx.commit().unwrap();
+        let req = AggRequest {
+            group_by: None,
+            metrics: vec![AggMetric {
+                func: AggMetricFunc::Count,
+                column: None,
+            }],
+        };
+        let count = |ownership: Option<&[(u64, u64)]>| -> u64 {
+            idx.aggregate(&matches("body", "event"), &req, ownership)
+                .unwrap()
+                .expect("servable")[0]
+                .count
+        };
+        // Full arc == unfiltered.
+        assert_eq!(count(None), n);
+        assert_eq!(count(Some(&[(0, u64::MAX)])), n);
+        // Complementary halves tile the doc set exactly.
+        let half = u64::MAX / 2;
+        let lo = count(Some(&[(0, half)]));
+        let hi = count(Some(&[(half + 1, u64::MAX)]));
+        assert_eq!(lo + hi, n, "arcs must partition ({lo} + {hi})");
+        assert!(lo > 0 && hi > 0, "hashes should spread across halves");
+        // A specific key's exact-hash arc counts exactly that key.
+        let h = skaidb_types::ring_hash(b"k7");
+        assert_eq!(count(Some(&[(h, h)])), 1);
     }
 
     #[test]
@@ -1733,7 +1819,7 @@ mod tests {
             }],
         };
         let rows = idx
-            .aggregate(&matches("body", "red"), &req)
+            .aggregate(&matches("body", "red"), &req, None)
             .unwrap()
             .expect("exact");
         let flat: Vec<(Value, u64)> = rows.iter().map(|r| (r.key.clone(), r.count)).collect();
@@ -1753,7 +1839,7 @@ mod tests {
             }],
         };
         assert!(idx
-            .aggregate(&matches("body", "red"), &grouped_metrics)
+            .aggregate(&matches("body", "red"), &grouped_metrics, None)
             .unwrap()
             .is_none());
 
@@ -1776,7 +1862,7 @@ mod tests {
             ],
         };
         let rows = idx
-            .aggregate(&matches("body", "apple"), &global)
+            .aggregate(&matches("body", "apple"), &global, None)
             .unwrap()
             .expect("exact");
         assert_eq!(rows.len(), 1);
@@ -1793,7 +1879,7 @@ mod tests {
             }],
         };
         let rows = idx
-            .aggregate(&matches("body", "red"), &distinct)
+            .aggregate(&matches("body", "red"), &distinct, None)
             .unwrap()
             .expect("exact");
         assert_eq!(rows[0].metrics[0], Value::Int(2)); // fruit, building
@@ -1804,7 +1890,7 @@ mod tests {
             group_by: Some(crate::AggGroupBy::Keyword("body".into())),
             metrics: vec![],
         };
-        assert!(idx.aggregate(&matches("body", "red"), &bad).unwrap().is_none());
+        assert!(idx.aggregate(&matches("body", "red"), &bad, None).unwrap().is_none());
         // ...or a metric over a non-numeric column.
         let bad = AggRequest {
             group_by: Some(crate::AggGroupBy::Keyword("category".into())),
@@ -1813,7 +1899,7 @@ mod tests {
                 column: Some("body".into()),
             }],
         };
-        assert!(idx.aggregate(&matches("body", "red"), &bad).unwrap().is_none());
+        assert!(idx.aggregate(&matches("body", "red"), &bad, None).unwrap().is_none());
     }
 
     #[test]
@@ -2005,7 +2091,7 @@ mod tests {
             }],
         };
         let rows = idx
-            .aggregate(&matches("body", "event"), &req)
+            .aggregate(&matches("body", "event"), &req, None)
             .unwrap()
             .expect("exact");
         // Buckets are hour-floored ms timestamps; gap-filling empty buckets
@@ -2026,7 +2112,7 @@ mod tests {
         )
         .unwrap();
         idx.commit().unwrap();
-        assert!(idx.aggregate(&matches("body", "event"), &req).unwrap().is_none());
+        assert!(idx.aggregate(&matches("body", "event"), &req, None).unwrap().is_none());
     }
 
     #[test]

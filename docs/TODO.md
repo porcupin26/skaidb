@@ -10,15 +10,13 @@ git history.
 
 ## Full-text search
 
-- [ ] **[fts] Sharded scatter for aggregations and fast-field sort** —
-  the one open FTS feature. Per-shard partials / per-shard sorted top-k
-  need per-key ownership filters (a ring-hash fast field kept consistent
-  through resharding epochs) so RF < members doesn't double-count
-  replicas, plus new internode request variants carrying the ownership
-  ranges. Correctness-critical: wants its own design + fleet-bench cycle
-  (kill/rejoin and mid-reshard races), not a drive-by. Today sharded
-  corpora take the correct-but-slower coordinator fallback; this also
-  gates per-hit explain on sharded clusters.
+- [ ] **[fts] Sharded scatter, remaining surface** — the aggregation
+  scatter **shipped** (per-key ownership via the `_ring` placement-hash
+  fast field; arcs tile the key-space; epoch-gated, all-members-or-
+  fallback; mergeable metrics only — see SEARCH.md). Remaining: sorted
+  top-k over the same ownership machinery (per-shard `search_sorted`
+  rows k-way-merged), AVG via sum+count partial pairs, and per-hit
+  explain on sharded clusters (route the explain to the key's primary).
 - [ ] **[fts] Lift the grouped-metrics pushdown guard** when
   [quickwit-oss/tantivy#2992](https://github.com/quickwit-oss/tantivy/issues/2992)
   is fixed upstream (per-bucket metrics currently take the exact row

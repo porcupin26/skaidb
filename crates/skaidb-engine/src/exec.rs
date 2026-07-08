@@ -943,17 +943,21 @@ impl Database {
     /// Exact fast-field aggregation over the local index (read-your-writes:
     /// pending index writes commit first). `Ok(None)` = the index cannot
     /// serve this request exactly; the caller falls back to rows.
+    /// `ownership`: restrict to documents in the given placement-hash arcs
+    /// (a sharded scatter's per-node primary key-space); `None` = whole
+    /// index.
     pub fn search_aggregate(
         &mut self,
         table: &str,
         query: &SearchQuery,
         agg: &skaidb_fts::AggRequest,
+        ownership: Option<&[(u64, u64)]>,
     ) -> Result<Option<Vec<skaidb_fts::AggRow>>> {
         let name = self.search_index_for_query(table, query)?;
         if let Some(live) = self.search_indexes.get_mut(&name) {
             live.commit_if_dirty()?;
         }
-        self.search_aggregate_read(table, query, agg)
+        self.search_aggregate_read(table, query, agg, ownership)
     }
 
     /// [`Database::search_aggregate`] over the last-committed index state
@@ -963,13 +967,14 @@ impl Database {
         table: &str,
         query: &SearchQuery,
         agg: &skaidb_fts::AggRequest,
+        ownership: Option<&[(u64, u64)]>,
     ) -> Result<Option<Vec<skaidb_fts::AggRow>>> {
         let name = self.search_index_for_query(table, query)?;
         let live = self
             .search_indexes
             .get(&name)
             .ok_or(EngineError::IndexNotFound(name))?;
-        Ok(live.index.aggregate(query, agg)?)
+        Ok(live.index.aggregate(query, agg, ownership)?)
     }
 
     /// Fast-field-ordered top-k over the local index (read-your-writes),
@@ -5435,7 +5440,8 @@ impl Cluster for LocalCluster<'_> {
         query: &SearchQuery,
         agg: &skaidb_fts::AggRequest,
     ) -> Result<Option<Vec<skaidb_fts::AggRow>>> {
-        self.db.search_aggregate(table, query, agg)
+        // Single-node: the local index holds every row; no ownership filter.
+        self.db.search_aggregate(table, query, agg, None)
     }
 
     fn search_sorted(
@@ -5586,7 +5592,7 @@ impl Cluster for LocalRead<'_> {
         query: &SearchQuery,
         agg: &skaidb_fts::AggRequest,
     ) -> Result<Option<Vec<skaidb_fts::AggRow>>> {
-        self.db.search_aggregate_read(table, query, agg)
+        self.db.search_aggregate_read(table, query, agg, None)
     }
 
     fn search_sorted(

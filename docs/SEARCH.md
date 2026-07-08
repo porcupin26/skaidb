@@ -234,7 +234,20 @@ an integer). The pushdown is **exact or declined** — on a truncated bucket
 list or any count mismatch (e.g. a date histogram that would lose rows
 missing the date column) it silently falls back rather than approximate.
 Cluster mode pushes down when one index holds every row (single node, or
-RF ≥ member count); sharded corpora take the fallback. One typing nuance:
+RF ≥ member count). **Sharded corpora** (RF < members) scatter partials:
+every document carries its placement hash in a `_ring` fast field, each
+member aggregates only the hash arcs it primarily owns (the arcs tile the
+key-space, so every key counts exactly once regardless of replication),
+and the coordinator merges. Exact-or-decline throughout: the scatter runs
+only for losslessly mergeable metrics (`COUNT(*)`/`COUNT(col)`/`SUM`/
+`MIN`/`MAX` globally; doc-count-only groupings while the tantivy#2992
+guard stands), requires a stable membership epoch across the whole gather
+and **every member answering** — a silent peer, an epoch change, or a
+membership change in flight (dual-ring placement) falls back to the
+deduped row gather. AVG and the distinct counts keep the fallback (their
+partials don't merge losslessly). Upgrade note: `_ring` was a schema
+change, so each search index rebuilds from its table once on first open
+after upgrading. One typing nuance:
 `time_bucket` pushdown keys are timestamps (a `date` column's semantics),
 while the fallback preserves each row's stored type — store timestamp
 values (not bare integers) in date columns for consistent typing.

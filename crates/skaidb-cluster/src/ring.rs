@@ -93,6 +93,46 @@ impl Ring {
     pub fn primary_for(&self, key: &[u8]) -> Option<NodeId> {
         self.replicas_for(key, 1).into_iter().next()
     }
+
+    /// The **primary-owned key-space** of `node`, as inclusive
+    /// `[start, end]` hash ranges: a key hashes into one of these arcs iff
+    /// `primary_for(key) == node`. Each of the node's vnode tokens `T` owns
+    /// the arc `(previous token, T]`; the arc that wraps past `u64::MAX`
+    /// splits in two. A single-node ring owns everything. The union of all
+    /// members' arcs tiles the hash space exactly once — the property that
+    /// lets a sharded scatter count every key exactly once.
+    pub fn primary_arcs(&self, node: &NodeId) -> Vec<(u64, u64)> {
+        if !self.nodes.contains(node) {
+            return Vec::new();
+        }
+        if self.nodes.len() == 1 {
+            return vec![(0, u64::MAX)];
+        }
+        let tokens: Vec<u64> = self.vnodes.keys().copied().collect();
+        let mut arcs = Vec::new();
+        for (i, (&token, owner)) in self.vnodes.iter().enumerate() {
+            if owner != node {
+                continue;
+            }
+            let prev = if i == 0 {
+                *tokens.last().expect("non-empty ring")
+            } else {
+                tokens[i - 1]
+            };
+            if prev < token {
+                // (prev, token]
+                arcs.push((prev + 1, token));
+            } else {
+                // Wraps: (prev, MAX] ∪ [0, token].
+                if prev < u64::MAX {
+                    arcs.push((prev + 1, u64::MAX));
+                }
+                arcs.push((0, token));
+            }
+        }
+        arcs.sort_unstable();
+        arcs
+    }
 }
 
 fn hash_token(node: &NodeId, vnode: u32) -> u64 {
@@ -101,18 +141,11 @@ fn hash_token(node: &NodeId, vnode: u32) -> u64 {
     hash_bytes(&buf)
 }
 
-/// 64-bit FNV-1a followed by a splitmix64 finalizer for good avalanche, so
-/// short, similar inputs (node names, vnode indices) spread across the ring.
+/// The shared key-placement hash — [`skaidb_types::ring_hash`]. The search
+/// indexes store the same hash per document, so ownership arcs computed
+/// from this ring apply directly to their `_ring` fast field.
 fn hash_bytes(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    let mut z = h;
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
+    skaidb_types::ring_hash(bytes)
 }
 
 #[cfg(test)]
@@ -180,6 +213,41 @@ mod tests {
             }
         }
         assert!(moved > 0 && unmoved_to_b > 0, "only b's keys should move");
+    }
+
+    /// primary_arcs must tile the hash space: every key's primary node is
+    /// exactly the node whose arcs contain the key's hash — no key counted
+    /// twice, none dropped.
+    #[test]
+    fn primary_arcs_partition_matches_primary_for() {
+        let r = ring(&["a", "b", "c"]);
+        let arcs: Vec<(NodeId, Vec<(u64, u64)>)> = ["a", "b", "c"]
+            .iter()
+            .map(|n| (NodeId::new(*n), r.primary_arcs(&NodeId::new(*n))))
+            .collect();
+        // Arc lengths tile the full space exactly once.
+        let total: u128 = arcs
+            .iter()
+            .flat_map(|(_, a)| a)
+            .map(|(s, e)| (*e as u128) - (*s as u128) + 1)
+            .sum();
+        assert_eq!(total, 1u128 << 64, "arcs must tile the hash space");
+        // Containment agrees with primary_for on many keys.
+        for i in 0..2000 {
+            let key = format!("key-{i}");
+            let h = super::hash_bytes(key.as_bytes());
+            let primary = r.primary_for(key.as_bytes()).unwrap();
+            let holders: Vec<&NodeId> = arcs
+                .iter()
+                .filter(|(_, a)| a.iter().any(|(s, e)| h >= *s && h <= *e))
+                .map(|(n, _)| n)
+                .collect();
+            assert_eq!(holders, vec![&primary], "key {key} hash {h}");
+        }
+        // A single-node ring owns everything; an absent node owns nothing.
+        let solo = ring(&["only"]);
+        assert_eq!(solo.primary_arcs(&NodeId::new("only")), vec![(0, u64::MAX)]);
+        assert!(solo.primary_arcs(&NodeId::new("ghost")).is_empty());
     }
 
     #[test]

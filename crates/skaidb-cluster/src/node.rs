@@ -823,6 +823,115 @@ impl Node {
     }
 
     /// All current peers as `(id, addr)` pairs (snapshot, cloned).
+    /// One node's shard of a sharded aggregation: the aggregation over the
+    /// LOCAL index restricted to this node's **primary-owned** placement
+    /// arcs at `epoch`. Declines (`None`) when the epoch differs, a
+    /// membership change is in flight (dual-ring placement — a key may be
+    /// mid-move), this node is not in the ring, or the index cannot serve
+    /// the shape exactly.
+    pub(crate) fn search_agg_shard(
+        &self,
+        table: &str,
+        query: &skaidb_fts::SearchQuery,
+        agg: &skaidb_fts::AggRequest,
+        epoch: u64,
+    ) -> EngineResult<Option<Vec<skaidb_fts::AggRow>>> {
+        let arcs = {
+            let topo = self.topo.read().expect("topo lock");
+            if topo.epoch != epoch || topo.prev.is_some() {
+                return Ok(None);
+            }
+            topo.ring.primary_arcs(&self.id)
+        };
+        if arcs.is_empty() {
+            return Ok(None);
+        }
+        self.local
+            .write()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .search_aggregate(table, query, agg, Some(&arcs))
+    }
+
+    /// Sharded scatter-gather aggregation (RF < members): every member
+    /// aggregates its primary-owned key-space from its local index and the
+    /// coordinator merges the partials — each key counted by exactly one
+    /// replica (the ring arcs tile the hash space). Exact-or-decline:
+    /// requires a stable epoch across the whole gather, no membership
+    /// change in flight, EVERY member answering, and metrics whose
+    /// partials merge losslessly (count/value_count/sum/min/max; grouped
+    /// requests are doc-count-only via the index-level guard). Anything
+    /// else returns `Ok(None)` and the caller falls back to the deduped
+    /// row gather.
+    pub(crate) fn search_aggregate_sharded(
+        &self,
+        table: &str,
+        query: &skaidb_fts::SearchQuery,
+        agg: &skaidb_fts::AggRequest,
+    ) -> EngineResult<Option<Vec<skaidb_fts::AggRow>>> {
+        use skaidb_fts::AggMetricFunc as F;
+        // Mergeable shapes only. AVG partials would need sum+count pairs,
+        // COUNT(DISTINCT)/APPROX_COUNT_DISTINCT would need term sets or
+        // sketches on the wire — none of which AggRow carries.
+        if agg
+            .metrics
+            .iter()
+            .any(|m| !matches!(m.func, F::Count | F::ValueCount | F::Sum | F::Min | F::Max))
+        {
+            return Ok(None);
+        }
+        let (epoch, resharding) = {
+            let topo = self.topo.read().expect("topo lock");
+            (topo.epoch, topo.prev.is_some())
+        };
+        if resharding {
+            return Ok(None);
+        }
+        let Some(local) = self.search_agg_shard(table, query, agg, epoch)? else {
+            return Ok(None);
+        };
+        let peers = self.peers_with_ids();
+        let query_json = serde_json::to_string(query)
+            .map_err(|e| EngineError::Cluster(format!("encode query: {e}")))?;
+        let agg_json = serde_json::to_string(agg)
+            .map_err(|e| EngineError::Cluster(format!("encode agg: {e}")))?;
+        let shards = scatter(&peers, |(_, addr)| {
+            self.counters.peer_requests.fetch_add(1, Ordering::Relaxed);
+            match self.pool.call(
+                addr,
+                &Request::SearchAgg {
+                    table: table.to_string(),
+                    query: query_json.clone(),
+                    agg: agg_json.clone(),
+                    epoch,
+                },
+            ) {
+                Ok(Response::SearchAggRows { rows: Some(rows) }) => {
+                    crate::internode::decode_agg_rows(&rows).ok()
+                }
+                _ => None,
+            }
+        });
+        let mut parts = vec![local];
+        for shard in shards {
+            match shard {
+                // A declining, unreachable, or too-old peer means some
+                // key-space would go uncounted — fall back.
+                Some(rows) => parts.push(rows),
+                None => return Ok(None),
+            }
+        }
+        // The ring must not have moved during the gather: every responder
+        // checked `epoch` before answering, and this re-check closes the
+        // window where the coordinator itself learns of a change late.
+        {
+            let topo = self.topo.read().expect("topo lock");
+            if topo.epoch != epoch || topo.prev.is_some() {
+                return Ok(None);
+            }
+        }
+        Ok(Some(merge_agg_shards(agg, parts)))
+    }
+
     fn peers_with_ids(&self) -> Vec<(NodeId, String)> {
         self.topo
             .read()
@@ -2565,6 +2674,29 @@ impl Node {
                 },
                 Err(_) => Response::Err("local lock poisoned".into()),
             },
+            Request::SearchAgg {
+                table,
+                query,
+                agg,
+                epoch,
+            } => {
+                let parsed = (
+                    serde_json::from_str::<skaidb_fts::SearchQuery>(&query),
+                    serde_json::from_str::<skaidb_fts::AggRequest>(&agg),
+                );
+                match parsed {
+                    (Ok(query), Ok(agg)) => {
+                        match self.search_agg_shard(&table, &query, &agg, epoch) {
+                            Ok(rows) => Response::SearchAggRows {
+                                rows: rows
+                                    .map(|r| crate::internode::encode_agg_rows(&r)),
+                            },
+                            Err(e) => Response::Err(e.to_string()),
+                        }
+                    }
+                    _ => Response::Err("bad search-agg request".into()),
+                }
+            }
             Request::ApplyPut {
                 table,
                 key,
@@ -4213,6 +4345,79 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// Ring-placement key for a series: its labels minus the reserved
 /// `__field__` discriminator, so every field stream of a logical series
 /// lands on the same replica set.
+/// Merge per-shard aggregation partials. Shards partition the key-space
+/// (ring arcs tile it exactly once), so doc counts and value counts add,
+/// sums add (SQL semantics: all-NULL stays NULL, otherwise NULL is the
+/// identity), and min/max fold — each preserving the typed Value the
+/// winning shard produced. Group keys union across shards; output is
+/// key-ordered for determinism.
+fn merge_agg_shards(
+    agg: &skaidb_fts::AggRequest,
+    parts: Vec<Vec<skaidb_fts::AggRow>>,
+) -> Vec<skaidb_fts::AggRow> {
+    use skaidb_fts::AggMetricFunc as F;
+    use skaidb_types::Value;
+
+    fn add(a: Value, b: &Value) -> Value {
+        match (a, b) {
+            (Value::Null, b) => b.clone(),
+            (a, Value::Null) => a,
+            (Value::Int(x), Value::Int(y)) => Value::Int(x + y),
+            (Value::Float(x), Value::Float(y)) => Value::Float(x + y),
+            (Value::Int(x), Value::Float(y)) => Value::Float(x as f64 + y),
+            (Value::Float(x), Value::Int(y)) => Value::Float(x + *y as f64),
+            (a, _) => a, // unreachable for column-typed metrics
+        }
+    }
+    fn extreme(a: Value, b: &Value, want_greater: bool) -> Value {
+        let num = |v: &Value| match v {
+            Value::Int(x) => Some(*x as f64),
+            Value::Float(x) => Some(*x),
+            Value::Timestamp(x) => Some(*x as f64),
+            _ => None,
+        };
+        match (num(&a), num(b)) {
+            (None, _) => b.clone(),
+            (_, None) => a,
+            (Some(x), Some(y)) => {
+                if (y > x) == want_greater && y != x {
+                    b.clone()
+                } else {
+                    a
+                }
+            }
+        }
+    }
+
+    let mut merged: std::collections::BTreeMap<Vec<u8>, skaidb_fts::AggRow> =
+        std::collections::BTreeMap::new();
+    for part in parts {
+        for row in part {
+            let slot = merged.entry(row.key.encode_key());
+            match slot {
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    v.insert(row);
+                }
+                std::collections::btree_map::Entry::Occupied(mut o) => {
+                    let acc = o.get_mut();
+                    acc.count += row.count;
+                    for (i, metric) in agg.metrics.iter().enumerate() {
+                        let cur = std::mem::replace(&mut acc.metrics[i], Value::Null);
+                        acc.metrics[i] = match metric.func {
+                            F::Count | F::ValueCount | F::Sum => add(cur, &row.metrics[i]),
+                            F::Min => extreme(cur, &row.metrics[i], false),
+                            F::Max => extreme(cur, &row.metrics[i], true),
+                            // Filtered out before the scatter.
+                            F::Avg | F::CountDistinct | F::ApproxCountDistinct => cur,
+                        };
+                    }
+                }
+            }
+        }
+    }
+    merged.into_values().collect()
+}
+
 /// Split matchers for a scatter: the internode requests carry equality
 /// forms only, so regex matchers stay behind — peers answer with the
 /// equality-matched superset and the coordinator re-applies the regex
@@ -4549,21 +4754,21 @@ impl Cluster for Coordinator {
         query: &skaidb_fts::SearchQuery,
         agg: &skaidb_fts::AggRequest,
     ) -> EngineResult<Option<Vec<skaidb_fts::AggRow>>> {
-        // Exact pushdown needs one index that holds every row: a sole
-        // member, or RF ≥ members (each node replicates the whole table).
-        // Sharded corpora (RF < members) decline — per-shard partials
-        // would double-count replicated rows; the coordinator falls back
-        // to the deduped row gather. Partial-merge with per-key ownership
-        // filters is future work (docs/TODO.md, sharded scatter partials).
+        // One index holding every row (a sole member, or RF ≥ members)
+        // serves locally. A sharded corpus (RF < members) scatters: each
+        // member aggregates its primary-owned key-space (an ownership
+        // filter over the `_ring` fast field) and the partials merge —
+        // exact-or-decline throughout, so any wobble (epoch change, silent
+        // peer, unmergeable metric) falls back to the deduped row gather.
         let members = self.node.member_count();
         if members > 1 && self.node.cfg.replication_factor < members {
-            return Ok(None);
+            return self.node.search_aggregate_sharded(table, query, agg);
         }
         self.node
             .local
             .write()
             .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
-            .search_aggregate(table, query, agg)
+            .search_aggregate(table, query, agg, None)
     }
 
     fn matching_rows(
@@ -5504,6 +5709,222 @@ mod tests {
                 ]
             );
         }
+    }
+
+    /// The sharded partials path (RF < members): every member aggregates
+    /// its primary-owned key-space and the coordinator merges — proven
+    /// directly (the sharded call answers rather than declines, and its
+    /// numbers equal ground truth), end-to-end over SQL from every
+    /// coordinator, with unmergeable metrics declining, and with a dead
+    /// member forcing the exact fallback (rf=2 keeps every key readable).
+    #[test]
+    fn sharded_search_aggregate_partials_merge_exactly() {
+        use skaidb_fts::{AggGroupBy, AggMetric, AggMetricFunc, AggRequest};
+        let rf2 = |id: &str, addr: &str, members: &[(NodeId, String)]| NodeConfig {
+            replication_factor: 2,
+            ..rf1(id, addr, members)
+        };
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let na = Node::new(Database::open(temp_dir("sagg-a")).unwrap(), rf2("a", &a, &members));
+        let nb = Node::new(Database::open(temp_dir("sagg-b")).unwrap(), rf2("b", &b, &members));
+        let nc = Node::new(Database::open(temp_dir("sagg-c")).unwrap(), rf2("c", &c, &members));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        nc.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE s (PRIMARY KEY (id))").unwrap();
+        na.execute(
+            "CREATE SEARCH INDEX s_fts ON s (product, region, units) WITH (\
+             region.type = 'keyword', units.type = 'long')",
+        )
+        .unwrap();
+        let n = 60i64;
+        for i in 1..=n {
+            let region = if i % 2 == 0 { "east" } else { "west" };
+            na.execute(&format!(
+                "INSERT INTO s (id, product, region, units) VALUES ({i}, 'widget number {i}', '{region}', {i})"
+            ))
+            .unwrap();
+        }
+
+        let query = skaidb_fts::SearchQuery::Match {
+            field: Some("product".into()),
+            text: "widget".into(),
+        };
+        // Direct proof the sharded path SERVES (rather than declining):
+        // grouped doc counts...
+        let grouped = AggRequest {
+            group_by: Some(AggGroupBy::Keyword("region".into())),
+            metrics: vec![AggMetric {
+                func: AggMetricFunc::Count,
+                column: None,
+            }],
+        };
+        let mut agg_rows = na
+            .search_aggregate_sharded("s", &query, &grouped)
+            .unwrap()
+            .expect("sharded partials must serve grouped doc counts");
+        agg_rows.sort_by_key(|r| r.key.encode_key());
+        assert_eq!(agg_rows.len(), 2);
+        assert_eq!(
+            (agg_rows[0].key.clone(), agg_rows[0].count),
+            (Value::String("east".into()), 30)
+        );
+        assert_eq!(
+            (agg_rows[1].key.clone(), agg_rows[1].count),
+            (Value::String("west".into()), 30)
+        );
+
+        // ...and global count/sum/min/max, merged across shards. Every key
+        // is replicated on TWO nodes; the ownership arcs count each exactly
+        // once.
+        let units = |f| AggMetric {
+            func: f,
+            column: Some("units".into()),
+        };
+        let global = AggRequest {
+            group_by: None,
+            metrics: vec![
+                AggMetric {
+                    func: AggMetricFunc::Count,
+                    column: None,
+                },
+                units(AggMetricFunc::Sum),
+                units(AggMetricFunc::Min),
+                units(AggMetricFunc::Max),
+            ],
+        };
+        let agg_rows = na
+            .search_aggregate_sharded("s", &query, &global)
+            .unwrap()
+            .expect("sharded partials must serve global metrics");
+        assert_eq!(agg_rows.len(), 1);
+        assert_eq!(agg_rows[0].count, n as u64);
+        assert_eq!(
+            agg_rows[0].metrics,
+            vec![
+                Value::Int(n),
+                Value::Int(n * (n + 1) / 2), // 1830
+                Value::Int(1),
+                Value::Int(n),
+            ]
+        );
+
+        // Unmergeable partials decline (AVG needs sum+count pairs).
+        let avg = AggRequest {
+            group_by: None,
+            metrics: vec![units(AggMetricFunc::Avg)],
+        };
+        assert!(na.search_aggregate_sharded("s", &query, &avg).unwrap().is_none());
+
+        // End-to-end over SQL from every coordinator: the sharded path and
+        // the fallback must be indistinguishable.
+        for coord in [&na, &nb, &nc] {
+            let rs = rows(
+                coord
+                    .execute(
+                        "SELECT region, COUNT(*) FROM s \
+                         WHERE MATCH(product, 'widget') GROUP BY region",
+                    )
+                    .unwrap(),
+            );
+            let mut got = rs.rows;
+            got.sort_by_key(|r| r[0].encode_key());
+            assert_eq!(
+                got,
+                vec![
+                    vec![Value::String("east".into()), Value::Int(30)],
+                    vec![Value::String("west".into()), Value::Int(30)],
+                ]
+            );
+            let rs = rows(
+                coord
+                    .execute(
+                        "SELECT COUNT(*), SUM(units), MIN(units), MAX(units), AVG(units) FROM s \
+                         WHERE MATCH(product, 'widget')",
+                    )
+                    .unwrap(),
+            );
+            assert_eq!(
+                rs.rows,
+                vec![vec![
+                    Value::Int(60),
+                    Value::Int(1830),
+                    Value::Int(1),
+                    Value::Int(60),
+                    Value::Float(30.5),
+                ]]
+            );
+        }
+
+        let _keep = nc; // all three stayed live for the assertions above
+    }
+
+    /// A dead member forces the sharded path to decline — its key-space
+    /// would go uncounted — while the SQL answer stays exact through the
+    /// row fallback (rf=2 keeps every key on a surviving replica).
+    #[test]
+    fn sharded_search_aggregate_declines_with_dead_member() {
+        use skaidb_fts::{AggGroupBy, AggMetric, AggMetricFunc, AggRequest};
+        let rf2 = |id: &str, addr: &str, members: &[(NodeId, String)]| NodeConfig {
+            replication_factor: 2,
+            ..rf1(id, addr, members)
+        };
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b), member("c", &c)];
+        // c is in the ring but its listener never starts (kill -9 style).
+        let na = Node::new(Database::open(temp_dir("saggd-a")).unwrap(), rf2("a", &a, &members));
+        let nb = Node::new(Database::open(temp_dir("saggd-b")).unwrap(), rf2("b", &b, &members));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE s (PRIMARY KEY (id))").unwrap();
+        na.execute(
+            "CREATE SEARCH INDEX s_fts ON s (product, region) WITH (region.type = 'keyword')",
+        )
+        .unwrap();
+        for i in 1..=30 {
+            let region = if i % 2 == 0 { "east" } else { "west" };
+            na.execute(&format!(
+                "INSERT INTO s (id, product, region) VALUES ({i}, 'widget {i}', '{region}')"
+            ))
+            .unwrap();
+        }
+
+        let query = skaidb_fts::SearchQuery::Match {
+            field: Some("product".into()),
+            text: "widget".into(),
+        };
+        let grouped = AggRequest {
+            group_by: Some(AggGroupBy::Keyword("region".into())),
+            metrics: vec![AggMetric {
+                func: AggMetricFunc::Count,
+                column: None,
+            }],
+        };
+        assert!(
+            na.search_aggregate_sharded("s", &query, &grouped)
+                .unwrap()
+                .is_none(),
+            "a silent member must force the fallback"
+        );
+        // The fallback still answers exactly: every key has a live replica.
+        let rs = rows(
+            na.execute(
+                "SELECT region, COUNT(*) FROM s WHERE MATCH(product, 'widget') GROUP BY region",
+            )
+            .unwrap(),
+        );
+        let mut got = rs.rows;
+        got.sort_by_key(|r| r[0].encode_key());
+        assert_eq!(
+            got,
+            vec![
+                vec![Value::String("east".into()), Value::Int(15)],
+                vec![Value::String("west".into()), Value::Int(15)],
+            ]
+        );
     }
 
     #[test]

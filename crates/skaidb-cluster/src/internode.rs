@@ -130,6 +130,18 @@ pub enum Request {
         query: String,
         k: u32,
     },
+    /// Sharded-aggregation shard: run `agg` (serde_json `AggRequest`) over
+    /// the responder's local index restricted to **its own primary-owned
+    /// key-space** derived from its ring at `epoch`. The responder declines
+    /// (`SearchAggRows { rows: None }`) when its epoch differs, a reshard
+    /// is active, or its index cannot serve the shape exactly — the
+    /// coordinator then falls back to the row gather.
+    SearchAgg {
+        table: String,
+        query: String,
+        agg: String,
+        epoch: u64,
+    },
     ApplyDdl {
         /// The coordinator's current database, so table/index names in `sql`
         /// resolve to the same internal namespace on every node.
@@ -213,6 +225,9 @@ pub enum Response {
     VectorHits {
         hits: Vec<(Vec<u8>, f32)>,
     },
+    /// Per-shard aggregation rows from a [`Request::SearchAgg`], encoded
+    /// with [`encode_agg_rows`]; `None` = declined, fall back.
+    SearchAggRows { rows: Option<Vec<u8>> },
     /// `(key, BM25 score)` hits from a [`Request::Search`], best-first
     /// (scores 0.0 on the unranked path).
     SearchHits {
@@ -298,6 +313,7 @@ const REQ_TSMERGE: u8 = 22;
 const REQ_TSSUMMARY: u8 = 23;
 const REQ_TSPARTIALS: u8 = 24;
 const REQ_SEARCH: u8 = 25;
+const REQ_SEARCHAGG: u8 = 26;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
@@ -312,6 +328,7 @@ const RES_TSSERIES: u8 = 9;
 const RES_TSSUMMARIES: u8 = 10;
 const RES_TSPARTIALS: u8 = 11;
 const RES_SHITS: u8 = 12;
+const RES_SAGG: u8 = 13;
 
 impl Request {
     pub fn encode(&self) -> Vec<u8> {
@@ -447,6 +464,18 @@ impl Request {
                 put_str(o, table);
                 put_str(o, query);
                 o.extend_from_slice(&k.to_le_bytes());
+            }
+            Request::SearchAgg {
+                table,
+                query,
+                agg,
+                epoch,
+            } => {
+                o.push(REQ_SEARCHAGG);
+                put_str(o, table);
+                put_str(o, query);
+                put_str(o, agg);
+                o.extend_from_slice(&epoch.to_le_bytes());
             }
             Request::ApplyDdl { db, sql, hlc } => {
                 o.push(REQ_DDL);
@@ -602,6 +631,12 @@ impl Request {
                 query: c.string()?,
                 k: c.u32()?,
             },
+            REQ_SEARCHAGG => Request::SearchAgg {
+                table: c.string()?,
+                query: c.string()?,
+                agg: c.string()?,
+                epoch: c.u64()?,
+            },
             REQ_DDL => Request::ApplyDdl {
                 db: c.string()?,
                 sql: c.string()?,
@@ -685,6 +720,16 @@ impl Response {
                 for (key, dist) in hits {
                     put_bytes(o, key);
                     o.extend_from_slice(&dist.to_le_bytes());
+                }
+            }
+            Response::SearchAggRows { rows } => {
+                o.push(RES_SAGG);
+                match rows {
+                    Some(rows) => {
+                        o.push(1);
+                        put_bytes(o, rows);
+                    }
+                    None => o.push(0),
                 }
             }
             Response::SearchHits { hits } => {
@@ -809,6 +854,10 @@ impl Response {
                     hits.push((key, c.f32()?));
                 }
                 Response::SearchHits { hits }
+            }
+            RES_SAGG => {
+                let rows = if c.u8()? == 1 { Some(c.bytes()?) } else { None };
+                Response::SearchAggRows { rows }
             }
             RES_SCHEMA => {
                 let n = c.u32()? as usize;
@@ -1275,6 +1324,46 @@ fn put_members(o: &mut Vec<u8>, members: &[(String, String)]) {
         put_str(o, addr);
     }
 }
+/// Binary encoding for shard aggregation rows: `u32` row count, then per
+/// row a length-prefixed `Value::encode` key, `u64` doc count, `u32`
+/// metric count, and length-prefixed `Value::encode` metrics. Uses the
+/// same Value codec as row data, so every Value variant round-trips.
+pub fn encode_agg_rows(rows: &[skaidb_fts::AggRow]) -> Vec<u8> {
+    let mut o = Vec::new();
+    o.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+    for row in rows {
+        put_bytes(&mut o, &row.key.encode());
+        o.extend_from_slice(&row.count.to_le_bytes());
+        o.extend_from_slice(&(row.metrics.len() as u32).to_le_bytes());
+        for m in &row.metrics {
+            put_bytes(&mut o, &m.encode());
+        }
+    }
+    o
+}
+
+/// Inverse of [`encode_agg_rows`].
+pub fn decode_agg_rows(buf: &[u8]) -> Result<Vec<skaidb_fts::AggRow>, WireError> {
+    let mut c = Cur::new(buf);
+    let n = c.u32()? as usize;
+    let mut rows = Vec::with_capacity(n.min(1 << 20));
+    for _ in 0..n {
+        let key = skaidb_types::Value::decode(&c.bytes()?)
+            .map_err(|_| WireError::Malformed("bad agg key value"))?;
+        let count = c.u64()?;
+        let mlen = c.u32()? as usize;
+        let mut metrics = Vec::with_capacity(mlen.min(1 << 16));
+        for _ in 0..mlen {
+            metrics.push(
+                skaidb_types::Value::decode(&c.bytes()?)
+                    .map_err(|_| WireError::Malformed("bad agg metric value"))?,
+            );
+        }
+        rows.push(skaidb_fts::AggRow { key, count, metrics });
+    }
+    Ok(rows)
+}
+
 fn put_bytes(o: &mut Vec<u8>, b: &[u8]) {
     o.extend_from_slice(&(b.len() as u32).to_le_bytes());
     o.extend_from_slice(b);
