@@ -70,6 +70,14 @@ pub enum SearchQuery {
     /// the index (none of the indexed columns present) are never returned —
     /// the index cannot speak for rows it does not contain.
     Not(Box<SearchQuery>),
+    /// `required` determines the document set; each `optional` sub-query
+    /// only **adds to the score** of documents that already match (tantivy
+    /// Must + Should — ES `bool` with `must`/`filter` plus `should` clauses
+    /// under the default `minimum_should_match: 0`).
+    Boosted {
+        required: Box<SearchQuery>,
+        optional: Vec<SearchQuery>,
+    },
 }
 
 /// What the query builder needs to know about one indexed field.
@@ -413,6 +421,13 @@ pub(crate) fn build_query(
                 (Occur::Must, Box::new(AllQuery) as Box<dyn Query>),
                 (Occur::MustNot, sub),
             ])))
+        }
+        SearchQuery::Boosted { required, optional } => {
+            let mut clauses = vec![(Occur::Must, build_query(index, fields, required)?)];
+            for sub in optional {
+                clauses.push((Occur::Should, build_query(index, fields, sub)?));
+            }
+            Ok(Box::new(BooleanQuery::new(clauses)))
         }
     }
 }

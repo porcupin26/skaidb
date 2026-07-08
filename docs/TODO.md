@@ -48,10 +48,12 @@ hardening, and tracked extras.
 
 ## Full-text search
 
-- [ ] **[fts] ES-REST subset follow-ups**: `bool.should` beside
-  must/filter (needs optional-scoring composition), multi-key sort,
-  `_source` include/exclude lists, GET-by-id (`/{index}/_doc/{id}`),
-  auto-create-on-bulk if shipper demand shows up.
+- [x] **[fts] ES-REST subset follow-ups** — all shipped: `bool.should`
+  beside must/filter via the new `BOOSTED(required, optional…)`
+  optional-scoring predicate (tantivy Must+Should; `minimum_should_match:
+  1` makes shoulds required; >1 rejected), multi-key sort, `_source`
+  include/exclude lists with trailing-`*` globs, `GET /{index}/_doc/{id}`,
+  and ES-style auto-create-on-bulk (dynamic mapping from the first doc).
 - [ ] **[fts] Phase 9 — hardening & the honesty pass**: 24 h soak under
   mixed ingest+query; failure injection (disk-full mid-merge, torn index
   dir → rebuild); explain-output audit; final SEARCH.md pass; benchmark

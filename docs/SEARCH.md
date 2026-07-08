@@ -156,6 +156,12 @@ indexed terms, so with a lowercasing analyzer write patterns lowercase):
 **Composition**: search predicates combine freely with `AND`/`OR`/`NOT`
 among themselves (ES bool `must`/`should`/`must_not`); ordinary SQL
 conditions join at the top level with `AND` and filter the hits afterward.
+`BOOSTED(required, optional…)` adds ES's optional-scoring shape: the
+`required` predicate decides which rows match, and each `optional`
+predicate only raises the score of rows that already match (tantivy
+Must + Should — ES bool `must` + `should` under the default
+`minimum_should_match: 0`). Every argument must itself be a search
+predicate.
 Mixing a search predicate with an ordinary condition under `OR`/`NOT` is
 rejected — the index cannot serve it. A `NOT` search returns only rows the
 index knows: a row with none of the indexed columns present is never
@@ -225,28 +231,40 @@ The REST endpoint speaks enough Elasticsearch for existing ES client
 libraries and log shippers (not Kibana). An ES "index" is a skaidb
 **table**; its `SEARCH INDEX` is the mapping; `_id` maps to the table's
 single-column primary key (stored as a string, auto-generated when a bulk
-action omits it). Pre-create the table + search index; the subset does
-not auto-create.
+action omits it). Pre-create the table + search index for full control —
+or let `_bulk` **auto-create** an unknown index ES-style: primary key
+`id` plus a dynamic mapping from the first document (strings → `text`,
+integers → `long`, floats → `double`, bools → `bool`; null/array/object
+fields are stored but not indexed).
 
 ```
 POST /{index}/_bulk      index / create / delete NDJSON actions
+                         (auto-creates an unknown index, see above)
 POST /{index}/_search    query DSL: match, match_phrase, prefix, wildcard,
-                         regexp, fuzzy, term, terms, range, exists, bool,
-                         query_string, more_like_this; from/size, sort
-                         (incl. _score), _source on/off, highlight, exact
-                         totals; aggs: terms, date_histogram (+ sum/avg/
-                         min/max/value_count/cardinality sub-aggs)
+                         regexp, fuzzy, term, terms, range, exists, bool
+                         (must/filter/must_not/should — should beside
+                         must/filter boosts scores via BOOSTED(), or is
+                         required with minimum_should_match: 1),
+                         query_string, more_like_this; from/size,
+                         multi-key sort (incl. _score), _source with
+                         include/exclude lists (trailing-* globs),
+                         highlight, exact totals; aggs: terms,
+                         date_histogram (+ sum/avg/min/max/value_count/
+                         cardinality sub-aggs)
 POST /{index}/_count     exact match count
+GET  /{index}/_doc/{id}  fetch one document by _id
 GET  /{index}/_mapping   the search-index declaration as ES properties
 ```
 
 Everything translates to the same SQL statements documented above and
 runs through the ordinary session path — HTTP Basic auth, RBAC, cluster
-routing, and all pushdowns apply unchanged. Limits: `bool.should` beside
-`must`/`filter` (optional-scoring) is rejected; a single sort key;
-clients that hard-check the `X-elastic-product` header need that check
-disabled. `cardinality` is skaidb's **exact** `COUNT(DISTINCT)`, not an
-HLL approximation.
+routing, and all pushdowns apply unchanged. Limits:
+`minimum_should_match` above 1 is rejected, and `bool.should` beside a
+must/filter with **no search clause** cannot be scored (set
+`minimum_should_match: 1` to make the shoulds required); clients that
+hard-check the `X-elastic-product` header need that check disabled.
+`cardinality` is skaidb's **exact** `COUNT(DISTINCT)`, not an HLL
+approximation.
 
 ## Architecture
 

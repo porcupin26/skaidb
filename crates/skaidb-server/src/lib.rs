@@ -614,6 +614,77 @@ mod tests {
         // Unknown index → clean ES-shaped error.
         let resp = http("POST", "/nope/_count", "{}");
         assert!(resp.contains("does not exist") || resp.contains("error"), "{resp}");
+
+        // GET by id — string _id, then a missing one.
+        let resp = http("GET", "/logs/_doc/a1", "");
+        assert!(resp.contains("\"found\":true"), "{resp}");
+        assert!(resp.contains("error connecting"), "{resp}");
+        let resp = http("GET", "/logs/_doc/never-was", "");
+        assert!(resp.contains("\"found\":false"), "{resp}");
+
+        // Multi-key sort: level asc, bytes desc within level.
+        let resp = http(
+            "POST",
+            "/logs/_search",
+            r#"{"query":{"match_all":{}},"sort":[{"level":{"order":"asc"}},{"bytes":{"order":"desc"}}]}"#,
+        );
+        let a1 = resp.find("\"_id\":\"a1\"").unwrap();
+        let anon = resp.find("another error").unwrap();
+        let a2 = resp.find("\"_id\":\"a2\"").unwrap();
+        assert!(a1 < anon && anon < a2, "expected error(100), error(50), info: {resp}");
+
+        // _source include/exclude lists.
+        let resp = http(
+            "POST",
+            "/logs/_search",
+            r#"{"query":{"match":{"msg":"error"}},"_source":["level","by*"]}"#,
+        );
+        assert!(resp.contains("\"level\""), "{resp}");
+        assert!(resp.contains("\"bytes\""), "{resp}");
+        assert!(!resp.contains("connecting"), "msg must be filtered out: {resp}");
+        let resp = http(
+            "POST",
+            "/logs/_search",
+            r#"{"query":{"match":{"msg":"error"}},"_source":{"excludes":["msg"]}}"#,
+        );
+        assert!(!resp.contains("connecting"), "{resp}");
+        assert!(resp.contains("\"bytes\""), "{resp}");
+
+        // bool.should beside must: default = optional scoring (BOOSTED
+        // pushdown). Both error docs match; the one also matching the
+        // should ranks first.
+        let resp = http(
+            "POST",
+            "/logs/_search",
+            r#"{"query":{"bool":{"must":[{"match":{"msg":"error"}}],"should":[{"match":{"msg":"worker"}}]}}}"#,
+        );
+        assert!(resp.contains("\"total\":{\"relation\":\"eq\",\"value\":2}"), "{resp}");
+        let worker = resp.find("another error in worker").unwrap();
+        let db = resp.find("error connecting to db").unwrap();
+        assert!(worker < db, "should-boosted hit must rank first: {resp}");
+        // minimum_should_match: 1 makes the should required.
+        let resp = http(
+            "POST",
+            "/logs/_count",
+            r#"{"query":{"bool":{"must":[{"match":{"msg":"error"}}],"should":[{"match":{"msg":"worker"}}],"minimum_should_match":1}}}"#,
+        );
+        assert!(resp.contains("\"count\":1"), "{resp}");
+
+        // Auto-create on bulk: unknown index springs into existence with a
+        // dynamic mapping from the first document.
+        let bulk = concat!(
+            "{\"index\":{\"_id\":\"n1\"}}\n",
+            "{\"note\":\"fresh index works\",\"severity\":\"low\",\"count\":7,\"ratio\":0.5,\"ok\":true}\n",
+        );
+        let resp = http("POST", "/autoidx/_bulk", bulk);
+        assert!(resp.contains("\"errors\":false"), "{resp}");
+        let resp = http("GET", "/autoidx/_mapping", "");
+        assert!(resp.contains("\"note\":{\"type\":\"text\"}"), "{resp}");
+        assert!(resp.contains("\"count\":{\"type\":\"long\"}"), "{resp}");
+        assert!(resp.contains("\"ratio\":{\"type\":\"double\"}"), "{resp}");
+        assert!(resp.contains("\"ok\":{\"type\":\"boolean\"}"), "{resp}");
+        let resp = http("GET", "/autoidx/_doc/n1", "");
+        assert!(resp.contains("\"found\":true") && resp.contains("fresh index"), "{resp}");
     }
 
     /// The embedded web UI: assets served with CSP, `/ui/meta` shape, and the

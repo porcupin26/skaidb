@@ -4029,6 +4029,7 @@ fn is_search_func(name: &str) -> bool {
             | "regexp"
             | "more_like_this"
             | "search"
+            | "boosted"
     )
 }
 
@@ -4094,6 +4095,12 @@ fn collect_search_fields(query: &SearchQuery, out: &mut Vec<String>) {
             }
         }
         SearchQuery::Not(sub) => collect_search_fields(sub, out),
+        SearchQuery::Boosted { required, optional } => {
+            collect_search_fields(required, out);
+            for sub in optional {
+                collect_search_fields(sub, out);
+            }
+        }
     }
 }
 
@@ -4312,6 +4319,41 @@ fn search_query_from_func(name: &str, args: &[Expr]) -> Result<SearchQuery> {
                 ));
             };
             Ok(SearchQuery::QueryString(text(q, "SEARCH('query')")?))
+        }
+        // BOOSTED(required, optional...): `required` decides which rows
+        // match; each optional predicate only raises the score of rows that
+        // already match (ES bool must/filter + should). Every argument must
+        // itself be a pure search predicate — the index serves the whole
+        // thing or the statement is rejected.
+        "boosted" => {
+            let [required, optional @ ..] = args else {
+                return Err(EngineError::Type(
+                    "BOOSTED(required, optional...) takes at least one search predicate".into(),
+                ));
+            };
+            if optional.is_empty() {
+                return Err(EngineError::Type(
+                    "BOOSTED(required, optional...) needs at least one optional predicate \
+                     (without one it is just the required predicate)"
+                        .into(),
+                ));
+            }
+            for arg in args {
+                if !is_pure_search(arg) {
+                    return Err(EngineError::Type(
+                        "BOOSTED() arguments must be search predicates (MATCH()-family \
+                         functions composed with AND/OR/NOT)"
+                            .into(),
+                    ));
+                }
+            }
+            Ok(SearchQuery::Boosted {
+                required: Box::new(to_search_query(required)?),
+                optional: optional
+                    .iter()
+                    .map(to_search_query)
+                    .collect::<Result<Vec<_>>>()?,
+            })
         }
         other => Err(EngineError::Type(format!(
             "unknown search function {other}()"

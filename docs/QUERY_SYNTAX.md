@@ -315,6 +315,11 @@ WHERE (MATCH(body, 'rust') OR MATCH(title, 'rust'))
   the given text: its most distinctive terms (by in-index document
   frequency; terms in fewer than 2 docs are ignored, at most 25 terms)
   OR-ed together. Composes like the other predicates.
+- **`BOOSTED(<required>, <optional> [, <optional> ...])`** — optional
+  scoring composition (ES bool `must` + `should`): rows match iff
+  `<required>` matches; each `<optional>` predicate only **raises the
+  score** of rows that already match. Every argument must itself be a
+  search predicate (possibly AND/OR/NOT-composed).
 - **`SUGGEST '<text>' ON <index> [COLUMN <col>] [LIMIT n]`** — a
   standalone statement returning "did you mean" term suggestions
   (`input`, `suggestion`, `distance`, `doc_freq` — closest first, most

@@ -26,10 +26,11 @@ static BULK_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Cheap path filter so non-ES requests skip the ES handler entirely.
 pub fn path_is_es(path: &str) -> bool {
     let path = path.split('?').next().unwrap_or(path);
+    let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
     matches!(
-        path.trim_matches('/').rsplit('/').next(),
-        Some("_bulk" | "_search" | "_count" | "_mapping")
-    )
+        segs.last(),
+        Some(&("_bulk" | "_search" | "_count" | "_mapping"))
+    ) || (segs.len() == 3 && segs[1] == "_doc")
 }
 
 /// Route an ES-style request; `None` when the path is not ours. Returns
@@ -49,6 +50,7 @@ pub fn try_route(
         ("POST" | "GET", [index, "_search"]) => search(ctx, role, index, body),
         ("POST" | "GET", [index, "_count"]) => count(ctx, role, index, body),
         ("GET", [index, "_mapping"]) => mapping(ctx, index),
+        ("GET", [index, "_doc", id]) => get_doc(ctx, role, index, id),
         _ => return None,
     };
     Some(match out {
@@ -303,9 +305,45 @@ fn query_expr(q: &Json) -> Result<Option<Expr>, String> {
                 if parts.is_empty() {
                     return Ok(or(shoulds));
                 }
-                // ES `should` beside must/filter only boosts scores; our
-                // subset cannot express optional-scoring clauses.
-                return Err("bool.should combined with must/filter is not supported".into());
+                // minimum_should_match (number or numeric string).
+                let msm = match &body["minimum_should_match"] {
+                    Json::Null => 0,
+                    v => v
+                        .as_i64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                        .ok_or("minimum_should_match must be a number")?,
+                };
+                match msm {
+                    1 => {
+                        // At least one should is required: plain AND/OR.
+                        parts.push(or(shoulds).expect("shoulds is non-empty"));
+                    }
+                    0 => {
+                        // ES default beside must/filter: `should` only
+                        // boosts scores. BOOSTED(required, optional...)
+                        // expresses exactly that in the index; ordinary
+                        // (term/range) must-parts stay AND-ed on top —
+                        // being required, they shift every hit equally in
+                        // ES too, so the ranking is unaffected.
+                        let (search_parts, ordinary): (Vec<Expr>, Vec<Expr>) =
+                            parts.into_iter().partition(expr_uses_search);
+                        if search_parts.is_empty() {
+                            return Err("bool.should beside a non-search must/filter cannot \
+                                 boost scores; set minimum_should_match: 1 to make the should \
+                                 clauses required instead"
+                                .into());
+                        }
+                        let mut args = vec![and(search_parts).expect("non-empty")];
+                        args.extend(shoulds);
+                        parts = ordinary;
+                        parts.push(func("boosted", args));
+                    }
+                    n => {
+                        return Err(format!(
+                            "minimum_should_match: {n} is not supported (only 0 or 1)"
+                        ))
+                    }
+                }
             }
             Ok(and(parts))
         }
@@ -385,15 +423,17 @@ fn search(ctx: &Shared, role: &str, index: &str, body: &[u8]) -> Result<(u16, Js
             }
             None => {}
             Some(sort) => {
-                let (col, desc) = parse_sort(sort)?;
-                sel.order_by = vec![OrderKey {
-                    expr: if col == "_score" {
-                        func("score", vec![])
-                    } else {
-                        Expr::Column(col)
-                    },
-                    descending: desc,
-                }];
+                sel.order_by = parse_sort(sort)?
+                    .into_iter()
+                    .map(|(col, desc)| OrderKey {
+                        expr: if col == "_score" {
+                            func("score", vec![])
+                        } else {
+                            Expr::Column(col)
+                        },
+                        descending: desc,
+                    })
+                    .collect();
             }
         }
         let pk = ctx
@@ -401,6 +441,7 @@ fn search(ctx: &Shared, role: &str, index: &str, body: &[u8]) -> Result<(u16, Js
             .table_primary_key(index)
             .ok_or_else(|| format!("no such index (table) '{index}'"))?;
         let pk = pk.first().cloned().unwrap_or_default();
+        let (include_source, includes, excludes) = source_spec(&body);
         let (columns, rows) = rows_of(run(ctx, role, Statement::Select(sel), "es:_search")?)?;
         for row in rows {
             let mut source = Map::new();
@@ -425,13 +466,14 @@ fn search(ctx: &Shared, role: &str, index: &str, body: &[u8]) -> Result<(u16, Js
                             other => Json::String(other.to_json().to_string()),
                         };
                     }
-                    source.insert(col.clone(), val.to_json());
+                    if source_allows(col, &includes, &excludes) {
+                        source.insert(col.clone(), val.to_json());
+                    }
                 }
             }
             if max_score.is_null() && !score.is_null() {
                 max_score = score.clone();
             }
-            let include_source = body.get("_source").map(|s| s != &json!(false)).unwrap_or(true);
             let mut hit = json!({"_index": index, "_id": id, "_score": score});
             if include_source {
                 hit["_source"] = Json::Object(source);
@@ -458,6 +500,43 @@ fn search(ctx: &Shared, role: &str, index: &str, body: &[u8]) -> Result<(u16, Js
     Ok((200, out))
 }
 
+/// `_source`: `false` | `true` | `"field"` | `["f1", "f2*"]` |
+/// `{"includes": [...], "excludes": [...]}` → (include at all, includes,
+/// excludes). Patterns support a trailing `*` (ES-style prefix glob).
+fn source_spec(body: &Json) -> (bool, Vec<String>, Vec<String>) {
+    fn list(v: &Json) -> Vec<String> {
+        match v {
+            Json::String(s) => vec![s.clone()],
+            Json::Array(a) => a
+                .iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+    match body.get("_source") {
+        None => (true, Vec::new(), Vec::new()),
+        Some(Json::Bool(b)) => (*b, Vec::new(), Vec::new()),
+        Some(Json::Object(o)) => (
+            true,
+            o.get("includes").map(list).unwrap_or_default(),
+            o.get("excludes").map(list).unwrap_or_default(),
+        ),
+        Some(v) => (true, list(v), Vec::new()),
+    }
+}
+
+fn source_allows(name: &str, includes: &[String], excludes: &[String]) -> bool {
+    let matches = |pat: &String| match pat.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => pat == name,
+    };
+    if excludes.iter().any(matches) {
+        return false;
+    }
+    includes.is_empty() || includes.iter().any(matches)
+}
+
 fn expr_uses_search(e: &Expr) -> bool {
     match e {
         Expr::Func { name, .. } => matches!(
@@ -470,6 +549,7 @@ fn expr_uses_search(e: &Expr) -> bool {
                 | "regexp"
                 | "more_like_this"
                 | "search"
+                | "boosted"
         ),
         Expr::Unary { expr, .. } => expr_uses_search(expr),
         Expr::Binary { left, right, .. } => expr_uses_search(left) || expr_uses_search(right),
@@ -477,21 +557,23 @@ fn expr_uses_search(e: &Expr) -> bool {
     }
 }
 
-fn parse_sort(sort: &Json) -> Result<(String, bool), String> {
-    let entry = match sort {
-        Json::Array(items) if items.len() == 1 => &items[0],
-        Json::Array(_) => return Err("only a single sort key is supported".into()),
-        one => one,
+fn parse_sort(sort: &Json) -> Result<Vec<(String, bool)>, String> {
+    let entries: Vec<&Json> = match sort {
+        Json::Array(items) => items.iter().collect(),
+        one => vec![one],
     };
-    match entry {
-        Json::String(col) => Ok((col.clone(), col == "_score")),
-        Json::Object(o) => {
-            let (col, spec) = o.iter().next().ok_or("empty sort entry")?;
-            let desc = spec["order"].as_str().unwrap_or("asc") == "desc";
-            Ok((col.clone(), desc))
-        }
-        _ => Err("unsupported sort specification".into()),
-    }
+    entries
+        .into_iter()
+        .map(|entry| match entry {
+            Json::String(col) => Ok((col.clone(), col == "_score")),
+            Json::Object(o) => {
+                let (col, spec) = o.iter().next().ok_or("empty sort entry")?;
+                let desc = spec["order"].as_str().unwrap_or("asc") == "desc";
+                Ok((col.clone(), desc))
+            }
+            _ => Err("unsupported sort specification".to_string()),
+        })
+        .collect()
 }
 
 // ---- aggregations ----
@@ -720,7 +802,119 @@ fn mapping(ctx: &Shared, index: &str) -> Result<(u16, Json), String> {
     ))
 }
 
+// ---- GET /{index}/_doc/{id} ----
+
+fn get_doc(ctx: &Shared, role: &str, index: &str, id: &str) -> Result<(u16, Json), String> {
+    let pk = match ctx.backend.table_primary_key(index) {
+        Some(pk) if pk.len() == 1 => pk[0].clone(),
+        Some(_) => return Err("composite primary keys cannot map to _id".into()),
+        None => return Ok(es_error(404, &format!("no such index (table) '{index}'"))),
+    };
+    // `_id` is a string on the wire; a table with a numeric key stores it
+    // as a number — try the string form first, then the numeric.
+    let mut candidates = vec![Value::String(id.to_string())];
+    if let Ok(n) = id.parse::<i64>() {
+        candidates.push(Value::Int(n));
+    }
+    for key in candidates {
+        let mut sel = select_from(index);
+        sel.items = vec![SelectItem::Wildcard];
+        sel.filter = Some(Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Column(pk.clone())),
+            right: Box::new(Expr::Literal(key)),
+        });
+        sel.limit = Some(1);
+        let (columns, rows) = rows_of(run(ctx, role, Statement::Select(sel), "es:_doc")?)?;
+        if let Some(row) = rows.into_iter().next() {
+            let mut source = Map::new();
+            for (col, val) in columns.iter().zip(row) {
+                source.insert(col.clone(), val.to_json());
+            }
+            return Ok((
+                200,
+                json!({
+                    "_index": index,
+                    "_id": id,
+                    "_version": 1,
+                    "found": true,
+                    "_source": Json::Object(source),
+                }),
+            ));
+        }
+    }
+    Ok((404, json!({"_index": index, "_id": id, "found": false})))
+}
+
 // ---- _bulk ----
+
+/// ES-style dynamic mapping: the first `_bulk` write to an unknown index
+/// creates the table (primary key `id`) and a search index derived from the
+/// first document — strings → `text`, integer numbers → `long`, floats →
+/// `double`, bools → `bool`; null/array/object fields are stored but not
+/// search-indexed. Field names that are not plain identifiers are skipped
+/// (stored, not indexed). Idempotent (`IF NOT EXISTS`) so concurrent bulks
+/// cannot race each other into an error.
+fn auto_create(
+    ctx: &Shared,
+    role: &str,
+    index: &str,
+    doc: &Map<String, Json>,
+) -> Result<(), String> {
+    let ident_ok =
+        |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !ident_ok(index) {
+        return Err(format!(
+            "cannot auto-create index '{index}': the name must be alphanumeric/underscore"
+        ));
+    }
+    let ddl = format!("CREATE TABLE IF NOT EXISTS {index} (PRIMARY KEY (id))");
+    let stmt = skaidb_sql::parse(&ddl).map_err(|e| format!("auto-create: {e}"))?;
+    if let Response::Error(e) = run(ctx, role, stmt, "es:_bulk#auto-create")? {
+        return Err(format!("auto-create table: {e}"));
+    }
+    let mut cols = Vec::new();
+    let mut opts = Vec::new();
+    for (field, value) in doc {
+        if field == "id" || !ident_ok(field) {
+            continue;
+        }
+        // Quoted, so field names that collide with SQL keywords still work.
+        match value {
+            Json::String(_) => cols.push(format!("\"{field}\"")),
+            Json::Number(n) if n.is_i64() || n.is_u64() => {
+                cols.push(format!("\"{field}\""));
+                opts.push(format!("\"{field}\".type = 'long'"));
+            }
+            Json::Number(_) => {
+                cols.push(format!("\"{field}\""));
+                opts.push(format!("\"{field}\".type = 'double'"));
+            }
+            Json::Bool(_) => {
+                cols.push(format!("\"{field}\""));
+                opts.push(format!("\"{field}\".type = 'bool'"));
+            }
+            _ => {}
+        }
+    }
+    if cols.is_empty() {
+        return Ok(()); // nothing searchable in the first doc; table alone
+    }
+    let with = if opts.is_empty() {
+        String::new()
+    } else {
+        format!(" WITH ({})", opts.join(", "))
+    };
+    let ddl = format!(
+        "CREATE SEARCH INDEX IF NOT EXISTS {index}_fts ON {index} ({}){with}",
+        cols.join(", ")
+    );
+    let stmt = skaidb_sql::parse(&ddl).map_err(|e| format!("auto-create: {e}"))?;
+    if let Response::Error(e) = run(ctx, role, stmt, "es:_bulk#auto-create")? {
+        return Err(format!("auto-create search index: {e}"));
+    }
+    Ok(())
+}
 
 fn bulk(
     ctx: &Shared,
@@ -791,12 +985,24 @@ fn bulk(
                     Some("composite primary keys cannot map to _id")));
                 continue;
             }
-            None => {
-                errors = true;
-                items.push(bulk_item(action.verb, &action.index, &action.id, 404,
-                    Some("no such index (table)")));
-                continue;
-            }
+            // Unknown index + a document to write → dynamic mapping.
+            None => match action.source.as_ref().and_then(|s| s.as_object()) {
+                Some(doc) => match auto_create(ctx, role, &action.index, doc) {
+                    Ok(()) => "id".to_string(),
+                    Err(e) => {
+                        errors = true;
+                        items.push(bulk_item(action.verb, &action.index, &action.id, 400,
+                            Some(&e)));
+                        continue;
+                    }
+                },
+                None => {
+                    errors = true;
+                    items.push(bulk_item(action.verb, &action.index, &action.id, 404,
+                        Some("no such index (table)")));
+                    continue;
+                }
+            },
         };
         let stmt = match action.source {
             Some(source) => {
