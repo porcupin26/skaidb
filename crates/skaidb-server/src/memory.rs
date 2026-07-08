@@ -23,6 +23,13 @@ const SEARCH_WRITER_SHARE: u64 = 8; // budget / 8 per search index
 const SEARCH_WRITER_MIN: u64 = 16 * 1024 * 1024;
 const SEARCH_WRITER_MAX: u64 = 64 * 1024 * 1024;
 
+/// Share and bounds for each time-series table's in-memory head. The head
+/// compresses aggressively (Gorilla-style chunks), so a modest cap holds a
+/// lot of samples; past the cap the head flushes wholesale.
+const TS_HEAD_SHARE: u64 = 8; // budget / 8 per TS table
+const TS_HEAD_MIN: u64 = 4 * 1024 * 1024;
+const TS_HEAD_MAX: u64 = 256 * 1024 * 1024;
+
 /// Assumed bytes per read-cache entry (key + value + map overhead) when
 /// converting the cache's byte share into an entry capacity. Conservative for
 /// small rows; a workload with much larger rows should size
@@ -42,6 +49,8 @@ pub struct MemoryPlan {
     pub read_cache_entries: u64,
     /// Tantivy writer heap per full-text search index (bytes).
     pub search_writer_bytes: u64,
+    /// In-memory head cap per time-series table (bytes).
+    pub ts_head_bytes: u64,
 }
 
 /// Resolve a `memory_target` setting into a plan. Empty/`"off"` → `None`
@@ -70,11 +79,13 @@ fn plan(budget: u64) -> MemoryPlan {
     let read_cache_entries = (budget / READ_CACHE_SHARE) / ASSUMED_ENTRY_BYTES;
     let search_writer_bytes =
         (budget / SEARCH_WRITER_SHARE).clamp(SEARCH_WRITER_MIN, SEARCH_WRITER_MAX);
+    let ts_head_bytes = (budget / TS_HEAD_SHARE).clamp(TS_HEAD_MIN, TS_HEAD_MAX);
     MemoryPlan {
         budget,
         memtable_bytes,
         read_cache_entries,
         search_writer_bytes,
+        ts_head_bytes,
     }
 }
 

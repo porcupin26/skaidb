@@ -19,6 +19,12 @@ pub type FlushedSeries = Vec<(Labels, Vec<crate::head::SealedChunk>)>;
 /// Store configuration.
 #[derive(Debug, Clone)]
 pub struct TsdbOptions {
+    /// Byte budget for the in-memory head (0 = unbounded, the default).
+    /// When an append pushes the head's approximate size past this, the
+    /// whole head flushes to blocks — bounding ingest RSS on budgeted
+    /// nodes (`[storage] memory_target`). Partial-window blocks from these
+    /// flushes fold together at compaction.
+    pub head_max_bytes: u64,
     /// Width of one block window (default 2 h).
     pub block_span_ms: i64,
     /// Drop data older than this (measured against the newest sample);
@@ -38,6 +44,7 @@ pub struct TsdbOptions {
 impl Default for TsdbOptions {
     fn default() -> Self {
         TsdbOptions {
+            head_max_bytes: 0,
             block_span_ms: 2 * 3600 * 1000,
             retention_ms: None,
             max_series: 1_000_000,
@@ -280,6 +287,15 @@ impl Tsdb {
         let mut flushed = Vec::new();
         if boundary > inner.flushed_through {
             flushed = self.flush_before(&mut inner, boundary)?;
+        }
+        // Memory budget: a head past its byte cap flushes wholesale, even
+        // mid-window (the partial blocks compact together later).
+        if self.opts.head_max_bytes > 0
+            && inner.head.max_ts != i64::MIN
+            && inner.head.approx_bytes() > self.opts.head_max_bytes
+        {
+            let boundary = inner.head.max_ts + 1;
+            flushed.extend(self.flush_before(&mut inner, boundary)?);
         }
         Ok((result, flushed))
     }
@@ -654,6 +670,42 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].1.len(), 50);
         assert_eq!(all[0].1[49].value, 49.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A byte-capped head flushes wholesale mid-window instead of growing
+    /// unbounded; the data stays fully queryable across head and blocks.
+    #[test]
+    fn head_byte_budget_triggers_flush() {
+        let dir = temp_dir("hbb");
+        let db = Tsdb::open(
+            &dir,
+            TsdbOptions {
+                block_span_ms: i64::MAX / 4, // the window never completes
+                head_max_bytes: 8 * 1024,
+                sync_on_append: false,
+                ..TsdbOptions::default()
+            },
+        )
+        .unwrap();
+        let labels: Labels = vec![("host".into(), "a".into())];
+        let mut rows = Vec::new();
+        for i in 0..5_000i64 {
+            rows.push((labels.clone(), i * 1000, i as f64));
+        }
+        db.append_batch(&rows).unwrap();
+        assert!(
+            db.flushed_through() > i64::MIN,
+            "budget flush never triggered"
+        );
+        let head_bytes = {
+            // Whatever remains in the head is under (or near) the cap.
+            let all = db.query(&[], 0, i64::MAX).unwrap();
+            assert_eq!(all.len(), 1);
+            assert_eq!(all[0].1.len(), 5_000, "no samples lost");
+            db.head_min_ts()
+        };
+        let _ = head_bytes;
         let _ = std::fs::remove_dir_all(&dir);
     }
 

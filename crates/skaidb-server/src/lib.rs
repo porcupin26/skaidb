@@ -134,18 +134,21 @@ pub fn run(
     let mut flush_threshold_bytes = (config.storage.memtable_size_mb.max(1) as usize) * 1024 * 1024;
     let mut read_cache_capacity = config.storage.read_cache_entries as usize;
     let mut search_writer_heap_bytes = skaidb_engine::DEFAULT_SEARCH_WRITER_HEAP;
+    let mut ts_head_max_bytes = 0u64; // unbounded without a budget
     match memory::resolve(&config.storage.memory_target) {
         Ok(Some(plan)) => {
             flush_threshold_bytes = plan.memtable_bytes as usize;
             read_cache_capacity = plan.read_cache_entries as usize;
             search_writer_heap_bytes = plan.search_writer_bytes as usize;
+            ts_head_max_bytes = plan.ts_head_bytes;
             skaidb_types::slog!(
                 "skaidb: storage memory target {} MB (memtable {} MB, read cache {} entries, \
-                 search writer {} MB/index)",
+                 search writer {} MB/index, ts head {} MB/table)",
                 plan.budget / (1024 * 1024),
                 plan.memtable_bytes / (1024 * 1024),
                 plan.read_cache_entries,
-                plan.search_writer_bytes / (1024 * 1024)
+                plan.search_writer_bytes / (1024 * 1024),
+                plan.ts_head_bytes / (1024 * 1024)
             );
         }
         Ok(None) => {}
@@ -155,6 +158,7 @@ pub fn run(
         flush_threshold_bytes,
         read_cache_capacity,
         search_writer_heap_bytes,
+        ts_head_max_bytes,
         ..Default::default()
     };
     let db = Database::open_with_options(&config.server.data_dir, storage_opts)?;
@@ -269,6 +273,37 @@ pub fn run(
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_millis(200));
             ctx.backend.search_refresh_tick();
+        });
+    }
+
+    // Self-scrape (`observability.self_scrape`, live-mutable): ingest the
+    // node's own /metrics into the `metrics` time-series table so the node
+    // can dashboard itself with no external Prometheus. The loop re-reads
+    // the live config each second, so `config set` toggles it immediately.
+    {
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let mut last = std::time::Instant::now();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let (on, every) = ctx
+                    .config
+                    .read()
+                    .map(|c| {
+                        (
+                            c.observability.self_scrape,
+                            c.observability.self_scrape_interval_secs.max(1),
+                        )
+                    })
+                    .unwrap_or((false, 15));
+                if !on || last.elapsed().as_secs() < every {
+                    continue;
+                }
+                last = std::time::Instant::now();
+                if let Err(e) = crate::promwrite::self_scrape_tick(&ctx) {
+                    eprintln!("skaidb self-scrape: {e}");
+                }
+            }
         });
     }
 
@@ -871,6 +906,43 @@ mod tests {
         // A bad database name errors cleanly.
         let resp = post(r#"{"sql": "SELECT 1 FROM t", "db": "nope"}"#);
         assert!(resp.starts_with("HTTP/1.1 400") || resp.contains("error"), "{resp}");
+    }
+
+    /// One self-scrape tick lands the node's own gauges in the `metrics`
+    /// TS table, queryable over SQL like any remote_write data.
+    #[test]
+    fn self_scrape_ingests_own_metrics() {
+        let ctx = temp_ctx();
+        // The startup path sets these in production; drive them here.
+        ctx.metrics.set("skaidb_up", 1);
+        ctx.metrics.connection_opened(crate::metrics::Endpoint::Rest);
+        let n = crate::promwrite::self_scrape_tick(&ctx).unwrap();
+        assert!(n > 0, "expected some series ingested");
+        let resp = crate::shared::execute_as(
+            &ctx,
+            "superuser",
+            "SELECT value FROM metrics WHERE name = 'skaidb_up' ORDER BY ts",
+        );
+        match resp {
+            Response::Rows { rows, .. } => {
+                assert!(!rows.is_empty(), "skaidb_up not ingested");
+                assert_eq!(rows[0], vec![Value::Float(1.0)]);
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+        // Labelled series keep their labels as queryable columns.
+        let resp = crate::shared::execute_as(
+            &ctx,
+            "superuser",
+            "SELECT value FROM metrics WHERE name = 'skaidb_connections_active' AND endpoint = 'rest'",
+        );
+        match resp {
+            Response::Rows { rows, .. } => {
+                assert!(!rows.is_empty(), "labeled series not ingested");
+                assert_eq!(rows[0], vec![Value::Float(1.0)]);
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
     }
 
     #[test]

@@ -81,10 +81,14 @@ extras below.
   ships raw samples cluster-wide (per-step lookback windows don't align
   with fixed buckets); teach `query_range` to reuse the v0.31.0 partial
   gather for step-aligned windows.
-- [ ] **[ts] Self-scrape** — `observability.self_scrape` ingesting the
-  node's own `/metrics` into the TS store.
-- [ ] **[ts] `memory_target` integration** — TS head memory isn't part of
-  the storage budget yet (FTS writer heap joined in v0.38).
+- [x] **[ts] Self-scrape** — shipped: `observability.self_scrape`
+  (+ `self_scrape_interval_secs`, both live-mutable) ingests the node's
+  own `/metrics` into the `metrics` TS table every interval — the node
+  dashboards itself with no external Prometheus.
+- [x] **[ts] `memory_target` integration** — shipped: the budget carves
+  a per-TS-table head cap (budget/8, clamped 4–256 MB); a head past its
+  cap flushes wholesale mid-window (partial blocks compact together),
+  bounding ingest RSS on budgeted nodes.
 - [ ] **[ts] Streamed TS results** — TS SELECT materializes before the
   (streamable) wire; large raw range dumps should stream end-to-end.
 - [ ] **[ts] Exemplars / native histograms** — chunk-format headroom is

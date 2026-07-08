@@ -192,6 +192,12 @@ pub struct StorageConfig {
 #[serde(default)]
 pub struct ObservabilityConfig {
     pub prometheus_port: u16,
+    /// Ingest this node's own `/metrics` into the `metrics` time-series
+    /// table every [`Self::self_scrape_interval_secs`] — the node
+    /// dashboards itself with no external Prometheus. **Live-mutable.**
+    pub self_scrape: bool,
+    /// Seconds between self-scrapes (minimum 1). **Live-mutable.**
+    pub self_scrape_interval_secs: u64,
     pub slow_query_ms: u64,
     pub query_log_enabled: bool,
     pub query_log_masked: bool,
@@ -292,6 +298,8 @@ impl Config {
 /// Everything else is read once at startup, so changing it only takes effect
 /// after the server is restarted (it is still persisted to the config file).
 pub const RUNTIME_MUTABLE_KEYS: &[&str] = &[
+    "observability.self_scrape",
+    "observability.self_scrape_interval_secs",
     "observability.slow_query_ms",
     "observability.query_log_enabled",
     "observability.query_log_masked",
@@ -435,6 +443,8 @@ impl Default for ObservabilityConfig {
     fn default() -> Self {
         ObservabilityConfig {
             prometheus_port: 9090,
+            self_scrape: false,
+            self_scrape_interval_secs: 15,
             slow_query_ms: 200,
             query_log_enabled: true,
             query_log_masked: true,

@@ -56,6 +56,26 @@ impl Head {
         self.live
     }
 
+    /// Approximate bytes held by the head: sealed chunk bytes, open
+    /// builders (compressed samples run ~2 bytes; count × 4 is a safe
+    /// over-estimate with struct overhead), and OOO buffers at raw sample
+    /// size. Serves the `head_max_bytes` budget trigger — an estimate, not
+    /// an accounting.
+    pub fn approx_bytes(&self) -> u64 {
+        let mut total = 0u64;
+        for entry in self.entries.iter().flatten() {
+            for c in &entry.sealed {
+                total += c.data.len() as u64;
+            }
+            if let Some((_, builder)) = &entry.open {
+                total += builder.count() as u64 * 4 + 64;
+            }
+            total += entry.ooo.len() as u64 * 24;
+            total += 64; // per-series map/labels overhead
+        }
+        total
+    }
+
     /// The oldest timestamp currently held in the head (sealed chunks, the
     /// open builders, and OOO buffers), or `None` when the head is empty.
     /// Everything strictly below it is in immutable blocks — the boundary

@@ -31,11 +31,16 @@ pub fn ingest(ctx: &Shared, role: &str, body: &[u8]) -> Result<usize, String> {
     if rows.is_empty() {
         return Ok(0);
     }
-    match ctx.backend.ts_append(TABLE, &rows) {
+    append_rows(ctx, role, &rows)
+}
+
+/// Append pre-decoded samples into the ingest table, creating it on first
+/// write (broadcast in a cluster) under the caller's role so RBAC still
+/// applies. Shared by remote_write and the self-scrape loop.
+fn append_rows(ctx: &Shared, role: &str, rows: &[(Labels, i64, f64)]) -> Result<usize, String> {
+    match ctx.backend.ts_append(TABLE, rows) {
         Ok(n) => Ok(n),
         Err(e) if e.to_string().contains("does not exist") => {
-            // First write: create the ingest table (broadcast in a cluster),
-            // under the caller's role so RBAC still applies.
             let mut db = skaidb_engine::DEFAULT_DATABASE.to_string();
             let create = format!(
                 "CREATE TIMESERIES TABLE IF NOT EXISTS {TABLE} (SERIES KEY (name), OOO 1h)"
@@ -44,10 +49,100 @@ pub fn ingest(ctx: &Shared, role: &str, body: &[u8]) -> Result<usize, String> {
             if let skaidb_proto::Response::Error(e) = resp {
                 return Err(format!("auto-creating {TABLE}: {e}"));
             }
-            ctx.backend.ts_append(TABLE, &rows).map_err(|e| e.to_string())
+            ctx.backend.ts_append(TABLE, rows).map_err(|e| e.to_string())
         }
         Err(e) => Err(e.to_string()),
     }
+}
+
+/// One self-scrape tick (`observability.self_scrape`): snapshot the node's
+/// own metrics registry into the remote_write table — the node dashboards
+/// itself with no external Prometheus. Runs as the superuser (a node
+/// writing its own telemetry, not a client call).
+pub fn self_scrape_tick(ctx: &Shared) -> Result<usize, String> {
+    crate::shared::collect_runtime_metrics(ctx);
+    let text = ctx.metrics.render();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let rows = parse_prom_text(&text, now);
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let role = ctx.superuser_role.clone();
+    append_rows(ctx, &role, &rows)
+}
+
+/// Parse Prometheus exposition text into ingest rows, mapping labels the
+/// same way remote_write does (`__name__`/metric name → `name`).
+fn parse_prom_text(text: &str, ts: i64) -> Vec<(Labels, i64, f64)> {
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (series, rest) = match line.find('{') {
+            Some(_) => {
+                let Some(close) = line.rfind('}') else { continue };
+                (line[..close + 1].to_string(), &line[close + 1..])
+            }
+            None => match line.split_once(' ') {
+                Some((name, rest)) => (name.to_string(), rest),
+                None => continue,
+            },
+        };
+        let Ok(value) = rest.split_whitespace().next().unwrap_or("").parse::<f64>() else {
+            continue;
+        };
+        let (metric, label_body) = match series.split_once('{') {
+            Some((m, body)) => (m, Some(body.trim_end_matches('}'))),
+            None => (series.as_str(), None),
+        };
+        let mut labels: Labels = vec![("name".to_string(), metric.to_string())];
+        if let Some(body) = label_body {
+            for pair in split_label_pairs(body) {
+                let Some((k, v)) = pair.split_once('=') else { continue };
+                let v = v.trim_matches('"').replace("\\\"", "\"").replace("\\\\", "\\");
+                let k = if let Some(stripped) = k.strip_prefix("__") {
+                    format!("_{stripped}")
+                } else {
+                    k.to_string()
+                };
+                labels.push((k, v));
+            }
+        }
+        labels.push(("__field__".to_string(), "value".to_string()));
+        labels.sort();
+        labels.dedup_by(|a, b| a.0 == b.0);
+        rows.push((labels, ts, value));
+    }
+    rows
+}
+
+/// Split `a="x",b="y,z"` on commas outside quotes.
+fn split_label_pairs(body: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth_quote = false;
+    let mut start = 0;
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' if i == 0 || bytes[i - 1] != b'\\' => depth_quote = !depth_quote,
+            b',' if !depth_quote => {
+                out.push(body[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if start < body.len() {
+        out.push(body[start..].trim());
+    }
+    out
 }
 
 /// Parse a protobuf `WriteRequest`: field 1 = repeated TimeSeries

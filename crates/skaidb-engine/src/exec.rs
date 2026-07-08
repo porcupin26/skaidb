@@ -229,7 +229,7 @@ impl Database {
 
         let mut timeseries = HashMap::new();
         for (name, def) in &catalog.timeseries {
-            timeseries.insert(name.clone(), open_tsdb(&dir, name, def)?);
+            timeseries.insert(name.clone(), open_tsdb(&dir, name, def, opts.ts_head_max_bytes)?);
         }
 
         // Vector indexes live in memory; rebuild each from its table's rows.
@@ -1849,7 +1849,7 @@ impl Database {
             rollups: Vec::new(),
             rollup_of: None,
         };
-        let store = open_tsdb(&self.dir, name, &def)?;
+        let store = open_tsdb(&self.dir, name, &def, self.storage_opts.ts_head_max_bytes)?;
         self.timeseries.insert(name.to_string(), store);
         self.catalog.timeseries.insert(name.to_string(), def);
         self.record_schema(key, hlc, false);
@@ -1905,7 +1905,7 @@ impl Database {
             rollups: Vec::new(),
             rollup_of: Some(source.to_string()),
         };
-        let store = open_tsdb(&self.dir, name, &def)?;
+        let store = open_tsdb(&self.dir, name, &def, self.storage_opts.ts_head_max_bytes)?;
         self.timeseries.insert(name.to_string(), store);
         self.catalog.timeseries.insert(name.to_string(), def);
         self.catalog
@@ -5821,12 +5821,13 @@ fn ts_dir(root: &Path, name: &str) -> PathBuf {
 }
 
 /// Open a time-series store for a catalog definition.
-fn open_tsdb(root: &Path, name: &str, def: &TsTableDef) -> Result<Tsdb> {
+fn open_tsdb(root: &Path, name: &str, def: &TsTableDef, head_max_bytes: u64) -> Result<Tsdb> {
     Tsdb::open(
         &ts_dir(root, name),
         TsdbOptions {
             retention_ms: def.retention_ms,
             ooo_window_ms: def.ooo_window_ms,
+            head_max_bytes,
             ..TsdbOptions::default()
         },
     )

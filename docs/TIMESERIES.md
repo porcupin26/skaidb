@@ -161,7 +161,6 @@ All tracked, with more detail, in [`TODO.md`](TODO.md).
 | Gap | Notes | Planned |
 |---|---|---|
 | PromQL partial gather | `/api/v1/query_range` still ships raw samples; the SQL surface uses the v0.31.0 partial pushdown | open |
-| Self-scrape (`/metrics` → TS table) | remote_write covers external scrapers | later |
 | In-retention rollup serving, clustered | single-node ships; clustered needs a min-over-replicas head-boundary exchange | with sharded partials |
 | PromQL: regex matchers, offset, arithmetic, histogram_quantile | the shipped subset covers selectors, rate/increase/delta, and sum/avg/min/max/count by/without | phase 7 follow-up |
 | Label postings index | matchers scan the per-block series list (fine at moderate cardinality) | with pushdown work |

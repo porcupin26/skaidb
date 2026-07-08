@@ -59,6 +59,10 @@ pub struct EngineOptions {
     /// the server assembles reaches `Database::open`. Sized from
     /// `memory_target` when one is set.
     pub search_writer_heap_bytes: usize,
+    /// Byte budget for each time-series table's in-memory head (0 =
+    /// unbounded). Consumed by the engine layer like the search heap;
+    /// sized from `memory_target` when one is set.
+    pub ts_head_max_bytes: u64,
 }
 
 /// Default read-cache size (entries). Modest so it can't dominate a small node's
@@ -79,6 +83,7 @@ impl Default for EngineOptions {
             bottom_compression: Codec::Brotli,
             read_cache_capacity: DEFAULT_READ_CACHE_CAPACITY,
             search_writer_heap_bytes: DEFAULT_SEARCH_WRITER_HEAP,
+            ts_head_max_bytes: 0,
         }
     }
 }
