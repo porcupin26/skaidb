@@ -34,6 +34,10 @@ CREATE SEARCH INDEX [IF NOT EXISTS] <name> ON <table> (<path> [, <path> ...])
        -- options are global (analyzer, refresh_ms) or per-column (<path>.<option>)
 DROP    SEARCH INDEX [IF EXISTS] <name>
 REBUILD SEARCH INDEX <name>
+ALTER   SEARCH INDEX <name> SET (<option> = <literal> [, ...])
+        -- query-time options only: synonyms, refresh_ms,
+        -- <col>.search_analyzer, <col>.boost (applied live, no reindex)
+SUGGEST '<text>' ON <index> [COLUMN <col>] [LIMIT <n>]
 ALTER  TABLE <table> RENAME TO <new_table>
 ALTER  TABLE <table> RENAME COLUMN <from> TO <to>
 

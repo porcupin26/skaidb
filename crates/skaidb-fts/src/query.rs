@@ -88,6 +88,8 @@ pub(crate) struct FieldRuntime {
 
 pub(crate) struct QueryFields<'a> {
     pub fields: &'a [FieldRuntime],
+    /// Query-time synonym groups (see `SearchIndexConfig::synonyms`).
+    pub synonyms: &'a [Vec<String>],
 }
 
 impl QueryFields<'_> {
@@ -160,6 +162,28 @@ fn per_field_union(
     })
 }
 
+/// The analyzed peers of `token` from any synonym group containing it
+/// (each entry run through the field's query pipeline, first token kept).
+fn synonym_expansions(synonyms: &[Vec<String>], rt: &FieldRuntime, token: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for group in synonyms {
+        let analyzed: Vec<String> = group
+            .iter()
+            .filter_map(|entry| {
+                let mut analyzer = rt.query_analyzer.build();
+                let mut stream = analyzer.token_stream(entry);
+                stream.next().map(|t| t.text.clone())
+            })
+            .collect();
+        if analyzed.iter().any(|t| t == token) {
+            out.extend(analyzed.into_iter().filter(|t| t != token));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// A [`RegexQuery`] over a field's indexed terms; pattern errors are user
 /// errors.
 fn regex_query(field: Field, pattern: &str) -> Result<Box<dyn Query>, FtsError> {
@@ -197,9 +221,27 @@ pub(crate) fn build_query(
 ) -> Result<Box<dyn Query>, FtsError> {
     match query {
         SearchQuery::Match { field, text } => per_field_union(fields.resolve(field)?, |rt| {
-            let terms = analyze(rt, text);
+            let mut terms = analyze(rt, text);
             if terms.is_empty() {
                 return Ok(None);
+            }
+            // Query-time synonym expansion: `match` is an OR of terms, so
+            // any group member a token hits contributes its peers as extra
+            // OR terms (entries analyzed with the field's own pipeline, so
+            // stemming lines up). Phrases and the query-string language do
+            // not expand.
+            if !fields.synonyms.is_empty() {
+                let mut extra = Vec::new();
+                for (pos, term) in &terms {
+                    let Some(token) = term.value().as_str().map(str::to_string) else {
+                        continue;
+                    };
+                    for peer in synonym_expansions(fields.synonyms, rt, &token) {
+                        extra.push((*pos, Term::from_field_text(rt.field, &peer)));
+                    }
+                }
+                terms.extend(extra);
+                terms.dedup_by(|a, b| a.1 == b.1);
             }
             let clauses: Vec<(Occur, Box<dyn Query>)> = terms
                 .into_iter()

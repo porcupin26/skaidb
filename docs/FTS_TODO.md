@@ -402,10 +402,19 @@ fleet-verified — the TS cadence)
     min_doc_freq 2, max 25 query terms — ES's min_term_freq=2 default
     silently empties short like-texts). Composes with AND/OR/NOT and
     ranked retrieval like the rest of the family.
-  - [ ] search_after cursor beyond keyset pagination (decide if the SQL
-    surface warrants more than ORDER BY + range + LIMIT).
-  - [ ] Synonyms with hot-reload (needs an `ALTER SEARCH INDEX` DDL design
-    for mutating options; query-time expansion so no reindex).
+  - [x] Synonyms with hot-reload: `synonyms = 'quick,fast,speedy; …'` as
+    an index option, expanded at **query time** in `MATCH` (entries
+    analyzed with each field's own pipeline, so stemming lines up;
+    single-word entries, phrases/query-string don't expand). Changed live
+    via the new `ALTER SEARCH INDEX <name> SET (...)` DDL — restricted to
+    query-time-safe options (synonyms, refresh_ms, `<col>.search_analyzer`,
+    `<col>.boost`; index-time options error and point at DROP+CREATE),
+    catalog-merged last-wins, broadcast like other DDL, applied to the
+    open index by rebuilding the query-side runtimes only (no reindex, no
+    writer churn).
+  - [x] search_after: **decision — keyset pagination is the surface**
+    (`ORDER BY <fast col> LIMIT k` + a residual range predicate); a
+    dedicated cursor adds no capability over that in SQL.
 - [ ] **Phase 8 — ES-compatible REST subset (decision checkpoint)**:
   `_search` (query DSL JSON: the §2 ✱ queries + aggs), `_bulk`, `_mapping`
   read-only — enough for existing ES client libraries and log shippers, not

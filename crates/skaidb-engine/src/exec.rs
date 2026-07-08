@@ -517,6 +517,56 @@ impl Database {
         Ok(QueryOutput::Ddl)
     }
 
+    /// `ALTER SEARCH INDEX <name> SET (...)`: change **query-time** options
+    /// — `synonyms`, `refresh_ms`, `<col>.search_analyzer`, `<col>.boost` —
+    /// in place: catalog merge (last-wins per key), live runtime rebuild,
+    /// no reindex. Index-time options (analyzers, types, twins, copy_to)
+    /// error: those change the stored postings and need DROP + CREATE.
+    fn alter_search_index(
+        &mut self,
+        name: &str,
+        options: &[(String, String)],
+    ) -> Result<QueryOutput> {
+        for (key, _) in options {
+            let query_time = key == "synonyms"
+                || key == "refresh_ms"
+                || key.ends_with(".search_analyzer")
+                || key.ends_with(".boost");
+            if !query_time {
+                return Err(EngineError::Type(format!(
+                    "'{key}' is an index-time option — DROP and re-CREATE the index to \
+                     change it (ALTER SET takes synonyms, refresh_ms, \
+                     <col>.search_analyzer, <col>.boost)"
+                )));
+            }
+        }
+        let hlc = self.ddl_stamp();
+        let key = format!("s:{name}");
+        if !self.schema_advances(&key, hlc) {
+            return Ok(QueryOutput::Ddl);
+        }
+        let Some(def) = self.catalog.search_indexes.get_mut(name) else {
+            return Err(EngineError::IndexNotFound(name.to_string()));
+        };
+        // Merge: replace existing entries for each altered key, keeping
+        // declaration order otherwise.
+        let mut merged = def.options.clone();
+        for (k, v) in options {
+            merged.retain(|(existing, _)| existing != k);
+            merged.push((k.clone(), v.clone()));
+        }
+        // Validate the merged declaration before committing anything.
+        let (cfg, refresh_ms) = SearchIndexConfig::from_declaration(&def.paths, &merged)?;
+        def.options = merged;
+        if let Some(live) = self.search_indexes.get_mut(name) {
+            live.index.update_query_config(&cfg);
+            live.refresh_ms = refresh_ms;
+        }
+        self.record_schema(key, hlc, false);
+        self.save_catalog()?;
+        Ok(QueryOutput::Ddl)
+    }
+
     /// `REBUILD SEARCH INDEX`: discard the index data and re-index every row
     /// of the table (recovery / anti-entropy escape hatch).
     fn rebuild_search_index_cmd(&mut self, name: &str) -> Result<QueryOutput> {
@@ -1284,6 +1334,9 @@ impl Database {
                 self.drop_search_index(&name, if_exists)
             }
             Statement::RebuildSearchIndex { name } => self.rebuild_search_index_cmd(&name),
+            Statement::AlterSearchIndex { name, options } => {
+                self.alter_search_index(&name, &options)
+            }
             Statement::Suggest {
                 text,
                 index,

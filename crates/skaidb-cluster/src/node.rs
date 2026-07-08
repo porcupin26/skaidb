@@ -4157,6 +4157,7 @@ fn is_ddl(stmt: &Statement) -> bool {
             | Statement::CreateSearchIndex(_)
             | Statement::DropSearchIndex { .. }
             | Statement::RebuildSearchIndex { .. }
+            | Statement::AlterSearchIndex { .. }
             | Statement::AlterTable(_)
             | Statement::CreateDatabase { .. }
             | Statement::DropDatabase { .. }

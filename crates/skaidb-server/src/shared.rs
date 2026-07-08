@@ -693,8 +693,10 @@ fn required_privilege(stmt: &Statement) -> Option<(Privilege, Object)> {
         Statement::DropIndex { .. } => (Privilege::Drop, Object::Global),
         Statement::DropVectorIndex { .. } => (Privilege::Drop, Object::Global),
         Statement::DropSearchIndex { .. } => (Privilege::Drop, Object::Global),
-        // A rebuild rewrites index data, so gate it like index creation.
+        // A rebuild rewrites index data, so gate it like index creation;
+        // ALTER changes index options the same way.
         Statement::RebuildSearchIndex { .. } => (Privilege::Create, Object::Global),
+        Statement::AlterSearchIndex { .. } => (Privilege::Create, Object::Global),
         // Suggestions read the index's term dictionary — a read, gated
         // like SELECT (the dictionary derives from table rows).
         Statement::Suggest { .. } => (Privilege::Select, Object::Global),

@@ -86,6 +86,21 @@ Set the index default with `analyzer = '...'`, or per column with
 Query text is analyzed with the field's **query-time** analyzer:
 `<column>.search_analyzer` if set, else the index-time analyzer.
 
+**Synonyms** (`synonyms = 'quick,fast,speedy; car,automobile'`) expand at
+query time in `MATCH` — each group entry is analyzed with the field's own
+pipeline so stemming lines up; phrases and the query-string language do
+not expand, and entries are single words for now. Because expansion is
+query-time, synonyms **hot-reload**:
+
+```sql
+ALTER SEARCH INDEX articles_fts SET (synonyms = 'quick,fast; car,auto');
+```
+
+`ALTER SEARCH INDEX … SET` changes query-time-safe options in place
+(`synonyms`, `refresh_ms`, `<col>.search_analyzer`, `<col>.boost`) with no
+reindex; index-time options (analyzers, types, twins, `copy_to`) error —
+those change the stored postings and need `DROP` + `CREATE`.
+
 ## Per-column options
 
 `WITH (...)` takes global options (`analyzer`, `refresh_ms`) and

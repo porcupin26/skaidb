@@ -216,6 +216,11 @@ pub struct SearchIndexConfig {
     pub fields: Vec<FieldConfig>,
     /// Analyzer for text fields that don't override it.
     pub default_analyzer: Analyzer,
+    /// Synonym groups (`synonyms = 'quick,fast,speedy; car,auto'`),
+    /// expanded at **query time** — hot-swappable via
+    /// `ALTER SEARCH INDEX … SET`, no reindex. Single-word entries only.
+    #[serde(default)]
+    pub synonyms: Vec<Vec<String>>,
 }
 
 impl SearchIndexConfig {
@@ -238,10 +243,12 @@ impl SearchIndexConfig {
         let mut fields: Vec<FieldConfig> = paths.iter().map(|p| FieldConfig::text(p)).collect();
         let mut default_analyzer = Analyzer::Standard;
         let mut refresh_ms = 1000u64;
+        let mut synonyms: Vec<Vec<String>> = Vec::new();
 
         for (key, value) in options {
             match key.as_str() {
                 "analyzer" => default_analyzer = Analyzer::parse(value)?,
+                "synonyms" => synonyms = parse_synonyms(value)?,
                 "refresh_ms" => {
                     refresh_ms = value.parse().map_err(|_| {
                         FtsError::Config(format!(
@@ -331,8 +338,44 @@ impl SearchIndexConfig {
                 }
             }
         }
-        Ok((SearchIndexConfig { fields, default_analyzer }, refresh_ms))
+        Ok((
+            SearchIndexConfig {
+                fields,
+                default_analyzer,
+                synonyms,
+            },
+            refresh_ms,
+        ))
     }
+}
+
+/// Parse the `synonyms` option: groups separated by `;`, single-word
+/// terms separated by `,` within a group.
+fn parse_synonyms(spec: &str) -> Result<Vec<Vec<String>>, FtsError> {
+    let mut groups = Vec::new();
+    for group in spec.split(';') {
+        let terms: Vec<String> = group
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect();
+        if terms.is_empty() {
+            continue;
+        }
+        if terms.len() < 2 {
+            return Err(FtsError::Config(format!(
+                "synonym group '{group}' needs at least two comma-separated terms"
+            )));
+        }
+        if let Some(bad) = terms.iter().find(|t| t.contains(char::is_whitespace)) {
+            return Err(FtsError::Config(format!(
+                "multi-word synonyms are not supported yet ('{bad}')"
+            )));
+        }
+        groups.push(terms);
+    }
+    Ok(groups)
 }
 
 #[cfg(test)]

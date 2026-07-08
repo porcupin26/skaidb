@@ -2112,6 +2112,56 @@ mod tests {
     }
 
     #[test]
+    fn search_alter_index_synonyms_hot_reload() {
+        let dir = tempdir();
+        let mut db = Database::open(&dir).unwrap();
+        db.execute("CREATE TABLE cars (PRIMARY KEY (id))").unwrap();
+        db.execute("CREATE SEARCH INDEX cars_fts ON cars (body)").unwrap();
+        db.execute(
+            "INSERT INTO cars (id, body) VALUES \
+             (1, 'a fast red car'), (2, 'a speedy blue automobile'), (3, 'a slow bike')",
+        )
+        .unwrap();
+        // Without synonyms only the literal term matches.
+        let rs = rows(db.execute("SELECT id FROM cars WHERE MATCH(body, 'quick')").unwrap());
+        assert!(rs.rows.is_empty());
+
+        // ALTER SET applies immediately — query-time expansion, no reindex.
+        db.execute(
+            "ALTER SEARCH INDEX cars_fts SET (synonyms = 'quick,fast,speedy; car,automobile')",
+        )
+        .unwrap();
+        let rs = rows(db.execute("SELECT id FROM cars WHERE MATCH(body, 'quick')").unwrap());
+        assert_eq!(sorted_ids(rs), vec![1, 2]);
+        let rs = rows(db.execute("SELECT id FROM cars WHERE MATCH(body, 'car')").unwrap());
+        assert_eq!(sorted_ids(rs), vec![1, 2]);
+
+        // Index-time options are rejected with a clear error; bad synonym
+        // specs too.
+        let err = db
+            .execute("ALTER SEARCH INDEX cars_fts SET (analyzer = 'english')")
+            .unwrap_err();
+        assert!(err.to_string().contains("index-time"), "{err}");
+        assert!(db
+            .execute("ALTER SEARCH INDEX cars_fts SET (synonyms = 'lonely')")
+            .is_err());
+        assert!(db
+            .execute("ALTER SEARCH INDEX nope SET (synonyms = 'a,b')")
+            .is_err());
+
+        // The altered options persist across a restart.
+        drop(db);
+        let mut db = Database::open(&dir).unwrap();
+        let rs = rows(db.execute("SELECT id FROM cars WHERE MATCH(body, 'quick')").unwrap());
+        assert_eq!(sorted_ids(rs), vec![1, 2]);
+        // And boost/refresh alters go through the same path.
+        db.execute("ALTER SEARCH INDEX cars_fts SET (refresh_ms = 250, body.boost = 2.0)")
+            .unwrap();
+        let rs = rows(db.execute("SELECT id FROM cars WHERE MATCH(body, 'fast')").unwrap());
+        assert_eq!(sorted_ids(rs), vec![1, 2]);
+    }
+
+    #[test]
     fn search_suggest_and_more_like_this() {
         let mut db = Database::open(tempdir()).unwrap();
         db.execute("CREATE TABLE notes (PRIMARY KEY (id))").unwrap();

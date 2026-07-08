@@ -207,61 +207,18 @@ impl SearchIndex {
         let field_of = |path: &str| schema.get_field(path).expect("schema owns declared field");
 
         let mut columns = Vec::with_capacity(config.fields.len());
-        let mut runtimes = Vec::new();
         for fc in &config.fields {
-            let field = field_of(&fc.path);
-            let twin = fc
-                .keyword_twin
-                .then(|| field_of(&format!("{}.keyword", fc.path)));
-            let copy_to = fc.copy_to.as_deref().map(field_of);
             columns.push(IndexedColumn {
                 path: fc.path.clone(),
-                field,
+                field: field_of(&fc.path),
                 ftype: fc.ftype,
-                twin,
-                copy_to,
-            });
-            let index_analyzer = match fc.ftype {
-                FieldType::Keyword => Analyzer::Keyword,
-                _ => fc
-                    .analyzer
-                    .clone()
-                    .unwrap_or_else(|| config.default_analyzer.clone()),
-            };
-            runtimes.push(FieldRuntime {
-                path: fc.path.clone(),
-                field,
-                ftype: fc.ftype,
-                query_analyzer: fc.search_analyzer.clone().unwrap_or(index_analyzer),
-                boost: fc.boost,
-            });
-            if let Some(twin) = twin {
-                runtimes.push(FieldRuntime {
-                    path: format!("{}.keyword", fc.path),
-                    field: twin,
-                    ftype: FieldType::Keyword,
-                    query_analyzer: Analyzer::Keyword,
-                    boost: 1.0,
-                });
-            }
-        }
-        // Deduplicated copy_to targets, queryable like declared text columns.
-        let mut targets: Vec<&str> = config
-            .fields
-            .iter()
-            .filter_map(|f| f.copy_to.as_deref())
-            .collect();
-        targets.sort_unstable();
-        targets.dedup();
-        for target in targets {
-            runtimes.push(FieldRuntime {
-                path: target.to_string(),
-                field: field_of(target),
-                ftype: FieldType::Text,
-                query_analyzer: config.default_analyzer.clone(),
-                boost: 1.0,
+                twin: fc
+                    .keyword_twin
+                    .then(|| field_of(&format!("{}.keyword", fc.path))),
+                copy_to: fc.copy_to.as_deref().map(field_of),
             });
         }
+        let runtimes = build_runtimes(config, &schema);
 
         let writer = index.writer(writer_heap_bytes.max(MIN_WRITER_HEAP))?;
         let reader = index
@@ -293,6 +250,16 @@ impl SearchIndex {
 
     pub fn config(&self) -> &SearchIndexConfig {
         &self.config
+    }
+
+    /// Apply a config whose **query-time** options changed (synonyms,
+    /// `search_analyzer`, boosts — `ALTER SEARCH INDEX … SET`): rebuild
+    /// the query-side field runtimes in place, no reindex and no writer
+    /// churn. The caller guarantees index-time options are unchanged (the
+    /// schema would mismatch otherwise).
+    pub fn update_query_config(&mut self, config: &SearchIndexConfig) {
+        self.runtimes = build_runtimes(config, &self.index.schema());
+        self.config = config.clone();
     }
 
     /// Max row HLC durable in the index. Rows with a newer stamp must be
@@ -375,6 +342,7 @@ impl SearchIndex {
             &self.index,
             &QueryFields {
                 fields: &self.runtimes,
+                synonyms: &self.config.synonyms,
             },
             query,
         )?;
@@ -418,6 +386,7 @@ impl SearchIndex {
             &self.index,
             &QueryFields {
                 fields: &self.runtimes,
+                synonyms: &self.config.synonyms,
             },
             query,
         )?;
@@ -533,6 +502,7 @@ impl SearchIndex {
             &self.index,
             &QueryFields {
                 fields: &self.runtimes,
+                synonyms: &self.config.synonyms,
             },
             query,
         )?;
@@ -689,6 +659,7 @@ impl SearchIndex {
             &self.index,
             &QueryFields {
                 fields: &self.runtimes,
+                synonyms: &self.config.synonyms,
             },
             query,
         )?;
@@ -937,6 +908,7 @@ impl SearchIndex {
             &self.index,
             &QueryFields {
                 fields: &self.runtimes,
+                synonyms: &self.config.synonyms,
             },
             query,
         )?;
@@ -1026,6 +998,58 @@ impl Highlighter {
         }
         self.snippet(&text)
     }
+}
+
+/// The query-side view of every addressable field — declared columns,
+/// `.keyword` twins, and `copy_to` targets — with resolved query-time
+/// analyzers and boosts. Recomputed on `ALTER SEARCH INDEX … SET`.
+fn build_runtimes(config: &SearchIndexConfig, schema: &Schema) -> Vec<FieldRuntime> {
+    let field_of = |path: &str| schema.get_field(path).expect("schema owns declared field");
+    let mut runtimes = Vec::new();
+    for fc in &config.fields {
+        let index_analyzer = match fc.ftype {
+            FieldType::Keyword => Analyzer::Keyword,
+            _ => fc
+                .analyzer
+                .clone()
+                .unwrap_or_else(|| config.default_analyzer.clone()),
+        };
+        runtimes.push(FieldRuntime {
+            path: fc.path.clone(),
+            field: field_of(&fc.path),
+            ftype: fc.ftype,
+            query_analyzer: fc.search_analyzer.clone().unwrap_or(index_analyzer),
+            boost: fc.boost,
+        });
+        if fc.keyword_twin {
+            let twin_path = format!("{}.keyword", fc.path);
+            runtimes.push(FieldRuntime {
+                path: twin_path.clone(),
+                field: field_of(&twin_path),
+                ftype: FieldType::Keyword,
+                query_analyzer: Analyzer::Keyword,
+                boost: 1.0,
+            });
+        }
+    }
+    // Deduplicated copy_to targets, queryable like declared text columns.
+    let mut targets: Vec<&str> = config
+        .fields
+        .iter()
+        .filter_map(|f| f.copy_to.as_deref())
+        .collect();
+    targets.sort_unstable();
+    targets.dedup();
+    for target in targets {
+        runtimes.push(FieldRuntime {
+            path: target.to_string(),
+            field: field_of(target),
+            ftype: FieldType::Text,
+            query_analyzer: config.default_analyzer.clone(),
+            boost: 1.0,
+        });
+    }
+    runtimes
 }
 
 /// Add `value` to the document according to the column's declared type,
@@ -1720,6 +1744,51 @@ mod tests {
             }],
         };
         assert!(idx.aggregate(&matches("body", "red"), &bad).unwrap().is_none());
+    }
+
+    #[test]
+    fn synonyms_expand_match_at_query_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = config(
+            &["body"],
+            &[
+                ("analyzer", "english"),
+                ("synonyms", "quick,fast,speedy; car,automobile"),
+            ],
+        );
+        let mut idx = open(tmp.path(), &cfg);
+        idx.put(b"k1", &text_doc(&[("body", "a fast red car")]), wm(1)).unwrap();
+        idx.put(b"k2", &text_doc(&[("body", "a speedy blue automobile")]), wm(2))
+            .unwrap();
+        idx.put(b"k3", &text_doc(&[("body", "a slow green bike")]), wm(3)).unwrap();
+        idx.commit().unwrap();
+
+        // MATCH 'quick' hits both synonym rows; MATCH 'car' both vehicles.
+        let mut hits = idx.search_keys(&matches("body", "quick")).unwrap();
+        hits.sort();
+        assert_eq!(hits, vec![b"k1".to_vec(), b"k2".to_vec()]);
+        let mut hits = idx.search_keys(&matches("body", "car")).unwrap();
+        hits.sort();
+        assert_eq!(hits, vec![b"k1".to_vec(), b"k2".to_vec()]);
+
+        // Hot-swap: dropping the vehicle group takes effect immediately,
+        // no reindex (update_query_config only touches the query side).
+        let (cfg2, _) = SearchIndexConfig::from_declaration(
+            &["body".to_string()],
+            &[
+                ("analyzer".to_string(), "english".to_string()),
+                ("synonyms".to_string(), "quick,fast,speedy".to_string()),
+            ],
+        )
+        .unwrap();
+        idx.update_query_config(&cfg2);
+        assert_eq!(
+            idx.search_keys(&matches("body", "car")).unwrap(),
+            vec![b"k1".to_vec()]
+        );
+        let mut hits = idx.search_keys(&matches("body", "quick")).unwrap();
+        hits.sort();
+        assert_eq!(hits, vec![b"k1".to_vec(), b"k2".to_vec()]);
     }
 
     #[test]

@@ -357,6 +357,16 @@ impl Parser {
             let password = self.expect_string()?;
             return Ok(Statement::AlterUser { name, password });
         }
+        // `ALTER SEARCH INDEX <name> SET (<option> = <literal>, ...)` —
+        // SEARCH stays contextual.
+        if self.eat_ident_ci("search") {
+            self.expect_keyword(Keyword::Index)?;
+            let name = self.expect_ident()?;
+            self.expect_keyword(Keyword::Set)?;
+            self.expect(&Token::LParen)?;
+            let options = self.parse_option_list()?;
+            return Ok(Statement::AlterSearchIndex { name, options });
+        }
         self.expect_keyword(Keyword::Table)?;
         let name = self.parse_table_name()?;
         self.expect_keyword(Keyword::Rename)?;
@@ -627,6 +637,12 @@ impl Parser {
         }
         self.advance();
         self.expect(&Token::LParen)?;
+        self.parse_option_list()
+    }
+
+    /// The body of a parenthesized option list, after the `(`:
+    /// `name = literal [, ...] )`.
+    fn parse_option_list(&mut self) -> Result<Vec<(String, String)>, ParseError> {
         let mut options = Vec::new();
         loop {
             let name = self.parse_path()?.to_ascii_lowercase();
