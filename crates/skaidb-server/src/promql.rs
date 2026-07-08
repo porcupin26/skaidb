@@ -298,6 +298,15 @@ impl<'a> P<'a> {
                 .map(PExpr::Number)
                 .map_err(|_| format!("bad number {text:?}"));
         }
+        // Bare label-matcher selector: `{name=~"skaidb.*"}` (no metric).
+        if self.peek() == Some(b'{') {
+            let mut matchers = Vec::new();
+            self.matcher_block(&mut matchers)?;
+            if matchers.is_empty() {
+                return Err("a bare {} selector needs at least one matcher".into());
+            }
+            return self.selector_tail(matchers);
+        }
         let name = self.ident().ok_or("expected expression")?;
         // histogram_quantile(φ, expr).
         if name == "histogram_quantile" {
@@ -375,10 +384,24 @@ impl<'a> P<'a> {
         }
         // Selector: name is the metric.
         let mut matchers = vec![Matcher::Eq("name".into(), name)];
+        if self.peek() == Some(b'{') {
+            self.matcher_block(&mut matchers)?;
+        }
+        self.selector_tail(matchers)
+    }
+
+    /// `{label op "value", ...}` — the braces and every matcher inside.
+    /// `__name__` maps to the `name` label (the metric name's storage
+    /// label), so `{__name__=~"skaidb.*"}` and `{name=~"skaidb.*"}` both
+    /// work.
+    fn matcher_block(&mut self, matchers: &mut Vec<Matcher>) -> Result<(), String> {
         if self.eat(b'{') && !self.eat(b'}') {
             {
                 loop {
-                    let label = self.ident().ok_or("expected label name")?;
+                    let mut label = self.ident().ok_or("expected label name")?;
+                    if label == "__name__" {
+                        label = "name".into();
+                    }
                     self.ws();
                     enum Op {
                         Eq,
@@ -416,6 +439,11 @@ impl<'a> P<'a> {
                 self.expect(b'}')?;
             }
         }
+        Ok(())
+    }
+
+    /// The optional `[range]` / `offset` tail after a selector's matchers.
+    fn selector_tail(&mut self, matchers: Vec<Matcher>) -> Result<PExpr, String> {
         let mut range_ms = None;
         if self.eat(b'[') {
             range_ms = Some(self.duration()?);
@@ -1161,6 +1189,23 @@ mod tests {
         assert_eq!(q[0].1, 50.0);
         let q = histogram_quantile(0.75, buckets);
         assert_eq!(q[0].1, 75.0);
+    }
+
+    #[test]
+    fn parses_bare_and_name_mapped_selectors() {
+        // Bare {matcher} selector, regex form.
+        let e = P::new(r#"{name=~"skaidb.*"}"#).parse().unwrap();
+        let PExpr::Selector { matchers, .. } = e else { panic!() };
+        assert_eq!(matchers.len(), 1);
+        assert!(matches!(&matchers[0], Matcher::Re(k, r) if k == "name" && r.is_match("skaidb_up")));
+        // __name__ maps to the storage label `name`.
+        let e = P::new(r#"{__name__="up", job="api"}"#).parse().unwrap();
+        let PExpr::Selector { matchers, .. } = e else { panic!() };
+        assert!(matches!(&matchers[0], Matcher::Eq(k, v) if k == "name" && v == "up"));
+        // Works inside functions too.
+        assert!(P::new(r#"rate({name=~"http.*"}[5m])"#).parse().is_ok());
+        // An empty bare selector is rejected.
+        assert!(P::new("{}").parse().is_err());
     }
 
     #[test]
