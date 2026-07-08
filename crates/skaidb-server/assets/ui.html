@@ -31,6 +31,8 @@
     <button data-tab="status" class="active">status</button>
     <button data-tab="query">query</button>
     <button data-tab="stats">stats</button>
+    <button data-tab="config" hidden>config</button>
+    <button data-tab="admin" hidden>admin</button>
   </nav>
 
   <section id="tab-status">
@@ -121,6 +123,51 @@
       </div>
     </div>
     <p class="muted" id="stats-refreshed"></p>
+  </section>
+
+  <section id="tab-config" hidden>
+    <div class="card wide">
+      <h2>set a key</h2>
+      <div class="qbar">
+        <select id="cfg-key"><option value="">key…</option></select>
+        <input id="cfg-value" placeholder="value">
+        <button id="cfg-set">set</button>
+        <span id="cfg-result" class="muted"></span>
+      </div>
+      <p class="muted">Live-mutable keys apply immediately; every set persists
+      to the node's config file. Other keys need a restart to take effect.
+      Secrets are masked below.</p>
+    </div>
+    <div class="cards" id="cfg-sections"></div>
+  </section>
+
+  <section id="tab-admin" hidden>
+    <div class="cards">
+      <div class="card">
+        <h2>cluster operations</h2>
+        <div class="qbar">
+          <button id="ad-repair">repair</button>
+          <button id="ad-reclaim">reclaim</button>
+        </div>
+        <div class="qbar">
+          <input id="ad-add-addr" placeholder="host:internode-port">
+          <button id="ad-add" class="ghost">add node</button>
+        </div>
+        <div class="qbar">
+          <input id="ad-rm-id" placeholder="node id">
+          <button id="ad-rm" class="ghost">remove node</button>
+        </div>
+        <p id="ad-result" class="muted"></p>
+      </div>
+      <div class="card wide">
+        <h2>slow queries <button id="ad-slow-refresh" class="ghost">refresh</button></h2>
+        <div class="results"><table id="ad-slow">
+          <thead><tr><th>seq</th><th>elapsed ms</th><th>sql (masked)</th></tr></thead>
+          <tbody></tbody>
+        </table></div>
+        <p class="muted" id="ad-slow-empty" hidden>no slow queries recorded</p>
+      </div>
+    </div>
   </section>
 </main>
 

@@ -186,10 +186,18 @@ doc as phases land.
   duration histogram; per-table and per-search-index tables parsed from
   the `table.*`/`search.*` SHOW STATUS rows. Cluster-under-load
   cross-check rides the release rollout.
-- [ ] **Phase 4 — config + admin ops**: config viewer/editor, repair/
+- [x] **Phase 4 — config + admin ops**: config viewer/editor, repair/
   reclaim/add/remove-node with confirmations, slow-log view. Exit: a
   node join driven entirely from the UI on the test cluster; non-admin
   role sees no admin tab and gets server-side denials if it tries.
+  *Shipped notes*: config tab renders one card per section from the
+  masked `/admin/config`, with a key dropdown (scalar keys only) +
+  value + set; the set result surfaces the server's `applied` /
+  `restart_required` verdict and re-renders. Admin tab: repair/reclaim
+  and add/remove-node behind `window.confirm`, slow-log table with
+  refresh. Tab visibility comes from probing `/admin/config` at login
+  (server-side RBAC stays the boundary). Node-join-from-UI check rides
+  the cluster verification pass.
 - [ ] **Phase 5 — polish & hardening**: CSP/XSS audit pass, keyboard UX,
   dark mode, `docs/UI.md` feature doc + README screenshot; fleet
   verification rides a release rollout.

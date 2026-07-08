@@ -140,6 +140,9 @@ function showTab(name) {
     statsTick();
     statsTimer = setInterval(statsTick, STATS_INTERVAL_MS);
   }
+  const authFail = (e) => { if (e instanceof AuthError) logout(); };
+  if (name === "config") loadConfig().catch(authFail);
+  if (name === "admin") loadSlow().catch(authFail);
 }
 
 document.querySelector("#tabs").addEventListener("click", (ev) => {
@@ -530,6 +533,124 @@ function statsTick() {
   });
 }
 
+// ---- config tab ----
+async function loadConfig() {
+  const cfg = await api("POST", "/admin/config", "{}");
+  const box = $("cfg-sections");
+  box.textContent = "";
+  const keySel = $("cfg-key");
+  keySel.textContent = "";
+  const head = document.createElement("option");
+  head.value = "";
+  head.textContent = "key…";
+  keySel.append(head);
+  for (const section of Object.keys(cfg).sort()) {
+    if (typeof cfg[section] !== "object" || cfg[section] === null) continue;
+    const card = document.createElement("div");
+    card.className = "card";
+    const h = document.createElement("h2");
+    h.textContent = section;
+    const table = document.createElement("table");
+    table.className = "kv";
+    for (const [field, value] of Object.entries(cfg[section]).sort()) {
+      const tr = document.createElement("tr");
+      const kd = document.createElement("td");
+      kd.textContent = field;
+      const vd = document.createElement("td");
+      vd.textContent = typeof value === "object" ? JSON.stringify(value) : String(value);
+      tr.append(kd, vd);
+      table.append(tr);
+      if (typeof value !== "object") {
+        const opt = document.createElement("option");
+        opt.value = `${section}.${field}`;
+        opt.textContent = `${section}.${field}`;
+        keySel.append(opt);
+      }
+    }
+    card.append(h, table);
+    box.append(card);
+  }
+}
+
+$("cfg-set").addEventListener("click", async () => {
+  const key = $("cfg-key").value;
+  const value = $("cfg-value").value;
+  const out = $("cfg-result");
+  if (!key) return;
+  try {
+    const r = await api("POST", "/admin/config/set", JSON.stringify({ key, value }));
+    out.textContent = r.applied
+      ? "applied live" + (r.persisted ? " and persisted" : "")
+      : "persisted — restart required to take effect";
+    await loadConfig();
+  } catch (e) {
+    if (e instanceof AuthError) return logout();
+    out.textContent = e.message;
+  }
+});
+
+// ---- admin tab ----
+async function adminOp(path, body, confirmText) {
+  if (confirmText && !window.confirm(confirmText)) return;
+  const out = $("ad-result");
+  out.textContent = "running…";
+  try {
+    const r = await api("POST", path, JSON.stringify(body));
+    out.textContent = JSON.stringify(r);
+  } catch (e) {
+    if (e instanceof AuthError) return logout();
+    out.textContent = e.message;
+  }
+}
+
+$("ad-repair").addEventListener("click", () =>
+  adminOp("/admin/repair", {}, "Run a cluster-wide repair? This re-replicates data and can take a while."));
+$("ad-reclaim").addEventListener("click", () =>
+  adminOp("/admin/reclaim", {}, "Reclaim keys this node no longer owns?"));
+$("ad-add").addEventListener("click", () => {
+  const addr = $("ad-add-addr").value.trim();
+  if (addr) adminOp("/admin/add-node", { addr }, `Add node ${addr} to the cluster?`);
+});
+$("ad-rm").addEventListener("click", () => {
+  const id = $("ad-rm-id").value.trim();
+  if (id) adminOp("/admin/remove-node", { id }, `Remove node ${id} from the cluster? Its ranges move to the remaining nodes.`);
+});
+
+async function loadSlow() {
+  const snap = await api("POST", "/admin/slow", "{}");
+  const rows = snap.slow_queries || [];
+  const tbody = $("ad-slow").querySelector("tbody");
+  tbody.textContent = "";
+  for (const q of rows) {
+    const tr = document.createElement("tr");
+    for (const v of [q.seq, q.elapsed_ms, q.sql]) {
+      const td = document.createElement("td");
+      td.textContent = String(v);
+      tr.append(td);
+    }
+    tbody.append(tr);
+  }
+  $("ad-slow-empty").hidden = rows.length > 0;
+}
+
+$("ad-slow-refresh").addEventListener("click", () =>
+  loadSlow().catch((e) => { if (e instanceof AuthError) logout(); }));
+
+// Hide the config/admin tabs when the role lacks Admin. The server stays
+// the boundary — this only trims chrome the role cannot use.
+async function probeAdmin() {
+  let allowed = true;
+  try {
+    await api("POST", "/admin/config", "{}");
+  } catch (e) {
+    if (e instanceof AuthError) throw e;
+    allowed = false;
+  }
+  for (const tab of document.querySelectorAll('#tabs button[data-tab="config"], #tabs button[data-tab="admin"]')) {
+    tab.hidden = !allowed;
+  }
+}
+
 function fmtDuration(secs) {
   const d = Math.floor(secs / 86400), h = Math.floor((secs % 86400) / 3600),
         m = Math.floor((secs % 3600) / 60);
@@ -542,6 +663,7 @@ let refreshTimer = null;
 async function enterApp() {
   show("app");
   $("node-badge").textContent = `${meta.node_id || "standalone"} · v${meta.version}`;
+  probeAdmin().catch(() => {});
   const tick = () =>
     refreshStatus().catch((e) => {
       if (e instanceof AuthError) logout();
@@ -565,6 +687,9 @@ function logout() {
   $("q-results").textContent = "";
   $("q-meta").textContent = "";
   $("q-csv").hidden = $("q-json").hidden = true;
+  $("cfg-sections").textContent = "";
+  $("ad-slow").querySelector("tbody").textContent = "";
+  $("ad-result").textContent = "";
   showTab("status");
   show("login");
 }
