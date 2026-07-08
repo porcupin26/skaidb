@@ -1052,6 +1052,40 @@ impl Database {
     /// [`Database::suggest_cmd`] on the exclusive path: commit pending
     /// index writes first so a suggestion right after an insert sees it
     /// (read-your-writes, like searches on the write path).
+    /// Per-hit BM25 score breakdown (ES `_explanation`): how one row —
+    /// identified by its primary-key value — scored against the search
+    /// predicates in `filter`, as tantivy's explanation JSON. `Ok(None)`
+    /// when the row does not match. Serves from this node's local index
+    /// at its last-committed state; callers gate on deployments where one
+    /// index holds every row, like the other local-index paths.
+    pub fn search_explain(
+        &mut self,
+        table: &str,
+        filter: &Option<Expr>,
+        pk_value: &Value,
+    ) -> Result<Option<String>> {
+        let (mut queries, _residual) = split_search_filter(filter)?;
+        if queries.is_empty() {
+            return Err(EngineError::Type(
+                "score explain needs a MATCH()/SEARCH() predicate".into(),
+            ));
+        }
+        let query = match queries.len() {
+            1 => queries.pop().expect("len checked"),
+            _ => SearchQuery::All(queries),
+        };
+        let index_name = self.search_index_for_query(table, &query)?;
+        if let Some(live) = self.search_indexes.get_mut(&index_name) {
+            live.commit_if_dirty()?;
+        }
+        let live = self
+            .search_indexes
+            .get(&index_name)
+            .ok_or_else(|| EngineError::IndexNotFound(index_name.clone()))?;
+        let key = Value::Array(vec![pk_value.clone()]).encode_key();
+        Ok(live.index.explain(&query, &key)?)
+    }
+
     fn suggest_cmd_mut(
         &mut self,
         index: &str,
@@ -4030,6 +4064,8 @@ fn is_search_func(name: &str) -> bool {
             | "more_like_this"
             | "search"
             | "boosted"
+            | "match_cross"
+            | "match_best"
     )
 }
 
@@ -4095,6 +4131,13 @@ fn collect_search_fields(query: &SearchQuery, out: &mut Vec<String>) {
             }
         }
         SearchQuery::Not(sub) => collect_search_fields(sub, out),
+        SearchQuery::MultiMatch { fields, .. } => {
+            for f in fields {
+                if !out.contains(f) {
+                    out.push(f.clone());
+                }
+            }
+        }
         SearchQuery::Boosted { required, optional } => {
             collect_search_fields(required, out);
             for sub in optional {
@@ -4319,6 +4362,34 @@ fn search_query_from_func(name: &str, args: &[Expr]) -> Result<SearchQuery> {
                 ));
             };
             Ok(SearchQuery::QueryString(text(q, "SEARCH('query')")?))
+        }
+        // MATCH_CROSS(col, col, ..., 'text') — term-centric multi-field
+        // match (ES multi_match cross_fields): the fields behave like one
+        // big field, each term scoring by its best field. `match_best` is
+        // the field-centric twin (best_fields over an explicit subset;
+        // reached via the ES shim).
+        "match_cross" | "match_best" => {
+            let [cols @ .., q] = args else {
+                return Err(EngineError::Type(
+                    "MATCH_CROSS(column, ..., 'text') takes columns then the query text".into(),
+                ));
+            };
+            if cols.len() < 2 {
+                return Err(EngineError::Type(
+                    "MATCH_CROSS(column, ..., 'text') needs at least two columns \
+                     (use MATCH() for one)"
+                        .into(),
+                ));
+            }
+            let fields = cols
+                .iter()
+                .map(|c| column(c, "MATCH_CROSS(column, ..., 'text')"))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(SearchQuery::MultiMatch {
+                fields,
+                text: text(q, "MATCH_CROSS(column, ..., 'text')")?,
+                term_centric: name == "match_cross",
+            })
         }
         // BOOSTED(required, optional...): `required` decides which rows
         // match; each optional predicate only raises the score of rows that

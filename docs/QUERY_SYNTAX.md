@@ -306,6 +306,10 @@ WHERE (MATCH(body, 'rust') OR MATCH(title, 'rust'))
     columns: `term`, `"phrase"`, `col:term`, `+must`, `-must_not`,
     `AND`/`OR`, and ranges over typed columns (`year:[2020 TO 2024]`,
     `price:[30 TO *]`, `published:true`).
+  - `MATCH_CROSS(<col>, <col> [, ...], '<text>')` — term-centric
+    multi-field match (ES `multi_match` `cross_fields`): the listed
+    fields behave like one big field — each term scores by its best
+    field, terms OR together. At least two columns.
 - **Pattern predicates** (not analyzed — they run against the indexed
   terms, so with a lowercasing analyzer write patterns lowercase):
   - `MATCH_PREFIX(<col>, '<prefix>')` — term prefix.

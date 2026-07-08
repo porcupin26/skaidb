@@ -3,71 +3,35 @@
 **One consolidated list of all pending work**, roughly in priority order,
 tagged by area. Shipped feature state lives in
 [TIMESERIES.md](TIMESERIES.md) / [VECTOR.md](VECTOR.md) /
-[SEARCH.md](SEARCH.md) / the README; the FTS phase history and exit
-benchmarks in [FTS_TODO.md](FTS_TODO.md) and
-[BENCHMARKS.md](BENCHMARKS.md); performance-specific items in
-[PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md); history in git.
+[SEARCH.md](SEARCH.md) / [UI.md](UI.md) / [GRAFANA.md](GRAFANA.md) / the
+README; the FTS phase history and exit benchmarks in
+[FTS_TODO.md](FTS_TODO.md) and [BENCHMARKS.md](BENCHMARKS.md); the UI plan
+history in [UI_TODO.md](UI_TODO.md); performance-specific items in
+[PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md); everything completed, in git.
 
-FTS status: **phases 0–7 are complete with every exit criterion met**
-(perf + parity + aggregation A/Bs vs Elasticsearch, cluster fleet smoke
-with kill/rejoin). What follows FTS-wise is the phase-8 decision, phase-9
-hardening, and tracked extras.
-
-## Decisions needed (not code yet)
-
-- [x] **[fts] Phase 8 checkpoint** — decided **build**, core shipped
-  2026-07-08 (`_bulk`/`_search`/`_count`/`_mapping`; see FTS_TODO.md
-  phase 8 and SEARCH.md).
-- [x] **[fts] Tantivy sub-aggregation bug filed upstream** —
-  [quickwit-oss/tantivy#2992](https://github.com/quickwit-oss/tantivy/issues/2992).
-- [ ] **[fts] Lift the grouped-metrics pushdown guard** when
-  tantivy#2992 is fixed upstream (restores the one aggregation class ES
-  currently wins, 276 ms → ~2 ms).
-
-## Operational
-
-- [x] **[ops] Publish the latest release** — done 2026-07-08: v0.43.1
-  (ORDER BY, SUGGEST, MORE_LIKE_THIS, synonyms/ALTER, plus the two
-  cluster-path fixes its own release smoke caught) on repo.zapolski.nyc,
-  test cluster upgraded and smoke-verified.
-
-## Web UI
-
-- [x] **[ui] Built-in admin UI** — all five phases shipped (status,
-  query console, stats dashboards, config editor, admin ops, hardening
-  pass); feature doc: [UI.md](UI.md), plan history:
-  [UI_TODO.md](UI_TODO.md). Verified on the 3-node test cluster at
-  v0.46.0: `/ui` + `/ui/meta` on every node, auth (bad password 401),
-  read-only role gets admin-probe 403 + clean insert denial, live
-  `ui.enabled` toggle 404s and back, node remove/re-join driven through
-  the UI's admin endpoints (members 3→2→3, data intact). The rollout
-  also caught that packaged installs couldn't persist `config set`
-  (read-only /etc under systemd hardening + root-owned config) — fixed
-  in packaging (`ReadWritePaths=-/etc/skaidb`, group-writable config)
-  and in `config_set` (apply-live-first, persist failure = warning).
+FTS status: **phases 0–8 complete with every exit criterion met** (perf +
+parity + aggregation A/Bs vs Elasticsearch, cluster fleet smoke with
+kill/rejoin, ES-REST subset + follow-ups). Web UI: all five phases shipped
+and cluster-verified. What remains is phase-9 hardening and the tracked
+extras below.
 
 ## Full-text search
 
-- [x] **[fts] ES-REST subset follow-ups** — all shipped: `bool.should`
-  beside must/filter via the new `BOOSTED(required, optional…)`
-  optional-scoring predicate (tantivy Must+Should; `minimum_should_match:
-  1` makes shoulds required; >1 rejected), multi-key sort, `_source`
-  include/exclude lists with trailing-`*` globs, `GET /{index}/_doc/{id}`,
-  and ES-style auto-create-on-bulk (dynamic mapping from the first doc).
 - [ ] **[fts] Phase 9 — hardening & the honesty pass**: 24 h soak under
   mixed ingest+query; failure injection (disk-full mid-merge, torn index
   dir → rebuild); explain-output audit; final SEARCH.md pass; benchmark
   publication tidy-up in BENCHMARKS.md.
+- [ ] **[fts] Lift the grouped-metrics pushdown guard** when
+  [quickwit-oss/tantivy#2992](https://github.com/quickwit-oss/tantivy/issues/2992)
+  is fixed upstream (per-bucket metrics currently take the exact row
+  fallback; doc-count-only groupings still push down).
 - [ ] **[fts] Sharded scatter for aggregations and fast-field sort**:
   per-shard partials / per-shard sorted top-k need per-key ownership
-  filters (e.g. a ring-hash fast field) so RF < members doesn't
-  double-count replicas, plus wire additions. Today sharded corpora take
-  the correct-but-slower coordinator fallback.
-- [ ] **[fts] Per-hit score explain** (phase-3 nicety): tantivy has
-  `Query::explain`; needs a SQL surface (an `EXPLAIN SCORE`-style
-  statement or `score_explain()` projection).
-- [ ] **[fts] `multi_match` `cross_fields` mode** (phase-3 nicety;
-  dis-max `best_fields` is the shipped default).
+  filters (e.g. a ring-hash fast field kept consistent through
+  resharding) so RF < members doesn't double-count replicas, plus wire
+  additions. Correctness-critical — wants its own design + fleet-bench
+  cycle. Today sharded corpora take the correct-but-slower coordinator
+  fallback (this also gates per-hit explain on sharded clusters).
 - [ ] **[fts] top_hits** (per-group top documents): wants a SQL surface —
   window functions or a dedicated per-group-top-k clause.
 - [ ] **[fts] Multi-word synonyms + phrase expansion** (single-word groups
@@ -78,6 +42,10 @@ hardening, and tracked extras.
 - [ ] **[fts] Merge-policy tuning on LXC-class disks**: conditional —
   revisit only if an ingest-heavy workload surfaces merge stalls (the
   ingest win over ES leaves no urgency).
+- [ ] **[fts] ES-REST extras on demand**: `minimum_should_match` > 1,
+  multi_match per-field `^boosts` (declined today with a pointer to
+  `<col>.boost`), `_mget`, index templates — add when a real client needs
+  them.
 
 ## Time-series
 
@@ -114,12 +82,13 @@ hardening, and tracked extras.
   side-by-side with its own TSDB, zero-loss comparison (the TS phase-4
   exit criterion).
 
+## Web UI
+
+- [ ] **[ui] Phase 5+ extras (demand-driven)**: FTS playground
+  (query + highlight + SUGGEST tester), TS mini graphs from the query
+  console, ES-subset request tester.
+
 ## Other
 
 - [ ] **[perf]** See PERFORMANCE_AUDIT.md for the perf backlog
   (pipelining and paged migration shipped in v0.34.0).
-- [x] **[docs] Grafana route documentation** — [GRAFANA.md](GRAFANA.md):
-  built-in Prometheus datasource pointed at the node (verified
-  buildinfo/labels endpoints live), remote_write ingestion config, the
-  PromQL v1 subset boundaries, Infinity/SQL fallback with dialect-correct
-  time-series SQL.

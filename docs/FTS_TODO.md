@@ -262,9 +262,17 @@ fleet-verified — the TS cadence)
     indexes schema-mismatch on open and rebuild from the table
     automatically. Residual ~1.5% is fieldnorm quantization on near-ties;
     documented in BENCHMARKS.md.
-  - [ ] `multi_match` `cross_fields` mode (best_fields is the shipped
-    default).
-  - [ ] Per-hit score explain.
+  - [x] `multi_match` `cross_fields` mode (2026-07-08):
+    `SearchQuery::MultiMatch` — term-centric (per-term dis-max across
+    fields, terms OR-ed) vs field-centric best_fields over an explicit
+    subset; SQL surface `MATCH_CROSS(col, col, …, 'text')`; ES
+    `multi_match` maps best_fields/most_fields/cross_fields (per-field
+    `^boosts` decline — declare `<col>.boost` on the index).
+  - [x] Per-hit score explain (2026-07-08): `SearchIndex::explain` (find
+    doc by key, `Query::explain`) → `Database::search_explain` →
+    ES `"explain": true` attaches `_explanation` per hit. Cluster-gated
+    like the other whole-corpus local-index paths (declines on
+    RF < members).
 - [x] **Phase 4 — cluster**:
   - [x] Per-replica local indexes over replicated writes: the replicated
     apply paths (`apply_put`/`apply_delete` + batched variants) maintain
@@ -375,11 +383,16 @@ fleet-verified — the TS cadence)
     logs track — the one class ES currently wins). **Filed upstream as
     [quickwit-oss/tantivy#2992](https://github.com/quickwit-oss/tantivy/issues/2992)**;
     lift the guard when fixed.
-  - [ ] Sharded per-shard partials (needs per-key ownership filters — e.g.
-    a ring-hash fast field — to avoid double-counting replicas).
-  - [ ] top_hits (wants a SQL surface — window functions or a dedicated
-    per-group-top-k clause); approximate HLL cardinality as an opt-in
-    function if COUNT(DISTINCT)'s exact bail ever hurts.
+  - [~] Sharded per-shard partials — **deliberate backlog**, tracked in
+    TODO.md: needs per-key ownership filters (a ring-hash fast field kept
+    consistent through resharding) to avoid double-counting replicas; a
+    correctness-critical distributed change that wants its own design +
+    fleet-bench cycle, not a drive-by. The fallback is exact today.
+  - [~] top_hits / approximate HLL cardinality — **demand-conditioned
+    backlog**, tracked in TODO.md: top_hits wants a SQL surface (window
+    functions or a per-group-top-k clause) that doesn't exist yet, and
+    the HLL opt-in was conditioned on COUNT(DISTINCT)'s exact bail
+    hurting — the benches show the exact path winning, so no demand yet.
 - [x] **Phase 7 — search UX extras**:
   - [x] Fast-field sort: `ORDER BY <col> [ASC|DESC] LIMIT k` over search
     queries. Index-ordered top-k pushdown for declared fast columns

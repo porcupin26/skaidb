@@ -145,6 +145,13 @@ analyzer):
 - `SEARCH('query-string')` — the mini-language: bare terms over text
   columns, `"phrase"`, `col:term`, `+must`, `-must_not`, `AND`/`OR`, and
   ranges over typed columns (`year:[2020 TO 2024]`, `published:true`).
+- `MATCH_CROSS(col, col, …, 'text')` — term-centric multi-field match
+  (ES `multi_match` `cross_fields`): the fields behave like one big field —
+  each term scores by its best field and the terms OR together, so a query
+  whose terms are spread across columns (`'bob smith'` against
+  `first_name`/`last_name`) still matches and ranks sensibly. Per-field
+  `MATCH` composed with OR is field-centric instead (each field scores the
+  whole query).
 
 Term-level pattern predicates (**not analyzed** — they run against the
 indexed terms, so with a lowercasing analyzer write patterns lowercase):
@@ -245,7 +252,9 @@ POST /{index}/_search    query DSL: match, match_phrase, prefix, wildcard,
                          (must/filter/must_not/should — should beside
                          must/filter boosts scores via BOOSTED(), or is
                          required with minimum_should_match: 1),
-                         query_string, more_like_this; from/size,
+                         query_string, more_like_this, multi_match
+                         (best_fields / most_fields / cross_fields);
+                         "explain": true per-hit BM25 breakdowns; from/size,
                          multi-key sort (incl. _score), _source with
                          include/exclude lists (trailing-* globs),
                          highlight, exact totals; aggs: terms,

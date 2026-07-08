@@ -3110,6 +3110,30 @@ impl Node {
         self.local.read().ok()?.search_index_fields(table)
     }
 
+    /// Per-hit score explanation from the **local** search index. Gated
+    /// like the other whole-corpus local-index paths: a sole member or
+    /// RF ≥ members. On a sharded corpus (RF < members) the row may live
+    /// on another node — declined rather than answered wrong.
+    pub fn search_explain(
+        &self,
+        table: &str,
+        filter: &Option<skaidb_sql::ast::Expr>,
+        pk_value: &skaidb_types::Value,
+    ) -> EngineResult<Option<String>> {
+        let members = self.member_count();
+        if members > 1 && self.cfg.replication_factor < members {
+            return Err(EngineError::Unsupported(
+                "score explain on a sharded cluster (replication_factor < members) \
+                 is not supported"
+                    .into(),
+            ));
+        }
+        self.local
+            .write()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .search_explain(table, filter, pk_value)
+    }
+
     /// One background NRT tick over the local shard's search indexes (the
     /// engine's `search_refresh_tick`): read-lock gate first so the common
     /// no-index case never takes the write lock.

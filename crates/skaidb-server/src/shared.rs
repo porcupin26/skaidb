@@ -118,6 +118,28 @@ impl Backend {
         }
     }
 
+    /// Per-hit BM25 score breakdown (the ES `"explain": true` view) for the
+    /// row with primary-key `pk_value` against the search predicates in
+    /// `filter`. `Ok(None)` = the row does not match. Declines on sharded
+    /// clusters (RF < members) rather than explain from a partial index.
+    pub fn search_explain(
+        &self,
+        table: &str,
+        filter: &Option<skaidb_sql::ast::Expr>,
+        pk_value: &skaidb_types::Value,
+    ) -> Result<Option<String>, String> {
+        match self {
+            Backend::Local(db) => db
+                .write()
+                .map_err(|_| "local lock poisoned".to_string())?
+                .search_explain(table, filter, pk_value)
+                .map_err(|e| e.to_string()),
+            Backend::Cluster(node) => node
+                .search_explain(table, filter, pk_value)
+                .map_err(|e| e.to_string()),
+        }
+    }
+
     /// One background NRT tick: commit search indexes with pending writes
     /// whose refresh interval elapsed, so an idle table's last writes become
     /// searchable within `refresh_ms` with no follow-up traffic. Gated on a

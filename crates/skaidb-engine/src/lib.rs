@@ -1582,6 +1582,59 @@ mod tests {
         assert_eq!(ids(rs), vec![1]);
     }
 
+    /// MATCH_CROSS: the fields act as one big field — a query whose terms
+    /// are spread across columns still matches (term-centric, ES
+    /// multi_match cross_fields), where per-field MATCH cannot.
+    #[test]
+    fn search_match_cross_spans_fields() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE docs (PRIMARY KEY (id))").unwrap();
+        db.execute(
+            "INSERT INTO docs (id, title, body) VALUES \
+             (1, 'rust systems', 'a database engine'), \
+             (2, 'gardening', 'growing a database of plants'), \
+             (3, 'rust belt', 'industrial history')",
+        )
+        .unwrap();
+        db.execute("CREATE SEARCH INDEX docs_fts ON docs (title, body)")
+            .unwrap();
+        // 'rust' lives in title, 'database' in body: cross matches 1, 2, 3
+        // (OR semantics), and doc 1 — matching both terms — ranks first.
+        let rs = rows(
+            db.execute(
+                "SELECT id FROM docs WHERE MATCH_CROSS(title, body, 'rust database') \
+                 ORDER BY score() DESC LIMIT 3",
+            )
+            .unwrap(),
+        );
+        assert_eq!(ids(rs)[0], 1);
+        // Argument validation: one column is rejected.
+        let err = db
+            .execute("SELECT id FROM docs WHERE MATCH_CROSS(title, 'rust')")
+            .unwrap_err();
+        assert!(err.to_string().contains("at least two columns"), "{err}");
+    }
+
+    /// BOOSTED: the required predicate decides the set; optionals only
+    /// re-rank.
+    #[test]
+    fn search_boosted_reranks_without_filtering() {
+        let mut db = search_db();
+        let rs = rows(
+            db.execute(
+                "SELECT id FROM articles WHERE BOOSTED(MATCH(body, 'quick'), MATCH(body, 'fox')) \
+                 ORDER BY score() DESC LIMIT 5",
+            )
+            .unwrap(),
+        );
+        // Both quick-docs match; the fox doc outranks the tf-heavy one.
+        assert_eq!(ids(rs), vec![1, 2]);
+        let err = db
+            .execute("SELECT id FROM articles WHERE BOOSTED(MATCH(body, 'quick'), flag = true)")
+            .unwrap_err();
+        assert!(err.to_string().contains("search predicates"), "{err}");
+    }
+
     #[test]
     fn search_predicate_only_returns_all_matches() {
         let mut db = search_db();

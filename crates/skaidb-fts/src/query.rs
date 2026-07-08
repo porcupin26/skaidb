@@ -59,6 +59,20 @@ pub enum SearchQuery {
         field: Option<String>,
         text: String,
     },
+    /// Multi-field match over an explicit field list (ES `multi_match`).
+    /// `term_centric: false` is field-centric `best_fields`: each field
+    /// scores the whole query and the best field wins (dis-max) — like
+    /// [`SearchQuery::Match`] with `field: None`, but over a chosen subset.
+    /// `term_centric: true` is `cross_fields`: the text is analyzed per
+    /// field, each distinct term dis-maxes across the fields it appears
+    /// in, and the terms OR together — the fields behave like one big
+    /// field, so a query whose terms are spread across fields still ranks
+    /// sensibly.
+    MultiMatch {
+        fields: Vec<String>,
+        text: String,
+        term_centric: bool,
+    },
     /// Query-string mini-language over the default fields
     /// (`title:"rust db" +performance -draft`).
     QueryString(String),
@@ -139,6 +153,42 @@ fn analyze(rt: &FieldRuntime, text: &str) -> Vec<(usize, Term)> {
         terms.push((token.position, Term::from_field_text(rt.field, &token.text)));
     }
     terms
+}
+
+/// One field's `match` query: analyzed terms OR-ed, with query-time
+/// synonym expansion — any group member a token hits contributes its peers
+/// as extra OR terms (entries analyzed with the field's own pipeline, so
+/// stemming lines up). Phrases and the query-string language do not expand.
+fn match_terms_query(
+    fields: &QueryFields<'_>,
+    rt: &FieldRuntime,
+    text: &str,
+) -> Result<Option<Box<dyn Query>>, FtsError> {
+    let mut terms = analyze(rt, text);
+    if terms.is_empty() {
+        return Ok(None);
+    }
+    if !fields.synonyms.is_empty() {
+        let mut extra = Vec::new();
+        for (pos, term) in &terms {
+            let Some(token) = term.value().as_str().map(str::to_string) else {
+                continue;
+            };
+            for peer in synonym_expansions(fields.synonyms, rt, &token) {
+                extra.push((*pos, Term::from_field_text(rt.field, &peer)));
+            }
+        }
+        terms.extend(extra);
+        terms.dedup_by(|a, b| a.1 == b.1);
+    }
+    let clauses: Vec<(Occur, Box<dyn Query>)> = terms
+        .into_iter()
+        .map(|(_, term)| {
+            let q: Box<dyn Query> = Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
+            (Occur::Should, q)
+        })
+        .collect();
+    Ok(Some(Box::new(BooleanQuery::new(clauses))))
 }
 
 /// Apply the field boost to a built query.
@@ -229,38 +279,56 @@ pub(crate) fn build_query(
 ) -> Result<Box<dyn Query>, FtsError> {
     match query {
         SearchQuery::Match { field, text } => per_field_union(fields.resolve(field)?, |rt| {
-            let mut terms = analyze(rt, text);
-            if terms.is_empty() {
-                return Ok(None);
+            match_terms_query(fields, rt, text)
+        }),
+        SearchQuery::MultiMatch {
+            fields: names,
+            text,
+            term_centric,
+        } => {
+            let mut rts = Vec::with_capacity(names.len());
+            for name in names {
+                rts.extend(fields.resolve(&Some(name.clone()))?);
             }
-            // Query-time synonym expansion: `match` is an OR of terms, so
-            // any group member a token hits contributes its peers as extra
-            // OR terms (entries analyzed with the field's own pipeline, so
-            // stemming lines up). Phrases and the query-string language do
-            // not expand.
-            if !fields.synonyms.is_empty() {
-                let mut extra = Vec::new();
-                for (pos, term) in &terms {
+            if !term_centric {
+                // best_fields over the subset: whole-query score per
+                // field, best field wins.
+                return per_field_union(rts, |rt| match_terms_query(fields, rt, text));
+            }
+            // cross_fields: analyze per field (analyzers may differ), then
+            // group by term text — each term dis-maxes across its fields,
+            // terms OR together. Synonyms don't expand here (same rule as
+            // phrases and the query-string language).
+            let mut per_term: std::collections::BTreeMap<String, Vec<Box<dyn Query>>> =
+                std::collections::BTreeMap::new();
+            for rt in &rts {
+                for (_, term) in analyze(rt, text) {
                     let Some(token) = term.value().as_str().map(str::to_string) else {
                         continue;
                     };
-                    for peer in synonym_expansions(fields.synonyms, rt, &token) {
-                        extra.push((*pos, Term::from_field_text(rt.field, &peer)));
-                    }
+                    per_term.entry(token).or_default().push(boosted(
+                        Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)),
+                        rt.boost,
+                    ));
                 }
-                terms.extend(extra);
-                terms.dedup_by(|a, b| a.1 == b.1);
             }
-            let clauses: Vec<(Occur, Box<dyn Query>)> = terms
-                .into_iter()
-                .map(|(_, term)| {
-                    let q: Box<dyn Query> =
-                        Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
+            let clauses: Vec<(Occur, Box<dyn Query>)> = per_term
+                .into_values()
+                .map(|mut qs| {
+                    let q: Box<dyn Query> = if qs.len() == 1 {
+                        qs.pop().expect("len checked")
+                    } else {
+                        Box::new(DisjunctionMaxQuery::new(qs))
+                    };
                     (Occur::Should, q)
                 })
                 .collect();
-            Ok(Some(Box::new(BooleanQuery::new(clauses))))
-        }),
+            Ok(if clauses.is_empty() {
+                Box::new(EmptyQuery)
+            } else {
+                Box::new(BooleanQuery::new(clauses))
+            })
+        }
         SearchQuery::Phrase { field, text, slop } => {
             per_field_union(fields.resolve(field)?, |rt| {
                 let terms = analyze(rt, text);

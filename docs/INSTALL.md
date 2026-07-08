@@ -17,6 +17,7 @@ binaries**:
 
 ## Contents
 
+- [System requirements](#system-requirements)
 - [Which download do I want?](#which-download-do-i-want)
 - [Package repository (apt / dnf)](#package-repository-apt--dnf)
 - [Downloading the right file](#downloading-the-right-file)
@@ -38,6 +39,28 @@ binaries**:
 - [Run it / verify the install](#run-it--verify-the-install)
 - [Upgrading](#upgrading)
 - [Uninstalling](#uninstalling)
+
+## System requirements
+
+|  | Minimum | Recommended |
+|---|---|---|
+| CPU | 1 core (x86-64 or ARM64) | 2+ cores |
+| RAM | 512 MB | 2 GB+ |
+| Disk | 1 GB free beyond your data | SSD/NVMe, 2–3× your expected data size |
+
+- **RAM**: the default memtable alone budgets 256 MB. On boxes at or near
+  the minimum, set `storage.memory_target` (e.g. `"256MB"`) so the
+  memtable, read cache, and search-index writer heaps share one explicit
+  budget instead of assuming a bigger machine. A 3-node test cluster runs
+  comfortably in 1 GB per node.
+- **Disk**: LSM compaction needs transient headroom (it rewrites
+  overlapping sstables before deleting the old ones), the WAL adds its own
+  footprint, and a full-text `SEARCH INDEX` typically adds another
+  0.5–1× the size of the text it indexes — hence 2–3× your expected live
+  data. Watch real usage with `SHOW STATUS` (`disk_bytes`, `wal_bytes`,
+  `search.*.disk_bytes`).
+- **Cluster**: the same figures apply per node; total storage scales with
+  the replication factor (default 3 — every row is stored RF times).
 
 ## Which download do I want?
 

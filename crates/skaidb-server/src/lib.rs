@@ -670,6 +670,29 @@ mod tests {
         );
         assert!(resp.contains("\"count\":1"), "{resp}");
 
+        // multi_match cross_fields (terms spread across fields still hit)
+        // and per-hit explain.
+        let resp = http(
+            "POST",
+            "/logs/_search",
+            r#"{"query":{"multi_match":{"query":"error","fields":["msg","level"],"type":"cross_fields"}},"explain":true}"#,
+        );
+        assert!(resp.contains("\"total\":{\"relation\":\"eq\",\"value\":2}"), "{resp}");
+        assert!(resp.contains("\"_explanation\""), "{resp}");
+        // most_fields and best_fields route too.
+        let resp = http(
+            "POST",
+            "/logs/_count",
+            r#"{"query":{"multi_match":{"query":"error","fields":["msg","level"],"type":"most_fields"}}}"#,
+        );
+        assert!(resp.contains("\"count\":2"), "{resp}");
+        let resp = http(
+            "POST",
+            "/logs/_count",
+            r#"{"query":{"multi_match":{"query":"error","fields":["msg","level"]}}}"#,
+        );
+        assert!(resp.contains("\"count\":2"), "{resp}");
+
         // Auto-create on bulk: unknown index springs into existence with a
         // dynamic mapping from the first document.
         let bulk = concat!(

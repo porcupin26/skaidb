@@ -217,6 +217,57 @@ fn query_expr(q: &Json) -> Result<Option<Expr>, String> {
                 .ok_or("query_string needs query: '<text>'")?;
             Ok(Some(func("search", vec![str_lit(text)])))
         }
+        "multi_match" => {
+            let text = body["query"]
+                .as_str()
+                .ok_or("multi_match needs query: '<text>'")?;
+            let fields: Vec<&str> = body["fields"]
+                .as_array()
+                .ok_or("multi_match needs fields: [...]")?
+                .iter()
+                .filter_map(|f| f.as_str())
+                .collect();
+            if fields.is_empty() {
+                return Err("multi_match needs at least one field".into());
+            }
+            if fields.iter().any(|f| f.contains('^')) {
+                return Err("multi_match per-field ^boosts are not supported — declare \
+                     <col>.boost on the search index instead"
+                    .into());
+            }
+            let mm_type = body["type"].as_str().unwrap_or("best_fields");
+            if fields.len() == 1 {
+                // One field: every type degenerates to a plain match.
+                return Ok(Some(func(
+                    "match",
+                    vec![Expr::Column(fields[0].to_string()), str_lit(text)],
+                )));
+            }
+            match mm_type {
+                // Field-centric (whole-query score per field, best wins)
+                // vs term-centric (fields act as one big field).
+                "best_fields" | "cross_fields" => {
+                    let name = if mm_type == "cross_fields" {
+                        "match_cross"
+                    } else {
+                        "match_best"
+                    };
+                    let mut args: Vec<Expr> = fields
+                        .into_iter()
+                        .map(|f| Expr::Column(f.to_string()))
+                        .collect();
+                    args.push(str_lit(text));
+                    Ok(Some(func(name, args)))
+                }
+                // most_fields sums the per-field scores — exactly what an
+                // OR of matches scores.
+                "most_fields" => Ok(or(fields
+                    .into_iter()
+                    .map(|f| func("match", vec![Expr::Column(f.to_string()), str_lit(text)]))
+                    .collect())),
+                other => Err(format!("multi_match type '{other}' is not supported")),
+            }
+        }
         // Exact comparisons run as residual predicates over the row —
         // right for keyword/numeric/bool/date fields (ES best practice for
         // `term` anyway; on analyzed text use `match`).
@@ -481,6 +532,28 @@ fn search(ctx: &Shared, role: &str, index: &str, body: &[u8]) -> Result<(u16, Js
             if !highlight.is_empty() {
                 hit["highlight"] = Json::Object(highlight);
             }
+            // "explain": true — per-hit BM25 breakdown from the index.
+            // The string _id first, then the numeric form (numeric-keyed
+            // tables), like GET /_doc/{id}.
+            if body["explain"].as_bool() == Some(true) {
+                if let Some(id_str) = id.as_str() {
+                    let mut keys = vec![Value::String(id_str.to_string())];
+                    if let Ok(n) = id_str.parse::<i64>() {
+                        keys.push(Value::Int(n));
+                    }
+                    for pk_value in keys {
+                        if let Some(explanation) = ctx
+                            .backend
+                            .search_explain(index, &filter, &pk_value)
+                            .map_err(|e| format!("explain: {e}"))?
+                        {
+                            hit["_explanation"] = serde_json::from_str(&explanation)
+                                .unwrap_or_else(|_| json!(explanation));
+                            break;
+                        }
+                    }
+                }
+            }
             hits.push(hit);
         }
     }
@@ -550,6 +623,8 @@ fn expr_uses_search(e: &Expr) -> bool {
                 | "more_like_this"
                 | "search"
                 | "boosted"
+                | "match_cross"
+                | "match_best"
         ),
         Expr::Unary { expr, .. } => expr_uses_search(expr),
         Expr::Binary { left, right, .. } => expr_uses_search(left) || expr_uses_search(right),

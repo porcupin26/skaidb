@@ -361,6 +361,37 @@ impl SearchIndex {
         Ok(hits)
     }
 
+    /// The BM25 score breakdown for one document against `query` (ES
+    /// per-hit `_explanation`), as tantivy's explanation JSON. `Ok(None)`
+    /// when the key does not match the query (or is not in the index).
+    pub fn explain(&self, query: &SearchQuery, key: &[u8]) -> Result<Option<String>, FtsError> {
+        use tantivy::query::{Query as _, TermQuery};
+        let q = build_query(
+            &self.index,
+            &QueryFields {
+                fields: &self.runtimes,
+                synonyms: &self.config.synonyms,
+            },
+            query,
+        )?;
+        let searcher = self.reader.searcher();
+        // Find the doc address by key, then explain the scoring query
+        // against exactly that document.
+        let key_q = TermQuery::new(
+            Term::from_field_bytes(self.key_field, key),
+            IndexRecordOption::Basic,
+        );
+        let found = searcher.search(&key_q, &TopDocs::with_limit(1).order_by_score())?;
+        let Some((_, addr)) = found.into_iter().next() else {
+            return Ok(None);
+        };
+        match q.explain(&searcher, addr) {
+            Ok(explanation) => Ok(Some(explanation.to_pretty_json())),
+            // A doc the query does not match cannot be explained.
+            Err(_) => Ok(None),
+        }
+    }
+
     /// Top-k retrieval ordered by a declared fast-field column instead of
     /// BM25 (`ORDER BY <col> [DESC] LIMIT k`), as `(key, sort value)`
     /// pairs, best-first. `Ok(None)` when the index cannot serve it with
