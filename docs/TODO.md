@@ -45,9 +45,11 @@ extras below.
   multi-word group entries match as consecutive query-token sequences
   and expand as phrase alternatives (both directions), analyzed with the
   field's own pipeline; still `MATCH`-only, hot-reloadable.
-- [ ] **[fts] Approximate cardinality opt-in** (e.g.
-  `APPROX_COUNT_DISTINCT()`) if `COUNT(DISTINCT)`'s exact terms-bucket
-  bail ever hurts on very high cardinality. Conditional — no demand yet.
+- [x] **[fts] Approximate cardinality opt-in** — shipped:
+  `APPROX_COUNT_DISTINCT(col)` pushes down as tantivy's HLL cardinality
+  sketch (never bails on wide term sets); grouped requests and every
+  non-pushdown path answer exactly (an exact answer is a valid
+  approximation). `COUNT(DISTINCT)` stays exact-or-fallback.
 - [ ] **[fts] Merge-policy tuning on LXC-class disks**: conditional —
   revisit only if an ingest-heavy workload surfaces merge stalls (the
   ingest win over ES leaves no urgency).

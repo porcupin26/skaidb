@@ -94,6 +94,10 @@ pub enum AggMetricFunc {
     /// nested terms bucket count (bails to the row fallback rather than
     /// approximate à la HLL when the term set would truncate).
     CountDistinct,
+    /// `APPROX_COUNT_DISTINCT(col)` — the opt-in HLL sketch (tantivy's
+    /// cardinality aggregation): never bails on wide term sets, may be
+    /// off by the sketch's error bound (~±1–2%).
+    ApproxCountDistinct,
     Sum,
     Avg,
     Min,

@@ -2593,6 +2593,48 @@ mod tests {
             .is_err());
     }
 
+    /// APPROX_COUNT_DISTINCT: the opt-in sketch. On the pushdown path it
+    /// answers via HLL (exact at these cardinalities), grouped it takes
+    /// the exact row fallback, and it also works with no search predicate
+    /// at all — everywhere agreeing with COUNT(DISTINCT) on small sets.
+    #[test]
+    fn approx_count_distinct_all_paths() {
+        let mut db = agg_db();
+        // Pushdown (global metric over the match set).
+        let rs = rows(
+            db.execute(
+                "SELECT APPROX_COUNT_DISTINCT(region) FROM sales WHERE MATCH(product, 'red')",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(2)]]);
+        // Grouped → exact row fallback (identical to COUNT(DISTINCT)).
+        let approx = sorted_groups(rows(
+            db.execute(
+                "SELECT region, APPROX_COUNT_DISTINCT(product) FROM sales \
+                 WHERE MATCH(product, 'widget') GROUP BY region",
+            )
+            .unwrap(),
+        ));
+        let exact = sorted_groups(rows(
+            db.execute(
+                "SELECT region, COUNT(DISTINCT product) FROM sales \
+                 WHERE MATCH(product, 'widget') GROUP BY region",
+            )
+            .unwrap(),
+        ));
+        assert_eq!(approx, exact);
+        // Plain table scan (no search predicate).
+        let rs = rows(
+            db.execute("SELECT APPROX_COUNT_DISTINCT(region) FROM sales").unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(2)]]); // east, west (NULL ignored)
+        // Only COUNT-shaped: rejected under SUM etc. is the DISTINCT rule.
+        assert!(db
+            .execute("SELECT APPROX_COUNT_DISTINCT(region, units) FROM sales")
+            .is_err());
+    }
+
     #[test]
     fn search_count_distinct_exact_on_both_paths() {
         let mut db = agg_db();

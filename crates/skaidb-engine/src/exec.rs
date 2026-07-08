@@ -4707,6 +4707,15 @@ fn map_search_aggregate(sel: &Select) -> Option<(skaidb_fts::AggRequest, Vec<Agg
                         func: skaidb_fts::AggMetricFunc::Count,
                         column: None,
                     },
+                    (AggFunc::Count, AggArg::ApproxDistinct(e)) => {
+                        let Expr::Column(col) = e.as_ref() else {
+                            return None;
+                        };
+                        skaidb_fts::AggMetric {
+                            func: skaidb_fts::AggMetricFunc::ApproxCountDistinct,
+                            column: Some(col.clone()),
+                        }
+                    }
                     (AggFunc::Count, AggArg::Distinct(e)) => {
                         let Expr::Column(col) = &**e else {
                             return None;
@@ -6370,9 +6379,11 @@ fn lower_aggregates(expr: &Expr, docs: &[Document]) -> Result<Expr> {
 }
 
 fn eval_aggregate(func: AggFunc, arg: &AggArg, docs: &[Document]) -> Result<Value> {
-    // `DISTINCT` is exact and COUNT-only (SQL semantics; an approximate
-    // HLL-style cardinality would need its own opt-in function).
-    if let AggArg::Distinct(e) = arg {
+    // `DISTINCT` is exact and COUNT-only (SQL semantics). The opt-in
+    // `APPROX_COUNT_DISTINCT()` shares this row path — here it answers
+    // exactly (an exact answer is a valid approximation); only the
+    // search-index pushdown uses a sketch.
+    if let AggArg::Distinct(e) | AggArg::ApproxDistinct(e) = arg {
         if func != AggFunc::Count {
             return Err(EngineError::Unsupported(
                 "DISTINCT aggregate arguments are supported for COUNT only".into(),
@@ -6389,7 +6400,7 @@ fn eval_aggregate(func: AggFunc, arg: &AggArg, docs: &[Document]) -> Result<Valu
     }
     // Collect the (non-null) argument values for the group.
     let values: Vec<Value> = match arg {
-        AggArg::Star | AggArg::Distinct(_) => Vec::new(),
+        AggArg::Star | AggArg::Distinct(_) | AggArg::ApproxDistinct(_) => Vec::new(),
         AggArg::Expr(e) => {
             let mut vs = Vec::new();
             for doc in docs {
@@ -6405,7 +6416,9 @@ fn eval_aggregate(func: AggFunc, arg: &AggArg, docs: &[Document]) -> Result<Valu
     Ok(match func {
         AggFunc::Count => match arg {
             AggArg::Star => Value::Int(docs.len() as i64),
-            AggArg::Expr(_) | AggArg::Distinct(_) => Value::Int(values.len() as i64),
+            AggArg::Expr(_) | AggArg::Distinct(_) | AggArg::ApproxDistinct(_) => {
+                Value::Int(values.len() as i64)
+            }
         },
         AggFunc::Sum => sum_values(&values),
         AggFunc::Avg => {

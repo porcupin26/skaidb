@@ -205,7 +205,11 @@ SHOW DATABASES
   8. unary: `-<expr>`, `NOT <expr>`
   9. parentheses `( … )`
 - **Aggregate functions:** `COUNT(*)` / `COUNT(<expr>)` /
-  `COUNT(DISTINCT <expr>)` (exact distinct non-null values), `SUM`, `AVG`,
+  `COUNT(DISTINCT <expr>)` (exact distinct non-null values),
+  `APPROX_COUNT_DISTINCT(<expr>)` (opt-in approximate distinct: the
+  search-index pushdown may answer from an HLL sketch — never truncates,
+  ~±1–2% at high cardinality; every other path answers exactly), `SUM`,
+  `AVG`,
   `MIN`, `MAX`, and the time-series aggregates `RATE`, `INCREASE`, `DELTA`,
   `FIRST`, `LAST` (see *Time-series tables* below). Using an aggregate (or
   `GROUP BY`) puts the query in aggregate mode.

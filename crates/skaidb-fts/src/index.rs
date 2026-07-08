@@ -638,6 +638,21 @@ impl SearchIndex {
             let Some(col) = &metric.column else {
                 continue; // Count reads doc_count
             };
+            if metric.func == AggMetricFunc::ApproxCountDistinct {
+                // The caller opted into approximation: an HLL sketch that
+                // never truncates, over any fast-field type.
+                if !matches!(
+                    ftype_of(col),
+                    Some(FieldType::Keyword | FieldType::Long | FieldType::Double)
+                ) {
+                    return Ok(None);
+                }
+                metric_aggs.insert(
+                    format!("m{i}"),
+                    serde_json::json!({"cardinality": {"field": col}}),
+                );
+                continue;
+            }
             if metric.func == AggMetricFunc::CountDistinct {
                 // Exact distinct = the number of nested terms buckets;
                 // works over keyword and numeric fast fields alike.
@@ -657,7 +672,9 @@ impl SearchIndex {
                 return Ok(None);
             }
             let name = match metric.func {
-                AggMetricFunc::Count | AggMetricFunc::CountDistinct => continue,
+                AggMetricFunc::Count
+                | AggMetricFunc::CountDistinct
+                | AggMetricFunc::ApproxCountDistinct => continue,
                 AggMetricFunc::ValueCount => "value_count",
                 AggMetricFunc::Sum => "sum",
                 AggMetricFunc::Avg => "avg",
@@ -742,6 +759,9 @@ impl SearchIndex {
                             Value::Int(
                                 sub["buckets"].as_array().map_or(0, |b| b.len()) as i64
                             )
+                        }
+                        AggMetricFunc::ApproxCountDistinct => {
+                            Value::Int(raw.unwrap_or(0.0).round() as i64)
                         }
                         AggMetricFunc::Sum
                             if obj[format!("m{i}n")]["value"].as_f64() == Some(0.0) =>

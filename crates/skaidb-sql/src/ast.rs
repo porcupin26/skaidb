@@ -437,6 +437,11 @@ pub enum AggArg {
     Expr(Box<Expr>),
     /// `COUNT(DISTINCT expr)` — distinct non-null values of the expression.
     Distinct(Box<Expr>),
+    /// `APPROX_COUNT_DISTINCT(expr)` — the caller opts into an approximate
+    /// distinct count: the search-index pushdown may answer with an
+    /// HLL-style sketch instead of bailing on wide term sets; paths without
+    /// a sketch answer exactly (an exact answer is a valid approximation).
+    ApproxDistinct(Box<Expr>),
 }
 
 /// Aggregate functions (SPEC §3).

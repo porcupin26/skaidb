@@ -1205,6 +1205,19 @@ impl Parser {
                         }
                         self.expect(&Token::RParen)?;
                     }
+                    if path.eq_ignore_ascii_case("approx_count_distinct") {
+                        if args.len() != 1 {
+                            return Err(ParseError::Other(
+                                "APPROX_COUNT_DISTINCT(expr) takes exactly one argument".into(),
+                            ));
+                        }
+                        return Ok(Expr::Aggregate {
+                            func: AggFunc::Count,
+                            arg: AggArg::ApproxDistinct(Box::new(
+                                args.into_iter().next().unwrap(),
+                            )),
+                        });
+                    }
                     if let Some(func) = ts_agg_func(&path) {
                         if args.len() != 1 {
                             return Err(ParseError::Other(format!(

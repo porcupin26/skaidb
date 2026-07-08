@@ -215,6 +215,8 @@ Two serving paths produce identical results:
   `date` column (fixed-interval date histogram) with `COUNT(*)` — compute
   inside the index over fast fields (Tantivy aggregations).
   `COUNT(DISTINCT)` is **exact** — a terms-bucket count, never an HLL
+  (the opt-in `APPROX_COUNT_DISTINCT()` is the HLL: it pushes down as a
+  cardinality sketch and never bails on wide term sets) —
   approximation. Grouped **per-bucket metrics** deliberately do not push
   down: tantivy 0.26.1 has a sub-aggregation data-loss bug (small buckets
   lose metric input on periodic flushes while their doc counts stay
