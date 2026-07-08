@@ -102,6 +102,22 @@ impl Backend {
         }
     }
 
+    /// The primary-key columns of `table` (the ES gateway's `_id` target).
+    pub fn table_primary_key(&self, table: &str) -> Option<Vec<String>> {
+        match self {
+            Backend::Local(db) => db.read().ok()?.table_primary_key(table).ok(),
+            Backend::Cluster(node) => node.table_primary_key(table),
+        }
+    }
+
+    /// The declared search-index fields of `table` (the ES `_mapping` view).
+    pub fn search_index_fields(&self, table: &str) -> Option<Vec<(String, String)>> {
+        match self {
+            Backend::Local(db) => db.read().ok()?.search_index_fields(table),
+            Backend::Cluster(node) => node.search_index_fields(table),
+        }
+    }
+
     /// One background NRT tick: commit search indexes with pending writes
     /// whose refresh interval elapsed, so an idle table's last writes become
     /// searchable within `refresh_ms` with no follow-up traffic. Gated on a

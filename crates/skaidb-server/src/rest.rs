@@ -172,6 +172,24 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) -> io::Result<()> {
         };
     }
 
+    // ES-compatible subset (SPEC/FTS phase 8): /{index}/_search, _count,
+    // _bulk, _mapping (+ /_bulk). Authenticated like /query.
+    if crate::es::path_is_es(&req.path) {
+        let role = if ctx.authn.required {
+            match basic_auth_role(&ctx, req.authorization.as_deref()) {
+                Some(role) => role,
+                None => return write_unauthorized(&mut stream),
+            }
+        } else {
+            ctx.superuser_role.clone()
+        };
+        if let Some((status, payload)) =
+            crate::es::try_route(&ctx, &role, &req.method, &req.path, &req.body)
+        {
+            return write_response(&mut stream, status, &payload);
+        }
+    }
+
     if req.method != "POST" || !req.path.starts_with("/query") {
         return write_response(
             &mut stream,

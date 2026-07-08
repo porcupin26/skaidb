@@ -173,7 +173,9 @@ Implemented end-to-end and tested (202 tests):
   `copy_to` composites; near-real-time refresh with WAL-replay crash
   recovery (the table is the source of truth). Fully distributed: every
   node indexes its shard, queries scatter-gather with per-shard top-k
-  merged at the coordinator — see [docs/SEARCH.md](docs/SEARCH.md)
+  merged at the coordinator. An **ES-compatible REST subset**
+  (`_bulk`/`_search`/`_count`/`_mapping`) serves existing Elasticsearch
+  clients and log shippers — see [docs/SEARCH.md](docs/SEARCH.md)
 - **time-series tables**: `CREATE TIMESERIES TABLE … (SERIES KEY (…),
   RETENTION 30d)` stores samples in a Prometheus-style engine
   (Gorilla-compressed chunks, ~1–1.5 B/sample, ≥2M samples/s ingest) with

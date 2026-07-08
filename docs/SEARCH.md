@@ -7,7 +7,7 @@ This documents the **shipped** state; the plan and pending phases live in
 [FTS_TODO.md](FTS_TODO.md), and the SQL grammar in
 [QUERY_SYNTAX.md](QUERY_SYNTAX.md#full-text-search-match--search).
 
-Status: **phase 6 (aggregations)** — phases 1–5 (single-node core: DDL,
+Status: **phases 0–8 complete** — phases 1–5 (single-node core: DDL,
 index maintenance on put/delete, `score()`, top-k pushdown, crash
 recovery, rebuild; analysis & mappings: analyzer registry, per-column
 configuration, typed fast fields, `.keyword` twins, `copy_to`; query DSL:

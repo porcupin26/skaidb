@@ -3099,6 +3099,17 @@ impl Node {
         Ok(())
     }
 
+    /// Catalog lookups for stateless gateways (the catalog is identical
+    /// cluster-wide, so the local copy answers).
+    pub fn table_primary_key(&self, table: &str) -> Option<Vec<String>> {
+        self.local.read().ok()?.table_primary_key(table).ok()
+    }
+
+    /// See [`Node::table_primary_key`].
+    pub fn search_index_fields(&self, table: &str) -> Option<Vec<(String, String)>> {
+        self.local.read().ok()?.search_index_fields(table)
+    }
+
     /// One background NRT tick over the local shard's search indexes (the
     /// engine's `search_refresh_tick`): read-lock gate first so the common
     /// no-index case never takes the write lock.

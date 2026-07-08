@@ -1129,6 +1129,34 @@ impl Database {
         ))
     }
 
+    /// The declared `(path, type-name)` fields of the first search index on
+    /// `table` (the ES-REST `_mapping` view). `None` when the table has no
+    /// search index.
+    pub fn search_index_fields(&self, table: &str) -> Option<Vec<(String, String)>> {
+        let def = self
+            .catalog
+            .search_indexes
+            .values()
+            .find(|def| def.table == table)?;
+        let (cfg, _) = SearchIndexConfig::from_declaration(&def.paths, &def.options).ok()?;
+        Some(
+            cfg.fields
+                .into_iter()
+                .map(|f| {
+                    let t = match f.ftype {
+                        skaidb_fts::FieldType::Text => "text",
+                        skaidb_fts::FieldType::Keyword => "keyword",
+                        skaidb_fts::FieldType::Long => "long",
+                        skaidb_fts::FieldType::Double => "double",
+                        skaidb_fts::FieldType::Bool => "boolean",
+                        skaidb_fts::FieldType::Date => "date",
+                    };
+                    (f.path, t.to_string())
+                })
+                .collect(),
+        )
+    }
+
     /// A snippet generator for `query` over `column`, from the index
     /// serving the query — the cluster coordinator highlights re-read rows
     /// with this after the scatter merge.

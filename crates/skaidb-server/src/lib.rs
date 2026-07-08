@@ -9,6 +9,7 @@
 pub mod admin;
 pub mod audit;
 pub mod authn;
+mod es;
 pub mod binary;
 pub mod memory;
 mod promql;
@@ -518,6 +519,100 @@ mod tests {
         // Selecting a missing table is a server-side error.
         let err = client.execute("SELECT * FROM missing").unwrap_err();
         assert!(err.to_string().contains("does not exist"), "got: {err}");
+    }
+
+    #[test]
+    fn es_rest_subset_end_to_end() {
+        let ctx = temp_ctx();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
+        let http = |method: &str, path: &str, body: &str| -> String {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            let head = format!(
+                "{method} {path} HTTP/1.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(body.as_bytes()).unwrap();
+            let mut resp = String::new();
+            stream.read_to_string(&mut resp).unwrap();
+            resp
+        };
+
+        // The ES index is a table + search index (pre-created; the subset
+        // does not auto-create).
+        http("POST", "/query", "CREATE TABLE logs (PRIMARY KEY (id))");
+        http(
+            "POST",
+            "/query",
+            // refresh_ms = 0 commits every write (the test spawns no
+            // background refresher thread; ES-wise this is refresh=true).
+            "CREATE SEARCH INDEX logs_fts ON logs (msg, level, bytes) \
+             WITH (refresh_ms = 0, level.type = 'keyword', bytes.type = 'long')",
+        );
+
+        // _bulk: index with and without _id, plus a delete.
+        let bulk = concat!(
+            "{\"index\":{\"_id\":\"a1\"}}\n",
+            "{\"msg\":\"error connecting to db\",\"level\":\"error\",\"bytes\":100}\n",
+            "{\"index\":{\"_id\":\"a2\"}}\n",
+            "{\"msg\":\"request served fine\",\"level\":\"info\",\"bytes\":250}\n",
+            "{\"index\":{}}\n",
+            "{\"msg\":\"another error in worker\",\"level\":\"error\",\"bytes\":50}\n",
+            "{\"index\":{\"_id\":\"gone\"}}\n",
+            "{\"msg\":\"to be deleted\",\"level\":\"info\",\"bytes\":1}\n",
+            "{\"delete\":{\"_id\":\"gone\"}}\n",
+        );
+        let resp = http("POST", "/logs/_bulk", bulk);
+        assert!(resp.contains("\"errors\":false"), "{resp}");
+
+        // _count with a query.
+        let resp = http(
+            "POST",
+            "/logs/_count",
+            r#"{"query":{"match":{"msg":"error"}}}"#,
+        );
+        assert!(resp.contains("\"count\":2"), "{resp}");
+
+        // _search: match + highlight, relevance-ordered by default.
+        let resp = http(
+            "POST",
+            "/logs/_search",
+            r#"{"query":{"match":{"msg":"error"}},"highlight":{"fields":{"msg":{}}}}"#,
+        );
+        assert!(resp.contains("\"total\":{\"relation\":\"eq\",\"value\":2}"), "{resp}");
+        assert!(resp.contains("<b>error</b>"), "{resp}");
+        assert!(resp.contains("\"_id\":\"a1\""), "{resp}");
+        // The deleted doc is gone.
+        assert!(!resp.contains("to be deleted"), "{resp}");
+
+        // bool + range + sort by a fast field.
+        let resp = http(
+            "POST",
+            "/logs/_search",
+            r#"{"query":{"bool":{"must":[{"match":{"msg":"error"}}],"filter":[{"range":{"bytes":{"gte":60}}}]}},"sort":[{"bytes":{"order":"desc"}}]}"#,
+        );
+        assert!(resp.contains("\"total\":{\"relation\":\"eq\",\"value\":1}"), "{resp}");
+        assert!(resp.contains("connecting"), "{resp}");
+
+        // Aggregations: terms buckets + a metric, hits suppressed.
+        let resp = http(
+            "POST",
+            "/logs/_search",
+            r#"{"size":0,"query":{"match_all":{}},"aggs":{"levels":{"terms":{"field":"level"},"aggs":{"b":{"sum":{"field":"bytes"}}}}}}"#,
+        );
+        assert!(resp.contains("\"key\":\"error\""), "{resp}");
+        assert!(resp.contains("\"doc_count\":2"), "{resp}");
+        assert!(resp.contains("\"b\":{\"value\":150"), "{resp}");
+
+        // _mapping mirrors the search-index declaration.
+        let resp = http("GET", "/logs/_mapping", "");
+        assert!(resp.contains("\"msg\":{\"type\":\"text\"}"), "{resp}");
+        assert!(resp.contains("\"level\":{\"type\":\"keyword\"}"), "{resp}");
+        assert!(resp.contains("\"bytes\":{\"type\":\"long\"}"), "{resp}");
+
+        // Unknown index → clean ES-shaped error.
+        let resp = http("POST", "/nope/_count", "{}");
+        assert!(resp.contains("does not exist") || resp.contains("error"), "{resp}");
     }
 
     #[test]

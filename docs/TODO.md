@@ -15,17 +15,14 @@ hardening, and tracked extras.
 
 ## Decisions needed (not code yet)
 
-- [ ] **[fts] Phase 8 checkpoint — ES-compatible REST subset**: `_search`
-  (the shipped query surface as ES JSON), `_bulk`, read-only `_mapping` —
-  enough for existing ES client libraries and log shippers, not Kibana.
-  Weigh maintenance cost vs adoption pull before building (the Prometheus
-  API precedent says worth it; validate demand first).
-- [ ] **[fts] File the tantivy sub-aggregation bug upstream**
-  (quickwit-oss/tantivy): `CachedSubAggs::flush_local` drops small
-  buckets' sub-agg input on periodic flushes — full analysis in
-  FTS_TODO.md phase 6. Posts from the owner's GitHub account, so needs an
-  explicit go-ahead. Lift the grouped-metrics pushdown guard when fixed
-  (restores the one aggregation class ES currently wins, 276 ms → ~2 ms).
+- [x] **[fts] Phase 8 checkpoint** — decided **build**, core shipped
+  2026-07-08 (`_bulk`/`_search`/`_count`/`_mapping`; see FTS_TODO.md
+  phase 8 and SEARCH.md).
+- [x] **[fts] Tantivy sub-aggregation bug filed upstream** —
+  [quickwit-oss/tantivy#2992](https://github.com/quickwit-oss/tantivy/issues/2992).
+- [ ] **[fts] Lift the grouped-metrics pushdown guard** when
+  tantivy#2992 is fixed upstream (restores the one aggregation class ES
+  currently wins, 276 ms → ~2 ms).
 
 ## Operational
 
@@ -36,6 +33,10 @@ hardening, and tracked extras.
 
 ## Full-text search
 
+- [ ] **[fts] ES-REST subset follow-ups**: `bool.should` beside
+  must/filter (needs optional-scoring composition), multi-key sort,
+  `_source` include/exclude lists, GET-by-id (`/{index}/_doc/{id}`),
+  auto-create-on-bulk if shipper demand shows up.
 - [ ] **[fts] Phase 9 — hardening & the honesty pass**: 24 h soak under
   mixed ingest+query; failure injection (disk-full mid-merge, torn index
   dir → rebuild); explain-output audit; final SEARCH.md pass; benchmark

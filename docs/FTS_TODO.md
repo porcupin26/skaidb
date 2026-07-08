@@ -372,8 +372,9 @@ fleet-verified — the TS cadence)
     **Guarded**: grouped requests push down only when every metric is a
     doc count; per-bucket metrics (grouped SUM/AVG/MIN/MAX/COUNT(col)/
     COUNT(DISTINCT)) take the exact row fallback (~276 ms vs 10 ms on the
-    logs track — the one class ES currently wins). TODO: file the issue
-    upstream (quickwit-oss/tantivy) and lift the guard when fixed.
+    logs track — the one class ES currently wins). **Filed upstream as
+    [quickwit-oss/tantivy#2992](https://github.com/quickwit-oss/tantivy/issues/2992)**;
+    lift the guard when fixed.
   - [ ] Sharded per-shard partials (needs per-key ownership filters — e.g.
     a ring-hash fast field — to avoid double-counting replicas).
   - [ ] top_hits (wants a SQL surface — window functions or a dedicated
@@ -416,7 +417,20 @@ fleet-verified — the TS cadence)
   - [x] search_after: **decision — keyset pagination is the surface**
     (`ORDER BY <fast col> LIMIT k` + a residual range predicate); a
     dedicated cursor adds no capability over that in SQL.
-- [ ] **Phase 8 — ES-compatible REST subset (decision checkpoint)**:
+- [x] **Phase 8 — ES-compatible REST subset** (decision: build — the
+  Prometheus-API precedent; core shipped 2026-07-08): `_bulk` (index/
+  create/delete, auto `_id`, per-action status items), `_search` (match/
+  match_phrase/prefix/wildcard/regexp/fuzzy/term/terms/range/exists/bool/
+  query_string/more_like_this; from/size, sort incl. `_score`, `_source`
+  toggle, highlight, exact totals; terms/date_histogram/metric/cardinality
+  aggregations), `_count`, read-only `_mapping`. An ES "index" is a skaidb
+  table (its SEARCH INDEX is the mapping; `_id` ↔ the single-column
+  primary key, written as a string). Everything translates to statement
+  ASTs and runs through the ordinary session path — RBAC, cluster routing,
+  and all pushdowns apply unchanged. Not Kibana; `bool.should` beside
+  must/filter (optional-scoring) unsupported; strict clients checking the
+  `X-elastic-product` header need that check disabled. Original scope
+  note:
   `_search` (query DSL JSON: the §2 ✱ queries + aggs), `_bulk`, `_mapping`
   read-only — enough for existing ES client libraries and log shippers, not
   Kibana. Weigh maintenance cost vs adoption pull before building (the
