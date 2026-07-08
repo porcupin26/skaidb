@@ -187,6 +187,25 @@ impl SearchIndex {
                         "index schema does not match the catalog definition".into(),
                     ));
                 }
+                // A torn-but-openable index (a segment file deleted or
+                // half-written while meta.json survived) opens fine and
+                // then fails every search with a corruption error — catch
+                // it here so the caller wipes and rebuilds instead of
+                // serving errors. Missing or checksum-mismatched files
+                // both land in the rebuild path.
+                match existing.validate_checksum() {
+                    Ok(damaged) if damaged.is_empty() => {}
+                    Ok(damaged) => {
+                        return Err(FtsError::NeedsRebuild(format!(
+                            "index files failed checksum validation: {damaged:?}"
+                        )))
+                    }
+                    Err(e) => {
+                        return Err(FtsError::NeedsRebuild(format!(
+                            "index cannot be validated (torn files?): {e}"
+                        )))
+                    }
+                }
                 existing
             }
             Err(tantivy::TantivyError::IndexAlreadyExists) => unreachable!("open, not create"),

@@ -1729,6 +1729,69 @@ mod tests {
         assert_eq!(ids(rs), vec![1]);
     }
 
+    /// Failure injection: a torn search-index directory (truncated
+    /// meta.json, a deleted segment file, or a wiped directory) must
+    /// rebuild from the table on reopen — never error, never lose hits.
+    #[test]
+    fn search_index_rebuilds_from_torn_dir() {
+        let dir = tempdir();
+        let seed = |db: &mut Database| {
+            db.execute("CREATE TABLE articles (PRIMARY KEY (id))").ok();
+            db.execute(
+                "INSERT INTO articles (id, body) VALUES \
+                 (1, 'quick brown fox'), (2, 'quick delivery'), (3, 'slow snail')",
+            )
+            .ok();
+            db.execute("CREATE SEARCH INDEX articles_fts ON articles (body)")
+                .ok();
+        };
+        let hits = |db: &mut Database| {
+            sorted_ids(rows(
+                db.execute("SELECT id FROM articles WHERE MATCH(body, 'quick')")
+                    .unwrap(),
+            ))
+        };
+        {
+            let mut db = Database::open(&dir).unwrap();
+            seed(&mut db);
+            assert_eq!(hits(&mut db), vec![1, 2]);
+        }
+        let idx_dir = dir.join("fts").join("articles_fts");
+
+        // Injection 1: truncate meta.json (a torn write).
+        let meta = idx_dir.join("meta.json");
+        let content = std::fs::read(&meta).unwrap();
+        std::fs::write(&meta, &content[..content.len() / 2]).unwrap();
+        {
+            let mut db = Database::open(&dir).unwrap();
+            assert_eq!(hits(&mut db), vec![1, 2], "after truncated meta.json");
+        }
+
+        // Injection 2: delete a segment payload file, keep meta.json.
+        let victim = std::fs::read_dir(&idx_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                p.extension().is_some_and(|e| e != "json") && p.is_file()
+            });
+        if let Some(victim) = victim {
+            std::fs::remove_file(victim).unwrap();
+        }
+        {
+            let mut db = Database::open(&dir).unwrap();
+            assert_eq!(hits(&mut db), vec![1, 2], "after deleted segment file");
+        }
+
+        // Injection 3: the whole index directory gone.
+        std::fs::remove_dir_all(&idx_dir).unwrap();
+        {
+            let mut db = Database::open(&dir).unwrap();
+            assert_eq!(hits(&mut db), vec![1, 2], "after wiped index dir");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// MATCH_CROSS: the fields act as one big field — a query whose terms
     /// are spread across columns still matches (term-centric, ES
     /// multi_match cross_fields), where per-field MATCH cannot.
