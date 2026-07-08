@@ -3093,9 +3093,96 @@ impl Database {
     }
 
     /// Repair-path sample merge (accepts any-aged samples; see tsdb docs).
+    /// Also **backfills rollups**: repair-merged samples can land in
+    /// buckets the flush path already aggregated, so every touched bucket
+    /// is recomputed from the source table (authoritative after the merge)
+    /// and rewritten — same series + bucket timestamp, and the newer block
+    /// wins the query-time/compaction dedupe, so the stale partial is
+    /// replaced rather than doubled.
     pub fn ts_merge(&self, table: &str, rows: &[(skaidb_tsdb::Labels, i64, f64)]) -> Result<usize> {
-        self.ts_store(table)?
+        let n = self
+            .ts_store(table)?
             .merge_samples(rows)
+            .map_err(|e| EngineError::Timeseries(e.to_string()))?;
+        if n > 0 {
+            if let Some(def) = self.catalog.timeseries.get(table) {
+                if !def.rollups.is_empty() {
+                    self.ts_rollup_backfill(table, &def.rollups, rows)?;
+                }
+            }
+        }
+        Ok(n)
+    }
+
+    /// Recompute and rewrite every rollup bucket touched by repair-merged
+    /// `rows` (see [`Database::ts_merge`]).
+    fn ts_rollup_backfill(
+        &self,
+        table: &str,
+        rollups: &[crate::catalog::RollupDef],
+        rows: &[(skaidb_tsdb::Labels, i64, f64)],
+    ) -> Result<()> {
+        let source = self.ts_store(table)?;
+        for rollup in rollups {
+            let Some(store) = self.timeseries.get(&rollup.name) else {
+                continue;
+            };
+            // The touched buckets, per source series.
+            let mut per: BTreeMap<&skaidb_tsdb::Labels, std::collections::BTreeSet<i64>> =
+                BTreeMap::new();
+            for (labels, ts, _) in rows {
+                per.entry(labels)
+                    .or_default()
+                    .insert(ts.div_euclid(rollup.bucket_ms) * rollup.bucket_ms);
+            }
+            let mut recomputed = Vec::new();
+            for (labels, buckets) in per {
+                let matchers: Vec<skaidb_tsdb::Matcher> = labels
+                    .iter()
+                    .map(|(k, v)| skaidb_tsdb::Matcher::Eq(k.clone(), v.clone()))
+                    .collect();
+                for bucket in buckets {
+                    let series = source
+                        .query(&matchers, bucket, bucket + rollup.bucket_ms - 1)
+                        .map_err(|e| EngineError::Timeseries(e.to_string()))?;
+                    for (slabels, samples) in &series {
+                        // Eq matchers admit series with extra labels; the
+                        // rollup row belongs to this exact label set only.
+                        if slabels == labels {
+                            recomputed.extend(rollup_partial_rows(
+                                slabels,
+                                samples,
+                                rollup.bucket_ms,
+                            ));
+                        }
+                    }
+                }
+            }
+            if !recomputed.is_empty() {
+                // The stale partials may still sit in the rollup's head,
+                // which outranks any block in the later-wins dedupe. Flush
+                // it first so the recomputed rows land in the newest block
+                // and win.
+                store
+                    .flush()
+                    .map_err(|e| EngineError::Timeseries(e.to_string()))?;
+                store
+                    .merge_samples(&recomputed)
+                    .map_err(|e| EngineError::Timeseries(e.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop whole series from a time-series table (the post-resharding
+    /// reclaim unit; see the tsdb's `drop_series`).
+    pub fn ts_drop_series(
+        &self,
+        table: &str,
+        targets: &std::collections::HashSet<skaidb_tsdb::Labels>,
+    ) -> Result<usize> {
+        self.ts_store(table)?
+            .drop_series(targets)
             .map_err(|e| EngineError::Timeseries(e.to_string()))
     }
 
@@ -3187,12 +3274,25 @@ impl Database {
             }
             None => None,
         };
-        let rollups = def
+        let rollups: Vec<(String, i64)> = def
             .rollups
             .iter()
             .map(|r| (r.name.clone(), r.bucket_ms))
             .collect();
-        Ok((horizon, rollups))
+        // Opportunistic boundary: rollups are complete strictly below the
+        // head's oldest sample (everything else went through flush-path or
+        // repair-path rollup maintenance). An empty head means complete
+        // through the newest sample.
+        let complete_below = if rollups.is_empty() {
+            None
+        } else {
+            let store = self.ts_store(table)?;
+            store.head_min_ts().or_else(|| {
+                let m = store.max_ts_all();
+                (m != i64::MIN).then(|| m + 1)
+            })
+        };
+        Ok((horizon, complete_below, rollups))
     }
 
     /// Per-series per-bucket partial aggregates (see [`Cluster::ts_partials`]);
@@ -3721,8 +3821,15 @@ impl Database {
 /// Read methods take `&self` so a `SELECT` can execute with shared access to
 /// the underlying storage (concurrent readers); only the write methods need
 /// `&mut self`.
-/// Rollup routing metadata: `(retention horizon, [(rollup name, bucket_ms)])`.
-pub type TsRollupInfo = (Option<i64>, Vec<(String, i64)>);
+/// Rollup routing metadata:
+/// `(retention horizon, rollup-complete-below, [(rollup name, bucket_ms)])`.
+/// Below the **retention horizon** raw blocks may already be dropped, so
+/// group buckets *must* come from a rollup. Below **rollup-complete-below**
+/// (the head's oldest timestamp) every sample has been through rollup
+/// maintenance (flush path or repair backfill), so buckets *may* come from
+/// a rollup opportunistically — same numbers, less raw-sample IO. `None`
+/// disables the respective routing.
+pub type TsRollupInfo = (Option<i64>, Option<i64>, Vec<(String, i64)>);
 
 pub trait Cluster {
     /// Primary-key columns of `table`.
@@ -3867,7 +3974,7 @@ pub trait Cluster {
     /// `(name, bucket_ms)`. Lets the executor serve aged buckets from a
     /// rollup. The default reports no retention and no rollups.
     fn ts_rollup_info(&self, _table: &str) -> Result<TsRollupInfo> {
-        Ok((None, Vec::new()))
+        Ok((None, None, Vec::new()))
     }
     /// Per-series per-bucket partial aggregates for series matching every
     /// matcher in `[t0, t1]` (`bucket_ms <= 0` = one whole-range bucket).
@@ -5537,59 +5644,81 @@ fn rollup_rows(
 ) -> Result<Vec<(skaidb_tsdb::Labels, i64, f64)>> {
     let mut out = Vec::new();
     for (labels, chunks) in flushed {
-        let field = labels
-            .iter()
-            .find(|(k, _)| k == "__field__")
-            .map(|(_, v)| v.clone())
-            .unwrap_or_else(|| "value".into());
-        let base: skaidb_tsdb::Labels = labels
-            .iter()
-            .filter(|(k, _)| k != "__field__")
-            .cloned()
-            .collect();
-        // (count, sum, min, max, first_ts, first, last_ts, last) per bucket.
-        // (count, sum, min, max, first_ts, first, last_ts, last)
-        type Acc = (u64, f64, f64, f64, i64, f64, i64, f64);
-        let mut buckets: BTreeMap<i64, Acc> = BTreeMap::new();
+        let mut samples = Vec::new();
         for chunk in chunks {
-            for s in skaidb_tsdb::decode_chunk(&chunk.data)
-                .map_err(|e| EngineError::Timeseries(e.to_string()))?
-            {
-                let b = s.ts.div_euclid(bucket_ms) * bucket_ms;
-                let e = buckets
-                    .entry(b)
-                    .or_insert((0, 0.0, f64::INFINITY, f64::NEG_INFINITY, s.ts, s.value, s.ts, s.value));
-                e.0 += 1;
-                e.1 += s.value;
-                e.2 = e.2.min(s.value);
-                e.3 = e.3.max(s.value);
-                if s.ts < e.4 {
-                    e.4 = s.ts;
-                    e.5 = s.value;
-                }
-                if s.ts >= e.6 {
-                    e.6 = s.ts;
-                    e.7 = s.value;
-                }
-            }
+            samples.extend(
+                skaidb_tsdb::decode_chunk(&chunk.data)
+                    .map_err(|e| EngineError::Timeseries(e.to_string()))?,
+            );
         }
-        for (bucket, (count, sum, min, max, _, first, _, last)) in buckets {
-            for (suffix, value) in [
-                ("count", count as f64),
-                ("sum", sum),
-                ("min", min),
-                ("max", max),
-                ("first", first),
-                ("last", last),
-            ] {
-                let mut l = base.clone();
-                l.push(("__field__".to_string(), format!("{field}_{suffix}")));
-                l.sort();
-                out.push((l, bucket, value));
-            }
-        }
+        out.extend(rollup_partial_rows(labels, &samples, bucket_ms));
     }
     Ok(out)
+}
+
+/// One series' per-bucket rollup partial rows
+/// (`<field>_{count,sum,min,max,first,last}`) from its samples. Shared by
+/// the flush path ([`rollup_rows`]) and repair backfill.
+fn rollup_partial_rows(
+    labels: &skaidb_tsdb::Labels,
+    samples: &[skaidb_tsdb::Sample],
+    bucket_ms: i64,
+) -> Vec<(skaidb_tsdb::Labels, i64, f64)> {
+    let field = labels
+        .iter()
+        .find(|(k, _)| k == "__field__")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| "value".into());
+    let base: skaidb_tsdb::Labels = labels
+        .iter()
+        .filter(|(k, _)| k != "__field__")
+        .cloned()
+        .collect();
+    // (count, sum, min, max, first_ts, first, last_ts, last) per bucket.
+    type Acc = (u64, f64, f64, f64, i64, f64, i64, f64);
+    let mut buckets: BTreeMap<i64, Acc> = BTreeMap::new();
+    for s in samples {
+        let b = s.ts.div_euclid(bucket_ms) * bucket_ms;
+        let e = buckets.entry(b).or_insert((
+            0,
+            0.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            s.ts,
+            s.value,
+            s.ts,
+            s.value,
+        ));
+        e.0 += 1;
+        e.1 += s.value;
+        e.2 = e.2.min(s.value);
+        e.3 = e.3.max(s.value);
+        if s.ts < e.4 {
+            e.4 = s.ts;
+            e.5 = s.value;
+        }
+        if s.ts >= e.6 {
+            e.6 = s.ts;
+            e.7 = s.value;
+        }
+    }
+    let mut out = Vec::new();
+    for (bucket, (count, sum, min, max, _, first, _, last)) in buckets {
+        for (suffix, value) in [
+            ("count", count as f64),
+            ("sum", sum),
+            ("min", min),
+            ("max", max),
+            ("first", first),
+            ("last", last),
+        ] {
+            let mut l = base.clone();
+            l.push(("__field__".to_string(), format!("{field}_{suffix}")));
+            l.sort();
+            out.push((l, bucket, value));
+        }
+    }
+    out
 }
 
 /// Render the idempotent CREATE DDL for a time-series table definition

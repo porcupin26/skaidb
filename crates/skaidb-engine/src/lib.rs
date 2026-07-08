@@ -306,6 +306,153 @@ mod tests {
         );
     }
 
+    /// With rollup backfill keeping rollups exact, whole group buckets
+    /// below the head boundary serve from the rollup even **inside**
+    /// retention (less raw IO, same numbers). Proven with a phantom bucket
+    /// written only to the rollup: it can only appear in the output if the
+    /// rollup answered.
+    #[test]
+    fn timeseries_rollup_serves_in_retention_windows_opportunistically() {
+        let mut db = Database::open(tempdir()).unwrap();
+        // No RETENTION: the old (required-only) router would never engage.
+        db.execute("CREATE TIMESERIES TABLE cpu (SERIES KEY (host))")
+            .unwrap();
+        db.execute("CREATE ROLLUP cpu_5m ON cpu BUCKET 5m RETENTION 90d")
+            .unwrap();
+        let (m, h) = (60_000i64, 3_600_000i64);
+        for i in 0..5i64 {
+            db.execute(&format!(
+                "INSERT INTO cpu (host, ts, value) VALUES ('a', {}, {})",
+                i * m,
+                i
+            ))
+            .unwrap();
+        }
+        // Flush bucket 0 into the rollup; the 4h sample stays in the head.
+        db.execute(&format!(
+            "INSERT INTO cpu (host, ts, value) VALUES ('a', {}, 100)",
+            4 * h
+        ))
+        .unwrap();
+        // Phantom rollup-only bucket at 10m (count 2, sum 42).
+        let mut phantom = Vec::new();
+        for (suffix, v) in [
+            ("count", 2.0),
+            ("sum", 42.0),
+            ("min", 21.0),
+            ("max", 21.0),
+            ("first", 21.0),
+            ("last", 21.0),
+        ] {
+            let mut labels: skaidb_tsdb::Labels = vec![
+                ("__field__".to_string(), format!("value_{suffix}")),
+                ("host".to_string(), "a".to_string()),
+            ];
+            labels.sort();
+            phantom.push((labels, 600_000i64, v));
+        }
+        db.ts_merge("cpu_5m", &phantom).unwrap();
+
+        // A window fully below the head boundary: the phantom bucket shows
+        // up — the rollup served it.
+        let rs = rows(
+            db.execute(
+                "SELECT time_bucket(5m, ts) AS t, count(value), sum(value) FROM cpu \
+                 WHERE ts < 900000 GROUP BY t ORDER BY t",
+            )
+            .unwrap(),
+        );
+        // Rollup-served bucket keys are Timestamps (the documented typing
+        // nuance of the rollup path).
+        assert_eq!(
+            rs.rows,
+            vec![
+                vec![Value::Timestamp(0), Value::Int(5), Value::Float(10.0)],
+                vec![Value::Timestamp(600_000), Value::Int(2), Value::Float(42.0)],
+            ]
+        );
+
+        // A whole-table window stitches: rollup below the boundary (phantom
+        // included), raw head above it.
+        let rs = rows(
+            db.execute(
+                "SELECT time_bucket(5m, ts) AS t, count(value), sum(value) FROM cpu \
+                 GROUP BY t ORDER BY t",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            rs.rows,
+            vec![
+                vec![Value::Timestamp(0), Value::Int(5), Value::Float(10.0)],
+                vec![Value::Timestamp(600_000), Value::Int(2), Value::Float(42.0)],
+                vec![Value::Timestamp(4 * h), Value::Int(1), Value::Float(100.0)],
+            ]
+        );
+    }
+
+    /// Repair-merged samples landing in already-aggregated buckets must
+    /// retroactively update the rollup: the touched bucket is recomputed
+    /// from the source and the newer rows win the dedupe.
+    #[test]
+    fn timeseries_rollup_backfill_on_repair_merge() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TIMESERIES TABLE cpu (SERIES KEY (host), RETENTION 30d)")
+            .unwrap();
+        db.execute("CREATE ROLLUP cpu_5m ON cpu BUCKET 5m RETENTION 90d")
+            .unwrap();
+        let (m, h) = (60_000i64, 3_600_000i64);
+        // Five samples in bucket 0 (0..5m): count 5, sum 0+1+2+3+4 = 10.
+        for i in 0..5i64 {
+            db.execute(&format!(
+                "INSERT INTO cpu (host, ts, value) VALUES ('a', {}, {})",
+                i * m,
+                i
+            ))
+            .unwrap();
+        }
+        // A far-future append flushes the first window → rollup maintained.
+        db.execute(&format!(
+            "INSERT INTO cpu (host, ts, value) VALUES ('a', {}, 100)",
+            4 * h
+        ))
+        .unwrap();
+        let field = |series: &[(skaidb_tsdb::Labels, Vec<skaidb_tsdb::Sample>)], name: &str| {
+            series
+                .iter()
+                .find(|(labels, _)| {
+                    labels.iter().any(|(k, v)| k == "__field__" && v == name)
+                })
+                .and_then(|(_, samples)| samples.first())
+                .map(|s| s.value)
+        };
+        let series = db.ts_query("cpu_5m", &[], 0, 0).unwrap();
+        assert_eq!(field(&series, "value_sum"), Some(10.0));
+        assert_eq!(field(&series, "value_count"), Some(5.0));
+
+        // Repair-merge two gap-filled samples into the aggregated bucket.
+        let labels = db.ts_series_labels("cpu").unwrap().remove(0);
+        db.ts_merge(
+            "cpu",
+            &[
+                (labels.clone(), 10_000, 100.0),
+                (labels, 20_000, 50.0),
+            ],
+        )
+        .unwrap();
+
+        // Sanity: the source sees all 7 samples in the bucket.
+        let src = db.ts_query("cpu", &[], 0, 299_999).unwrap();
+        let total: usize = src.iter().map(|(_, ss)| ss.len()).sum();
+        assert_eq!(total, 7, "source bucket samples: {src:?}");
+
+        // The bucket was recomputed: count 7, sum 160, max 100.
+        let series = db.ts_query("cpu_5m", &[], 0, 0).unwrap();
+        assert_eq!(field(&series, "value_sum"), Some(160.0));
+        assert_eq!(field(&series, "value_count"), Some(7.0));
+        assert_eq!(field(&series, "value_max"), Some(100.0));
+    }
+
     /// Aggregates over windows the source's RETENTION has already dropped
     /// are served from a satisfying rollup: raw samples are gone, but
     /// bucketed count/sum/min/max/first/last still answer, and windows

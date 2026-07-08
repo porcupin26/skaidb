@@ -103,8 +103,13 @@ stored as its own compressed stream. Full grammar and semantics:
   bucket divides the group's `time_bucket` step, stitched seamlessly with
   exact source partials for the within-retention part of the window.
   Covers `count/sum/avg/min/max/first/last`; `rate`-family aggregates need
-  raw samples and never read rollups. Within retention, queries always use
-  source data (exact even where rollups lag repair backfill).
+  raw samples and never read rollups. **Within retention** (single-node):
+  group buckets wholly below the head's oldest sample also serve from the
+  rollup — the backfill above keeps them exact, so this is the same
+  numbers with less raw IO; the bucket straddling the head boundary stays
+  on the source. Clustered deployments keep retention-only routing (a
+  peer's head may lag; extending needs a min-over-replicas boundary
+  exchange, tracked in TODO.md).
 - **Partial-aggregate pushdown** (v0.31.0): an aggregation whose `WHERE`
   is fully served by the pushdown (a `ts` range plus label `=`/`!=`),
   grouping by labels and/or one `time_bucket`, ships **per-series
@@ -153,9 +158,7 @@ All tracked, with more detail, in [`TODO.md`](TODO.md).
 |---|---|---|
 | PromQL partial gather | `/api/v1/query_range` still ships raw samples; the SQL surface uses the v0.31.0 partial pushdown | open |
 | Self-scrape (`/metrics` → TS table) | remote_write covers external scrapers | later |
-| TS reclaim | after a reshard, former owners keep stale series copies (harmless under union-merge; no `reclaim` pass for TS yet) | with TS anti-entropy |
-| Rollup backfill/repair | rollups aggregate at flush; repair-merged (gap-filled) samples don't retroactively update them | open |
-| In-retention rollup serving | the rewrite reads rollups only beyond the retention horizon; serving big live windows from rollups awaits backfill | after backfill |
+| In-retention rollup serving, clustered | single-node ships; clustered needs a min-over-replicas head-boundary exchange | with sharded partials |
 | PromQL: regex matchers, offset, arithmetic, histogram_quantile | the shipped subset covers selectors, rate/increase/delta, and sum/avg/min/max/count by/without | phase 7 follow-up |
 | Label postings index | matchers scan the per-block series list (fine at moderate cardinality) | with pushdown work |
 | Regex label matchers | only `=` / `!=` push down | with postings |

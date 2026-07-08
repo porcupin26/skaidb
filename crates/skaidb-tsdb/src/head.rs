@@ -56,6 +56,26 @@ impl Head {
         self.live
     }
 
+    /// The oldest timestamp currently held in the head (sealed chunks, the
+    /// open builders, and OOO buffers), or `None` when the head is empty.
+    /// Everything strictly below it is in immutable blocks — the boundary
+    /// below which rollups are complete.
+    pub fn min_ts(&self) -> Option<i64> {
+        let mut min = i64::MAX;
+        for entry in self.entries.iter().flatten() {
+            for c in &entry.sealed {
+                min = min.min(c.min_ts);
+            }
+            if let Some((_, builder)) = &entry.open {
+                min = min.min(builder.first_ts());
+            }
+            if let Some(s) = entry.ooo.first() {
+                min = min.min(s.ts);
+            }
+        }
+        (min != i64::MAX).then_some(min)
+    }
+
     /// Look up or create the series id for `labels`.
     pub fn get_or_create(
         &mut self,

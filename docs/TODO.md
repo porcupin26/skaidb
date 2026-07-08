@@ -49,16 +49,25 @@ extras below.
 
 ## Time-series
 
-- [ ] **[ts] Rollup backfill** — repair-merged (gap-filled) samples don't
-  retroactively update rollups (flush-path maintenance only).
-- [ ] **[ts] Opportunistic rollup serving within retention** — the
-  v0.32.0 rewrite reads rollups only beyond the retention horizon;
-  serving big in-retention windows from rollups would cut IO but can
-  silently miss repair-backfilled samples until rollup backfill lands.
-  Revisit (opt-in hint or automatic) after backfill.
-- [ ] **[ts] TS reclaim** — after a reshard, former owners keep stale
-  series copies (harmless under union-merge reads); add a reclaim pass
-  like row tables.
+- [x] **[ts] Rollup backfill** — shipped: any write path (flush **or**
+  repair merge) now recomputes every touched rollup bucket from the
+  authoritative store and rewrites it (rollup head flushed first so the
+  newer block wins the dedupe) — rollups stay exact under gap-filling
+  repairs and out-of-order flushes.
+- [x] **[ts] Opportunistic rollup serving within retention** — shipped
+  (automatic, single-node): with backfill keeping rollups exact, group
+  buckets wholly below the head's oldest sample serve from the rollup —
+  same numbers, less raw IO; the straddling bucket rounds **down** to
+  stay on the source (the retention tier keeps rounding up). Clustered
+  deployments keep retention-only routing until a min-over-replicas
+  boundary exchange exists (the sharded-partials work below).
+- [x] **[ts] TS reclaim** — shipped: `reclaim` now also drops whole
+  unowned series (head flushed so the WAL can't resurrect them; blocks
+  rewritten without the series) once a current owner confirms an
+  **identical** copy (count + checksum); a diverged owner gets the copy
+  pushed instead and the next pass reclaims. Rollup series co-place with
+  their source (placement ignores `__field__`), so they reclaim by the
+  same rule.
 - [ ] **[ts] Label postings index + regex matchers** — matchers scan the
   per-block series list (fine at moderate cardinality); postings unlock
   regex and high-cardinality matching.

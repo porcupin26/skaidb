@@ -446,6 +446,76 @@ impl Tsdb {
         self.inner.lock().expect("tsdb lock").head.max_ts
     }
 
+    /// Remove whole series (a post-resharding reclaim): flush the head so
+    /// the WAL cannot resurrect them, then rewrite every block that holds a
+    /// target series without it. Returns how many of `targets` were
+    /// actually present. Rare admin-path operation — the block rewrites are
+    /// deliberate, not incremental.
+    pub fn drop_series(
+        &self,
+        targets: &std::collections::HashSet<Labels>,
+    ) -> Result<usize> {
+        if targets.is_empty() {
+            return Ok(0);
+        }
+        self.flush()?;
+        let mut inner = self.inner.lock().expect("tsdb lock");
+        let blocks_dir = self.dir.join("blocks");
+        let mut found: std::collections::HashSet<&Labels> = std::collections::HashSet::new();
+        let mut rebuilt = Vec::with_capacity(inner.blocks.len());
+        type KeptSeries = Vec<(Labels, Vec<crate::head::SealedChunk>)>;
+        let mut pending: Vec<(std::path::PathBuf, KeptSeries)> = Vec::new();
+        for block in inner.blocks.drain(..) {
+            let hit = block.series_labels().iter().any(|l| targets.contains(l));
+            if !hit {
+                rebuilt.push(block);
+                continue;
+            }
+            let mut kept = Vec::new();
+            for (labels, chunks) in block.raw_series()? {
+                if let Some(t) = targets.get(&labels) {
+                    found.insert(t);
+                } else {
+                    kept.push((labels, chunks));
+                }
+            }
+            pending.push((block.dir.clone(), kept));
+        }
+        for (old_dir, kept) in pending {
+            if !kept.is_empty() {
+                let seq = inner.next_block_seq;
+                inner.next_block_seq += 1;
+                let dir = write_block(&blocks_dir, seq, 0, kept)?;
+                rebuilt.push(Block::open(&dir)?);
+            }
+            let _ = std::fs::remove_dir_all(&old_dir);
+        }
+        rebuilt.sort_by_key(|b| (b.meta.min_ts, b.meta.seq));
+        inner.blocks = rebuilt;
+        Ok(found.len())
+    }
+
+    /// The newest timestamp anywhere in the store (head **and** blocks —
+    /// merged blocks can outrun the head), `i64::MIN` when empty.
+    pub fn max_ts_all(&self) -> i64 {
+        let inner = self.inner.lock().expect("tsdb lock");
+        let blocks_max = inner
+            .blocks
+            .iter()
+            .map(|b| b.meta.max_ts)
+            .max()
+            .unwrap_or(i64::MIN);
+        inner.head.max_ts.max(blocks_max)
+    }
+
+    /// The oldest timestamp still in the head, or `None` when everything
+    /// is flushed. Rollups are complete strictly below this boundary (any
+    /// non-head sample has been through flush-path or repair-path rollup
+    /// maintenance).
+    pub fn head_min_ts(&self) -> Option<i64> {
+        self.inner.lock().expect("tsdb lock").head.min_ts()
+    }
+
     /// Everything below this boundary is durable in immutable blocks
     /// (`i64::MIN` before the first flush). Data above it lives in the head
     /// and is never touched by retention; data below it is what rollups have

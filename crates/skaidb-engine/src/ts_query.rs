@@ -696,29 +696,47 @@ fn run_partials(
     project(&rewritten, docs, &hide, true).map(Some)
 }
 
-/// Decide whether (and how) the aged part of `[t0, ..]` routes to a rollup:
-/// the table must have a retention horizon the window reaches past, and a
-/// rollup whose bucket divides the group step (any rollup for whole-range
-/// groups). Returns `(rollup table, its bucket, split)` — group buckets
-/// starting at/after `split` stay on the source.
+/// Decide whether (and how) part of `[t0, ..]` routes to a rollup, and
+/// where the source takes over. Two tiers, both requiring a rollup whose
+/// bucket divides the group step (any rollup for whole-range groups):
+///
+/// - **Required** (below the retention horizon): raw blocks may already be
+///   dropped — rounded **up** to the group step so the straddling bucket
+///   comes wholly from the rollup (everything below the true horizon was
+///   flushed, so its rollup buckets are complete).
+/// - **Opportunistic** (below the rollup-complete boundary, i.e. the head's
+///   oldest sample): the raw data still exists, but the rollup answers with
+///   the same numbers and less IO — rounded **down** so the straddling
+///   bucket (which may have head samples the rollup hasn't seen) stays on
+///   the source.
+///
+/// Returns `(rollup table, its bucket, split)` — group buckets starting
+/// at/after `split` stay on the source.
 fn rollup_route(
     table: &str,
     plan: &PartialsPlan,
     t0: i64,
     cluster: &dyn Cluster,
 ) -> Result<Option<(String, i64, i64)>> {
-    let (horizon, rollups) = cluster.ts_rollup_info(table)?;
-    let Some(h) = horizon else { return Ok(None) };
-    if t0 >= h {
-        return Ok(None); // the source is complete for the whole window
-    }
+    let (horizon, complete_below, rollups) = cluster.ts_rollup_info(table)?;
     let s = plan.bucket_ms;
     let best = rollups
         .into_iter()
         .filter(|(_, b)| *b > 0 && (s == 0 || s % *b == 0))
         .max_by_key(|(_, b)| *b);
     let Some((name, b)) = best else { return Ok(None) };
-    let split = round_up(h, if s > 0 { s } else { b });
+    let step = if s > 0 { s } else { b };
+    let required = horizon.map(|h| round_up(h, step));
+    let opportunistic = complete_below.map(|c| round_down(c, step));
+    let split = match (required, opportunistic) {
+        (Some(r), Some(o)) => r.max(o),
+        (Some(r), None) => r,
+        (None, Some(o)) => o,
+        (None, None) => return Ok(None),
+    };
+    if t0 >= split {
+        return Ok(None); // nothing the rollup should serve
+    }
     Ok(Some((name, b, split)))
 }
 

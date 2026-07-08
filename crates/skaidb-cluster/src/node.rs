@@ -1747,6 +1747,88 @@ impl Node {
                 .retain_rows(&table, |k| !confirmed.contains(k))?;
             total += dropped;
         }
+        // Time-series tables reclaim by whole series (their migration unit).
+        total += self.ts_reclaim()?;
+        Ok(total)
+    }
+
+    /// Time-series reclaim: drop whole series this node no longer owns,
+    /// but only once a current owner provably holds an **identical** copy
+    /// (same sample count and checksum). A diverged owner gets our copy
+    /// pushed instead — the next reclaim pass (post-convergence) drops it.
+    /// Rollup tables reclaim by the same rule: a rollup series carries its
+    /// source's labels (placement ignores `__field__`), so it is owned by
+    /// the same replica set.
+    fn ts_reclaim(&self) -> EngineResult<usize> {
+        let tables = self
+            .local
+            .read()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .ts_table_names();
+        let mut total = 0usize;
+        for table in tables {
+            let mine: Vec<(skaidb_tsdb::Labels, u64, u64)> = self
+                .local
+                .read()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+                .ts_summaries(&table)?;
+            // Unowned series, grouped so each owner is asked once per table.
+            let unowned: Vec<&(skaidb_tsdb::Labels, u64, u64)> = mine
+                .iter()
+                .filter(|(labels, _, _)| {
+                    !self.replicas_for(&ts_placement_key(labels)).contains(&self.id)
+                })
+                .collect();
+            if unowned.is_empty() {
+                continue;
+            }
+            type OwnerSummary = Option<HashMap<skaidb_tsdb::Labels, (u64, u64)>>;
+            let mut owner_summaries: HashMap<NodeId, OwnerSummary> = HashMap::new();
+            let mut confirmed: std::collections::HashSet<skaidb_tsdb::Labels> =
+                std::collections::HashSet::new();
+            for (labels, count, checksum) in unowned {
+                let owners = self.replicas_for(&ts_placement_key(labels));
+                let mut held = false;
+                for owner in &owners {
+                    let summary = owner_summaries.entry(owner.clone()).or_insert_with(|| {
+                        let addr = self.peer_addr(owner)?;
+                        match self
+                            .pool
+                            .call(&addr, &Request::TsSummary { table: table.clone() })
+                        {
+                            Ok(Response::TsSummaries { series }) => Some(
+                                series
+                                    .into_iter()
+                                    .map(|(l, c, x)| (l, (c, x)))
+                                    .collect(),
+                            ),
+                            _ => None,
+                        }
+                    });
+                    if let Some(theirs) = summary {
+                        if theirs.get(labels) == Some(&(*count, *checksum)) {
+                            held = true;
+                            break;
+                        }
+                    }
+                }
+                if held {
+                    confirmed.insert(labels.clone());
+                } else if let Some(owner) = owners.first() {
+                    // Converge first, reclaim on a later pass.
+                    if let Some(addr) = self.peer_addr(owner) {
+                        let _ = self.ts_push_series_merge(&addr, &table, labels);
+                    }
+                }
+            }
+            if !confirmed.is_empty() {
+                total += self
+                    .local
+                    .write()
+                    .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+                    .ts_drop_series(&table, &confirmed)?;
+            }
+        }
         Ok(total)
     }
 
@@ -4354,11 +4436,19 @@ impl Cluster for Coordinator {
         // Rollup registrations replicate with the schema, and the local data
         // frontier is a sound horizon: it can only lag the cluster's, which
         // only widens the exactly-served source range.
-        self.node
+        let (horizon, complete_below, rollups) = self
+            .node
             .local
             .read()
             .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
-            .ts_rollup_info(table)
+            .ts_rollup_info(table)?;
+        // The opportunistic boundary is a *local* head watermark; a peer's
+        // head may still hold older samples its rollup hasn't seen, so on a
+        // multi-member cluster only the retention tier routes to rollups.
+        // Extending this needs a min-over-replicas boundary exchange (the
+        // sharded-partials work in docs/TODO.md).
+        let complete_below = (self.node.member_count() <= 1).then_some(complete_below).flatten();
+        Ok((horizon, complete_below, rollups))
     }
 
     fn vector_search(
@@ -6557,6 +6647,77 @@ mod tests {
         }
 
         // Idempotent: a second pass drops nothing (everyone owns what they hold).
+        assert_eq!(
+            na.reclaim().unwrap() + nb.reclaim().unwrap() + nc.reclaim().unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn ts_reclaim_drops_unowned_series_after_join() {
+        // The TS twin of reclaim_drops_unowned_keys_after_join: rf=1, series
+        // move to a joining node; former owners drop whole series only after
+        // the new owner confirms an identical copy; nothing is lost.
+        let one = Consistency::One;
+        let rf1 = |id: &str, addr: &str, members: &[(NodeId, String)]| NodeConfig {
+            id: NodeId::new(id),
+            internode_addr: addr.to_string(),
+            members: members.to_vec(),
+            replication_factor: 1,
+            vnodes_per_node: 64,
+            read_consistency: one,
+            write_consistency: one,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
+            anti_entropy_interval_secs: 0,
+        };
+
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let ab = vec![member("a", &a), member("b", &b)];
+        let abc = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let na = Node::new(Database::open(temp_dir("tsrca")).unwrap(), rf1("a", &a, &ab));
+        let nb = Node::new(Database::open(temp_dir("tsrcb")).unwrap(), rf1("b", &b, &ab));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+
+        na.execute("CREATE TIMESERIES TABLE cpu (SERIES KEY (host))")
+            .unwrap();
+        let n = 40;
+        for i in 1..=n {
+            for t in 0..3i64 {
+                na.execute(&format!(
+                    "INSERT INTO cpu (host, ts, value) VALUES ('h{i}', {}, {})",
+                    t * 60_000,
+                    i * 10 + t
+                ))
+                .unwrap();
+            }
+        }
+
+        let nc = Node::new(Database::open(temp_dir("tsrcc")).unwrap(), rf1("c", &c, &abc));
+        nc.serve_internode().unwrap();
+        na.add_member("c", &c).unwrap();
+
+        // Former owners reclaim series that moved onto c.
+        let dropped = na.reclaim().unwrap() + nb.reclaim().unwrap() + nc.reclaim().unwrap();
+        assert!(dropped > 0, "some series moved to c and were reclaimed");
+
+        // No data lost — every series still fully readable from every node.
+        for coord in [&na, &nb, &nc] {
+            for i in 1..=n {
+                let rs = rows(
+                    coord
+                        .execute(&format!(
+                            "SELECT value FROM cpu WHERE host = 'h{i}' ORDER BY ts"
+                        ))
+                        .unwrap(),
+                );
+                assert_eq!(rs.rows.len(), 3, "host h{i} after ts reclaim");
+                assert_eq!(rs.rows[0], vec![Value::Float((i * 10) as f64)]);
+            }
+        }
+
+        // Idempotent.
         assert_eq!(
             na.reclaim().unwrap() + nb.reclaim().unwrap() + nc.reclaim().unwrap(),
             0
