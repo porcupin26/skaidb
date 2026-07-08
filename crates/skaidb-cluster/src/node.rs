@@ -852,6 +852,20 @@ impl Node {
         self.local.read().ok()?.auth_user(name)
     }
 
+    /// Cluster-wide per-bucket partials at the configured read
+    /// consistency — the PromQL `query_range` fast path (per-bucket
+    /// partials ship instead of raw samples).
+    pub fn ts_partials_replicated(
+        &self,
+        table: &str,
+        matchers: &[skaidb_tsdb::Matcher],
+        t0: i64,
+        t1: i64,
+        bucket_ms: i64,
+    ) -> EngineResult<Vec<(skaidb_tsdb::Labels, Vec<skaidb_engine::TsPartial>)>> {
+        self.ts_partials_scatter(table, matchers, t0, t1, bucket_ms, None)
+    }
+
     /// Cluster-wide time-series query at the configured read consistency
     /// (union-merged across members) — the PromQL/HTTP query path.
     pub fn ts_query_replicated(
@@ -1171,7 +1185,7 @@ impl Node {
     /// quorum writes, handoff and repair, so the fullest view is the series'
     /// answer — raw-sample queries keep the union-merge). Requires the
     /// read-consistency number of responders.
-    fn ts_partials_scatter(
+    pub(crate) fn ts_partials_scatter(
         &self,
         table: &str,
         matchers: &[skaidb_tsdb::Matcher],

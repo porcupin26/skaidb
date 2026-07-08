@@ -202,6 +202,29 @@ impl Backend {
         }
     }
 
+    /// Per-series per-bucket partial aggregates over a time-series table —
+    /// the PromQL `query_range` fast path. On a cluster, partials ship from
+    /// each member instead of raw samples (the v0.31.0 pushdown).
+    pub fn ts_partials(
+        &self,
+        table: &str,
+        matchers: &[skaidb_tsdb::Matcher],
+        t0: i64,
+        t1: i64,
+        bucket_ms: i64,
+    ) -> Result<Vec<(skaidb_tsdb::Labels, Vec<skaidb_engine::TsPartial>)>, skaidb_engine::EngineError>
+    {
+        match self {
+            Backend::Local(db) => db
+                .read()
+                .map_err(|_| skaidb_engine::EngineError::Cluster("lock poisoned".into()))?
+                .ts_partials(table, matchers, t0, t1, bucket_ms),
+            Backend::Cluster(node) => {
+                node.ts_partials_replicated(table, matchers, t0, t1, bucket_ms)
+            }
+        }
+    }
+
     /// Append time-series samples (remote_write ingest): local store or
     /// replicated via the cluster coordinator.
     pub fn ts_append(

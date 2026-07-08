@@ -639,38 +639,7 @@ fn eval_steps(expr: &PExpr, fetched: &[Fetched], steps: &[i64]) -> Result<Vec<St
                     let StepVal::Vector(vector) = val else {
                         return Vec::new();
                     };
-                    let mut groups: BTreeMap<Labels, Vec<f64>> = BTreeMap::new();
-                    for (labels, value) in vector {
-                        let key: Labels = match (by, without) {
-                            (Some(by), _) => labels
-                                .iter()
-                                .filter(|(k, _)| by.contains(k))
-                                .cloned()
-                                .collect(),
-                            (None, Some(wo)) => labels
-                                .iter()
-                                .filter(|(k, _)| !wo.contains(k))
-                                .cloned()
-                                .collect(),
-                            (None, None) => Vec::new(),
-                        };
-                        groups.entry(key).or_default().push(value);
-                    }
-                    groups
-                        .into_iter()
-                        .map(|(labels, values)| {
-                            let value = match op {
-                                AggOp::Sum => values.iter().sum(),
-                                AggOp::Avg => values.iter().sum::<f64>() / values.len() as f64,
-                                AggOp::Min => values.iter().cloned().fold(f64::INFINITY, f64::min),
-                                AggOp::Max => {
-                                    values.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
-                                }
-                                AggOp::Count => values.len() as f64,
-                            };
-                            (labels, value)
-                        })
-                        .collect::<Vector>()
+                    fold_agg(*op, by, without, vector)
                 })
                 .map(StepVal::Vector)
                 .collect())
@@ -732,6 +701,76 @@ fn histogram_quantile(phi: f64, vector: Vector) -> Vector {
         out.push((labels, value));
     }
     out
+}
+
+/// One aggregation fold over an instant vector (`sum by (...)` etc.).
+fn fold_agg(
+    op: AggOp,
+    by: &Option<Vec<String>>,
+    without: &Option<Vec<String>>,
+    vector: Vector,
+) -> Vector {
+    let mut groups: BTreeMap<Labels, Vec<f64>> = BTreeMap::new();
+    for (labels, value) in vector {
+        let key: Labels = match (by, without) {
+            (Some(by), _) => labels
+                .iter()
+                .filter(|(k, _)| by.contains(k))
+                .cloned()
+                .collect(),
+            (None, Some(wo)) => labels
+                .iter()
+                .filter(|(k, _)| !wo.contains(k))
+                .cloned()
+                .collect(),
+            (None, None) => Vec::new(),
+        };
+        groups.entry(key).or_default().push(value);
+    }
+    groups
+        .into_iter()
+        .map(|(labels, values)| {
+            let value = match op {
+                AggOp::Sum => values.iter().sum(),
+                AggOp::Avg => values.iter().sum::<f64>() / values.len() as f64,
+                AggOp::Min => values.iter().cloned().fold(f64::INFINITY, f64::min),
+                AggOp::Max => values.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+                AggOp::Count => values.len() as f64,
+            };
+            (labels, value)
+        })
+        .collect()
+}
+
+/// Pivot per-step values into the Prometheus `matrix` response.
+fn render_matrix(steps: &[i64], vals: Vec<StepVal>) -> (u16, Json) {
+    let mut by_series: BTreeMap<Labels, Vec<(i64, f64)>> = BTreeMap::new();
+    for (t, val) in steps.iter().zip(vals) {
+        let vector = match val {
+            StepVal::Vector(v) => v,
+            StepVal::Scalar(v) => vec![(Vec::new(), v)],
+        };
+        for (labels, value) in vector {
+            if value.is_finite() {
+                by_series.entry(labels).or_default().push((*t, value));
+            }
+        }
+    }
+    let result: Vec<Json> = by_series
+        .into_iter()
+        .map(|(labels, points)| {
+            let values: Vec<Json> = points
+                .into_iter()
+                .map(|(t, v)| json!([t as f64 / 1000.0, format!("{v}")]))
+                .collect();
+            json!({"metric": labels_json(&labels), "values": values})
+        })
+        .collect();
+    (
+        200,
+        json!({"status": "success",
+               "data": {"resultType": "matrix", "result": result}}),
+    )
 }
 
 /// Output labels: drop skaidb-internal pairs; `name` renders as `__name__`
@@ -894,36 +933,7 @@ pub fn query_range(ctx: &Shared, params: &BTreeMap<String, String>) -> (u16, Jso
         Err(e) => return err_json(&e),
     };
     match eval_steps(&expr, &fetched, &steps) {
-        Ok(vals) => {
-            // Pivot per-step vectors into per-series time series.
-            let mut by_series: BTreeMap<Labels, Vec<(i64, f64)>> = BTreeMap::new();
-            for (t, val) in steps.iter().zip(vals) {
-                let vector = match val {
-                    StepVal::Vector(v) => v,
-                    StepVal::Scalar(v) => vec![(Vec::new(), v)],
-                };
-                for (labels, value) in vector {
-                    if value.is_finite() {
-                        by_series.entry(labels).or_default().push((*t, value));
-                    }
-                }
-            }
-            let result: Vec<Json> = by_series
-                .into_iter()
-                .map(|(labels, points)| {
-                    let values: Vec<Json> = points
-                        .into_iter()
-                        .map(|(t, v)| json!([t as f64 / 1000.0, format!("{v}")]))
-                        .collect();
-                    json!({"metric": labels_json(&labels), "values": values})
-                })
-                .collect();
-            (
-                200,
-                json!({"status": "success",
-                       "data": {"resultType": "matrix", "result": result}}),
-            )
-        }
+        Ok(vals) => render_matrix(&steps, vals),
         Err(e) => err_json(&e),
     }
 }

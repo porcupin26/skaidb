@@ -77,10 +77,15 @@ extras below.
   `histogram_quantile`. Remaining: subqueries, `group_left`/right,
   `topk`; then the node-exporter dashboard panel-by-panel diff against
   a real Prometheus (the original phase-7 exit criterion).
-- [ ] **[ts] PromQL partial gather** — the `/api/v1` evaluator still
-  ships raw samples cluster-wide (per-step lookback windows don't align
-  with fixed buckets); teach `query_range` to reuse the v0.31.0 partial
-  gather for step-aligned windows.
+- [ ] **[ts] PromQL partial gather** — investigated 2026-07-08 and
+  **declined as inexact**: the raw evaluator's range window is
+  `[t-w, t]` (both boundaries inclusive) while partials bucket
+  `[b, b+step)`, so samples landing exactly on step boundaries — the
+  common case for scraped data — would silently differ. Needs a
+  windowed-partial variant (per-window `(t-w, t]` partials over the
+  wire) rather than the fixed-bucket ts_partialize. Groundwork shipped:
+  `Backend::ts_partials` now exposes the cluster partial scatter to the
+  server layer.
 - [x] **[ts] Self-scrape** — shipped: `observability.self_scrape`
   (+ `self_scrape_interval_secs`, both live-mutable) ingests the node's
   own `/metrics` into the `metrics` TS table every interval — the node
