@@ -29,9 +29,10 @@ hardening, and tracked extras.
 
 ## Operational
 
-- [ ] **[ops] Publish the latest release** (≥ v0.43 — ORDER BY, SUGGEST,
-  MORE_LIKE_THIS, synonyms/ALTER) to repo.zapolski.nyc and upgrade the
-  test cluster (currently on v0.41.1).
+- [x] **[ops] Publish the latest release** — done 2026-07-08: v0.43.1
+  (ORDER BY, SUGGEST, MORE_LIKE_THIS, synonyms/ALTER, plus the two
+  cluster-path fixes its own release smoke caught) on repo.zapolski.nyc,
+  test cluster upgraded and smoke-verified.
 
 ## Full-text search
 
