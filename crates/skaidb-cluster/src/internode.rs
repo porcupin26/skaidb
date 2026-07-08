@@ -120,6 +120,16 @@ pub enum Request {
         query: Vec<f32>,
         k: u32,
     },
+    /// Top-k full-text hits from the node's local search index (one shard).
+    /// `query` is the serde_json-encoded `skaidb_fts::SearchQuery`
+    /// (self-describing, so the predicate model can grow without a wire
+    /// change); `k == 0` is the unranked path (every matching key). The
+    /// coordinator merges per-shard hits and re-reads survivors.
+    Search {
+        table: String,
+        query: String,
+        k: u32,
+    },
     ApplyDdl {
         /// The coordinator's current database, so table/index names in `sql`
         /// resolve to the same internal namespace on every node.
@@ -203,6 +213,11 @@ pub enum Response {
     VectorHits {
         hits: Vec<(Vec<u8>, f32)>,
     },
+    /// `(key, BM25 score)` hits from a [`Request::Search`], best-first
+    /// (scores 0.0 on the unranked path).
+    SearchHits {
+        hits: Vec<(Vec<u8>, f32)>,
+    },
     /// A node's versioned schema as `(database, ddl, hlc)` triples (reply to
     /// `SchemaDdl`): live objects as CREATEs and dropped ones as DROPs, each
     /// with its version stamp for last-writer-wins merge.
@@ -282,6 +297,7 @@ const REQ_TSQUERY: u8 = 21;
 const REQ_TSMERGE: u8 = 22;
 const REQ_TSSUMMARY: u8 = 23;
 const REQ_TSPARTIALS: u8 = 24;
+const REQ_SEARCH: u8 = 25;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
@@ -295,6 +311,7 @@ const RES_NODESTATUS: u8 = 8;
 const RES_TSSERIES: u8 = 9;
 const RES_TSSUMMARIES: u8 = 10;
 const RES_TSPARTIALS: u8 = 11;
+const RES_SHITS: u8 = 12;
 
 impl Request {
     pub fn encode(&self) -> Vec<u8> {
@@ -423,6 +440,12 @@ impl Request {
                 for x in query {
                     o.extend_from_slice(&x.to_le_bytes());
                 }
+                o.extend_from_slice(&k.to_le_bytes());
+            }
+            Request::Search { table, query, k } => {
+                o.push(REQ_SEARCH);
+                put_str(o, table);
+                put_str(o, query);
                 o.extend_from_slice(&k.to_le_bytes());
             }
             Request::ApplyDdl { db, sql, hlc } => {
@@ -574,6 +597,11 @@ impl Request {
                 let k = c.u32()?;
                 Request::VectorSearch { index, query, k }
             }
+            REQ_SEARCH => Request::Search {
+                table: c.string()?,
+                query: c.string()?,
+                k: c.u32()?,
+            },
             REQ_DDL => Request::ApplyDdl {
                 db: c.string()?,
                 sql: c.string()?,
@@ -657,6 +685,14 @@ impl Response {
                 for (key, dist) in hits {
                     put_bytes(o, key);
                     o.extend_from_slice(&dist.to_le_bytes());
+                }
+            }
+            Response::SearchHits { hits } => {
+                o.push(RES_SHITS);
+                o.extend_from_slice(&(hits.len() as u32).to_le_bytes());
+                for (key, score) in hits {
+                    put_bytes(o, key);
+                    o.extend_from_slice(&score.to_le_bytes());
                 }
             }
             Response::Schema { entries } => {
@@ -764,6 +800,15 @@ impl Response {
                     hits.push((key, c.f32()?));
                 }
                 Response::VectorHits { hits }
+            }
+            RES_SHITS => {
+                let n = c.u32()? as usize;
+                let mut hits = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let key = c.bytes()?;
+                    hits.push((key, c.f32()?));
+                }
+                Response::SearchHits { hits }
             }
             RES_SCHEMA => {
                 let n = c.u32()? as usize;
@@ -1460,6 +1505,16 @@ mod tests {
                 query: vec![0.1, -0.2, 0.3, 0.0],
                 k: 10,
             },
+            Request::Search {
+                table: "articles".into(),
+                query: r#"{"match":{"field":"body","text":"quick fox"}}"#.into(),
+                k: 10,
+            },
+            Request::Search {
+                table: "articles".into(),
+                query: "{}".into(),
+                k: 0,
+            },
             Request::SetMembership {
                 epoch: 7,
                 members: vec![
@@ -1502,6 +1557,9 @@ mod tests {
             },
             Response::VectorHits {
                 hits: vec![(vec![1], 0.0), (vec![2, 3], 1.5)],
+            },
+            Response::SearchHits {
+                hits: vec![(vec![1], 7.25), (vec![2, 3], 0.0)],
             },
             Response::Get {
                 entry: Some((vec![1, 2, 3], Hlc::new(9, 1), true)),

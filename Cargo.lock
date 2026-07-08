@@ -1099,6 +1099,7 @@ version = "0.36.0"
 dependencies = [
  "rustls",
  "rustls-pemfile",
+ "serde_json",
  "skaidb-auth",
  "skaidb-engine",
  "skaidb-fts",

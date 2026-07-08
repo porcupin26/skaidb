@@ -7,13 +7,15 @@ This documents the **shipped** state; the plan and pending phases live in
 [FTS_TODO.md](FTS_TODO.md), and the SQL grammar in
 [QUERY_SYNTAX.md](QUERY_SYNTAX.md#full-text-search-match--search).
 
-Status: **phase 3 (query DSL)** — phases 1–2 (single-node core: DDL, index
+Status: **phase 4 (cluster)** — phases 1–3 (single-node core: DDL, index
 maintenance on put/delete, `score()`, top-k pushdown, crash recovery,
 rebuild; analysis & mappings: analyzer registry, per-column configuration,
-typed fast fields, `.keyword` twins, `copy_to`) plus the full predicate
-family (`MATCH`/`MATCH_PHRASE`/`MATCH_PREFIX`/`FUZZY`/`WILDCARD`/`REGEXP`/
-`SEARCH`), AND/OR/NOT composition of search predicates, dis-max multi-field
-scoring, and `HIGHLIGHT()` snippets.
+typed fast fields, `.keyword` twins, `copy_to`; query DSL: the full
+predicate family `MATCH`/`MATCH_PHRASE`/`MATCH_PREFIX`/`FUZZY`/`WILDCARD`/
+`REGEXP`/`SEARCH`, AND/OR/NOT composition, dis-max multi-field scoring,
+`HIGHLIGHT()` snippets) plus **distributed search**: scatter-gather top-k
+across the cluster, per-replica local indexes over replicated writes, and
+index continuity through join/decommission/rebalance/repair.
 
 ## Using it
 
@@ -171,9 +173,23 @@ when the column didn't match). Stemming is respected — a query for
   over-fetch to keep k results (the vector-search discipline). A `MATCH`
   used as a plain predicate (no ranking) retrieves the matching key set
   from the index.
-- **Cluster**: DDL broadcasts (every node indexes its shard from replicated
-  writes); scatter-gather top-k merge across members is phase 4 — today a
-  multi-node coordinator rejects search queries, single-node serves them.
+- **Cluster** (the vector-search pattern): DDL broadcasts, and every member
+  indexes its shard locally from replicated writes — the replicated apply
+  paths (`apply_put`/`apply_delete`, batched) maintain search indexes, so
+  replication, rebalance, drain, hinted replay, and anti-entropy repair all
+  keep the index in step with the table for free. A query scatters to all
+  members; each answers with its local `(key, score)` top-k after
+  committing pending index writes (writes replicate synchronously at the
+  write consistency, so **every acked write is searchable cluster-wide**,
+  not just NRT). The coordinator merges by score (keeping a replicated
+  row's best per-shard score), re-reads survivors at read consistency,
+  applies the residual filter, and generates highlight snippets from its
+  own index. An unreachable member is skipped — its rows still surface
+  through reachable replicas. Scoring uses **per-shard BM25 statistics**
+  (Elasticsearch's default across shards); a two-phase global-stats mode is
+  a later phase. Post-resharding `Reclaim` leaves stale postings for
+  moved-away keys — harmless (the authoritative re-read resolves them) and
+  reclaimed by `REBUILD SEARCH INDEX`.
 
 ## Observability
 
@@ -183,7 +199,7 @@ when the column didn't match). Stemming is respected — a query for
 - `/metrics` gauges: `skaidb_search_indexes`, `skaidb_search_docs_total`,
   `skaidb_search_disk_bytes`, `skaidb_search_rebuild_seconds`.
 
-## Limits (phase 3)
+## Limits (phase 4)
 
 - Search predicates compose with `AND`/`OR`/`NOT` among themselves; mixing
   them with ordinary conditions under `OR`/`NOT` is rejected (top-level
@@ -194,6 +210,6 @@ when the column didn't match). Stemming is respected — a query for
   the same query.
 - Per-shard BM25 statistics (like Elasticsearch's default); a global-stats
   mode is a later phase.
-- Per-hit score explain, the ES side-by-side parity suite, cluster
-  scatter-gather, aggregations, and suggesters land in phases 3–7 (see
+- Per-hit score explain, the ES side-by-side parity suite, ingest/NRT
+  performance work, aggregations, and suggesters land in phases 3–7 (see
   [FTS_TODO.md](FTS_TODO.md)).

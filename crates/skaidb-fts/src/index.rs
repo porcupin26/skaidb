@@ -490,6 +490,29 @@ impl Highlighter {
             snippet.to_html()
         }
     }
+
+    /// [`Highlighter::snippet`] over every string reachable at `path` in
+    /// the row (arrays are multi-valued fields), space-joined — the same
+    /// text the index saw at write time.
+    pub fn snippet_doc(&self, doc: &Document, path: &str) -> String {
+        fn collect(v: &Value, out: &mut String) {
+            match v {
+                Value::String(s) => {
+                    if !out.is_empty() {
+                        out.push(' ');
+                    }
+                    out.push_str(s);
+                }
+                Value::Array(items) => items.iter().for_each(|item| collect(item, out)),
+                _ => {}
+            }
+        }
+        let mut text = String::new();
+        if let Some(v) = doc.get_path(path) {
+            collect(v, &mut text);
+        }
+        self.snippet(&text)
+    }
 }
 
 /// Add `value` to the document according to the column's declared type,

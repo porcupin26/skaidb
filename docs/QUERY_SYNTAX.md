@@ -334,9 +334,12 @@ WHERE (MATCH(body, 'rust') OR MATCH(title, 'rust'))
   search after a write sees it immediately. The index is derived data — the
   table is the source of truth, and a lost or stale index rebuilds from it
   (automatically on restart, or via `REBUILD SEARCH INDEX`).
-- Cluster mode: the DDL broadcasts like other DDL (every node indexes its
-  shard); scatter-gather search across a multi-node cluster lands in a later
-  phase (single-node serving works today).
+- Cluster mode: the DDL broadcasts like other DDL, every node indexes its
+  shard from replicated writes, and a search scatters to all members —
+  per-shard top-k merged by score at the coordinator, survivors re-read at
+  read consistency. Every acked write is searchable cluster-wide (replicas
+  commit pending index writes before answering). Unreachable members are
+  skipped; their rows surface through reachable replicas.
 
 ## Time-series tables
 

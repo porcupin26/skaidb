@@ -794,6 +794,71 @@ impl Database {
         self.search_with_index(&name, table, query, k, filter, highlights)
     }
 
+    /// Local-shard raw hits for the cluster scatter path: `(key, score)`
+    /// from the index covering `query`, no row resolution or filtering.
+    /// `k = Some(n)`: the `n` best local scores, best first; `k = None`:
+    /// every matching key with score 0.0 (the unranked path). Serves the
+    /// last-committed index state (NRT).
+    pub fn search_local(
+        &self,
+        table: &str,
+        query: &SearchQuery,
+        k: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, f32)>> {
+        let name = self.search_index_for_query(table, query)?;
+        let live = self
+            .search_indexes
+            .get(&name)
+            .ok_or(EngineError::IndexNotFound(name))?;
+        match k {
+            Some(n) => Ok(live
+                .index
+                .search_top(query, n)?
+                .into_iter()
+                .map(|hit| (hit.key, hit.score))
+                .collect()),
+            None => Ok(live
+                .index
+                .search_keys(query)?
+                .into_iter()
+                .map(|key| (key, 0.0))
+                .collect()),
+        }
+    }
+
+    /// [`Database::search_local`] with the coordinator's read-your-writes
+    /// half: commit the serving index's pending writes first.
+    pub fn search_local_commit_if_dirty(
+        &mut self,
+        table: &str,
+        query: &SearchQuery,
+        k: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, f32)>> {
+        let name = self.search_index_for_query(table, query)?;
+        if let Some(live) = self.search_indexes.get_mut(&name) {
+            live.commit_if_dirty()?;
+        }
+        self.search_local(table, query, k)
+    }
+
+    /// A snippet generator for `query` over `column`, from the index
+    /// serving the query — the cluster coordinator highlights re-read rows
+    /// with this after the scatter merge.
+    pub fn search_highlighter(
+        &self,
+        table: &str,
+        query: &SearchQuery,
+        column: &str,
+        max_chars: usize,
+    ) -> Result<skaidb_fts::Highlighter> {
+        let name = self.search_index_for_query(table, query)?;
+        let live = self
+            .search_indexes
+            .get(&name)
+            .ok_or(EngineError::IndexNotFound(name))?;
+        Ok(live.index.highlighter(query, column, max_chars)?)
+    }
+
     /// Full-text search over the last-committed index state (see
     /// [`Database::search_commit_if_dirty`]).
     pub fn search_read(
@@ -847,7 +912,7 @@ impl Database {
                 Some(bytes) => match Value::decode(&bytes) {
                     Ok(Value::Document(mut doc)) if matches_filter(filter, &doc)? => {
                         for (col, h) in &highlighters {
-                            let snippet = h.snippet(&doc_text_at(&doc, col));
+                            let snippet = h.snippet_doc(&doc, col);
                             doc.insert(format!("_highlight_{col}"), Value::String(snippet));
                         }
                         Ok(Some(doc))
@@ -3945,28 +4010,6 @@ fn collect_highlights(sel: &Select) -> Result<Vec<(String, usize)>> {
     Ok(out)
 }
 
-/// Every string reachable at `path` in the row, joined with spaces (arrays
-/// are multi-valued fields) — the text a highlight snippet is generated
-/// from, mirroring what the index saw at write time.
-fn doc_text_at(doc: &Document, path: &str) -> String {
-    fn collect(v: &Value, out: &mut String) {
-        match v {
-            Value::String(s) => {
-                if !out.is_empty() {
-                    out.push(' ');
-                }
-                out.push_str(s);
-            }
-            Value::Array(items) => items.iter().for_each(|item| collect(item, out)),
-            _ => {}
-        }
-    }
-    let mut out = String::new();
-    if let Some(v) = doc.get_path(path) {
-        collect(v, &mut out);
-    }
-    out
-}
 
 /// Whether the query is in aggregate/grouped mode.
 pub(crate) fn is_grouped(sel: &Select) -> bool {

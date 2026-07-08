@@ -2459,6 +2459,24 @@ impl Node {
                 },
                 Err(_) => Response::Err("local lock poisoned".into()),
             },
+            // Serve under the write lock so pending index writes commit
+            // first: replicated writes reach replicas synchronously at the
+            // write consistency, so committing here makes every acked write
+            // searchable cluster-wide (read-your-writes, not just NRT). A
+            // clean index is a no-op.
+            Request::Search { table, query, k } => match self.local.write() {
+                Ok(mut db) => match serde_json::from_str::<skaidb_fts::SearchQuery>(&query) {
+                    Ok(parsed) => {
+                        let k = (k > 0).then_some(k as usize);
+                        match db.search_local_commit_if_dirty(&table, &parsed, k) {
+                            Ok(hits) => Response::SearchHits { hits },
+                            Err(e) => Response::Err(e.to_string()),
+                        }
+                    }
+                    Err(e) => Response::Err(format!("bad search query: {e}")),
+                },
+                Err(_) => Response::Err("local lock poisoned".into()),
+            },
             Request::ApplyPut {
                 table,
                 key,
@@ -3783,6 +3801,108 @@ impl Node {
         }
         Ok(out)
     }
+
+    /// Distributed full-text search (the vector-search pattern): every
+    /// member searches its local shard, the coordinator merges hits by
+    /// score, re-reads survivors at read consistency, applies the residual
+    /// `filter`, and snippets `highlights` from its own index (every node
+    /// holds the same index definition). `k = None` is the unranked path
+    /// (every matching row, scores 0.0).
+    ///
+    /// Scoring is per-shard BM25 (Elasticsearch's default across shards): a
+    /// row replicated on several members keeps its best per-shard score.
+    pub fn search(
+        self: &Arc<Self>,
+        table: &str,
+        query: &skaidb_fts::SearchQuery,
+        k: Option<usize>,
+        filter: &Option<Expr>,
+        highlights: &[(String, usize)],
+    ) -> EngineResult<Vec<(Vec<u8>, Document, f32)>> {
+        // Over-fetch per shard so the merge (and any filtering) still yields k.
+        let fetch = k.map(|k| {
+            if filter.is_some() {
+                k.saturating_mul(4).max(k + 16)
+            } else {
+                k.max(1)
+            }
+        });
+
+        // Best score seen per key across all shards.
+        let mut best: HashMap<Vec<u8>, f32> = HashMap::new();
+        let consider = |key: Vec<u8>, score: f32, best: &mut HashMap<Vec<u8>, f32>| {
+            best.entry(key)
+                .and_modify(|s| {
+                    if score > *s {
+                        *s = score;
+                    }
+                })
+                .or_insert(score);
+        };
+        // Local shard under the write lock: pending index writes commit
+        // first, so the coordinator reads its own writes.
+        {
+            let mut db = self
+                .local
+                .write()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
+            for (key, score) in db.search_local_commit_if_dirty(table, query, fetch)? {
+                consider(key, score, &mut best);
+            }
+        }
+        // Peer shards, scattered concurrently (unreachable peers are
+        // skipped — their rows still surface through the replicas that
+        // remain reachable).
+        let req = Request::Search {
+            table: table.to_string(),
+            query: serde_json::to_string(query)
+                .map_err(|e| EngineError::Cluster(format!("encode search query: {e}")))?,
+            k: fetch.map_or(0, |f| f as u32),
+        };
+        let addrs = self.peer_addrs();
+        for hits in scatter(&addrs, |addr| match self.pool.call(addr, &req) {
+            Ok(Response::SearchHits { hits }) => hits,
+            _ => Vec::new(),
+        }) {
+            for (key, score) in hits {
+                consider(key, score, &mut best);
+            }
+        }
+
+        // Coordinator-side snippet generators, one per requested column.
+        let highlighters = {
+            let db = self
+                .local
+                .read()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
+            highlights
+                .iter()
+                .map(|(col, max_chars)| {
+                    db.search_highlighter(table, query, col, *max_chars)
+                        .map(|h| (col.clone(), h))
+                })
+                .collect::<EngineResult<Vec<_>>>()?
+        };
+
+        // Rank globally by score, then re-read + filter until we have k.
+        let mut ranked: Vec<(Vec<u8>, f32)> = best.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let mut out = Vec::new();
+        for (key, score) in ranked {
+            let rows = filter_rows(filter, self.point_get(table, &key, None)?)?;
+            if let Some((_, mut doc)) = rows.into_iter().next() {
+                for (col, h) in &highlighters {
+                    let snippet = h.snippet_doc(&doc, col);
+                    doc.insert(format!("_highlight_{col}"), Value::String(snippet));
+                }
+                out.push((key, doc, score));
+                if k.is_some_and(|k| out.len() >= k) {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// A pending replicated mutation.
@@ -4222,12 +4342,10 @@ impl Cluster for Coordinator {
         filter: &Option<Expr>,
         highlights: &[(String, usize)],
     ) -> EngineResult<Vec<(Vec<u8>, Document, f32)>> {
-        // Phase 1 is single-node: scatter/merge of per-shard top-k (and the
-        // internode messages it needs) is phase 4.
+        // Multi-node: scatter to every member's local shard and merge
+        // (per-shard BM25, re-read at read consistency).
         if self.node.member_count() > 1 {
-            return Err(EngineError::Unsupported(
-                "cluster-wide full-text search lands in a later phase".into(),
-            ));
+            return self.node.search(table, query, k, filter, highlights);
         }
         // Sole member: every row is local. Serve under the write lock so
         // pending index writes commit first (read-your-writes).
@@ -4999,6 +5117,203 @@ mod tests {
             .execute("SELECT id FROM docs NEAREST (embedding, [1.0, 0.0, 0.0], 2) ORDER BY id")
             .unwrap_err();
         assert!(err.to_string().contains("ORDER BY"), "got: {err}");
+    }
+
+    /// rf=1 NodeConfig: every key lives on exactly one node, so a full-text
+    /// result set that is complete from any coordinator proves the scatter
+    /// actually gathered the other members' shards.
+    #[cfg(test)]
+    fn rf1(id: &str, addr: &str, members: &[(NodeId, String)]) -> NodeConfig {
+        NodeConfig {
+            id: NodeId::new(id),
+            internode_addr: addr.to_string(),
+            members: members.to_vec(),
+            replication_factor: 1,
+            vnodes_per_node: 64,
+            read_consistency: Consistency::One,
+            write_consistency: Consistency::One,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
+            anti_entropy_interval_secs: 0,
+        }
+    }
+
+    /// The sorted `id` column of a search result set.
+    #[cfg(test)]
+    fn sorted_ids(rs: skaidb_engine::ResultSet) -> Vec<i64> {
+        let mut out: Vec<i64> = rs
+            .rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Int(i) => *i,
+                other => panic!("expected int id, got {other:?}"),
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    #[test]
+    fn distributed_full_text_search() {
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let na = Node::new(Database::open(temp_dir("ftsa")).unwrap(), rf1("a", &a, &members));
+        let nb = Node::new(Database::open(temp_dir("ftsb")).unwrap(), rf1("b", &b, &members));
+        let nc = Node::new(Database::open(temp_dir("ftsc")).unwrap(), rf1("c", &c, &members));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        nc.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE articles (PRIMARY KEY (id))").unwrap();
+        // Broadcast DDL: every node builds its own (initially empty) index.
+        na.execute("CREATE SEARCH INDEX articles_fts ON articles (body)").unwrap();
+        // Enough rows that (with rf=1 over 64 vnodes) every node owns some.
+        for i in 1..=30 {
+            let text = if i % 3 == 0 {
+                "quick brown fox jumps"
+            } else if i % 3 == 1 {
+                "slow roasted vegetables"
+            } else {
+                "unrelated filler words"
+            };
+            na.execute(&format!("INSERT INTO articles (id, body, flag) VALUES ({i}, '{text}', {})", i % 2 == 0))
+                .unwrap();
+        }
+
+        // Predicate-only search from every coordinator returns the complete
+        // cross-shard match set (ids 3, 6, ..., 30).
+        let expect: Vec<i64> = (1..=30).filter(|i| i % 3 == 0).collect();
+        for coord in [&na, &nb, &nc] {
+            let rs = rows(coord.execute("SELECT id FROM articles WHERE MATCH(body, 'fox')").unwrap());
+            assert_eq!(sorted_ids(rs), expect);
+        }
+
+        // Ranked top-k from another node: scatter, merge by score, k rows
+        // best-first with score() projected.
+        let rs = rows(
+            nb.execute(
+                "SELECT id, score() FROM articles WHERE MATCH(body, 'quick fox') \
+                 ORDER BY score() DESC LIMIT 5",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows.len(), 5);
+        for row in &rs.rows {
+            assert!(matches!(row[1], Value::Float(s) if s > 0.0), "scored hit: {row:?}");
+        }
+
+        // Residual filter applies after the authoritative re-read.
+        let rs = rows(
+            nc.execute("SELECT id FROM articles WHERE MATCH(body, 'vegetables') AND flag = true")
+                .unwrap(),
+        );
+        assert_eq!(sorted_ids(rs), vec![4, 10, 16, 22, 28]);
+
+        // Bool composition pushes the whole tree to every shard.
+        let rs = rows(
+            nb.execute(
+                "SELECT id FROM articles \
+                 WHERE (MATCH(body, 'fox') OR MATCH(body, 'vegetables')) \
+                   AND NOT MATCH(body, 'quick')",
+            )
+            .unwrap(),
+        );
+        assert_eq!(sorted_ids(rs), (1..=30).filter(|i| i % 3 == 1).collect::<Vec<_>>());
+
+        // Highlighting is generated coordinator-side after the re-read.
+        let rs = rows(
+            nc.execute(
+                "SELECT id, HIGHLIGHT(body, 40) AS s FROM articles \
+                 WHERE MATCH(body, 'roasted') ORDER BY score() DESC LIMIT 3",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows.len(), 3);
+        for row in &rs.rows {
+            assert!(
+                matches!(&row[1], Value::String(s) if s.contains("<b>roasted</b>")),
+                "snippet: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_index_follows_resharding_join() {
+        // rf=1: after c joins, the keys it now owns exist ONLY on c — a
+        // complete search result proves c's index was populated by the
+        // migration apply path (schema sync + rebalance push).
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let ab = vec![member("a", &a), member("b", &b)];
+        let abc = vec![member("a", &a), member("b", &b), member("c", &c)];
+
+        let na = Node::new(Database::open(temp_dir("fjr-a")).unwrap(), rf1("a", &a, &ab));
+        let nb = Node::new(Database::open(temp_dir("fjr-b")).unwrap(), rf1("b", &b, &ab));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        na.execute("CREATE SEARCH INDEX t_fts ON t (body)").unwrap();
+        let n = 40;
+        for i in 1..=n {
+            na.execute(&format!("INSERT INTO t (id, body) VALUES ({i}, 'searchable words')"))
+                .unwrap();
+        }
+
+        let nc = Node::new(Database::open(temp_dir("fjr-c")).unwrap(), rf1("c", &c, &abc));
+        nc.serve_internode().unwrap();
+        na.add_member("c", &c).unwrap();
+
+        // Every row is still found through the index, from every coordinator
+        // (the keys c now owns migrated to it, and its index followed).
+        for coord in [&na, &nb, &nc] {
+            let rs = rows(coord.execute("SELECT id FROM t WHERE MATCH(body, 'searchable')").unwrap());
+            assert_eq!(rs.rows.len(), n, "complete result set after the join");
+        }
+
+        // A write after the join indexes on the new owner and is searchable
+        // cluster-wide.
+        nc.execute(&format!("INSERT INTO t (id, body) VALUES ({}, 'fresh searchable entry')", n + 1))
+            .unwrap();
+        let rs = rows(na.execute("SELECT id FROM t WHERE MATCH(body, 'fresh')").unwrap());
+        assert_eq!(sorted_ids(rs), vec![n as i64 + 1]);
+    }
+
+    #[test]
+    fn search_skips_unreachable_member() {
+        // rf=3 over three members: every node holds every row. c is in the
+        // ring but its listener never starts (a dead peer, kill -9 style);
+        // the scatter must skip it and still return the full result set from
+        // the reachable replicas.
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let na = Node::new(
+            Database::open(temp_dir("fdark-a")).unwrap(),
+            cfg("a", &a, &members, Consistency::One, Consistency::One),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("fdark-b")).unwrap(),
+            cfg("b", &b, &members, Consistency::One, Consistency::One),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        na.execute("CREATE SEARCH INDEX t_fts ON t (body)").unwrap();
+        for i in 1..=10 {
+            na.execute(&format!("INSERT INTO t (id, body) VALUES ({i}, 'resilient text')"))
+                .unwrap();
+        }
+        for coord in [&na, &nb] {
+            let rs = rows(
+                coord
+                    .execute(
+                        "SELECT id FROM t WHERE MATCH(body, 'resilient') \
+                         ORDER BY score() DESC LIMIT 20",
+                    )
+                    .unwrap(),
+            );
+            assert_eq!(rs.rows.len(), 10, "dead peer skipped, replicas answer");
+        }
     }
 
     #[test]

@@ -257,12 +257,29 @@ fleet-verified — the TS cadence)
     *sets* (top-k overlap ≥ 95%, scoring-order differences documented).
     Needs the ES container on the bench fleet; fold into the phase-5 bench
     setup.
-- [ ] **Phase 4 — cluster**: per-replica local indexes over replicated
-  writes; scatter-gather top-k merge at read consistency (vector-search
-  pattern); rebuild on join/decommission/rebalance; anti-entropy = detect
-  index-behind-table (opstamp/checksum) and rebuild; hinted writes already
-  replay through the table path so the index follows for free. Exit: 3-node
-  tests incl. kill/rejoin convergence; fleet smoke.
+- [ ] **Phase 4 — cluster** (core shipped, fleet smoke pending):
+  - [x] Per-replica local indexes over replicated writes: the replicated
+    apply paths (`apply_put`/`apply_delete` + batched variants) maintain
+    search indexes, so replication, rebalance, drain, hinted replay, and
+    repair all keep the index in step with the table — verified, no extra
+    machinery needed.
+  - [x] Scatter-gather: `Request::Search` (query ships as serde_json —
+    self-describing, grows without wire changes) → per-shard `(key, score)`
+    top-k; coordinator merges best-score-per-key, re-reads survivors at
+    read consistency, filters, snippets from its own index. Peers commit
+    pending index writes before answering, so acked writes are searchable
+    cluster-wide (stronger than NRT). Unreachable members are skipped.
+  - [x] Join/decommission/rebalance: schema sync delivers the regenerated
+    `CREATE SEARCH INDEX` (backfills from whatever rows already arrived);
+    migrated rows index via the apply path. 3-node tests: rf=1 scatter
+    completeness, rf=1 join migration, dead-member tolerance; engine-level
+    kill -9 watermark-replay recovery. `Reclaim` leaves stale postings for
+    moved-away keys (harmless — authoritative re-read resolves; `REBUILD`
+    reclaims); revisit in phase 9 if it bothers anyone.
+  - [x] Anti-entropy: open-time watermark replay covers restart divergence;
+    repair copies flow through the apply path so the index follows.
+  - [ ] Fleet smoke on the 3-node test cluster (rides the next release
+    rollout).
 - [ ] **Phase 5 — NRT + ingest performance**: refresh-interval config, bulk
   ingest path (index once per statement batch, not per row), writer memory
   budget under `memory_target`, merge-policy tuning; first full ingest+query

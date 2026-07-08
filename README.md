@@ -171,8 +171,9 @@ Implemented end-to-end and tested (202 tests):
   `HIGHLIGHT()` snippets; per-column analyzers (18 stemmed languages,
   ngram/edge-ngram, folding), boosts, `.keyword` exact-match twins, and
   `copy_to` composites; near-real-time refresh with WAL-replay crash
-  recovery (the table is the source of truth). Single-node core today;
-  cluster scatter-gather is next — see [docs/SEARCH.md](docs/SEARCH.md)
+  recovery (the table is the source of truth). Fully distributed: every
+  node indexes its shard, queries scatter-gather with per-shard top-k
+  merged at the coordinator — see [docs/SEARCH.md](docs/SEARCH.md)
 - **time-series tables**: `CREATE TIMESERIES TABLE … (SERIES KEY (…),
   RETENTION 30d)` stores samples in a Prometheus-style engine
   (Gorilla-compressed chunks, ~1–1.5 B/sample, ≥2M samples/s ingest) with
