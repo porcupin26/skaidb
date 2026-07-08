@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>skaidb</title>
+<link rel="stylesheet" href="/ui/app.css">
+</head>
+<body>
+<header>
+  <span class="logo">skaidb</span>
+  <span id="node-badge" class="badge"></span>
+  <span class="spacer"></span>
+  <button id="logout" class="ghost" hidden>log out</button>
+</header>
+
+<main id="login-view" hidden>
+  <form id="login-form" class="card login">
+    <h1>skaidb</h1>
+    <p id="login-hint" class="muted"></p>
+    <label>user <input id="login-user" autocomplete="username" required></label>
+    <label>password <input id="login-pass" type="password" autocomplete="current-password"></label>
+    <label class="row"><input id="login-remember" type="checkbox"> remember for this tab</label>
+    <button type="submit">connect</button>
+    <p id="login-error" class="error" hidden></p>
+  </form>
+</main>
+
+<main id="app-view" hidden>
+  <nav id="tabs">
+    <button data-tab="status" class="active">status</button>
+  </nav>
+
+  <section id="tab-status">
+    <div class="cards">
+      <div class="card">
+        <h2>node</h2>
+        <table class="kv" id="node-info"></table>
+      </div>
+      <div class="card">
+        <h2>cluster</h2>
+        <table class="kv" id="cluster-info"></table>
+      </div>
+      <div class="card wide">
+        <h2>members</h2>
+        <table id="members">
+          <thead><tr><th>id</th><th>configured</th><th>in ring</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+    <p class="muted" id="status-refreshed"></p>
+  </section>
+</main>
+
+<script src="/ui/app.js"></script>
+</body>
+</html>

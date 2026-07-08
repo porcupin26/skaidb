@@ -144,13 +144,23 @@ doc as phases land.
 
 ## 5. Phases (each ends tested, clippy-clean, docs updated — the FTS cadence)
 
-- [ ] **Phase 1 — skeleton + status**: `[ui]` config section wired
+- [x] **Phase 1 — skeleton + status**: `[ui]` config section wired
   through `skaidb-config` → server route guard (live-checked); embedded
   shell + `GET /ui` + `GET /ui/meta`; login flow against Basic auth; the
   status page (node + cluster). Exit: UI loads and shows live status on
   single-node and on the 3-node test cluster; `\config set ui.enabled
   false` 404s it immediately and back; server tests cover route gating,
   meta shape, and disabled-mode 404.
+  *Shipped notes*: assets live in `crates/skaidb-server/assets/`
+  (`ui.html`/`ui.css`/`ui.js`, `include_str!` in `src/ui.rs`), served as
+  three files (`/ui`, `/ui/app.css`, `/ui/app.js`) rather than one
+  inlined page — keeps CSP hash-free (`script-src 'self'`). `/ui/meta`
+  also carries `uptime_seconds` (from `ctx.start`; `/status` has no
+  uptime). Login verifies credentials against `POST /query` (`SHOW
+  TABLES`) because `/status` is unauthenticated. Members table renders
+  from `endpoints` + the `configured_not_in_ring` /
+  `ring_not_configured` discrepancy lists. `\ui [on|off]` landed in
+  skaidbsh. Cluster-side visual check rides the next release rollout.
 - [ ] **Phase 2 — query console**: editor, results table, errors,
   history, exports, canned statements. Exit: FTS (`MATCH`/`HIGHLIGHT`),
   TS, and plain relational queries all render correctly incl. the

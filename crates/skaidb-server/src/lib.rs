@@ -18,6 +18,7 @@ pub mod metrics;
 pub mod rest;
 pub mod shared;
 pub mod slowlog;
+mod ui;
 
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -613,6 +614,51 @@ mod tests {
         // Unknown index → clean ES-shaped error.
         let resp = http("POST", "/nope/_count", "{}");
         assert!(resp.contains("does not exist") || resp.contains("error"), "{resp}");
+    }
+
+    /// The embedded web UI: assets served with CSP, `/ui/meta` shape, and the
+    /// live `ui.enabled` toggle 404ing the whole prefix without a restart.
+    #[test]
+    fn web_ui_end_to_end() {
+        let ctx = temp_ctx();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx.clone()).unwrap();
+        let get = |path: &str| -> String {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream
+                .write_all(format!("GET {path} HTTP/1.1\r\nConnection: close\r\n\r\n").as_bytes())
+                .unwrap();
+            let mut resp = String::new();
+            stream.read_to_string(&mut resp).unwrap();
+            resp
+        };
+
+        // The shell and its assets, each with the locked-down CSP.
+        let resp = get("/ui");
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(resp.contains("Content-Type: text/html"), "{resp}");
+        assert!(resp.contains("Content-Security-Policy: default-src 'none'"), "{resp}");
+        assert!(resp.contains("<title>skaidb</title>"), "{resp}");
+        assert!(get("/ui/app.css").contains("Content-Type: text/css"));
+        assert!(get("/ui/app.js").contains("Content-Type: text/javascript"));
+
+        // /ui/meta: version + auth mode, nothing secret.
+        let resp = get("/ui/meta");
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(resp.contains(&format!("\"version\":\"{}\"", env!("CARGO_PKG_VERSION"))), "{resp}");
+        assert!(resp.contains("\"auth_required\":false"), "{resp}");
+        assert!(resp.contains("\"clustered\":false"), "{resp}");
+
+        // Unknown paths under the prefix 404 even while enabled.
+        assert!(get("/ui/nope").starts_with("HTTP/1.1 404"));
+
+        // Live disable: every /ui path 404s immediately, and back.
+        let (status, _) = ctx.config_set("ui.enabled", "false");
+        assert_eq!(status, 200);
+        assert!(get("/ui").starts_with("HTTP/1.1 404"));
+        assert!(get("/ui/meta").starts_with("HTTP/1.1 404"));
+        let (status, _) = ctx.config_set("ui.enabled", "true");
+        assert_eq!(status, 200);
+        assert!(get("/ui").starts_with("HTTP/1.1 200"));
     }
 
     #[test]

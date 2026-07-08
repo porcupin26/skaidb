@@ -82,6 +82,23 @@ pub struct Config {
     pub encryption: EncryptionConfig,
     pub storage: StorageConfig,
     pub observability: ObservabilityConfig,
+    pub ui: UiConfig,
+}
+
+/// The built-in web UI (`/ui` on the REST port).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    /// Serve the embedded admin UI. **Live-mutable**: `config set
+    /// ui.enabled false` makes `/ui` return 404 immediately, no restart.
+    /// The UI is auth-gated exactly like `POST /query` either way.
+    pub enabled: bool,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        UiConfig { enabled: true }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -287,6 +304,7 @@ pub const RUNTIME_MUTABLE_KEYS: &[&str] = &[
     "observability.slow_query_log_file",
     "observability.error_log_file",
     "observability.login_log_file",
+    "ui.enabled",
 ];
 
 /// Whether changing `key` takes effect live (see [`RUNTIME_MUTABLE_KEYS`]).

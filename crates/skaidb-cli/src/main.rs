@@ -514,9 +514,41 @@ impl Shell {
                 }
                 _ => eprintln!("usage: \\config | \\config get <key> | \\config set <key> <value>"),
             },
+            "\\ui" => match rest.first().copied() {
+                None => self.ui_info(),
+                Some(v @ ("on" | "off")) => {
+                    let value = if v == "on" { "true" } else { "false" };
+                    self.rest_admin(
+                        "/admin/config/set",
+                        json_kv2("key", "ui.enabled", "value", value),
+                    );
+                }
+                _ => eprintln!("usage: \\ui | \\ui on | \\ui off"),
+            },
             other => eprintln!("unknown command: {other} (type 'help')"),
         }
         Flow::Handled
+    }
+
+    /// Print the web UI URL(s) and whether the UI answers there right now.
+    /// `/ui/meta` 404s when `ui.enabled` is off, so its status *is* the state.
+    fn ui_info(&self) {
+        if self.is_local() {
+            eprintln!("the web UI is served by a network node (not in --local mode)");
+            return;
+        }
+        for target in self.rest_targets() {
+            let state = match http::get(std::slice::from_ref(&target), "/ui/meta", None) {
+                Ok((200, _)) => "enabled",
+                Ok((404, _)) => "disabled (\\ui on to enable)",
+                Ok((code, _)) => return eprintln!("http://{target}/ui — unexpected HTTP {code}"),
+                Err(e) => {
+                    eprintln!("http://{target}/ui — unreachable: {e}");
+                    continue;
+                }
+            };
+            println!("http://{target}/ui — {state}");
+        }
     }
 
     /// Unauthenticated GET helper (`/status`, `/metrics`).
@@ -738,6 +770,7 @@ skaidbsh — commands
     \\config                  show all settings (secrets masked)
     \\config get <key>        read one section.field key
     \\config set <key> <val>  change a key (live if mutable, else needs restart)
+    \\ui [on|off]             show the web UI URL, or toggle it live
 
   Full grammar: docs/QUERY_SYNTAX.md"
     );

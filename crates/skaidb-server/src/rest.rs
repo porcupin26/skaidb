@@ -71,7 +71,13 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) -> io::Result<()> {
             "/status" => {
                 return write_response(&mut stream, 200, &status_json(&ctx));
             }
-            _ => {}
+            // The embedded web UI: static shell + /ui/meta. Gated on the
+            // live `ui.enabled` config inside try_route (404 when off).
+            path => {
+                if let Some(asset) = crate::ui::try_route(&ctx, path) {
+                    return write_asset(&mut stream, &asset);
+                }
+            }
         }
     }
 
@@ -436,6 +442,21 @@ fn write_text(stream: &mut TcpStream, status: u16, body: &str) -> io::Result<()>
     );
     stream.write_all(head.as_bytes())?;
     stream.write_all(body.as_bytes())?;
+    stream.flush()
+}
+
+/// Write an embedded UI asset with the UI's Content-Security-Policy header.
+fn write_asset(stream: &mut TcpStream, asset: &crate::ui::Asset) -> io::Result<()> {
+    let reason = http_reason(asset.status);
+    let head = format!(
+        "HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\nContent-Security-Policy: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
+        asset.status,
+        asset.content_type,
+        asset.body.len(),
+        crate::ui::CSP,
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(asset.body.as_bytes())?;
     stream.flush()
 }
 

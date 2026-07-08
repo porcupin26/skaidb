@@ -37,7 +37,9 @@ hardening, and tracked extras.
   SQL query console served by the node itself, reusing REST Basic auth +
   RBAC unchanged; `[ui] enabled` config knob, live-toggleable via
   `\config set ui.enabled`. Full plan and phased roadmap:
-  [UI_TODO.md](UI_TODO.md). Next action: phase 1 (skeleton + status).
+  [UI_TODO.md](UI_TODO.md). Phase 1 (skeleton + status page, `/ui`
+  routes + CSP, login flow, `\ui` CLI command, live toggle) shipped.
+  Next action: phase 2 (query console).
 
 ## Full-text search
 
