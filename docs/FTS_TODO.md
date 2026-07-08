@@ -298,12 +298,23 @@ fleet-verified — the TS cadence)
     write path checks it per statement, peers commit-if-dirty on scatter.
   - [x] `skaidb-engine/examples/fts_bench` — ingest + query latency bench
     over the real SQL path (the ES A/B uses this shape on the fleet).
-  - [ ] Merge-policy tuning on LXC-class disks (wants fleet bench data
-    first — no speculative knobs).
-  - [ ] **Exit**: full ingest+query bench vs ES on the bench fleet (§4
-    targets met or gaps root-caused). Corpora: wiki abstracts +
-    search-benchmark-game queries; ES in identical containers, warmed page
-    cache, shared-network confounds checked.
+  - [x] Background NRT refresher (server tick every 200 ms →
+    `search_refresh_tick`): refresh checks previously ran only on the
+    write path, so an idle table's last index writes never became visible
+    to read-only searches. **Found by the exit bench** (the NRT probe hung
+    forever); regression-tested.
+  - [x] **Exit met** (2026-07-08): ingest+query A/B vs Elasticsearch
+    8.14.3 on identical 2 vCPU / 2 GB containers, 280 k Simple-English-
+    Wikipedia articles — skaidb 10.6 k docs/s ingest vs ES 7.0 k warm;
+    term/AND/OR/phrase p50 0.5–0.7 ms vs ES 4.9–5.8 ms; RSS 650 MB vs
+    1.49 GB; disk 336 MB vs 529 MB. Both §4 single-node targets hold
+    (query ≤ ES every class, ingest ≥ ES bulk). Full table + caveats
+    (protocol framing, 1 GB ES heap) in docs/BENCHMARKS.md; harness in
+    `bench/clients/fts_{corpus,bench}.py`.
+  - [ ] Merge-policy tuning on LXC-class disks: the win over ES leaves no
+    urgency; revisit if an ingest-heavy workload surfaces merge stalls.
+  - [ ] Cluster scatter overhead leg (§4's ≤ 10 ms p99 over single-node) on
+    the 3-node test cluster once it runs ≥ v0.38.
 - [ ] **Phase 6 — aggregations/facets**: terms/range/histogram/
   date_histogram/cardinality/top_hits over fast fields, exposed through SQL
   (GROUP BY over indexed columns pushes to per-shard facet partials, merged

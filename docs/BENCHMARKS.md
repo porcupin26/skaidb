@@ -217,6 +217,58 @@ paged merge-join repair), and v0.19.0 paged the distributed full-table scan the
 same way. Benchmarks are now expected to scale to the feature's target size,
 not the suite's historical 1,000 rows.
 
+## Full-text search vs Elasticsearch (v0.38, 2026-07-08)
+
+The docs/FTS_TODO.md §4 exit benchmark: skaidb `SEARCH INDEX` against
+Elasticsearch 8.14.3 on **identical fresh containers** (p225: 2 vCPU /
+2 GB / 25 GB Debian 12 LXC each), one system running at a time with the
+rest of the bench fleet stopped. skaidb v0.38 + the background NRT
+refresher (found by this bench, see below), `memory_target = "1GB"`; ES
+with a 1 GB heap, 1 shard, 0 replicas, security off. Corpus: **280,595
+Simple English Wikipedia articles** (lead prose, ≤ 2,000 chars — Wikimedia
+discontinued the abstract dumps), identical bytes to both engines, both on
+their `standard` analyzer and 1 s refresh, per-batch durability (skaidb:
+WAL fsync per statement; ES: translog fsync per bulk request). Client: one
+connection on each system's canonical protocol (skaidb binary / ES HTTP
+keep-alive) from a container on the same bridge (0.1 ms RTT). 1,000-doc
+batches; queries are the same 400 generated term/AND/OR/phrase inputs,
+top-10 ranked. Two alternating runs per system; run-2 (warm) shown for ES,
+skaidb was stable across both.
+
+|                       | skaidb 0.38 | Elasticsearch 8.14.3 |
+|-----------------------|------------:|---------------------:|
+| ingest (docs/s)       |  **10,600** |   7,000 (5,200 cold) |
+| term p50 / p95 (ms)   | **0.5 / 0.7** |           5.8 / 10.4 |
+| AND p50 / p95 (ms)    | **0.5 / 0.6** |            5.0 / 8.2 |
+| OR p50 / p95 (ms)     | **0.7 / 0.9** |            5.1 / 8.5 |
+| phrase p50 / p95 (ms) | **0.7 / 5.4** |           4.9 / 11.2 |
+| NRT visibility (ms)   |    43–1,197 |            414–2,594 |
+| RSS after ingest (MB) |    **~650** |               ~1,490 |
+| disk, all data (MB)   |     **336** |                  529 |
+
+Both §4 single-node targets hold on this hardware: query latency ≤ ES on
+every class, ingest ≥ ES bulk.
+
+Caveats, honestly: part of the per-query gap is protocol — ES answers
+JSON-over-HTTP (its only surface), skaidb its binary protocol; both are
+each system's canonical path, but they are not equal-cost framing. A 1 GB
+heap is small for ES (it is also half the container, matching skaidb's
+budget); hit counts agreed within tokenizer-level differences (AND 850 vs
+845, phrase 551 vs 495). Single query stream; the host carries unrelated
+(identical for both) background load. Cluster scatter-gather overhead
+(§4's ≤ 10 ms p99 target) is a separate leg on the 3-node test cluster,
+pending its upgrade to ≥ v0.38.
+
+**The bench found a real bug**: skaidb's NRT probe initially hung forever —
+index refresh checks ran only on the write path, so an idle table's *last*
+writes never became visible to read-only searches. Fixed with a background
+refresher tick in the server (v0.39); the probe then measured 43–1,197 ms,
+inside the refresh_ms + tick bound.
+
+Reproduce: `bench/clients/fts_corpus.py` (corpus + query generation from a
+MediaWiki dump) and `bench/clients/fts_bench.py`
+(`fts_bench.py <skaidb|es> <addr> <setup|ingest|query|nrt> <data_dir>`).
+
 ## Reproducing
 
 skaidb's load generator is in-tree:

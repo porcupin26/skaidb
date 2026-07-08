@@ -258,6 +258,18 @@ pub fn run(
     skaidb_types::slog!("skaidb binary endpoint listening on {binary_local}");
     skaidb_types::slog!("skaidb REST endpoint listening on http://{rest_local}/query");
 
+    // Background NRT refresher: search-index refresh checks otherwise run
+    // only on the write path, so an idle table's last index writes would
+    // stay invisible to shared/read-only searches until traffic resumes.
+    // The tick makes writes searchable within refresh_ms + the tick period.
+    {
+        let ctx = ctx.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            ctx.backend.search_refresh_tick();
+        });
+    }
+
     // Dedicated metrics/health listener on `observability.prometheus_port`. It
     // reuses the same handler (so `/metrics`, `/health`, `/ready`, `/status` are
     // served), giving scrapers a port separate from the data plane. Bound only

@@ -1958,6 +1958,26 @@ mod tests {
     }
 
     #[test]
+    fn search_refresh_tick_commits_idle_writes() {
+        // Write-path refresh checks only run on the next write: with no
+        // follow-up traffic, the read-only path would never see the last
+        // writes. The server's background tick closes that gap (found by
+        // the fleet FTS bench — the NRT probe hung forever without it).
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        db.execute("CREATE SEARCH INDEX t_fts ON t (body) WITH (refresh_ms = 50)")
+            .unwrap();
+        db.execute("INSERT INTO t (id, body) VALUES (1, 'idle words')").unwrap();
+        assert!(db.has_search_indexes());
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        db.search_refresh_tick().unwrap();
+        let rs = rows(
+            db.execute_read("SELECT id FROM t WHERE MATCH(body, 'idle')").unwrap(),
+        );
+        assert_eq!(ids(rs), vec![1]);
+    }
+
+    #[test]
     fn search_legacy_catalog_def_still_loads() {
         // A phase-1 catalog stored `analyzer`/`refresh_ms` as dedicated
         // fields; it must deserialize into the options-based def.

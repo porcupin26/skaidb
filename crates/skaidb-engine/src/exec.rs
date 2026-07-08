@@ -745,6 +745,26 @@ impl Database {
         Ok(())
     }
 
+    /// Whether any search index exists — the cheap gate for the server's
+    /// background NRT tick (checked under a read lock before taking the
+    /// write lock).
+    pub fn has_search_indexes(&self) -> bool {
+        !self.search_indexes.is_empty()
+    }
+
+    /// One background NRT tick over **all** search indexes: commit any with
+    /// pending writes whose refresh interval elapsed. Write-path refresh
+    /// checks only run on the next write, so without this an idle table's
+    /// last index writes stay invisible to shared/read-only searches until
+    /// traffic resumes; the server ticks this so they become searchable
+    /// within `refresh_ms` regardless.
+    pub fn search_refresh_tick(&mut self) -> Result<()> {
+        for live in self.search_indexes.values_mut() {
+            live.maybe_refresh()?;
+        }
+        Ok(())
+    }
+
     /// Maintain every search index on `table` for a written row, then commit
     /// any index whose NRT refresh interval elapsed.
     fn maintain_search_put(

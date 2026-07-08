@@ -102,6 +102,26 @@ impl Backend {
         }
     }
 
+    /// One background NRT tick: commit search indexes with pending writes
+    /// whose refresh interval elapsed, so an idle table's last writes become
+    /// searchable within `refresh_ms` with no follow-up traffic. Gated on a
+    /// read lock so deployments without search indexes never pay the write
+    /// lock.
+    pub fn search_refresh_tick(&self) {
+        match self {
+            Backend::Local(db) => {
+                if db.read().is_ok_and(|d| d.has_search_indexes()) {
+                    if let Ok(mut d) = db.write() {
+                        let _ = d.search_refresh_tick();
+                    }
+                }
+            }
+            Backend::Cluster(node) => {
+                let _ = node.search_refresh_tick();
+            }
+        }
+    }
+
     /// Whether this backend is a cluster coordinator.
     pub fn is_clustered(&self) -> bool {
         matches!(self, Backend::Cluster(_))

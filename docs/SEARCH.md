@@ -51,7 +51,12 @@ DROP SEARCH INDEX articles_fts;
 - `refresh_ms` (default 1000) controls how quickly writes become
   searchable — Elasticsearch-style near-real-time. On the single-node
   write path, a search after a write commits the index first, so you read
-  your own writes immediately.
+  your own writes immediately; the server also runs a background refresher
+  tick (200 ms), so even a table receiving no further traffic becomes
+  searchable on the shared/read-only path within `refresh_ms` + one tick.
+- Measured against Elasticsearch on identical hardware: ~1.5× ES's bulk
+  ingest and single-digit-fraction query latencies (see
+  [BENCHMARKS.md](BENCHMARKS.md#full-text-search-vs-elasticsearch-v038-2026-07-08)).
 
 ## Analyzers
 

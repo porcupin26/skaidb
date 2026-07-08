@@ -3096,6 +3096,24 @@ impl Node {
         Ok(())
     }
 
+    /// One background NRT tick over the local shard's search indexes (the
+    /// engine's `search_refresh_tick`): read-lock gate first so the common
+    /// no-index case never takes the write lock.
+    pub fn search_refresh_tick(&self) -> EngineResult<()> {
+        let has = self
+            .local
+            .read()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .has_search_indexes();
+        if has {
+            self.local
+                .write()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+                .search_refresh_tick()?;
+        }
+        Ok(())
+    }
+
     /// The buffered half of [`Node::apply_batch_local`]: append + apply every
     /// row under one write-lock acquisition (and one search-index refresh
     /// check for the whole batch), returning the last row's commit point so
