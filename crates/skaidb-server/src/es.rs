@@ -1,4 +1,4 @@
-//! Elasticsearch-compatible REST subset (docs/FTS_TODO.md phase 8):
+//! Elasticsearch-compatible REST subset (docs/SEARCH.md "ES-compatible REST subset"):
 //! `_bulk`, `_search`, `_count`, and read-only `_mapping` — enough for
 //! existing ES client libraries and log shippers, not Kibana.
 //!

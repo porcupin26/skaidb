@@ -184,7 +184,7 @@ only 512 MB to spend.
 
 The durable findings from the optimization work since the matrix run — what to
 use and what to expect. (Per-release histories and the record of measured dead
-ends live in [PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md) and git history.)
+ends live in [Performance engineering notes](#performance-engineering-notes) below and git history.)
 
 **Use prepared statements for read-heavy work.** `?` placeholders +
 `Prepare`/`Execute` (v0.17.0) make point reads ~9% faster (C4 read 16c:
@@ -219,7 +219,7 @@ not the suite's historical 1,000 rows.
 
 ## Full-text search vs Elasticsearch (v0.38, 2026-07-08)
 
-The docs/FTS_TODO.md §4 exit benchmark: skaidb `SEARCH INDEX` against
+The FTS performance exit benchmark: skaidb `SEARCH INDEX` against
 Elasticsearch 8.14.3 on **identical fresh containers** (p225: 2 vCPU /
 2 GB / 25 GB Debian 12 LXC each), one system running at a time with the
 rest of the bench fleet stopped. skaidb v0.38 + the background NRT
@@ -273,7 +273,7 @@ writes never became visible to read-only searches. Fixed with a background
 refresher tick in the server (v0.39); the probe then measured 43–1,197 ms,
 inside the refresh_ms + tick bound.
 
-**Result-set parity** (the docs/FTS_TODO.md phase-3 exit, same corpus and
+**Result-set parity** (the FTS query-DSL exit, same corpus and
 queries): mean top-10 overlap per query against ES initially measured
 89.2% — score traces put nearly all of the divergence in tokenization
 (skaidb's `standard` split on every non-alphanumeric; ES uses Unicode word
@@ -339,3 +339,83 @@ come from `cargo run --release --example index_bench -p skaidb-engine`
 
 Write consistency is set per node via `cluster.default_write_consistency`
 (`ONE` | `QUORUM` | `ALL`) and replication factor via `cluster.replication_factor`.
+
+## Performance engineering notes
+
+*Absorbed from the standalone performance audit (originally 2026-07-03,
+v0.16.0; everything actionable was implemented and measured across
+v0.16.2 – v0.19.0). The remaining open items live in [TODO.md](TODO.md)
+under `[perf]`; what follows is the record that keeps dead ends dead.*
+
+### What already holds
+
+- Scans stream (k-way merge over memtable + SSTables, O(pages) memory) with
+  early-stop for plain `LIMIT`; `scan_prefix` is range-bounded.
+- Reads run under a shared lock (`&self`); writes group-commit one fsync per
+  multi-row statement; replica fan-out is pipelined and batched
+  (`ApplyBatch`), with the async tail drained and regrouped per peer.
+- Equi-joins hash-join; unfiltered `COUNT(*)` answers from key stats; `ORDER
+  BY … LIMIT k` is a selection, not a full sort; per-table block cache +
+  sharded read cache + bloom filters on the point-read path.
+- SQL parses once per request; prepared statements skip the parse entirely;
+  hot metrics are pre-registered atomics; framing layers reuse per-connection
+  buffers and allocate nothing steady-state.
+- Row-returning results can stream in ~256 KB chunks (`QueryStream`), and
+  distributed full-table gathers + anti-entropy are paged (2,000 rows/page) —
+  coordinator memory is O(pages in flight), not O(table).
+- Client connections **pipeline**: id-tagged requests (`OP_TAGGED`) let a
+  client keep any number of requests in flight per connection; the server
+  executes serially in order (session semantics unchanged) and echoes the id
+  on every frame, so a batch pays one round-trip of link latency
+  (`Client::pipeline`). Old servers reject the opcode cleanly.
+- Topology changes are paged: rebalance, drain, and reclaim scan shards
+  2,000 rows at a time (like repair/gathers) — a join or decommission
+  against a multi-GB table holds one page + one in-flight batch, not the
+  shard.
+- `[profile.release]`: `lto = "thin"`, `codegen-units = 1`.
+- Checked and fine: TCP_NODELAY everywhere, pooled internode connections,
+  no locks held across network calls, no per-row re-parsing, compact binary
+  wire protocol with LZ4 above 256 B.
+- The pre-`ScanPage` repair fallback (used only against peers too old to
+  answer `ScanPage`) necessarily remains O(table) — the old peer's wire
+  protocol has no paging. It never fires between current versions.
+
+### Deliberately skipped (documented reasons)
+
+- **Atomic HLC.** `HlcClock` stays a `Mutex` — it is only taken under the
+  write lock, which already serializes writers, and repacking the 96-bit
+  state risks the on-disk stamp format.
+- **Boxing `Statement::Select`.** `clippy::large_enum_variant` is allowed
+  with a comment instead; boxing would touch every match site in the engine
+  for no runtime benefit.
+
+### Measured dead ends — do not re-attempt without new evidence
+
+- **Sync-path replication group commit** (tried v0.16.6): coalescing
+  concurrent sessions' quorum writes into shared per-peer `ApplyBatch`
+  flushes cost **~9%** concurrent-write throughput. The coordinator is
+  CPU-bound on small nodes; the batching saved CPU on the peer (which had
+  headroom) and spent it on coordinator queue/wake machinery (which had
+  none). Analysis recorded next to the scatter path in `node.rs`. Async-tail
+  batching (kept) is the part that paid.
+- **Borrowed (`Cow`) predicate evaluation** (tried v0.19.0): removing the
+  per-row column-value clones from `eval` measured **3–6% slower** on
+  AND-chain predicates over 200k-row scans, reproducibly (alternating A/B,
+  three rounds). Per-row document *decode* dominates scan cost — even
+  deleting a 60-byte string clone per row was unmeasurable — while the `Cow`
+  wrapper added real per-node overhead. Any future attempt must first make
+  row decode itself borrowed/lazy; predicate-eval tweaks alone are
+  optimizing a rounding error.
+- **Allocation cleanups on fsync/RTT-dominated paths** (v0.16.7 framing
+  pass): real CPU/allocator reduction, zero throughput change on this
+  hardware. Fine to ship for CPU headroom, but don't expect ops/s.
+
+### Methodology (hard-won, follow it)
+
+- Scale the benchmark to the feature's target size — the 1,000-row suite hid
+  two OOM bugs that 1M rows exposed immediately.
+- Only trust alternating same-day A/B runs; leg ordering alone produces
+  double-digit artifacts on a shared host.
+- If every system lands in the same band on a fleet leg, suspect a shared
+  environmental floor and isolate on a single node over loopback before
+  concluding a change does nothing (or something).

@@ -5,7 +5,7 @@
 //! Measures, on a synthetic corpus (deliberately worst-case posting lengths:
 //! a small vocabulary means every term matches a large slice of the table):
 //!   - ingest throughput with a search index maintained, batched INSERTs
-//!     (docs/FTS_TODO.md phase-5 bulk path: one NRT refresh check per
+//!     (the FTS bulk-ingest path, docs/SEARCH.md: one NRT refresh check per
 //!     statement) vs single-row INSERTs,
 //!   - backfill speed (`CREATE SEARCH INDEX` over an existing table),
 //!   - query latency percentiles: term, bool AND, phrase, ranked top-10.

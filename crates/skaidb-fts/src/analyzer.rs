@@ -1,7 +1,7 @@
 //! Analyzer registry: named token pipelines, resolved from the spec strings
 //! written in `CREATE SEARCH INDEX ... WITH (...)`.
 //!
-//! Phase 2 surface (docs/FTS_TODO.md §2 "Analysis"): the core analyzers,
+//! The analysis surface (docs/SEARCH.md "Analyzers"): the core analyzers,
 //! Snowball language analyzers for the usual European set, `folding`
 //! (ASCII-folded standard), and parametrized `ngram(min,max)` /
 //! `edge_ngram(min,max)`. Synonyms with hot-reload and ICU normalization

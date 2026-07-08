@@ -3,7 +3,7 @@
 //! Wraps [Tantivy](https://github.com/quickwit-oss/tantivy) behind an
 //! engine-agnostic API: skaidb types in, skaidb types out. No Tantivy types
 //! leak past this crate, so the engine and SQL layers stay independent of
-//! the search core (see docs/FTS_TODO.md §0–1).
+//! the search core (see docs/SEARCH.md "Architecture").
 //!
 //! The index is derived data over an LSM table. The table's WAL is the
 //! translog: puts/deletes are applied here immediately (visible to searches

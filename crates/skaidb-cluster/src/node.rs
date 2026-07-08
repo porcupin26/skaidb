@@ -4554,7 +4554,7 @@ impl Cluster for Coordinator {
         // Sharded corpora (RF < members) decline — per-shard partials
         // would double-count replicated rows; the coordinator falls back
         // to the deduped row gather. Partial-merge with per-key ownership
-        // filters is future work (docs/FTS_TODO.md phase 6).
+        // filters is future work (docs/TODO.md, sharded scatter partials).
         let members = self.node.member_count();
         if members > 1 && self.node.cfg.replication_factor < members {
             return Ok(None);

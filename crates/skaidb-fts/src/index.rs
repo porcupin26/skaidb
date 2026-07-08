@@ -569,7 +569,7 @@ impl SearchIndex {
     }
 
     /// Exact fast-field aggregation over the rows matching `query`
-    /// (docs/FTS_TODO.md phase 6), or `Ok(None)` when this index cannot
+    /// (docs/SEARCH.md "Aggregations"), or `Ok(None)` when this index cannot
     /// serve the request **exactly** — unsupported column types, or a
     /// truncated terms bucket list — and the caller must fall back to
     /// materializing rows. Missing group values bucket under a sentinel

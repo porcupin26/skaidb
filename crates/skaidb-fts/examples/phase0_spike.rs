@@ -1,4 +1,4 @@
-//! Phase 0 spike (docs/FTS_TODO.md): validate the risky Tantivy integration
+//! Phase 0 spike (historical; see docs/SEARCH.md): validate the risky Tantivy integration
 //! points before committing to it as the FTS core.
 //!
 //! Measures, on a synthetic corpus:

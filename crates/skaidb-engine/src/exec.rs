@@ -3899,7 +3899,7 @@ pub trait Cluster {
         ))
     }
     /// Exact fast-field aggregation pushdown for a grouped search SELECT
-    /// (docs/FTS_TODO.md phase 6), or `Ok(None)` when this deployment or
+    /// (docs/SEARCH.md "Aggregations"), or `Ok(None)` when this deployment or
     /// request shape cannot serve it **exactly** — the caller falls back to
     /// materializing the matching rows and aggregating those. The default
     /// (and any deployment whose local index does not hold every row)

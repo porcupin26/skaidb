@@ -3,9 +3,10 @@
 Native full-text search over skaidb tables: BM25-ranked retrieval with
 `MATCH()` / `SEARCH()` SQL predicates, backed by an embedded
 [Tantivy](https://github.com/quickwit-oss/tantivy) index per search index.
-This documents the **shipped** state; the plan and pending phases live in
-[FTS_TODO.md](FTS_TODO.md), and the SQL grammar in
-[QUERY_SYNTAX.md](QUERY_SYNTAX.md#full-text-search-match--search).
+This documents the **shipped** state; pending work lives in
+[TODO.md](TODO.md), the SQL grammar in
+[QUERY_SYNTAX.md](QUERY_SYNTAX.md#full-text-search-match--search), and the
+phase history in git.
 
 Status: **phases 0–8 complete** — phases 1–5 (single-node core: DDL,
 index maintenance on put/delete, `score()`, top-k pushdown, crash
@@ -285,6 +286,16 @@ approximation.
 
 ## Architecture
 
+- **Why Tantivy** (decision record): Lucene is a JVM library — embedding a
+  JVM contradicts the single static Rust binary, and out-of-process Lucene
+  is just running Elasticsearch. Tantivy is Lucene's architecture re-done
+  in Rust (MIT, a plain dependency, `forbid(unsafe)` on our crates
+  unaffected): immutable segments, skip-list postings, positional indexes,
+  FST term dictionaries, columnar fast fields, BM25 — and public
+  benchmarks have it matching or beating Lucene per core. A native engine
+  stayed on the table (skaidb built its own TSDB and HNSW), but FTS parity
+  is 10–20× the surface of either; hence the thin crate boundary below,
+  which keeps a native replacement possible without touching engine/SQL.
 - **`skaidb-fts` crate** wraps Tantivy behind an engine-agnostic API
   (skaidb `Document`s in, `(key, score)` hits out); no Tantivy types cross
   the crate boundary, so the engine and SQL layers stay independent of the
@@ -358,8 +369,7 @@ approximation.
   executor.
 - No `JOIN`, `UNION`, aggregates/`GROUP BY`, `DISTINCT`, or `NEAREST` in
   the same query.
-- Per-shard BM25 statistics (like Elasticsearch's default); a global-stats
-  mode is a later phase.
-- Per-hit score explain, the ES side-by-side parity suite, ingest/NRT
-  performance work, aggregations, and suggesters land in phases 3–7 (see
-  [FTS_TODO.md](FTS_TODO.md)).
+- Per-shard BM25 statistics (like Elasticsearch's default across shards);
+  a global-stats mode remains future work. "Parity" with ES is defined as
+  result-set parity, not identical score floats — BM25 constants and
+  length normalization differ subtly between engines.

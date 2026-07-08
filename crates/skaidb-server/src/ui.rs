@@ -1,4 +1,4 @@
-//! The built-in web UI (docs/UI_TODO.md) — a pure API client embedded in the
+//! The built-in web UI (docs/UI.md) — a pure API client embedded in the
 //! binary at compile time. It adds no privileged surface: the shell and its
 //! assets are static and secret-free, and every data call the page makes goes
 //! through the ordinary authenticated endpoints (`POST /query`, `GET /status`,
