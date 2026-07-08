@@ -23,9 +23,11 @@ extras below.
   segment file, wiped dir) all rebuild from the table on reopen, and the
   deleted-segment case exposed a real gap (torn-but-openable index
   served corruption errors forever) now fixed with checksum validation
-  at open; still open: explain-output audit, final SEARCH.md pass,
-  benchmark publication tidy-up, disk-full-mid-merge (needs a
-  fault-injecting filesystem).
+  at open. ~~Explain-output audit~~ — done: the ES `"explain": true`
+  breakdown carries the full BM25 chain (per-term K1 / idf(n, N) /
+  tf-norm), verified live. ~~SEARCH.md pass~~ — done. Still open: the
+  24 h soak (deferred on request), disk-full-mid-merge (needs a
+  fault-injecting filesystem), benchmark re-publication.
 - [ ] **[fts] Lift the grouped-metrics pushdown guard** when
   [quickwit-oss/tantivy#2992](https://github.com/quickwit-oss/tantivy/issues/2992)
   is fixed upstream (per-bucket metrics currently take the exact row
