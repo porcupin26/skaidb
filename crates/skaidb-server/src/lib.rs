@@ -630,6 +630,16 @@ mod tests {
         assert!(resp.contains("\"total\":{\"relation\":\"eq\",\"value\":1}"), "{resp}");
         assert!(resp.contains("connecting"), "{resp}");
 
+        // top_hits: per-bucket top documents, relevance-ordered.
+        let resp = http(
+            "POST",
+            "/logs/_search",
+            r#"{"size":0,"query":{"match":{"msg":"error"}},"aggs":{"levels":{"terms":{"field":"level"},"aggs":{"best":{"top_hits":{"size":1}}}}}}"#,
+        );
+        assert!(resp.contains("\"best\""), "{resp}");
+        assert!(resp.contains("error connecting") || resp.contains("another error"), "{resp}");
+        assert!(resp.contains("\"_id\""), "{resp}");
+
         // Aggregations: terms buckets + a metric, hits suppressed.
         let resp = http(
             "POST",

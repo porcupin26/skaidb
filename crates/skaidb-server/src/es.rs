@@ -680,12 +680,31 @@ fn metric_item(func_name: AggFunc, field: &str) -> SelectItem {
     }
 }
 
-fn parse_metrics(spec: &Json) -> Result<Vec<(String, SelectItem)>, String> {
+/// A `top_hits` sub-aggregation request: `(name, size, include_source)`.
+type TopHitsSpec = (String, u64, bool);
+
+type ParsedSubAggs = (Vec<(String, SelectItem)>, Vec<TopHitsSpec>);
+
+fn parse_metrics(spec: &Json) -> Result<ParsedSubAggs, String> {
     let mut out = Vec::new();
+    let mut top_hits = Vec::new();
     if let Some(subs) = spec["aggs"].as_object().or_else(|| spec["aggregations"].as_object()) {
         for (mname, mspec) in subs {
             let mobj = mspec.as_object().ok_or("sub-agg must be an object")?;
             let (kind, body) = mobj.iter().next().ok_or("empty sub-agg")?;
+            if kind == "top_hits" {
+                if body.get("sort").is_some() {
+                    return Err(
+                        "top_hits sort is not supported (hits come back relevance-ordered)"
+                            .into(),
+                    );
+                }
+                let size = body["size"].as_u64().unwrap_or(3);
+                let include_source =
+                    body.get("_source").map(|s| s != &json!(false)).unwrap_or(true);
+                top_hits.push((mname.clone(), size, include_source));
+                continue;
+            }
             let field = body["field"].as_str().ok_or("metric agg needs field")?;
             let f = match kind.as_str() {
                 "sum" => AggFunc::Sum,
@@ -711,7 +730,7 @@ fn parse_metrics(spec: &Json) -> Result<Vec<(String, SelectItem)>, String> {
             out.push((mname.clone(), metric_item(f, field)));
         }
     }
-    Ok(out)
+    Ok((out, top_hits))
 }
 
 fn run_one_agg(
@@ -757,7 +776,7 @@ fn run_one_agg(
                     alias: None,
                 },
             ];
-            let metrics = parse_metrics(spec)?;
+            let (metrics, top_specs) = parse_metrics(spec)?;
             for (_, item) in &metrics {
                 sel.items.push(item.clone());
             }
@@ -783,6 +802,33 @@ fn run_one_agg(
                 buckets.truncate(size);
             } else {
                 buckets.sort_by_key(|b| b["key"].as_i64().unwrap_or(0));
+            }
+            // top_hits: one relevance-ordered per-bucket query each (runs
+            // only for the retained buckets).
+            if !top_specs.is_empty() {
+                let interval_ms = if kind == "date_histogram" {
+                    Some(parse_interval_ms(
+                        body["fixed_interval"].as_str().unwrap_or(""),
+                    )?)
+                } else {
+                    None
+                };
+                for bucket in &mut buckets {
+                    let key = bucket["key"].clone();
+                    for (name, size, include_source) in &top_specs {
+                        bucket[name.as_str()] = bucket_top_hits(
+                            ctx,
+                            role,
+                            index,
+                            filter,
+                            field,
+                            &key,
+                            interval_ms,
+                            *size,
+                            *include_source,
+                        )?;
+                    }
+                }
             }
             Ok(json!({"buckets": buckets}))
         }
@@ -813,6 +859,97 @@ fn run_one_agg(
         }
         other => Err(format!("unsupported aggregation '{other}'")),
     }
+}
+
+/// The top documents of one bucket (ES `top_hits`): the base filter ANDed
+/// with the bucket's group predicate, relevance-ordered when the query
+/// searches, capped at `size`.
+#[allow(clippy::too_many_arguments)]
+fn bucket_top_hits(
+    ctx: &Shared,
+    role: &str,
+    index: &str,
+    filter: &Option<Expr>,
+    group_field: &str,
+    key: &Json,
+    interval_ms: Option<i64>,
+    size: u64,
+    include_source: bool,
+) -> Result<Json, String> {
+    // The bucket predicate: field = key (terms), or the histogram's
+    // half-open interval [key, key + interval).
+    let bucket_pred = match interval_ms {
+        None => Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Column(group_field.to_string())),
+            right: Box::new(Expr::Literal(Value::from_json(key.clone()))),
+        },
+        Some(ms) => {
+            let k = key.as_i64().ok_or("histogram bucket key must be numeric")?;
+            Expr::Binary {
+                op: BinaryOp::And,
+                left: Box::new(Expr::Binary {
+                    op: BinaryOp::GtEq,
+                    left: Box::new(Expr::Column(group_field.to_string())),
+                    right: Box::new(Expr::Literal(Value::Int(k))),
+                }),
+                right: Box::new(Expr::Binary {
+                    op: BinaryOp::Lt,
+                    left: Box::new(Expr::Column(group_field.to_string())),
+                    right: Box::new(Expr::Literal(Value::Int(k + ms))),
+                }),
+            }
+        }
+    };
+    let mut sel = select_from(index);
+    sel.items = vec![SelectItem::Wildcard];
+    sel.filter = Some(match filter {
+        Some(f) => Expr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(f.clone()),
+            right: Box::new(bucket_pred),
+        },
+        None => bucket_pred,
+    });
+    sel.limit = Some(size);
+    let scored = filter.as_ref().map(expr_uses_search).unwrap_or(false);
+    if scored {
+        sel.order_by = vec![OrderKey {
+            expr: func("score", vec![]),
+            descending: true,
+        }];
+    }
+    let pk = ctx
+        .backend
+        .table_primary_key(index)
+        .and_then(|pk| pk.first().cloned())
+        .unwrap_or_default();
+    let (columns, rows) = rows_of(run(ctx, role, Statement::Select(sel), "es:top_hits")?)?;
+    let mut hits = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut source = Map::new();
+        let mut id = Json::Null;
+        let mut score = Json::Null;
+        for (col, val) in columns.iter().zip(row) {
+            if col == "_score" {
+                score = val.to_json();
+            } else {
+                if col == &pk {
+                    id = match &val {
+                        Value::String(s) => Json::String(s.clone()),
+                        other => Json::String(other.to_json().to_string()),
+                    };
+                }
+                source.insert(col.clone(), val.to_json());
+            }
+        }
+        let mut hit = json!({"_index": index, "_id": id, "_score": score});
+        if include_source {
+            hit["_source"] = Json::Object(source);
+        }
+        hits.push(hit);
+    }
+    Ok(json!({"hits": {"total": {"value": hits.len(), "relation": "eq"}, "hits": hits}}))
 }
 
 fn parse_interval_ms(spec: &str) -> Result<i64, String> {

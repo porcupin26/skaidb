@@ -39,8 +39,12 @@ extras below.
   additions. Correctness-critical — wants its own design + fleet-bench
   cycle. Today sharded corpora take the correct-but-slower coordinator
   fallback (this also gates per-hit explain on sharded clusters).
-- [ ] **[fts] top_hits** (per-group top documents): wants a SQL surface —
-  window functions or a dedicated per-group-top-k clause.
+- [x] **[fts] top_hits** — shipped on the ES subset: a `top_hits`
+  sub-agg under terms/date_histogram buckets returns each retained
+  bucket's top documents (relevance-ordered when the query searches;
+  one bounded per-bucket query each; `size`/`_source` honored, explicit
+  `sort` declines). A native SQL surface (window functions or a
+  per-group-top-k clause) remains an open language-design question.
 - [x] **[fts] Multi-word synonyms + phrase expansion** — shipped:
   multi-word group entries match as consecutive query-token sequences
   and expand as phrase alternatives (both directions), analyzed with the

@@ -265,7 +265,9 @@ POST /{index}/_search    query DSL: match, match_phrase, prefix, wildcard,
                          include/exclude lists (trailing-* globs),
                          highlight, exact totals; aggs: terms,
                          date_histogram (+ sum/avg/min/max/value_count/
-                         cardinality sub-aggs)
+                         cardinality/top_hits sub-aggs — top_hits runs
+                         one relevance-ordered query per retained
+                         bucket)
 POST /{index}/_count     exact match count
 GET  /{index}/_doc/{id}  fetch one document by _id
 GET  /{index}/_mapping   the search-index declaration as ES properties
