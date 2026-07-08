@@ -31,6 +31,14 @@ hardening, and tracked extras.
   cluster-path fixes its own release smoke caught) on repo.zapolski.nyc,
   test cluster upgraded and smoke-verified.
 
+## Web UI
+
+- [ ] **[ui] Built-in admin UI** — status, stats, configuration, and a
+  SQL query console served by the node itself, reusing REST Basic auth +
+  RBAC unchanged; `[ui] enabled` config knob, live-toggleable via
+  `\config set ui.enabled`. Full plan and phased roadmap:
+  [UI_TODO.md](UI_TODO.md). Next action: phase 1 (skeleton + status).
+
 ## Full-text search
 
 - [ ] **[fts] ES-REST subset follow-ups**: `bool.should` beside
