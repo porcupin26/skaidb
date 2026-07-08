@@ -133,6 +133,13 @@ function showTab(name) {
   for (const section of document.querySelectorAll("main#app-view > section")) {
     section.hidden = section.id !== `tab-${name}`;
   }
+  // The stats tab polls only while visible (two requests every 5s).
+  clearInterval(statsTimer);
+  statsTimer = null;
+  if (name === "stats") {
+    statsTick();
+    statsTimer = setInterval(statsTick, STATS_INTERVAL_MS);
+  }
 }
 
 document.querySelector("#tabs").addEventListener("click", (ev) => {
@@ -334,6 +341,195 @@ $("q-history-sel").addEventListener("change", (ev) => {
   $("q-sql").focus();
 });
 
+// ---- stats tab ----
+const STATS_INTERVAL_MS = 5000;
+const SPARK_WINDOW = 60; // 60 samples x 5s = 5 minutes of history
+let statsHistory = []; // [{t, m: Map(metric name → value)}]
+let statsTimer = null;
+
+async function apiText(path) {
+  const resp = await fetch(path, { headers: auth ? { Authorization: auth } : {} });
+  if (resp.status === 401) throw new AuthError();
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  return resp.text();
+}
+
+// Prometheus text → Map. Each exact series keeps its own key; label sets
+// are also summed under the bare metric name (all we need client-side).
+function parseProm(text) {
+  const m = new Map();
+  for (const line of text.split("\n")) {
+    if (!line || line.startsWith("#")) continue;
+    const sp = line.lastIndexOf(" ");
+    if (sp < 0) continue;
+    const key = line.slice(0, sp);
+    const val = Number(line.slice(sp + 1));
+    if (!Number.isFinite(val)) continue;
+    m.set(key, val);
+    const brace = key.indexOf("{");
+    if (brace > 0) {
+      const name = key.slice(0, brace);
+      m.set(name, (m.get(name) || 0) + val);
+    }
+  }
+  return m;
+}
+
+// Per-interval rate of a counter across the sampled history.
+function rateSeries(name) {
+  const out = [];
+  for (let i = 1; i < statsHistory.length; i++) {
+    const dt = (statsHistory[i].t - statsHistory[i - 1].t) / 1000;
+    const d = (statsHistory[i].m.get(name) ?? 0) - (statsHistory[i - 1].m.get(name) ?? 0);
+    out.push(dt > 0 ? Math.max(0, d) / dt : 0);
+  }
+  return out;
+}
+
+function spark(values) {
+  const c = document.createElement("canvas");
+  c.width = 120;
+  c.height = 22;
+  c.className = "spark";
+  if (values.length > 1) {
+    const g = c.getContext("2d");
+    const max = Math.max(...values, 1e-9);
+    g.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#2563eb";
+    g.lineWidth = 1.5;
+    g.beginPath();
+    values.forEach((v, i) => {
+      const x = (i / (values.length - 1)) * 118 + 1;
+      const y = 20 - (v / max) * 18 + 1;
+      if (i === 0) g.moveTo(x, y);
+      else g.lineTo(x, y);
+    });
+    g.stroke();
+  }
+  return c;
+}
+
+// A value with a trailing sparkline, for kv() cells.
+function withSpark(text, values) {
+  const wrap = document.createElement("span");
+  wrap.className = "valspark";
+  const label = document.createElement("span");
+  label.textContent = text;
+  wrap.append(label, spark(values));
+  return wrap;
+}
+
+function fmtBytes(n) {
+  if (n < 1024) return `${n} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < units.length - 1);
+  return `${n.toFixed(n < 10 ? 1 : 0)} ${units[i]}`;
+}
+
+function fmtRate(v) {
+  return v >= 100 ? Math.round(v).toString() : v.toFixed(1);
+}
+
+async function refreshStats() {
+  const [promText, statusResult] = await Promise.all([
+    apiText("/metrics"),
+    api("POST", "/query", JSON.stringify({ sql: "SHOW STATUS" })),
+  ]);
+  const m = parseProm(promText);
+  statsHistory.push({ t: Date.now(), m });
+  if (statsHistory.length > SPARK_WINDOW) statsHistory.shift();
+  const s = new Map(statusResult.rows);
+
+  const qRates = rateSeries("skaidb_queries_total");
+  const scanRates = rateSeries("skaidb_rows_scanned_total");
+  const byteRates = rateSeries("skaidb_bytes_returned_total");
+  // Mean latency over the last interval: Δsum / Δcount.
+  let latency = "—";
+  if (statsHistory.length > 1) {
+    const [a, b] = statsHistory.slice(-2);
+    const dc = (b.m.get("skaidb_query_duration_seconds_count") ?? 0) -
+               (a.m.get("skaidb_query_duration_seconds_count") ?? 0);
+    const ds = (b.m.get("skaidb_query_duration_seconds_sum") ?? 0) -
+               (a.m.get("skaidb_query_duration_seconds_sum") ?? 0);
+    if (dc > 0) latency = `${(ds / dc * 1000).toFixed(2)} ms`;
+  }
+  kv("st-queries", [
+    ["queries/s", withSpark(fmtRate(qRates.at(-1) ?? 0), qRates)],
+    ["mean latency (5s)", latency],
+    ["in flight", m.get("skaidb_queries_in_flight") ?? 0],
+    ["rows scanned/s", withSpark(fmtRate(scanRates.at(-1) ?? 0), scanRates)],
+    ["bytes returned/s", withSpark(fmtBytes(byteRates.at(-1) ?? 0), byteRates)],
+    ["connections", m.get("skaidb_connections_active") ?? 0],
+  ]);
+
+  kv("st-storage", [
+    ["tables", s.get("tables")],
+    ["disk", fmtBytes(s.get("disk_bytes") ?? 0)],
+    ["memtable", fmtBytes(s.get("memtable_bytes") ?? 0)],
+    ["sstables", s.get("sstable_count")],
+    ["secondary indexes", s.get("secondary_indexes")],
+    ["compactions", s.get("compactions")],
+    ["compacted", fmtBytes(s.get("compaction_bytes") ?? 0)],
+  ]);
+
+  kv("st-cache", [
+    ["cache hit rate", s.get("cache_hit_rate")],
+    ["cache entries", s.get("cache_entries")],
+    ["cache evictions", s.get("cache_evictions")],
+    ["bloom negatives", s.get("bloom_negatives")],
+    ["wal", fmtBytes(s.get("wal_bytes") ?? 0)],
+    ["wal fsyncs", s.get("wal_fsyncs")],
+  ]);
+
+  kv("st-search", [
+    ["search indexes", s.get("search_indexes")],
+    ["search docs", s.get("search_docs")],
+    ["search disk", fmtBytes(m.get("skaidb_search_disk_bytes") ?? 0)],
+    ["last rebuild", `${s.get("search_rebuild_ms") ?? 0} ms`],
+    ["timeseries tables", s.get("timeseries_tables")],
+    ["vector indexes", s.get("vector_indexes")],
+  ]);
+
+  renderStatGroup("st-tables", statusResult.rows, /^table\.(.+)\.(live_keys|tombstones|disk_bytes)$/,
+    ["live_keys", "tombstones", "disk_bytes"]);
+  renderStatGroup("st-indexes", statusResult.rows, /^search\.(.+)\.(docs|disk_bytes|uncommitted)$/,
+    ["docs", "disk_bytes", "uncommitted"]);
+  $("stats-refreshed").textContent = `refreshed ${new Date().toLocaleTimeString()} · sparklines cover ${Math.round((statsHistory.length - 1) * STATS_INTERVAL_MS / 1000)}s`;
+}
+
+// Rows like `table.<name>.<field>` → one table row per <name>.
+function renderStatGroup(tableId, rows, pattern, fields) {
+  const groups = new Map();
+  for (const [metric, value] of rows) {
+    const match = String(metric).match(pattern);
+    if (!match) continue;
+    if (!groups.has(match[1])) groups.set(match[1], {});
+    groups.get(match[1])[match[2]] = value;
+  }
+  const tbody = $(tableId).querySelector("tbody");
+  tbody.textContent = "";
+  for (const [name, vals] of [...groups].sort((a, b) => a[0].localeCompare(b[0]))) {
+    const tr = document.createElement("tr");
+    const nameCell = document.createElement("td");
+    nameCell.textContent = name;
+    tr.append(nameCell);
+    for (const f of fields) {
+      const td = document.createElement("td");
+      const v = vals[f];
+      td.textContent = v === undefined ? "—" : f.includes("bytes") ? fmtBytes(v) : String(v);
+      tr.append(td);
+    }
+    tbody.append(tr);
+  }
+}
+
+function statsTick() {
+  refreshStats().catch((e) => {
+    if (e instanceof AuthError) logout();
+    else $("stats-refreshed").textContent = `refresh failed: ${e.message}`;
+  });
+}
+
 function fmtDuration(secs) {
   const d = Math.floor(secs / 86400), h = Math.floor((secs % 86400) / 3600),
         m = Math.floor((secs % 3600) / 60);
@@ -359,6 +555,9 @@ async function enterApp() {
 function logout() {
   clearAuth();
   clearInterval(refreshTimer);
+  clearInterval(statsTimer);
+  statsTimer = null;
+  statsHistory = [];
   $("login-pass").value = "";
   $("login-error").hidden = true;
   // Drop anything fetched with the old credentials from the screen.

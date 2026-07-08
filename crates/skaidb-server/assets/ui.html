@@ -30,6 +30,7 @@
   <nav id="tabs">
     <button data-tab="status" class="active">status</button>
     <button data-tab="query">query</button>
+    <button data-tab="stats">stats</button>
   </nav>
 
   <section id="tab-status">
@@ -84,6 +85,42 @@
       <p id="q-banner" class="muted" hidden></p>
       <div id="q-results" class="results"></div>
     </div>
+  </section>
+
+  <section id="tab-stats" hidden>
+    <div class="cards">
+      <div class="card">
+        <h2>queries</h2>
+        <table class="kv" id="st-queries"></table>
+      </div>
+      <div class="card">
+        <h2>storage</h2>
+        <table class="kv" id="st-storage"></table>
+      </div>
+      <div class="card">
+        <h2>cache &amp; wal</h2>
+        <table class="kv" id="st-cache"></table>
+      </div>
+      <div class="card">
+        <h2>search &amp; timeseries</h2>
+        <table class="kv" id="st-search"></table>
+      </div>
+      <div class="card wide">
+        <h2>tables</h2>
+        <div class="results"><table id="st-tables">
+          <thead><tr><th>table</th><th>live keys</th><th>tombstones</th><th>disk</th></tr></thead>
+          <tbody></tbody>
+        </table></div>
+      </div>
+      <div class="card wide">
+        <h2>search indexes</h2>
+        <div class="results"><table id="st-indexes">
+          <thead><tr><th>index</th><th>docs</th><th>disk</th><th>uncommitted</th></tr></thead>
+          <tbody></tbody>
+        </table></div>
+      </div>
+    </div>
+    <p class="muted" id="stats-refreshed"></p>
   </section>
 </main>
 

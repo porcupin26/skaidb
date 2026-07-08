@@ -92,6 +92,10 @@ textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 }
 .results td.null { color: var(--muted); font-style: italic; }
 .results b { color: var(--accent); }
+.spark { vertical-align: middle; opacity: 0.9; }
+.valspark {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+}
 .ok { color: var(--ok); }
 .bad { color: var(--error); }
 .error { color: var(--error); font-size: 13px; }

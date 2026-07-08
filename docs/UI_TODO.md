@@ -175,9 +175,17 @@ doc as phases land.
   Blob download, display capped at 1000 rows with a visible add-a-LIMIT
   banner, results cleared on logout. Server test covers the `db` key;
   browser-side RBAC/readonly check rides the cluster verification.
-- [ ] **Phase 3 — stats dashboards**: storage/FTS/TS/cluster panels with
+- [x] **Phase 3 — stats dashboards**: storage/FTS/TS/cluster panels with
   auto-refresh + sparklines. Exit: numbers cross-checked against
   `SHOW STATUS` and `/metrics` on the test cluster under load.
+  *Shipped notes*: stats tab polls `/metrics` + `SHOW STATUS` every 5 s
+  **only while visible**; a client-side Prometheus text parser sums
+  label sets under the bare metric name; canvas sparklines (CSP-safe,
+  no SVG strings) over a 60-sample rolling window for queries/s, rows
+  scanned/s, bytes returned/s; mean latency from Δsum/Δcount of the
+  duration histogram; per-table and per-search-index tables parsed from
+  the `table.*`/`search.*` SHOW STATUS rows. Cluster-under-load
+  cross-check rides the release rollout.
 - [ ] **Phase 4 — config + admin ops**: config viewer/editor, repair/
   reclaim/add/remove-node with confirmations, slow-log view. Exit: a
   node join driven entirely from the UI on the test cluster; non-admin
