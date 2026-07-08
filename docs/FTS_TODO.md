@@ -186,13 +186,37 @@ error.
 ## 5. Phases (each ends tested, clippy-clean, docs updated, released,
 fleet-verified — the TS cadence)
 
-- [ ] **Phase 0 — spike & decision checkpoint** (~branchless, throwaway ok):
-  embed Tantivy in a scratch binary; validate (a) index-from-LSM-table
-  rebuild speed, (b) writer memory bounds + commit/refresh semantics against
-  our WAL-replay recovery idea, (c) mmap behavior inside LXC memory limits,
-  (d) binary-size and compile-time cost. Exit: written go/no-go on Tantivy
-  (fallback: native mini-engine scoped to match/phrase/BM25 only — accept
-  the smaller surface, then grow).
+- [x] **Phase 0 — spike & decision checkpoint** — **GO on Tantivy** (0.26).
+  Spike lives at `crates/skaidb-fts/examples/phase0_spike.rs`; measured on
+  the dev box (synthetic corpus, 47-word vocab — deliberately worst-case
+  posting lengths since every term matches ~20% of docs):
+  - (a) Rebuild speed: 434–576 k docs/s (≈280–370 MB/s of text) with a
+    128 MB writer heap; 1 M docs (640 MB text) indexed + committed in 2.3 s.
+    Index on disk ≈ 29–30 % of raw text (positions + stored title/pk).
+    Full rebuild-from-table is clearly viable as the recovery/anti-entropy
+    story.
+  - (b) Commit/refresh semantics match the WAL-as-translog plan: uncommitted
+    docs are invisible to readers and lost on crash (verified via
+    rollback + reopen); tantivy commits return a monotonic opstamp and
+    accept a payload — we'll store the max-indexed HLC as the commit
+    payload, and on restart replay table rows with `hlc > payload`.
+    Refresh tick under ingest (2 k-doc batch): commit ≈ 13 ms, reader
+    reload ≈ 1 ms — a 1 s NRT refresh interval costs ~1.5 % of a core.
+    Delete+reinsert updates (1 k) commit in ~20 ms.
+  - (c) Memory: peak RSS ≈ 1.5× the configured writer heap during a bulk
+    build (arena + stored-field buffers), independent of corpus size
+    (196 MB peak at 1 M docs / 128 MB heap). Search-side RSS is mmap'd
+    segment pages — evictable under LXC memory pressure, so `memory_target`
+    only needs to budget the writer heap. LXC-limit behavior re-checked on
+    the fleet in phase 5.
+  - (d) Build cost: tantivy dep tree adds ~40 s wall (~130 s CPU) one-time
+    release compile; incremental `skaidb-fts` rebuild ≈ 11 s; spike binary
+    6.7 MB release — acceptable for the static-binary story. ~110 crates in
+    the fts dep tree (compile-time only; `forbid(unsafe)` on our crates is
+    unaffected).
+  - (d) Query sanity at 1 M docs, worst-case postings: term p50 3 ms,
+    bool-AND 16 ms, bool-OR 8 ms, phrase 47 ms (top-10). Realistic-corpus
+    numbers (wiki abstracts) come with the phase-1 exit benchmark.
 - [ ] **Phase 1 — single-node core**: `skaidb-fts` crate; catalog +
   `CREATE/DROP SEARCH INDEX` DDL (broadcast like other DDL); maintenance on
   put/delete; `MATCH()`, `SEARCH()`, `score()`; top-k pushdown for

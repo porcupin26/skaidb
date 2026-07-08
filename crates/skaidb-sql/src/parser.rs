@@ -166,6 +166,16 @@ impl Parser {
             let name = self.expect_ident()?;
             return Ok(Statement::UseDatabase { name });
         }
+        // `REBUILD SEARCH INDEX <name>` — both words contextual.
+        if self.peek_ident_ci("rebuild") {
+            self.advance();
+            if !self.eat_ident_ci("search") {
+                return Err(self.unexpected("SEARCH INDEX after REBUILD".into()));
+            }
+            self.expect_keyword(Keyword::Index)?;
+            let name = self.expect_ident()?;
+            return Ok(Statement::RebuildSearchIndex { name });
+        }
         match self.peek() {
             Token::Keyword(Keyword::Select) => self.parse_select().map(Statement::Select),
             Token::Keyword(Keyword::Insert) => self.parse_insert().map(Statement::Insert),
@@ -476,6 +486,29 @@ impl Parser {
                 dim,
                 metric: metric.unwrap_or_else(|| "cosine".into()),
             }))
+        } else if self.peek_ident_ci("search") {
+            // `SEARCH` is contextual so `SEARCH('...')` stays a valid
+            // function call in expressions.
+            self.advance();
+            self.expect_keyword(Keyword::Index)?;
+            let if_not_exists = self.parse_if_not_exists()?;
+            let name = self.expect_ident()?;
+            self.expect_keyword(Keyword::On)?;
+            let table = self.parse_table_name()?;
+            self.expect(&Token::LParen)?;
+            let mut paths = vec![self.parse_path()?];
+            while self.eat(&Token::Comma) {
+                paths.push(self.parse_path()?);
+            }
+            self.expect(&Token::RParen)?;
+            let options = self.parse_with_options()?;
+            Ok(Statement::CreateSearchIndex(CreateSearchIndex {
+                name,
+                if_not_exists,
+                table,
+                paths,
+                options,
+            }))
         } else if self.eat_keyword(Keyword::Index) {
             let if_not_exists = self.parse_if_not_exists()?;
             let name = self.expect_ident()?;
@@ -524,6 +557,12 @@ impl Parser {
             let if_exists = self.parse_if_exists()?;
             let name = self.expect_ident()?;
             Ok(Statement::DropVectorIndex { name, if_exists })
+        } else if self.peek_ident_ci("search") {
+            self.advance();
+            self.expect_keyword(Keyword::Index)?;
+            let if_exists = self.parse_if_exists()?;
+            let name = self.expect_ident()?;
+            Ok(Statement::DropSearchIndex { name, if_exists })
         } else if self.eat_keyword(Keyword::Index) {
             let if_exists = self.parse_if_exists()?;
             let name = self.expect_ident()?;
@@ -533,8 +572,48 @@ impl Parser {
             let name = self.expect_ident()?;
             Ok(Statement::DropDatabase { name, if_exists })
         } else {
-            Err(self.unexpected("TABLE, INDEX, VECTOR INDEX, or DATABASE".into()))
+            Err(self.unexpected("TABLE, INDEX, VECTOR INDEX, SEARCH INDEX, or DATABASE".into()))
         }
+    }
+
+    /// `[WITH (name = value, ...)]` — an optional options list. Values may be
+    /// string, integer, float, or boolean literals; each is captured as its
+    /// literal text and validated by the consumer of the statement.
+    fn parse_with_options(&mut self) -> Result<Vec<(String, String)>, ParseError> {
+        // `WITH` is contextual: only an options list when followed by `(`.
+        if !(self.peek_ident_ci("with")
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen)))
+        {
+            return Ok(Vec::new());
+        }
+        self.advance();
+        self.expect(&Token::LParen)?;
+        let mut options = Vec::new();
+        loop {
+            let name = self.expect_ident()?.to_ascii_lowercase();
+            self.expect(&Token::Eq)?;
+            let value = match self.advance() {
+                Token::Str(s) => s,
+                Token::Int(i) => i.to_string(),
+                Token::Float(x) => x.to_string(),
+                Token::Ident(s)
+                    if s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("false") =>
+                {
+                    s.to_ascii_lowercase()
+                }
+                other => {
+                    return Err(ParseError::Other(format!(
+                        "expected a literal value for option {name}, found {other:?}"
+                    )))
+                }
+            };
+            options.push((name, value));
+            if !self.eat(&Token::Comma) {
+                break;
+            }
+        }
+        self.expect(&Token::RParen)?;
+        Ok(options)
     }
 
     fn parse_if_not_exists(&mut self) -> Result<bool, ParseError> {
@@ -1159,6 +1238,84 @@ mod tests {
                 primary_key: vec!["id".into()],
             })
         );
+    }
+
+    #[test]
+    fn parse_search_index_ddl() {
+        assert_eq!(
+            parse("CREATE SEARCH INDEX articles_fts ON articles (title, body) \
+                   WITH (analyzer = 'english', refresh_ms = 500)")
+            .unwrap(),
+            Statement::CreateSearchIndex(CreateSearchIndex {
+                name: "articles_fts".into(),
+                if_not_exists: false,
+                table: "articles".into(),
+                paths: vec!["title".into(), "body".into()],
+                options: vec![
+                    ("analyzer".into(), "english".into()),
+                    ("refresh_ms".into(), "500".into()),
+                ],
+            })
+        );
+        // WITH is optional; IF NOT EXISTS and dotted paths work.
+        assert_eq!(
+            parse("CREATE SEARCH INDEX IF NOT EXISTS s ON t (meta.title)").unwrap(),
+            Statement::CreateSearchIndex(CreateSearchIndex {
+                name: "s".into(),
+                if_not_exists: true,
+                table: "t".into(),
+                paths: vec!["meta.title".into()],
+                options: vec![],
+            })
+        );
+        assert_eq!(
+            parse("DROP SEARCH INDEX IF EXISTS articles_fts").unwrap(),
+            Statement::DropSearchIndex {
+                name: "articles_fts".into(),
+                if_exists: true,
+            }
+        );
+        assert_eq!(
+            parse("REBUILD SEARCH INDEX articles_fts").unwrap(),
+            Statement::RebuildSearchIndex {
+                name: "articles_fts".into(),
+            }
+        );
+        // Options must be literals.
+        assert!(parse("CREATE SEARCH INDEX s ON t (a) WITH (analyzer = english)").is_err());
+        assert!(parse("REBUILD INDEX x").is_err());
+    }
+
+    #[test]
+    fn search_functions_parse_as_plain_functions() {
+        // `SEARCH`/`MATCH`/`score` stay contextual: they parse as ordinary
+        // function calls in expressions, and the search-index DDL does not
+        // reserve them.
+        let s = parse(
+            "SELECT id, score() FROM articles \
+             WHERE MATCH(body, 'quick fox') AND published = true \
+             ORDER BY score() DESC LIMIT 10",
+        )
+        .unwrap();
+        let Statement::Select(sel) = s else {
+            panic!("expected select");
+        };
+        assert_eq!(sel.limit, Some(10));
+        assert_eq!(sel.order_by.len(), 1);
+        assert!(sel.order_by[0].descending);
+        assert_eq!(
+            sel.order_by[0].expr,
+            Expr::Func {
+                name: "score".into(),
+                args: vec![],
+            }
+        );
+        // The MATCH predicate is the left arm of the AND.
+        let Some(Expr::Binary { .. }) = sel.filter else {
+            panic!("expected AND filter");
+        };
+        // A table named `search` can still be queried.
+        assert!(parse("SELECT * FROM search WHERE SEARCH('title:rust +db')").is_ok());
     }
 
     #[test]

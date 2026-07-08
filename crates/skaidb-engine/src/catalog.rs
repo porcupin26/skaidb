@@ -58,6 +58,21 @@ pub struct VectorIndexDef {
     pub dim: usize,
 }
 
+/// A full-text search index declaration (`CREATE SEARCH INDEX ... ON t(paths)
+/// WITH (...)`), backing `MATCH()`/`SEARCH()` predicates over the text at
+/// `paths`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchIndexDef {
+    pub table: String,
+    /// Dotted paths into the row document indexed as text.
+    pub paths: Vec<String>,
+    /// Analyzer name (`standard`, `english`, `whitespace`, `keyword`).
+    pub analyzer: String,
+    /// NRT refresh cadence: uncommitted index writes become visible (and
+    /// durable) after at most this many milliseconds.
+    pub refresh_ms: u64,
+}
+
 /// A table definition: just its primary key columns.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TableDef {
@@ -115,6 +130,10 @@ pub struct Catalog {
     /// Vector indexes (rebuilt in memory on open). `default` so older catalogs load.
     #[serde(default)]
     pub vector_indexes: BTreeMap<String, VectorIndexDef>,
+    /// Full-text search indexes (Tantivy-backed, reopened/replayed on open).
+    /// `default` so older catalogs load.
+    #[serde(default)]
+    pub search_indexes: BTreeMap<String, SearchIndexDef>,
     /// Named databases other than the implicit `default`. A database is a
     /// namespace prefix on table/index names; this set lets an empty database
     /// (created but holding no tables yet) persist. `default` so older catalogs
@@ -129,7 +148,8 @@ pub struct Catalog {
     pub auth_roles: BTreeMap<String, AuthRoleDef>,
     /// Per-object DDL version stamps for last-writer-wins schema replication,
     /// keyed by a kind-prefixed name: `d:<db>`, `t:<table>`, `i:<index>`,
-    /// `v:<vector index>`. A `dropped` stamp is a tombstone. `default` so older
+    /// `v:<vector index>`, `s:<search index>`. A `dropped` stamp is a
+    /// tombstone. `default` so older
     /// catalogs load with no versions and converge on the next DDL/repair.
     #[serde(default)]
     pub schema_versions: BTreeMap<String, SchemaVersion>,

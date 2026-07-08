@@ -162,6 +162,14 @@ Implemented end-to-end and tested (202 tests):
   ("nearest neighbors `WHERE …`"); cosine/L2/dot. **Distributed** — the index is
   broadcast so each node indexes its shard and queries scatter-gather + merge.
   In-memory/rebuilt-on-open for now — see [docs/VECTOR.md](docs/VECTOR.md)
+- **full-text search**: `CREATE SEARCH INDEX … ON t (title, body)` builds a
+  **BM25** index (embedded Tantivy) queried straight from SQL —
+  `WHERE MATCH(body, '…') ORDER BY score() DESC LIMIT k` pushes ranked top-k
+  into the index; `MATCH_PHRASE`/`FUZZY`/`SEARCH('query-string')` predicates;
+  `standard`/`english`/`whitespace`/`keyword` analyzers; near-real-time
+  refresh with WAL-replay crash recovery (the table is the source of truth).
+  Single-node core today; cluster scatter-gather is next — see
+  [docs/SEARCH.md](docs/SEARCH.md)
 - **time-series tables**: `CREATE TIMESERIES TABLE … (SERIES KEY (…),
   RETENTION 30d)` stores samples in a Prometheus-style engine
   (Gorilla-compressed chunks, ~1–1.5 B/sample, ≥2M samples/s ingest) with

@@ -21,6 +21,14 @@ pub enum Statement {
     DropIndex { name: String, if_exists: bool },
     CreateVectorIndex(CreateVectorIndex),
     DropVectorIndex { name: String, if_exists: bool },
+    /// `CREATE SEARCH INDEX` — a full-text index over one or more text
+    /// columns, queried with `MATCH()`/`SEARCH()` predicates.
+    CreateSearchIndex(CreateSearchIndex),
+    /// `DROP SEARCH INDEX [IF EXISTS] name`.
+    DropSearchIndex { name: String, if_exists: bool },
+    /// `REBUILD SEARCH INDEX name` — discard the index data and re-index
+    /// every row of the table (recovery / anti-entropy escape hatch).
+    RebuildSearchIndex { name: String },
     AlterTable(AlterTable),
     Insert(Insert),
     Select(Select),
@@ -126,6 +134,7 @@ impl Statement {
             Statement::DropTable { name, .. } => f(name),
             Statement::CreateIndex(c) => f(&mut c.table),
             Statement::CreateVectorIndex(c) => f(&mut c.table),
+            Statement::CreateSearchIndex(c) => f(&mut c.table),
             Statement::AlterTable(a) => {
                 f(&mut a.name);
                 if let AlterAction::RenameTable { new_name } = &mut a.action {
@@ -149,6 +158,9 @@ impl Statement {
             Statement::DropIndex { name, .. } => f(name),
             Statement::CreateVectorIndex(c) => f(&mut c.name),
             Statement::DropVectorIndex { name, .. } => f(name),
+            Statement::CreateSearchIndex(c) => f(&mut c.name),
+            Statement::DropSearchIndex { name, .. } => f(name),
+            Statement::RebuildSearchIndex { name } => f(name),
             _ => {}
         }
     }
@@ -243,6 +255,22 @@ pub struct CreateVectorIndex {
     pub dim: usize,
     /// `cosine` (default), `l2`, or `dot`.
     pub metric: String,
+}
+
+/// `CREATE SEARCH INDEX [IF NOT EXISTS] name ON table (path1 [, path2, ...])
+/// [WITH (option = value, ...)]`. A full-text (BM25) index over the text at
+/// the given document paths. Options: `analyzer` (string, default
+/// `'standard'`), `refresh_ms` (integer, default 1000).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateSearchIndex {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub table: String,
+    pub paths: Vec<String>,
+    /// Raw `WITH (...)` options in declaration order; values are kept as
+    /// written (strings unquoted, numbers/bools as their literal text) and
+    /// validated by the engine.
+    pub options: Vec<(String, String)>,
 }
 
 /// `INSERT INTO table (cols...) VALUES (..), (..)`.

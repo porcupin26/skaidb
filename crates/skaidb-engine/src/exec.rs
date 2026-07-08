@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use skaidb_sql::ast::{
-    AggArg, AggFunc, AlterAction, AlterTable, BinaryOp, Delete, Expr, Insert, JoinKind, OrderKey,
-    Select, SelectItem, Statement, Update,
+    AggArg, AggFunc, AlterAction, AlterTable, BinaryOp, CreateSearchIndex, Delete, Expr, Insert,
+    JoinKind, OrderKey, Select, SelectItem, Statement, Update,
 };
 use skaidb_sql::parse;
 use std::sync::Arc;
@@ -21,7 +21,9 @@ use skaidb_types::{Document, Value};
 
 use skaidb_tsdb::{Tsdb, TsdbOptions};
 
-use crate::catalog::{AuthRoleDef, Catalog, IndexDef, RollupDef, SchemaVersion, TableDef, TsTableDef, UserDef, VectorIndexDef};
+use skaidb_fts::{Analyzer, SearchIndex, SearchIndexConfig, SearchQuery, Watermark};
+
+use crate::catalog::{AuthRoleDef, Catalog, IndexDef, RollupDef, SchemaVersion, SearchIndexDef, TableDef, TsTableDef, UserDef, VectorIndexDef};
 use skaidb_auth::{privilege_from_name, Object as AuthObject, Privilege as AuthPrivilege, RoleStore, ScramCredential};
 use crate::error::{EngineError, Result};
 use crate::eval::{compare, eval, eval_predicate};
@@ -67,6 +69,9 @@ pub struct Database {
     indexes: HashMap<String, StorageEngine>,
     /// In-memory HNSW vector indexes by name (rebuilt from the table on open).
     vector_indexes: HashMap<String, Hnsw>,
+    /// Live full-text search indexes by name (reopened from disk on open,
+    /// caught up from the table by watermark replay).
+    search_indexes: HashMap<String, LiveSearchIndex>,
     /// The open transaction's buffered writes, if a `BEGIN` is in flight.
     txn: Option<TxnBuffer>,
     /// Clock for stamping DDL so schema changes order under last-writer-wins.
@@ -79,6 +84,61 @@ pub struct Database {
     /// (they live only in RAM and are reconstructed from table rows), in
     /// milliseconds — surfaced as a metric so a slow open is visible.
     vector_rebuild_ms: u64,
+    /// Wall-clock spent reopening/replaying/rebuilding search indexes during
+    /// the last `open`, in milliseconds.
+    search_rebuild_ms: u64,
+}
+
+/// A search index plus its NRT refresh state: writes apply immediately but
+/// only commit (become visible and durable) when `refresh_ms` has elapsed
+/// since the last commit — or right before a search on the write path.
+/// Deliberately no commit on `Drop`: a clean shutdown loses at most
+/// `refresh_ms` of index writes and the open-time watermark replay recovers
+/// them, so the recovery path is exercised constantly.
+#[derive(Debug)]
+struct LiveSearchIndex {
+    index: SearchIndex,
+    last_commit: std::time::Instant,
+    refresh_ms: u64,
+}
+
+impl LiveSearchIndex {
+    /// Commit if there is anything to commit and the refresh interval elapsed.
+    fn maybe_refresh(&mut self) -> Result<()> {
+        if self.index.dirty()
+            && self.last_commit.elapsed() >= std::time::Duration::from_millis(self.refresh_ms)
+        {
+            self.index.commit()?;
+            self.last_commit = std::time::Instant::now();
+        }
+        Ok(())
+    }
+
+    /// Commit any pending writes now (read-your-writes before a search).
+    fn commit_if_dirty(&mut self) -> Result<()> {
+        if self.index.dirty() {
+            self.index.commit()?;
+            self.last_commit = std::time::Instant::now();
+        }
+        Ok(())
+    }
+}
+
+/// Tantivy writer heap per search index. Phase 5 ties this into the server's
+/// `memory_target` instead of a fixed size.
+const FTS_WRITER_HEAP: usize = 64 * 1024 * 1024;
+
+/// An [`Hlc`] as the search crate's engine-agnostic watermark.
+fn hlc_to_watermark(hlc: Hlc) -> Watermark {
+    Watermark {
+        physical: hlc.physical,
+        logical: hlc.logical,
+    }
+}
+
+/// A persisted watermark back as an [`Hlc`].
+fn watermark_to_hlc(w: Watermark) -> Hlc {
+    Hlc::new(w.physical, w.logical)
 }
 
 /// Aggregate storage/runtime statistics across all of a database's tables and
@@ -92,6 +152,13 @@ pub struct DbStats {
     pub vectors_indexed: usize,
     /// Wall-clock spent rebuilding vector indexes on the last open (ms).
     pub vector_rebuild_ms: u64,
+    pub search_indexes: usize,
+    /// Total searchable (committed) documents across all search indexes.
+    pub search_docs: u64,
+    /// Bytes on disk across all search index segments.
+    pub search_disk_bytes: u64,
+    /// Wall-clock spent reopening/replaying search indexes on the last open (ms).
+    pub search_rebuild_ms: u64,
     pub memtable_bytes: u64,
     pub sstable_count: u64,
     pub disk_bytes: u64,
@@ -186,6 +253,72 @@ impl Database {
         }
         let vector_rebuild_ms = rebuild_start.elapsed().as_millis() as u64;
 
+        // Search indexes persist their own segments; reopen each and replay
+        // table rows newer than its committed watermark (writes lost to a
+        // crash or the no-commit-on-drop shutdown). A missing, corrupt, or
+        // definition-mismatched index is wiped and rebuilt from the table.
+        let rebuild_start = std::time::Instant::now();
+        let mut search_indexes = HashMap::new();
+        for (name, def) in &catalog.search_indexes {
+            let cfg = SearchIndexConfig {
+                fields: def.paths.clone(),
+                analyzer: Analyzer::parse(&def.analyzer)?,
+            };
+            let idx_dir = fts_dir(&dir, name);
+            let mut index = match SearchIndex::open(&idx_dir, &cfg, FTS_WRITER_HEAP) {
+                Ok(index) => index,
+                // NeedsRebuild or any other open failure: start from scratch.
+                Err(_) => {
+                    let _ = std::fs::remove_dir_all(&idx_dir);
+                    SearchIndex::open(&idx_dir, &cfg, FTS_WRITER_HEAP)?
+                }
+            };
+            if let Some(engine) = tables.get(&def.table) {
+                match index.committed_watermark() {
+                    // Catch-up: replay every put/delete stamped after the
+                    // watermark (deletes included, so a row removed while the
+                    // delete was uncommitted stays removed).
+                    Some(w) => {
+                        let watermark = watermark_to_hlc(w);
+                        for (key, hlc, value) in engine.scan_versioned_with_tombstones()? {
+                            if hlc <= watermark {
+                                continue;
+                            }
+                            match value {
+                                Some(bytes) => {
+                                    if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
+                                        index.put(&key, &doc, hlc_to_watermark(hlc))?;
+                                    }
+                                }
+                                None => index.delete(&key, hlc_to_watermark(hlc)),
+                            }
+                        }
+                    }
+                    // Never committed: full rebuild from the table.
+                    None => {
+                        index.clear()?;
+                        for (key, bytes, hlc) in engine.scan_versioned()? {
+                            if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
+                                index.put(&key, &doc, hlc_to_watermark(hlc))?;
+                            }
+                        }
+                    }
+                }
+            }
+            if index.dirty() {
+                index.commit()?;
+            }
+            search_indexes.insert(
+                name.clone(),
+                LiveSearchIndex {
+                    index,
+                    last_commit: std::time::Instant::now(),
+                    refresh_ms: def.refresh_ms,
+                },
+            );
+        }
+        let search_rebuild_ms = rebuild_start.elapsed().as_millis() as u64;
+
         let role_store = build_role_store(&catalog);
         Ok(Database {
             dir,
@@ -196,10 +329,12 @@ impl Database {
             role_store,
             indexes,
             vector_indexes,
+            search_indexes,
             txn: None,
             clock,
             ddl_hlc: None,
             vector_rebuild_ms,
+            search_rebuild_ms,
         })
     }
 
@@ -307,6 +442,152 @@ impl Database {
         self.record_schema(key, hlc, true);
         self.save_catalog()?;
         Ok(QueryOutput::Ddl)
+    }
+
+    /// `CREATE SEARCH INDEX`: validate the `WITH` options, build the index on
+    /// disk, backfill it from the table's existing rows (committing so the
+    /// backfill is immediately searchable), and register it in the catalog.
+    fn create_search_index(&mut self, c: &CreateSearchIndex) -> Result<QueryOutput> {
+        if !self.catalog.tables.contains_key(&c.table) {
+            return Err(EngineError::TableNotFound(c.table.clone()));
+        }
+        let hlc = self.ddl_stamp();
+        let key = format!("s:{}", c.name);
+        if !self.schema_advances(&key, hlc) {
+            return Ok(QueryOutput::Ddl);
+        }
+        if self.catalog.search_indexes.contains_key(&c.name) {
+            if c.if_not_exists {
+                self.record_schema(key, hlc, false);
+                self.save_catalog()?;
+                return Ok(QueryOutput::Ddl);
+            }
+            return Err(EngineError::IndexExists(c.name.clone()));
+        }
+        // Options: `analyzer` and `refresh_ms` only; anything else is a typo
+        // the user should hear about.
+        let mut analyzer = Analyzer::Standard;
+        let mut refresh_ms: u64 = 1000;
+        for (name, value) in &c.options {
+            match name.as_str() {
+                "analyzer" => analyzer = Analyzer::parse(value)?,
+                "refresh_ms" => {
+                    refresh_ms = value.parse().map_err(|_| {
+                        EngineError::Type(format!(
+                            "refresh_ms must be a non-negative integer, got '{value}'"
+                        ))
+                    })?;
+                }
+                other => {
+                    return Err(EngineError::Type(format!(
+                        "unknown search index option '{other}'"
+                    )))
+                }
+            }
+        }
+        let def = SearchIndexDef {
+            table: c.table.clone(),
+            paths: c.paths.clone(),
+            analyzer: analyzer.as_str().to_string(),
+            refresh_ms,
+        };
+        let cfg = SearchIndexConfig {
+            fields: def.paths.clone(),
+            analyzer,
+        };
+        // Start from an empty directory (a leftover from a dropped index of
+        // the same name must not leak into the new one) and backfill.
+        let idx_dir = fts_dir(&self.dir, &c.name);
+        let _ = std::fs::remove_dir_all(&idx_dir);
+        let mut index = SearchIndex::open(&idx_dir, &cfg, FTS_WRITER_HEAP)?;
+        let engine = self
+            .tables
+            .get(&c.table)
+            .ok_or_else(|| EngineError::TableNotFound(c.table.clone()))?;
+        for (row_key, bytes, row_hlc) in engine.scan_versioned()? {
+            if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
+                index.put(&row_key, &doc, hlc_to_watermark(row_hlc))?;
+            }
+        }
+        index.commit()?;
+        self.search_indexes.insert(
+            c.name.clone(),
+            LiveSearchIndex {
+                index,
+                last_commit: std::time::Instant::now(),
+                refresh_ms,
+            },
+        );
+        self.catalog.search_indexes.insert(c.name.clone(), def);
+        self.record_schema(key, hlc, false);
+        self.save_catalog()?;
+        Ok(QueryOutput::Ddl)
+    }
+
+    /// Drop a search index (and its on-disk segments).
+    fn drop_search_index(&mut self, name: &str, if_exists: bool) -> Result<QueryOutput> {
+        let hlc = self.ddl_stamp();
+        let key = format!("s:{name}");
+        if !self.schema_advances(&key, hlc) {
+            return Ok(QueryOutput::Ddl);
+        }
+        if self.catalog.search_indexes.remove(name).is_none() && !if_exists {
+            return Err(EngineError::IndexNotFound(name.to_string()));
+        }
+        self.search_indexes.remove(name); // drop the writer before the files
+        let idx_dir = fts_dir(&self.dir, name);
+        if idx_dir.exists() {
+            std::fs::remove_dir_all(idx_dir)?;
+        }
+        self.record_schema(key, hlc, true);
+        self.save_catalog()?;
+        Ok(QueryOutput::Ddl)
+    }
+
+    /// `REBUILD SEARCH INDEX`: discard the index data and re-index every row
+    /// of the table (recovery / anti-entropy escape hatch).
+    fn rebuild_search_index_cmd(&mut self, name: &str) -> Result<QueryOutput> {
+        if !self.catalog.search_indexes.contains_key(name) {
+            return Err(EngineError::IndexNotFound(name.to_string()));
+        }
+        self.rebuild_search_index(name)?;
+        Ok(QueryOutput::Ddl)
+    }
+
+    /// Wipe and re-backfill a search index from its table's current rows
+    /// (also picks up a changed definition, e.g. after a column rename).
+    fn rebuild_search_index(&mut self, name: &str) -> Result<()> {
+        let def = self
+            .catalog
+            .search_indexes
+            .get(name)
+            .ok_or_else(|| EngineError::IndexNotFound(name.to_string()))?
+            .clone();
+        let cfg = SearchIndexConfig {
+            fields: def.paths.clone(),
+            analyzer: Analyzer::parse(&def.analyzer)?,
+        };
+        self.search_indexes.remove(name); // drop the writer before the files
+        let idx_dir = fts_dir(&self.dir, name);
+        let _ = std::fs::remove_dir_all(&idx_dir);
+        let mut index = SearchIndex::open(&idx_dir, &cfg, FTS_WRITER_HEAP)?;
+        if let Some(engine) = self.tables.get(&def.table) {
+            for (row_key, bytes, row_hlc) in engine.scan_versioned()? {
+                if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
+                    index.put(&row_key, &doc, hlc_to_watermark(row_hlc))?;
+                }
+            }
+        }
+        index.commit()?;
+        self.search_indexes.insert(
+            name.to_string(),
+            LiveSearchIndex {
+                index,
+                last_commit: std::time::Instant::now(),
+                refresh_ms: def.refresh_ms,
+            },
+        );
+        Ok(())
     }
 
     /// Approximate `k` nearest rows to `query` under the named vector index,
@@ -443,6 +724,177 @@ impl Database {
         }
     }
 
+    /// The names of every search index on `table`.
+    fn search_indexes_on(&self, table: &str) -> Vec<String> {
+        self.catalog
+            .search_indexes
+            .iter()
+            .filter(|(_, def)| def.table == table)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Maintain every search index on `table` for a written row, then commit
+    /// any index whose NRT refresh interval elapsed.
+    fn maintain_search_put(
+        &mut self,
+        table: &str,
+        doc: &Document,
+        key: &[u8],
+        hlc: Hlc,
+    ) -> Result<()> {
+        for name in self.search_indexes_on(table) {
+            if let Some(live) = self.search_indexes.get_mut(&name) {
+                live.index.put(key, doc, hlc_to_watermark(hlc))?;
+                live.maybe_refresh()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Maintain every search index on `table` for a deleted row; see
+    /// [`Database::maintain_search_put`].
+    fn maintain_search_del(&mut self, table: &str, key: &[u8], hlc: Hlc) -> Result<()> {
+        for name in self.search_indexes_on(table) {
+            if let Some(live) = self.search_indexes.get_mut(&name) {
+                live.index.delete(key, hlc_to_watermark(hlc));
+                live.maybe_refresh()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve the search index serving `query` on `table`: the index whose
+    /// paths cover every field the query names (a `QueryString` resolves its
+    /// fields inside the index, so any index on the table serves it).
+    fn search_index_for_query(&self, table: &str, query: &SearchQuery) -> Result<String> {
+        let mut fields = Vec::new();
+        collect_search_fields(query, &mut fields);
+        let mut on_table = self
+            .catalog
+            .search_indexes
+            .iter()
+            .filter(|(_, def)| def.table == table)
+            .peekable();
+        if on_table.peek().is_none() {
+            return Err(EngineError::Unsupported(format!(
+                "table '{table}' has no search index"
+            )));
+        }
+        for (name, def) in on_table {
+            if fields.iter().all(|f| def.paths.iter().any(|p| p == f)) {
+                return Ok(name.clone());
+            }
+        }
+        let uncovered = fields
+            .iter()
+            .find(|f| {
+                !self
+                    .catalog
+                    .search_indexes
+                    .values()
+                    .any(|def| def.table == table && def.paths.iter().any(|p| p == *f))
+            })
+            .cloned()
+            .unwrap_or_default();
+        Err(EngineError::Unsupported(format!(
+            "no search index on table '{table}' covers column '{uncovered}'"
+        )))
+    }
+
+    /// Full-text search with read-your-writes: commit the serving index's
+    /// pending writes first, then search. Needs `&mut` — the shared-access
+    /// variant is [`Database::search_read`] (NRT semantics: staleness at most
+    /// the index's `refresh_ms`).
+    pub fn search_commit_if_dirty(
+        &mut self,
+        table: &str,
+        query: &SearchQuery,
+        k: Option<usize>,
+        filter: &Option<Expr>,
+    ) -> Result<Vec<(Vec<u8>, Document, f32)>> {
+        let name = self.search_index_for_query(table, query)?;
+        if let Some(live) = self.search_indexes.get_mut(&name) {
+            live.commit_if_dirty()?;
+        }
+        self.search_with_index(&name, table, query, k, filter)
+    }
+
+    /// Full-text search over the last-committed index state (see
+    /// [`Database::search_commit_if_dirty`]).
+    pub fn search_read(
+        &self,
+        table: &str,
+        query: &SearchQuery,
+        k: Option<usize>,
+        filter: &Option<Expr>,
+    ) -> Result<Vec<(Vec<u8>, Document, f32)>> {
+        let name = self.search_index_for_query(table, query)?;
+        self.search_with_index(&name, table, query, k, filter)
+    }
+
+    /// Run `query` against the named index and resolve hits to rows.
+    /// `k = Some(n)`: the `n` best-scoring rows, best first (over-fetched when
+    /// a residual `filter` will drop candidates, like filtered ANN).
+    /// `k = None`: every matching row, order unspecified, scores 0.0 (the
+    /// pure-predicate path).
+    fn search_with_index(
+        &self,
+        name: &str,
+        table: &str,
+        query: &SearchQuery,
+        k: Option<usize>,
+        filter: &Option<Expr>,
+    ) -> Result<Vec<(Vec<u8>, Document, f32)>> {
+        let live = self
+            .search_indexes
+            .get(name)
+            .ok_or_else(|| EngineError::IndexNotFound(name.to_string()))?;
+        let table_engine = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+        // The index only knows keys; re-read each hit's row (authoritative)
+        // to apply the residual filter and return the document.
+        let resolve = |key: &[u8]| -> Result<Option<Document>> {
+            match table_engine.get(key)? {
+                Some(bytes) => match Value::decode(&bytes) {
+                    Ok(Value::Document(doc)) if matches_filter(filter, &doc)? => Ok(Some(doc)),
+                    _ => Ok(None),
+                },
+                None => Ok(None),
+            }
+        };
+        match k {
+            Some(k) => {
+                let fetch = if filter.is_some() {
+                    k.saturating_mul(4).max(k + 16)
+                } else {
+                    k
+                };
+                let mut out = Vec::new();
+                for hit in live.index.search_top(query, fetch)? {
+                    if let Some(doc) = resolve(&hit.key)? {
+                        out.push((hit.key, doc, hit.score));
+                        if out.len() >= k {
+                            break;
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            None => {
+                let mut out = Vec::new();
+                for key in live.index.search_keys(query)? {
+                    if let Some(doc) = resolve(&key)? {
+                        out.push((key, doc, 0.0));
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+
     /// Parse and execute a single SQL statement.
     pub fn execute(&mut self, sql: &str) -> Result<QueryOutput> {
         self.execute_statement(parse(sql)?)
@@ -465,6 +917,12 @@ impl Database {
         let mut stmt = stmt;
         skaidb_sql::resolve_now(&mut stmt, now_ms());
         match stmt {
+            // A search SELECT needs the `&mut` seam (its `search` receiver is
+            // `&mut` for the write path's commit-if-dirty); `LocalRead` is a
+            // local value, so the reborrow is free and still read-only.
+            Statement::Select(sel) if select_uses_search(&sel) => {
+                run_search_select(&sel, &mut LocalRead { db: self }).map(QueryOutput::Rows)
+            }
             Statement::Select(sel) => {
                 run_select(&sel, &LocalRead { db: self }).map(QueryOutput::Rows)
             }
@@ -518,6 +976,11 @@ impl Database {
             Statement::DropVectorIndex { name, if_exists } => {
                 self.drop_vector_index(&name, if_exists)
             }
+            Statement::CreateSearchIndex(ci) => self.create_search_index(&ci),
+            Statement::DropSearchIndex { name, if_exists } => {
+                self.drop_search_index(&name, if_exists)
+            }
+            Statement::RebuildSearchIndex { name } => self.rebuild_search_index_cmd(&name),
             Statement::AlterTable(alt) => self.alter_table(alt),
             Statement::Begin => self.begin(),
             Statement::Commit => self.commit(),
@@ -761,6 +1224,16 @@ impl Database {
         for index in vec_indexes {
             self.drop_vector_index(&index, true)?;
         }
+        let fts_indexes: Vec<String> = self
+            .catalog
+            .search_indexes
+            .keys()
+            .filter(|i| namespace::belongs_to(i, name))
+            .cloned()
+            .collect();
+        for index in fts_indexes {
+            self.drop_search_index(&index, true)?;
+        }
         let sec_indexes: Vec<String> = self
             .catalog
             .indexes
@@ -845,6 +1318,17 @@ impl Database {
                 Value::String(namespace::split(&v.table).1.to_string()),
                 Value::String(format!("vector({}, dim={})", v.metric, v.dim)),
                 Value::String(v.path.clone()),
+            ]);
+        }
+        for (name, s) in &self.catalog.search_indexes {
+            if !namespace::belongs_to(name, current_db) {
+                continue;
+            }
+            rows.push(vec![
+                Value::String(namespace::split(name).1.to_string()),
+                Value::String(namespace::split(&s.table).1.to_string()),
+                Value::String(format!("search({})", s.analyzer)),
+                Value::String(s.paths.join(", ")),
             ]);
         }
         rows.sort_by(|a, b| match (&a[0], &b[0]) {
@@ -1404,6 +1888,11 @@ impl Database {
                 v.table = new.to_string();
             }
         }
+        for s in self.catalog.search_indexes.values_mut() {
+            if s.table == old {
+                s.table = new.to_string();
+            }
+        }
         self.save_catalog()?;
         Ok(QueryOutput::Ddl)
     }
@@ -1431,6 +1920,13 @@ impl Database {
         for v in self.catalog.vector_indexes.values_mut() {
             if v.path == from {
                 v.path = to.to_string();
+            }
+        }
+        for s in self.catalog.search_indexes.values_mut() {
+            for p in s.paths.iter_mut() {
+                if p == from {
+                    *p = to.to_string();
+                }
             }
         }
 
@@ -1472,6 +1968,16 @@ impl Database {
             .collect();
         for name in vectors {
             self.rebuild_vector_index(&name)?;
+        }
+        let searches: Vec<String> = self
+            .catalog
+            .search_indexes
+            .iter()
+            .filter(|(_, s)| s.table == table)
+            .map(|(n, _)| n.clone())
+            .collect();
+        for name in searches {
+            self.rebuild_search_index(&name)?;
         }
 
         self.save_catalog()?;
@@ -2004,6 +2510,21 @@ impl Database {
                 ver(&format!("v:{name}")),
             ));
         }
+        for (name, s) in &self.catalog.search_indexes {
+            let (db, bare) = namespace::split(name);
+            let table = namespace::split(&s.table).1;
+            out.push((
+                db.to_string(),
+                format!(
+                    "CREATE SEARCH INDEX IF NOT EXISTS {bare} ON {table} ({}) \
+                     WITH (analyzer = '{}', refresh_ms = {})",
+                    s.paths.join(", "),
+                    s.analyzer,
+                    s.refresh_ms
+                ),
+                ver(&format!("s:{name}")),
+            ));
+        }
         for (name, def) in &self.catalog.users {
             out.push((
                 DEFAULT_DATABASE.to_string(),
@@ -2042,6 +2563,10 @@ impl Database {
                 "v" => {
                     let (db, bare) = namespace::split(name);
                     (db.to_string(), format!("DROP VECTOR INDEX IF EXISTS {bare}"))
+                }
+                "s" => {
+                    let (db, bare) = namespace::split(name);
+                    (db.to_string(), format!("DROP SEARCH INDEX IF EXISTS {bare}"))
                 }
                 "usr" => (
                     DEFAULT_DATABASE.to_string(),
@@ -2115,6 +2640,20 @@ impl Database {
                 format!(
                     "CREATE VECTOR INDEX IF NOT EXISTS {bare} ON {table} ({}) DIM {} USING {}",
                     v.path, v.dim, v.metric
+                ),
+            ));
+        }
+        for (name, s) in &self.catalog.search_indexes {
+            let (db, bare) = namespace::split(name);
+            let table = namespace::split(&s.table).1;
+            out.push((
+                db.to_string(),
+                format!(
+                    "CREATE SEARCH INDEX IF NOT EXISTS {bare} ON {table} ({}) \
+                     WITH (analyzer = '{}', refresh_ms = {})",
+                    s.paths.join(", "),
+                    s.analyzer,
+                    s.refresh_ms
                 ),
             ));
         }
@@ -2296,6 +2835,14 @@ impl Database {
                 Value::String(v.path.clone()),
             ]);
         }
+        for (name, s) in &self.catalog.search_indexes {
+            rows.push(vec![
+                Value::String(name.clone()),
+                Value::String(s.table.clone()),
+                Value::String(format!("search({})", s.analyzer)),
+                Value::String(s.paths.join(", ")),
+            ]);
+        }
         rows.sort_by(|a, b| match (&a[0], &b[0]) {
             (Value::String(x), Value::String(y)) => x.cmp(y),
             _ => std::cmp::Ordering::Equal,
@@ -2332,6 +2879,9 @@ impl Database {
             row("vector_indexes", Value::Int(s.vector_indexes as i64));
             row("vectors_indexed", Value::Int(s.vectors_indexed as i64));
             row("vector_rebuild_ms", Value::Int(s.vector_rebuild_ms as i64));
+            row("search_indexes", Value::Int(s.search_indexes as i64));
+            row("search_docs", Value::Int(s.search_docs as i64));
+            row("search_rebuild_ms", Value::Int(s.search_rebuild_ms as i64));
             row("disk_bytes", Value::Int(s.disk_bytes as i64));
             row("memtable_bytes", Value::Int(s.memtable_bytes as i64));
             row("sstable_count", Value::Int(s.sstable_count as i64));
@@ -2349,6 +2899,16 @@ impl Database {
                 row(&format!("table.{}.live_keys", t.name), Value::Int(t.live_keys as i64));
                 row(&format!("table.{}.tombstones", t.name), Value::Int(t.tombstones as i64));
                 row(&format!("table.{}.disk_bytes", t.name), Value::Int(t.disk_bytes as i64));
+            }
+            // Per-search-index breakdown, in catalog (name) order.
+            for name in self.catalog.search_indexes.keys() {
+                let Some(live) = self.search_indexes.get(name) else {
+                    continue;
+                };
+                let fs = live.index.stats();
+                row(&format!("search.{name}.docs"), Value::Int(fs.docs as i64));
+                row(&format!("search.{name}.disk_bytes"), Value::Int(fs.disk_bytes as i64));
+                row(&format!("search.{name}.uncommitted"), Value::Int(fs.uncommitted as i64));
             }
             row("timeseries_tables", Value::Int(self.timeseries.len() as i64));
             for (name, store) in &self.timeseries {
@@ -2382,8 +2942,15 @@ impl Database {
             vector_indexes: self.catalog.vector_indexes.len(),
             vector_rebuild_ms: self.vector_rebuild_ms,
             vectors_indexed: self.vector_indexes.values().map(|h| h.len()).sum(),
+            search_indexes: self.catalog.search_indexes.len(),
+            search_rebuild_ms: self.search_rebuild_ms,
             ..Default::default()
         };
+        for live in self.search_indexes.values() {
+            let s = live.index.stats();
+            agg.search_docs += s.docs;
+            agg.search_disk_bytes += s.disk_bytes;
+        }
         // Fold in every table and index storage engine.
         for engine in self.tables.values().chain(self.indexes.values()) {
             let s = engine.stats();
@@ -2540,6 +3107,7 @@ impl Database {
             self.index_put(&name, &path, &doc, key)?;
         }
         self.maintain_vectors_put(table, &doc, key);
+        self.maintain_search_put(table, &doc, key, hlc)?;
         Ok(())
     }
 
@@ -2570,6 +3138,7 @@ impl Database {
             }
         }
         self.maintain_vectors_del(table, key);
+        self.maintain_search_del(table, key, hlc)?;
         Ok(())
     }
 
@@ -2602,6 +3171,7 @@ impl Database {
             self.index_put(&name, &path, &doc, key)?;
         }
         self.maintain_vectors_put(table, &doc, key);
+        self.maintain_search_put(table, &doc, key, hlc)?;
         Ok((commit, handle))
     }
 
@@ -2629,6 +3199,7 @@ impl Database {
             }
         }
         self.maintain_vectors_del(table, key);
+        self.maintain_search_del(table, key, hlc)?;
         Ok((commit, handle))
     }
 
@@ -2728,6 +3299,25 @@ pub trait Cluster {
             "vector search is not available on this backend".into(),
         ))
     }
+    /// Full-text search over the search index covering `query`'s fields on
+    /// `table`, as `(key, doc, score)`. `k = Some(n)` is the ranked path (the
+    /// `n` best BM25 scores, best first); `k = None` returns every matching
+    /// row with score 0.0 and unspecified order (pure predicate). `filter` is
+    /// the residual WHERE, applied authoritatively by the implementation.
+    /// `&mut self` so the write path can commit pending index writes first
+    /// (read-your-writes); read-only implementations serve the last-committed
+    /// state instead.
+    fn search(
+        &mut self,
+        _table: &str,
+        _query: &SearchQuery,
+        _k: Option<usize>,
+        _filter: &Option<Expr>,
+    ) -> Result<Vec<(Vec<u8>, Document, f32)>> {
+        Err(EngineError::Unsupported(
+            "full-text search is not supported on this deployment".into(),
+        ))
+    }
     /// Write `doc` under `key` in `table` (and maintain indexes/replicas).
     fn put(&mut self, table: &str, key: &[u8], doc: &Document) -> Result<()>;
     /// Write a whole statement's rows in one call. Implementations may batch
@@ -2818,6 +3408,11 @@ pub fn statement_is_read_only(stmt: &Statement) -> bool {
 pub fn run(stmt: Statement, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
     match stmt {
         Statement::Insert(ins) => run_insert(ins, cluster),
+        // A search SELECT keeps the `&mut` seam: `Cluster::search` commits
+        // pending index writes first (read-your-writes).
+        Statement::Select(sel) if select_uses_search(&sel) => {
+            run_search_select(&sel, cluster).map(QueryOutput::Rows)
+        }
         // SELECT only reads: reborrow shared so the executor's read-only
         // requirements are checked by the compiler.
         Statement::Select(sel) => run_select(&sel, &*cluster).map(QueryOutput::Rows),
@@ -2949,6 +3544,278 @@ fn run_nearest_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> 
     let mut rs = project(sel, docs, &HashSet::new(), true)?;
     apply_offset_limit(&mut rs.rows, sel.offset, sel.limit);
     Ok(rs)
+}
+
+/// The `MATCH()`-family predicate functions (names arrive lowercased).
+fn is_search_func(name: &str) -> bool {
+    matches!(name, "match" | "match_phrase" | "fuzzy" | "search")
+}
+
+/// Whether `score()` (no arguments) is called.
+fn is_score_call(expr: &Expr) -> bool {
+    matches!(expr, Expr::Func { name, args } if name == "score" && args.is_empty())
+}
+
+/// Whether a function satisfying `pred` appears anywhere in `expr`.
+fn expr_has_func(expr: &Expr, pred: &impl Fn(&str) -> bool) -> bool {
+    match expr {
+        Expr::Func { name, args } => pred(name) || args.iter().any(|a| expr_has_func(a, pred)),
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => expr_has_func(expr, pred),
+        Expr::Binary { left, right, .. } => {
+            expr_has_func(left, pred) || expr_has_func(right, pred)
+        }
+        Expr::Aggregate {
+            arg: AggArg::Expr(e),
+            ..
+        } => expr_has_func(e, pred),
+        Expr::Aggregate { .. } | Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) => false,
+    }
+}
+
+/// Whether a SELECT is a full-text search query: a `MATCH()`-family predicate
+/// anywhere in its WHERE, or `score()` in its projection or ORDER BY.
+fn select_uses_search(sel: &Select) -> bool {
+    sel.filter
+        .as_ref()
+        .is_some_and(|f| expr_has_func(f, &is_search_func))
+        || sel.items.iter().any(|it| match it {
+            SelectItem::Expr { expr, .. } => expr_has_func(expr, &|n| n == "score"),
+            SelectItem::Wildcard => false,
+        })
+        || sel
+            .order_by
+            .iter()
+            .any(|ok| expr_has_func(&ok.expr, &|n| n == "score"))
+}
+
+/// The field names a search query explicitly targets (used to pick the
+/// serving index; `SEARCH('...')` fields resolve inside the index and are
+/// not collected).
+fn collect_search_fields(query: &SearchQuery, out: &mut Vec<String>) {
+    match query {
+        SearchQuery::Match { field, .. }
+        | SearchQuery::Phrase { field, .. }
+        | SearchQuery::Fuzzy { field, .. } => {
+            if let Some(f) = field {
+                if !out.contains(f) {
+                    out.push(f.clone());
+                }
+            }
+        }
+        SearchQuery::QueryString(_) => {}
+        SearchQuery::All(subs) | SearchQuery::Any(subs) => {
+            for sub in subs {
+                collect_search_fields(sub, out);
+            }
+        }
+    }
+}
+
+/// Split a WHERE clause into search predicates and the residual filter. The
+/// filter must be a top-level AND chain: each leaf is either a search
+/// function (converted to a [`SearchQuery`]) or an ordinary predicate
+/// (recombined into the residual). A search function under OR/NOT or nested
+/// in an expression cannot be pushed to the index and is rejected.
+fn split_search_filter(filter: &Option<Expr>) -> Result<(Vec<SearchQuery>, Option<Expr>)> {
+    let Some(expr) = filter else {
+        return Ok((Vec::new(), None));
+    };
+    fn leaves<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+        if let Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } = e
+        {
+            leaves(left, out);
+            leaves(right, out);
+        } else {
+            out.push(e);
+        }
+    }
+    let mut ls = Vec::new();
+    leaves(expr, &mut ls);
+    let mut queries = Vec::new();
+    let mut residual: Option<Expr> = None;
+    for leaf in ls {
+        if let Expr::Func { name, args } = leaf {
+            if is_search_func(name) {
+                queries.push(search_query_from_func(name, args)?);
+                continue;
+            }
+        }
+        if expr_has_func(leaf, &is_search_func) {
+            return Err(EngineError::Unsupported(
+                "MATCH()/SEARCH() must be top-level AND conditions in the WHERE clause".into(),
+            ));
+        }
+        residual = Some(match residual.take() {
+            Some(acc) => Expr::Binary {
+                op: BinaryOp::And,
+                left: Box::new(acc),
+                right: Box::new(leaf.clone()),
+            },
+            None => leaf.clone(),
+        });
+    }
+    Ok((queries, residual))
+}
+
+/// Convert one `MATCH()`-family call into a [`SearchQuery`]. Arguments are
+/// literals after binding (plus a column reference for the field).
+fn search_query_from_func(name: &str, args: &[Expr]) -> Result<SearchQuery> {
+    fn column(e: &Expr, usage: &str) -> Result<String> {
+        match e {
+            Expr::Column(path) => Ok(path.clone()),
+            _ => Err(EngineError::Type(format!(
+                "{usage} takes a column as its first argument"
+            ))),
+        }
+    }
+    fn text(e: &Expr, usage: &str) -> Result<String> {
+        match e {
+            Expr::Literal(Value::String(s)) => Ok(s.clone()),
+            _ => Err(EngineError::Type(format!(
+                "{usage} takes a string literal as its query text"
+            ))),
+        }
+    }
+    fn uint(e: &Expr, usage: &str) -> Result<u64> {
+        match e {
+            Expr::Literal(Value::Int(i)) if *i >= 0 => Ok(*i as u64),
+            _ => Err(EngineError::Type(format!(
+                "{usage} must be a non-negative integer literal"
+            ))),
+        }
+    }
+    match name {
+        "match" => {
+            let [col, q] = args else {
+                return Err(EngineError::Type(
+                    "MATCH(column, 'text') takes exactly two arguments".into(),
+                ));
+            };
+            Ok(SearchQuery::Match {
+                field: Some(column(col, "MATCH(column, 'text')")?),
+                text: text(q, "MATCH(column, 'text')")?,
+            })
+        }
+        "match_phrase" => {
+            let (col, q, slop) = match args {
+                [col, q] => (col, q, 0),
+                [col, q, s] => (col, q, uint(s, "MATCH_PHRASE slop")?),
+                _ => {
+                    return Err(EngineError::Type(
+                        "MATCH_PHRASE(column, 'text' [, slop]) takes two or three arguments"
+                            .into(),
+                    ))
+                }
+            };
+            let slop = u32::try_from(slop)
+                .map_err(|_| EngineError::Type("MATCH_PHRASE slop is too large".into()))?;
+            Ok(SearchQuery::Phrase {
+                field: Some(column(col, "MATCH_PHRASE(column, 'text')")?),
+                text: text(q, "MATCH_PHRASE(column, 'text')")?,
+                slop,
+            })
+        }
+        "fuzzy" => {
+            let (col, q, distance) = match args {
+                [col, q] => (col, q, 1),
+                [col, q, d] => (col, q, uint(d, "FUZZY distance")?),
+                _ => {
+                    return Err(EngineError::Type(
+                        "FUZZY(column, 'text' [, distance]) takes two or three arguments".into(),
+                    ))
+                }
+            };
+            let distance = u8::try_from(distance)
+                .map_err(|_| EngineError::Type("FUZZY distance is too large".into()))?;
+            Ok(SearchQuery::Fuzzy {
+                field: Some(column(col, "FUZZY(column, 'text')")?),
+                text: text(q, "FUZZY(column, 'text')")?,
+                distance,
+            })
+        }
+        "search" => {
+            let [q] = args else {
+                return Err(EngineError::Type(
+                    "SEARCH('query') takes exactly one string argument".into(),
+                ));
+            };
+            Ok(SearchQuery::QueryString(text(q, "SEARCH('query')")?))
+        }
+        other => Err(EngineError::Type(format!(
+            "unknown search function {other}()"
+        ))),
+    }
+}
+
+/// Execute a full-text search SELECT: split the WHERE into search predicates
+/// (AND-ed into one [`SearchQuery`]) and a residual filter, gather through
+/// [`Cluster::search`], expose each hit's BM25 score as a `_score` field, and
+/// project as usual. `ORDER BY score() DESC LIMIT n` is the ranked top-n
+/// path; with no ORDER BY every matching row comes back (order unspecified,
+/// scores 0.0).
+fn run_search_select(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSet> {
+    if !sel.joins.is_empty() || !sel.set_ops.is_empty() {
+        return Err(EngineError::Unsupported(
+            "MATCH()/SEARCH() cannot be combined with JOIN or UNION".into(),
+        ));
+    }
+    if is_grouped(sel) || sel.having.is_some() {
+        return Err(EngineError::Unsupported(
+            "MATCH()/SEARCH() cannot be combined with aggregates or GROUP BY".into(),
+        ));
+    }
+    if sel.distinct {
+        return Err(EngineError::Unsupported(
+            "MATCH()/SEARCH() cannot be combined with DISTINCT".into(),
+        ));
+    }
+    if sel.nearest.is_some() {
+        return Err(EngineError::Unsupported(
+            "MATCH()/SEARCH() cannot be combined with NEAREST".into(),
+        ));
+    }
+    let (mut queries, residual) = split_search_filter(&sel.filter)?;
+    if queries.is_empty() {
+        // Routed here by score() alone: there is nothing to search.
+        return Err(EngineError::Type(
+            "score() is only valid in a query with a MATCH()/SEARCH() predicate".into(),
+        ));
+    }
+    let query = match queries.len() {
+        1 => queries.pop().expect("len checked"),
+        _ => SearchQuery::All(queries),
+    };
+    // ORDER BY: absent (predicate-only), or exactly `score() DESC` with a
+    // LIMIT (the index cannot rank without a bound).
+    let k = match sel.order_by.as_slice() {
+        [] => None,
+        [key] if key.descending && is_score_call(&key.expr) => {
+            let limit = sel.limit.ok_or_else(|| {
+                EngineError::Unsupported("ORDER BY score() requires LIMIT".into())
+            })?;
+            Some(sel.offset.unwrap_or(0).saturating_add(limit) as usize)
+        }
+        _ => {
+            return Err(EngineError::Unsupported(
+                "search queries support only ORDER BY score() DESC".into(),
+            ))
+        }
+    };
+    let hits = cluster.search(&sel.from, &query, k, &residual)?;
+    let docs: Vec<Document> = hits
+        .into_iter()
+        .map(|(_, mut doc, score)| {
+            doc.insert("_score", Value::Float(score as f64));
+            doc
+        })
+        .collect();
+    // `project` with `finalize` applies the ORDER BY (score() reads the
+    // injected `_score`) and the OFFSET/LIMIT page.
+    project(sel, docs, &HashSet::new(), true)
 }
 
 /// Whether the query is in aggregate/grouped mode.
@@ -3495,6 +4362,16 @@ impl Cluster for LocalCluster<'_> {
         self.db.vector_search(&index, query, k, filter)
     }
 
+    fn search(
+        &mut self,
+        table: &str,
+        query: &SearchQuery,
+        k: Option<usize>,
+        filter: &Option<Expr>,
+    ) -> Result<Vec<(Vec<u8>, Document, f32)>> {
+        self.db.search_commit_if_dirty(table, query, k, filter)
+    }
+
     fn put(&mut self, table: &str, key: &[u8], doc: &Document) -> Result<()> {
         // Buffer the write when a transaction is open (flushed on COMMIT).
         if let Some(txn) = self.db.txn.as_mut() {
@@ -3504,7 +4381,7 @@ impl Cluster for LocalCluster<'_> {
         }
         self.table_indexes(table);
         let engine = self.db.table_engine_mut(table)?;
-        let (_, commit) = engine.put_deferred(key, Value::encode_document(doc))?;
+        let (hlc, commit) = engine.put_deferred(key, Value::encode_document(doc))?;
         self.pending
             .insert(format!("t:{table}"), (engine.wal_sync_handle(), commit));
         for (name, paths) in &self.index_memo[table] {
@@ -3513,6 +4390,7 @@ impl Cluster for LocalCluster<'_> {
             }
         }
         self.db.maintain_vectors_put(table, doc, key);
+        self.db.maintain_search_put(table, doc, key, hlc)?;
         Ok(())
     }
 
@@ -3523,7 +4401,7 @@ impl Cluster for LocalCluster<'_> {
         }
         self.table_indexes(table);
         let engine = self.db.table_engine_mut(table)?;
-        let (_, commit) = engine.delete_deferred(key)?;
+        let (hlc, commit) = engine.delete_deferred(key)?;
         self.pending
             .insert(format!("t:{table}"), (engine.wal_sync_handle(), commit));
         for (name, paths) in &self.index_memo[table] {
@@ -3532,6 +4410,7 @@ impl Cluster for LocalCluster<'_> {
             }
         }
         self.db.maintain_vectors_del(table, key);
+        self.db.maintain_search_del(table, key, hlc)?;
         Ok(())
     }
 
@@ -3611,6 +4490,18 @@ impl Cluster for LocalRead<'_> {
         self.db.vector_search(&index, query, k, filter)
     }
 
+    fn search(
+        &mut self,
+        table: &str,
+        query: &SearchQuery,
+        k: Option<usize>,
+        filter: &Option<Expr>,
+    ) -> Result<Vec<(Vec<u8>, Document, f32)>> {
+        // Shared access: serve the last-committed index state (NRT — at most
+        // `refresh_ms` stale) rather than committing pending writes.
+        self.db.search_read(table, query, k, filter)
+    }
+
     fn put(&mut self, _table: &str, _key: &[u8], _doc: &Document) -> Result<()> {
         Err(EngineError::Unsupported(
             "write statement reached the read-only executor".into(),
@@ -3648,6 +4539,10 @@ fn table_dir(root: &Path, name: &str) -> PathBuf {
 
 fn index_dir(root: &Path, name: &str) -> PathBuf {
     root.join("indexes").join(name)
+}
+
+fn fts_dir(root: &Path, name: &str) -> PathBuf {
+    root.join("fts").join(name)
 }
 
 /// Aggregate a flushed window into rollup samples: per series and bucket,

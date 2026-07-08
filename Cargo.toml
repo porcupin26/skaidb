@@ -7,6 +7,7 @@ members = [
     "crates/skaidb-auth",
     "crates/skaidb-config",
     "crates/skaidb-sql",
+    "crates/skaidb-fts",
     "crates/skaidb-engine",
     "crates/skaidb-cluster",
     "crates/skaidb-proto",
@@ -29,6 +30,7 @@ skaidb-tsdb = { path = "crates/skaidb-tsdb" }
 skaidb-auth = { path = "crates/skaidb-auth" }
 skaidb-config = { path = "crates/skaidb-config" }
 skaidb-sql = { path = "crates/skaidb-sql" }
+skaidb-fts = { path = "crates/skaidb-fts" }
 skaidb-engine = { path = "crates/skaidb-engine" }
 skaidb-cluster = { path = "crates/skaidb-cluster" }
 skaidb-proto = { path = "crates/skaidb-proto" }

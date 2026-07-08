@@ -339,6 +339,13 @@ pub fn collect_runtime_metrics(ctx: &Shared) {
             "skaidb_vector_rebuild_seconds",
             s.vector_rebuild_ms / 1000,
         );
+        m.set("skaidb_search_indexes", s.search_indexes as u64);
+        m.set("skaidb_search_docs_total", s.search_docs);
+        m.set("skaidb_search_disk_bytes", s.search_disk_bytes);
+        m.set(
+            "skaidb_search_rebuild_seconds",
+            s.search_rebuild_ms / 1000,
+        );
         for t in &s.per_table {
             let label = escape_label(&t.name);
             m.set(
@@ -661,9 +668,13 @@ fn required_privilege(stmt: &Statement) -> Option<(Privilege, Object)> {
         Statement::CreateRollup(cr) => (Privilege::Create, Object::Table(cr.table.clone())),
         Statement::CreateIndex(ci) => (Privilege::Create, Object::Table(ci.table.clone())),
         Statement::CreateVectorIndex(ci) => (Privilege::Create, Object::Table(ci.table.clone())),
+        Statement::CreateSearchIndex(ci) => (Privilege::Create, Object::Table(ci.table.clone())),
         Statement::DropTable { name, .. } => (Privilege::Drop, Object::Table(name.clone())),
         Statement::DropIndex { .. } => (Privilege::Drop, Object::Global),
         Statement::DropVectorIndex { .. } => (Privilege::Drop, Object::Global),
+        Statement::DropSearchIndex { .. } => (Privilege::Drop, Object::Global),
+        // A rebuild rewrites index data, so gate it like index creation.
+        Statement::RebuildSearchIndex { .. } => (Privilege::Create, Object::Global),
         Statement::AlterTable(a) => (Privilege::Create, Object::Table(a.name.clone())),
         // Transaction control affects writes; gate it like a global write.
         Statement::Begin | Statement::Commit | Statement::Rollback => {

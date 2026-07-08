@@ -1482,4 +1482,261 @@ mod tests {
             vec![vec![Value::Int(1)], vec![Value::Int(2)], vec![Value::Int(3)]]
         );
     }
+
+    // ---- full-text search ----
+
+    /// `articles(id, body, flag)` with rows 1–3 and a search index on `body`
+    /// created **after** the rows exist (exercises the backfill).
+    fn search_db() -> Database {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE articles (PRIMARY KEY (id))").unwrap();
+        db.execute(
+            "INSERT INTO articles (id, body, flag) VALUES \
+             (1, 'the quick brown fox jumps', true), \
+             (2, 'quick quick quick delivery', false), \
+             (3, 'slow roasted vegetables', true)",
+        )
+        .unwrap();
+        db.execute("CREATE SEARCH INDEX articles_fts ON articles (body)")
+            .unwrap();
+        db
+    }
+
+    /// The `id` column of every row, sorted (search hit order is unspecified
+    /// on the predicate-only path).
+    fn sorted_ids(rs: ResultSet) -> Vec<i64> {
+        let mut out = ids(rs);
+        out.sort_unstable();
+        out
+    }
+
+    #[test]
+    fn search_index_backfills_and_ranks_by_score() {
+        let mut db = search_db();
+        // Backfill is committed at create: immediately searchable, ranked.
+        let rs = rows(
+            db.execute(
+                "SELECT id, score() FROM articles WHERE MATCH(body, 'quick') \
+                 ORDER BY score() DESC LIMIT 5",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.columns, vec!["id", "score"]);
+        assert_eq!(rs.rows.len(), 2);
+        // Row 2 repeats the term in a shorter field: the better BM25 score.
+        assert_eq!(rs.rows[0][0], Value::Int(2));
+        assert_eq!(rs.rows[1][0], Value::Int(1));
+        let score = |row: &[Value]| match row[1] {
+            Value::Float(f) => f,
+            ref other => panic!("expected float score, got {other:?}"),
+        };
+        assert!(score(&rs.rows[0]) > score(&rs.rows[1]));
+        assert!(score(&rs.rows[1]) > 0.0);
+        // LIMIT caps the ranked gather.
+        let rs = rows(
+            db.execute(
+                "SELECT id FROM articles WHERE MATCH(body, 'quick') \
+                 ORDER BY score() DESC LIMIT 1",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(2)]]);
+    }
+
+    #[test]
+    fn search_write_path_reads_its_own_writes() {
+        let mut db = search_db();
+        // Insert after create: visible without waiting for the NRT refresh.
+        db.execute("INSERT INTO articles (id, body, flag) VALUES (4, 'a very quick reply', true)")
+            .unwrap();
+        let rs = rows(db.execute("SELECT id FROM articles WHERE MATCH(body, 'quick')").unwrap());
+        assert_eq!(sorted_ids(rs), vec![1, 2, 4]);
+        // UPDATE re-indexes the row.
+        db.execute("UPDATE articles SET body = 'calm response' WHERE id = 4").unwrap();
+        let rs = rows(db.execute("SELECT id FROM articles WHERE MATCH(body, 'quick')").unwrap());
+        assert_eq!(sorted_ids(rs), vec![1, 2]);
+        let rs = rows(db.execute("SELECT id FROM articles WHERE MATCH(body, 'calm')").unwrap());
+        assert_eq!(sorted_ids(rs), vec![4]);
+        // DELETE removes it from the index.
+        db.execute("DELETE FROM articles WHERE id = 2").unwrap();
+        let rs = rows(db.execute("SELECT id FROM articles WHERE MATCH(body, 'quick')").unwrap());
+        assert_eq!(sorted_ids(rs), vec![1]);
+    }
+
+    #[test]
+    fn search_residual_predicate_filters_hits() {
+        let mut db = search_db();
+        let rs = rows(
+            db.execute("SELECT id FROM articles WHERE MATCH(body, 'quick') AND flag = true")
+                .unwrap(),
+        );
+        assert_eq!(sorted_ids(rs), vec![1]);
+        // The residual applies on the ranked path too.
+        let rs = rows(
+            db.execute(
+                "SELECT id FROM articles WHERE MATCH(body, 'quick') AND flag = true \
+                 ORDER BY score() DESC LIMIT 5",
+            )
+            .unwrap(),
+        );
+        assert_eq!(ids(rs), vec![1]);
+    }
+
+    #[test]
+    fn search_predicate_only_returns_all_matches() {
+        let mut db = search_db();
+        let rs = rows(db.execute("SELECT id FROM articles WHERE MATCH(body, 'quick')").unwrap());
+        assert_eq!(sorted_ids(rs), vec![1, 2]);
+        // score() still projects (0.0 on the unranked path).
+        let rs = rows(
+            db.execute("SELECT id, score() FROM articles WHERE MATCH(body, 'slow')").unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(3), Value::Float(0.0)]]);
+    }
+
+    #[test]
+    fn search_phrase_fuzzy_and_query_string_predicates() {
+        let mut db = search_db();
+        // Exact phrase, then slop lets a transposition in.
+        let rs = rows(
+            db.execute("SELECT id FROM articles WHERE MATCH_PHRASE(body, 'quick brown')").unwrap(),
+        );
+        assert_eq!(sorted_ids(rs), vec![1]);
+        let rs = rows(
+            db.execute("SELECT id FROM articles WHERE MATCH_PHRASE(body, 'brown quick', 2)")
+                .unwrap(),
+        );
+        assert_eq!(sorted_ids(rs), vec![1]);
+        // Typo within the default distance of 1.
+        let rs = rows(db.execute("SELECT id FROM articles WHERE FUZZY(body, 'quikc')").unwrap());
+        assert_eq!(sorted_ids(rs), vec![1, 2]);
+        // Query-string mini-language with required/excluded terms.
+        let rs = rows(db.execute("SELECT id FROM articles WHERE SEARCH('+quick -fox')").unwrap());
+        assert_eq!(sorted_ids(rs), vec![2]);
+    }
+
+    #[test]
+    fn search_invalid_positions_and_unindexed_columns_error() {
+        let mut db = search_db();
+        // A search predicate under OR cannot be pushed to the index.
+        let err = db
+            .execute("SELECT id FROM articles WHERE MATCH(body, 'quick') OR flag = true")
+            .unwrap_err();
+        assert!(err.to_string().contains("top-level AND"), "{err}");
+        // score() without a search predicate has nothing to read.
+        let err = db
+            .execute("SELECT id, score() FROM articles WHERE flag = true")
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Type(_)), "{err}");
+        // MATCH on a column no index covers.
+        let err = db
+            .execute("SELECT id FROM articles WHERE MATCH(title, 'x')")
+            .unwrap_err();
+        assert!(err.to_string().contains("covers column 'title'"), "{err}");
+        // MATCH on a table without any search index.
+        db.execute("CREATE TABLE plain (PRIMARY KEY (id))").unwrap();
+        let err = db
+            .execute("SELECT id FROM plain WHERE MATCH(body, 'x')")
+            .unwrap_err();
+        assert!(err.to_string().contains("has no search index"), "{err}");
+        // A ranked search needs a bound.
+        let err = db
+            .execute("SELECT id FROM articles WHERE MATCH(body, 'quick') ORDER BY score() DESC")
+            .unwrap_err();
+        assert!(err.to_string().contains("requires LIMIT"), "{err}");
+        // Only score() DESC can order a search.
+        let err = db
+            .execute("SELECT id FROM articles WHERE MATCH(body, 'quick') ORDER BY id LIMIT 5")
+            .unwrap_err();
+        assert!(err.to_string().contains("ORDER BY score() DESC"), "{err}");
+    }
+
+    #[test]
+    fn search_rebuild_drop_and_show_indexes() {
+        let mut db = search_db();
+        // SHOW INDEXES lists the index with its analyzer and columns.
+        let rs = rows(db.execute("SHOW INDEXES").unwrap());
+        assert!(rs.rows.iter().any(|r| r[0] == Value::String("articles_fts".into())
+            && r[1] == Value::String("articles".into())
+            && r[2] == Value::String("search(standard)".into())
+            && r[3] == Value::String("body".into())));
+        // REBUILD re-indexes from the table; results are unchanged.
+        db.execute("REBUILD SEARCH INDEX articles_fts").unwrap();
+        let rs = rows(db.execute("SELECT id FROM articles WHERE MATCH(body, 'quick')").unwrap());
+        assert_eq!(sorted_ids(rs), vec![1, 2]);
+        // DROP removes it: subsequent MATCH errors and SHOW INDEXES is empty.
+        db.execute("DROP SEARCH INDEX articles_fts").unwrap();
+        assert!(db.execute("SELECT id FROM articles WHERE MATCH(body, 'quick')").is_err());
+        let rs = rows(db.execute("SHOW INDEXES").unwrap());
+        assert!(rs.rows.is_empty());
+        // Duplicate create / missing drop honor the IF (NOT) EXISTS forms.
+        assert!(db.execute("DROP SEARCH INDEX articles_fts").is_err());
+        db.execute("DROP SEARCH INDEX IF EXISTS articles_fts").unwrap();
+        assert!(db.execute("REBUILD SEARCH INDEX articles_fts").is_err());
+    }
+
+    #[test]
+    fn search_read_only_path_serves_committed_state() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        // A huge refresh interval: nothing commits behind our back.
+        db.execute("CREATE SEARCH INDEX t_fts ON t (body) WITH (refresh_ms = 3600000)")
+            .unwrap();
+        db.execute("INSERT INTO t (id, body) VALUES (1, 'alpha words')").unwrap();
+        // Shared-access reads serve the last-committed state (NRT: the write
+        // is applied but not yet committed).
+        let rs = rows(db.execute_read("SELECT id FROM t WHERE MATCH(body, 'alpha')").unwrap());
+        assert!(rs.rows.is_empty());
+        // The write path commits pending index writes before searching...
+        let rs = rows(db.execute("SELECT id FROM t WHERE MATCH(body, 'alpha')").unwrap());
+        assert_eq!(ids(rs), vec![1]);
+        // ...after which the read path sees them too.
+        let rs = rows(db.execute_read("SELECT id FROM t WHERE MATCH(body, 'alpha')").unwrap());
+        assert_eq!(ids(rs), vec![1]);
+    }
+
+    #[test]
+    fn search_restart_replays_uncommitted_writes_from_watermark() {
+        let dir = tempdir();
+        {
+            let mut db = Database::open(&dir).unwrap();
+            db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+            db.execute("CREATE SEARCH INDEX t_fts ON t (body) WITH (refresh_ms = 3600000)")
+                .unwrap();
+            db.execute("INSERT INTO t (id, body) VALUES (1, 'alpha words'), (2, 'beta words')")
+                .unwrap();
+            // Dropped with the index writes uncommitted (no search, no flush):
+            // durability comes from the table WAL + watermark replay.
+        }
+        {
+            let mut db = Database::open(&dir).unwrap();
+            let rs = rows(db.execute("SELECT id FROM t WHERE MATCH(body, 'alpha')").unwrap());
+            assert_eq!(ids(rs), vec![1]);
+            // An uncommitted delete must replay as a delete too.
+            db.execute("DELETE FROM t WHERE id = 2").unwrap();
+        }
+        let mut db = Database::open(&dir).unwrap();
+        let rs = rows(db.execute("SELECT id FROM t WHERE MATCH(body, 'beta')").unwrap());
+        assert!(rs.rows.is_empty());
+        let rs = rows(db.execute("SELECT id FROM t WHERE MATCH(body, 'alpha')").unwrap());
+        assert_eq!(ids(rs), vec![1]);
+    }
+
+    #[test]
+    fn search_show_status_reports_index_stats() {
+        let mut db = search_db();
+        let rs = rows(db.execute("SHOW STATUS").unwrap());
+        let metric = |name: &str| {
+            rs.rows
+                .iter()
+                .find(|r| r[0] == Value::String(name.into()))
+                .map(|r| r[1].clone())
+        };
+        assert_eq!(metric("search_indexes"), Some(Value::Int(1)));
+        assert_eq!(metric("search_docs"), Some(Value::Int(3)));
+        assert!(metric("search_rebuild_ms").is_some());
+        assert_eq!(metric("search.articles_fts.docs"), Some(Value::Int(3)));
+        assert!(metric("search.articles_fts.disk_bytes").is_some());
+        assert_eq!(metric("search.articles_fts.uncommitted"), Some(Value::Int(0)));
+    }
 }

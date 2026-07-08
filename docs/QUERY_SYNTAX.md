@@ -29,6 +29,10 @@ CREATE INDEX [IF NOT EXISTS] <name> ON <table> (<path> [, <path> ...])
 DROP   INDEX [IF EXISTS] <name>
 CREATE VECTOR INDEX [IF NOT EXISTS] <name> ON <table> (<path>) DIM <n> [USING <metric>]
 DROP   VECTOR INDEX [IF EXISTS] <name>
+CREATE SEARCH INDEX [IF NOT EXISTS] <name> ON <table> (<path> [, <path> ...])
+       [WITH (<option> = <literal> [, <option> = <literal> ...])]
+DROP    SEARCH INDEX [IF EXISTS] <name>
+REBUILD SEARCH INDEX <name>
 ALTER  TABLE <table> RENAME TO <new_table>
 ALTER  TABLE <table> RENAME COLUMN <from> TO <to>
 
@@ -89,6 +93,13 @@ SHOW DATABASES
   `USING <metric>` is `cosine` (default), `l2`, or `dot`. It broadcasts across
   the cluster so every node indexes its shard. Query it with the `NEAREST`
   clause (see *Vector search* below and [VECTOR.md](VECTOR.md)).
+- `CREATE SEARCH INDEX` builds a **full-text (BM25) index** over the text at
+  the listed document paths. Options: `analyzer` (`'standard'` default,
+  `'english'`, `'whitespace'`, `'keyword'`) and `refresh_ms` (integer,
+  default `1000` — how quickly writes become searchable). Query it with
+  `MATCH()`/`SEARCH()` predicates and `score()` (see *Full-text search*
+  below and [SEARCH.md](SEARCH.md)); `REBUILD SEARCH INDEX` re-indexes the
+  table from scratch (recovery escape hatch).
 - `<select-item>` is `*` (all fields seen in the result rows) or
   `<expr> [[AS] <alias>]`.
 - `ALTER TABLE … RENAME TO` renames a table (moving its on-disk data and
@@ -97,7 +108,7 @@ SHOW DATABASES
   index that referenced it. The store is schema-less, so there is no
   `ADD`/`DROP COLUMN` — a field simply exists in the rows that set it.
 - **`SHOW TABLES`** lists catalog tables as `(table, primary_key)` rows;
-  **`SHOW INDEXES`** lists secondary and vector indexes as
+  **`SHOW INDEXES`** lists secondary, vector, and search indexes as
   `(index, table, kind, columns)`. Both are read-only and require no special
   privilege, so a monitoring/tooling agent can enumerate the schema without
   `/query` data access. In cluster mode they answer from the local catalog (the
@@ -192,7 +203,9 @@ SHOW DATABASES
   one instant per statement) and `time_bucket(<step>, <ts>)` (floors `<ts>`
   to a `<step>`-wide bucket: `time_bucket(5m, ts)`). A bare identifier
   directly followed by `(` parses as a function call; unknown functions are
-  execution errors.
+  execution errors. The full-text search functions `MATCH`, `MATCH_PHRASE`,
+  `FUZZY`, `SEARCH`, and `score` parse the same way and are only valid in a
+  search query (see *Full-text search* below).
 - **Bind parameters:** `?` marks a positional parameter in any expression
   position of a **prepared** `SELECT`/`INSERT`/`UPDATE`/`DELETE` (e.g.
   `INSERT INTO t (id, v) VALUES (?, ?)`). Parameters are numbered by order of
@@ -237,6 +250,62 @@ prepared statement. Requires a vector index on the path; errors if none
 exists. Cannot combine with `JOIN`, `UNION`, aggregates/`GROUP BY`, or
 `ORDER BY` (results are already ordered by distance) — `WHERE`, `LIMIT`, and
 `OFFSET` apply normally, post-search.
+
+## Full-text search (`MATCH` / `SEARCH`)
+
+Full-text predicates run against a [search index](SEARCH.md) on the table
+(BM25-ranked, Tantivy-backed). They are ordinary `WHERE` conditions, with the
+restriction that each must appear as a **top-level `AND` condition** (not
+under `OR`/`NOT`); the remaining conditions filter the matches afterward:
+
+```sql
+CREATE SEARCH INDEX articles_fts ON articles (title, body)
+  WITH (analyzer = 'english', refresh_ms = 1000);
+
+-- Ranked retrieval: top-k pushed into the index, best first. The BM25
+-- score is exposed as score() (and a _score field on the row).
+SELECT id, title, score() FROM articles
+WHERE MATCH(body, 'quick brown fox') AND published = true
+ORDER BY score() DESC LIMIT 10;
+
+-- Query-string mini-language over all indexed columns:
+SELECT id, score() FROM articles
+WHERE SEARCH('title:"rust database" +body:performance -draft')
+ORDER BY score() DESC LIMIT 20;
+
+-- Unranked: MATCH as a plain predicate returns every matching row.
+SELECT id FROM articles WHERE MATCH(title, 'skaidb') AND year >= 2024;
+```
+
+- **Predicates** (query text is analyzed with the index's analyzer):
+  - `MATCH(<col>, '<text>')` — true if the column matches any term (OR).
+  - `MATCH_PHRASE(<col>, '<text>' [, <slop>])` — terms in order, within
+    `<slop>` transpositions (default 0).
+  - `FUZZY(<col>, '<text>' [, <distance>])` — Levenshtein-fuzzy terms,
+    distance ≤ 2 (default 1).
+  - `SEARCH('<query-string>')` — mini-language over all indexed columns:
+    `term`, `"phrase"`, `col:term`, `+must`, `-must_not`, `AND`/`OR`.
+- **`score()`** projects the BM25 relevance of the row against the search
+  predicates; it is also injected as a `_score` field (like `_distance` for
+  vector search). Only valid together with a search predicate — else an
+  error.
+- **`ORDER BY score() DESC LIMIT k`** pushes top-k retrieval into the index
+  (no full scan). It is the only `ORDER BY` form allowed with search
+  predicates, and requires `LIMIT`. Without `ORDER BY`, matches return in
+  unspecified order.
+- The named column(s) must be covered by a search index on the table —
+  errors if none exists. Query text may be a bind parameter (`?`).
+- Cannot combine with `JOIN`, `UNION`, aggregates/`GROUP BY`, `DISTINCT`, or
+  `NEAREST`. Residual `WHERE` conditions, `LIMIT`, and `OFFSET` apply
+  normally, post-search.
+- **Visibility:** writes become searchable within `refresh_ms` (default
+  1 s, Elasticsearch-style near-real-time); on the single-node write path a
+  search after a write sees it immediately. The index is derived data — the
+  table is the source of truth, and a lost or stale index rebuilds from it
+  (automatically on restart, or via `REBUILD SEARCH INDEX`).
+- Cluster mode: the DDL broadcasts like other DDL (every node indexes its
+  shard); scatter-gather search across a multi-node cluster lands in a later
+  phase (single-node serving works today).
 
 ## Time-series tables
 

@@ -49,5 +49,17 @@ pub enum EngineError {
     Timeseries(String),
 }
 
+impl From<skaidb_fts::FtsError> for EngineError {
+    fn from(e: skaidb_fts::FtsError) -> Self {
+        match e {
+            // Bad configuration or query text: the user's mistake.
+            skaidb_fts::FtsError::Config(msg) => EngineError::Type(msg),
+            // Internal search-engine failures carry their own prefix; reuse
+            // the generic string carrier (the `corrupt row:` precedent).
+            other => EngineError::Constraint(other.to_string()),
+        }
+    }
+}
+
 /// Convenience result alias for engine operations.
 pub type Result<T> = std::result::Result<T, EngineError>;

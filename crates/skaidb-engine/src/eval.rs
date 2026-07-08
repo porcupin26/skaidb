@@ -69,6 +69,23 @@ fn eval_func(name: &str, args: &[Expr], row: &Document) -> Result<Value> {
         "now" => Ok(Value::Timestamp(
             crate::exec::now_ms(),
         )),
+        // `score()` reads the BM25 score the search gather injects into each
+        // hit; outside a search query there is nothing to read.
+        "score" => {
+            if !args.is_empty() {
+                return Err(EngineError::Type("score() takes no arguments".into()));
+            }
+            row.get("_score").cloned().ok_or_else(|| {
+                EngineError::Type(
+                    "score() is only valid in a query with a MATCH()/SEARCH() predicate".into(),
+                )
+            })
+        }
+        // Search predicates are consumed by the search planner; one reaching
+        // scalar evaluation sits in a position the index cannot serve.
+        "match" | "match_phrase" | "fuzzy" | "search" => Err(EngineError::Type(format!(
+            "{name}() must appear as a top-level AND condition in the WHERE clause of a search query"
+        ))),
         other => Err(EngineError::Type(format!("unknown function {other}()"))),
     }
 }

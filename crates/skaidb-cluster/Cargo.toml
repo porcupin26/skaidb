@@ -15,6 +15,7 @@ skaidb-storage.workspace = true
 skaidb-engine.workspace = true
 skaidb-tsdb.workspace = true
 skaidb-sql.workspace = true
+skaidb-fts.workspace = true
 skaidb-proto.workspace = true
 skaidb-auth.workspace = true
 thiserror.workspace = true

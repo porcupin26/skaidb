@@ -4024,6 +4024,9 @@ fn is_ddl(stmt: &Statement) -> bool {
             | Statement::DropIndex { .. }
             | Statement::CreateVectorIndex(_)
             | Statement::DropVectorIndex { .. }
+            | Statement::CreateSearchIndex(_)
+            | Statement::DropSearchIndex { .. }
+            | Statement::RebuildSearchIndex { .. }
             | Statement::AlterTable(_)
             | Statement::CreateDatabase { .. }
             | Statement::DropDatabase { .. }
@@ -4209,6 +4212,29 @@ impl Cluster for Coordinator {
         // Distributed ANN: scatter to every node's local HNSW, merge by
         // distance, re-read survivors at the read quorum.
         self.node.vector_search(&index, query, k, filter)
+    }
+
+    fn search(
+        &mut self,
+        table: &str,
+        query: &skaidb_fts::SearchQuery,
+        k: Option<usize>,
+        filter: &Option<Expr>,
+    ) -> EngineResult<Vec<(Vec<u8>, Document, f32)>> {
+        // Phase 1 is single-node: scatter/merge of per-shard top-k (and the
+        // internode messages it needs) is phase 4.
+        if self.node.member_count() > 1 {
+            return Err(EngineError::Unsupported(
+                "cluster-wide full-text search lands in a later phase".into(),
+            ));
+        }
+        // Sole member: every row is local. Serve under the write lock so
+        // pending index writes commit first (read-your-writes).
+        self.node
+            .local
+            .write()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .search_commit_if_dirty(table, query, k, filter)
     }
 
     fn matching_rows(
