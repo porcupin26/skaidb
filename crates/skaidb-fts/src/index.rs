@@ -18,6 +18,7 @@ use tantivy::schema::{
     BytesOptions, DateOptions, Field, IndexRecordOption, NumericOptions, Schema,
     TextFieldIndexing, TextOptions, Value as _,
 };
+use tantivy::snippet::SnippetGenerator;
 use tantivy::{DateTime, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
 use crate::query::{build_query, FieldRuntime, QueryFields};
@@ -412,6 +413,43 @@ impl SearchIndex {
         Ok(keys)
     }
 
+    /// Build a [`Highlighter`] for `query` over one text column: snippets of
+    /// row text with the query's matching terms marked. Built once per query
+    /// per column, then applied to each hit's authoritative row text.
+    pub fn highlighter(
+        &self,
+        query: &SearchQuery,
+        field: &str,
+        max_chars: usize,
+    ) -> Result<Highlighter, FtsError> {
+        let rt = self
+            .runtimes
+            .iter()
+            .find(|r| r.path == field)
+            .ok_or_else(|| {
+                FtsError::Config(format!(
+                    "column '{field}' is not covered by the search index"
+                ))
+            })?;
+        if !rt.ftype.is_texty() {
+            return Err(FtsError::Config(format!(
+                "HIGHLIGHT needs a text or keyword column, '{field}' is declared {:?}",
+                rt.ftype
+            )));
+        }
+        let q = build_query(
+            &self.index,
+            &QueryFields {
+                fields: &self.runtimes,
+            },
+            query,
+        )?;
+        let searcher = self.reader.searcher();
+        let mut generator = SnippetGenerator::create(&searcher, &*q, rt.field)?;
+        generator.set_max_num_chars(max_chars.max(1));
+        Ok(Highlighter { generator })
+    }
+
     pub fn stats(&self) -> SearchIndexStats {
         let disk_bytes = std::fs::read_dir(&self.dir)
             .map(|entries| {
@@ -424,6 +462,32 @@ impl SearchIndex {
             docs: self.reader.searcher().num_docs(),
             disk_bytes,
             uncommitted: self.uncommitted,
+        }
+    }
+}
+
+/// Generates highlighted snippets of row text for one (query, column) pair
+/// (from [`SearchIndex::highlighter`]).
+pub struct Highlighter {
+    generator: SnippetGenerator,
+}
+
+impl fmt::Debug for Highlighter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Highlighter").finish_non_exhaustive()
+    }
+}
+
+impl Highlighter {
+    /// The best-scoring fragment of `text` with matching terms wrapped in
+    /// `<b>…</b>` (HTML-escaped otherwise); empty string when nothing in
+    /// `text` matches.
+    pub fn snippet(&self, text: &str) -> String {
+        let snippet = self.generator.snippet(text);
+        if snippet.is_empty() {
+            String::new()
+        } else {
+            snippet.to_html()
         }
     }
 }
@@ -911,5 +975,122 @@ mod tests {
         assert_eq!(hits.len(), 2);
         // The boosted title match outranks the repeated body match.
         assert_eq!(hits[0].key, b"title_hit");
+    }
+
+    // ---- phase 3: prefix/wildcard/regexp, NOT composition, highlighting ----
+
+    /// `body` over three rows for the term-level pattern queries.
+    fn pattern_index(dir: &std::path::Path) -> SearchIndex {
+        let cfg = config(&["body"], &[]);
+        let mut idx = open(dir, &cfg);
+        idx.put(b"k1", &text_doc(&[("body", "quick brown fox")]), wm(1)).unwrap();
+        idx.put(b"k2", &text_doc(&[("body", "quiet quality street")]), wm(2)).unwrap();
+        idx.put(b"k3", &text_doc(&[("body", "slow red panda")]), wm(3)).unwrap();
+        idx.commit().unwrap();
+        idx
+    }
+
+    #[test]
+    fn prefix_wildcard_and_regexp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idx = pattern_index(tmp.path());
+        let sorted = |mut keys: Vec<Vec<u8>>| {
+            keys.sort();
+            keys
+        };
+        // Prefix runs against indexed (lowercased) terms.
+        let hits = idx
+            .search_keys(&SearchQuery::Prefix {
+                field: Some("body".into()),
+                text: "qui".into(),
+            })
+            .unwrap();
+        assert_eq!(sorted(hits), vec![b"k1".to_vec(), b"k2".to_vec()]);
+        // The prefix itself is a literal: regex metacharacters must not leak.
+        assert!(idx
+            .search_keys(&SearchQuery::Prefix {
+                field: Some("body".into()),
+                text: "qu.".into(),
+            })
+            .unwrap()
+            .is_empty());
+        // Wildcards: `*` any run, `?` exactly one char.
+        let hits = idx
+            .search_keys(&SearchQuery::Wildcard {
+                field: Some("body".into()),
+                pattern: "qu*k".into(),
+            })
+            .unwrap();
+        assert_eq!(hits, vec![b"k1".to_vec()]);
+        let hits = idx
+            .search_keys(&SearchQuery::Wildcard {
+                field: Some("body".into()),
+                pattern: "qui?t".into(),
+            })
+            .unwrap();
+        assert_eq!(hits, vec![b"k2".to_vec()]);
+        // Full regex over indexed terms.
+        let hits = idx
+            .search_keys(&SearchQuery::Regexp {
+                field: Some("body".into()),
+                pattern: "qu(ick|iet)".into(),
+            })
+            .unwrap();
+        assert_eq!(sorted(hits), vec![b"k1".to_vec(), b"k2".to_vec()]);
+        // A broken regex is a config (user) error.
+        let err = idx
+            .search_keys(&SearchQuery::Regexp {
+                field: Some("body".into()),
+                pattern: "qu(".into(),
+            })
+            .expect_err("bad regex");
+        assert!(matches!(err, FtsError::Config(_)));
+    }
+
+    #[test]
+    fn not_and_bool_composition() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idx = pattern_index(tmp.path());
+        // NOT excludes matching rows; the rest of the index comes back.
+        let mut hits = idx
+            .search_keys(&SearchQuery::Not(Box::new(matches("body", "quick"))))
+            .unwrap();
+        hits.sort();
+        assert_eq!(hits, vec![b"k2".to_vec(), b"k3".to_vec()]);
+        // AND of a positive and a negative: quick-or-quiet rows minus fox rows.
+        let hits = idx
+            .search_keys(&SearchQuery::All(vec![
+                SearchQuery::Any(vec![matches("body", "quick"), matches("body", "quiet")]),
+                SearchQuery::Not(Box::new(matches("body", "fox"))),
+            ]))
+            .unwrap();
+        assert_eq!(hits, vec![b"k2".to_vec()]);
+    }
+
+    #[test]
+    fn highlighter_marks_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = config(&["body"], &[("analyzer", "english")]);
+        let mut idx = open(tmp.path(), &cfg);
+        idx.put(
+            b"k1",
+            &text_doc(&[("body", "the quick brown fox jumps over the lazy dog")]),
+            wm(1),
+        )
+        .unwrap();
+        idx.commit().unwrap();
+        let query = matches("body", "jumping foxes");
+        let h = idx.highlighter(&query, "body", 60).unwrap();
+        // Stemmed query terms highlight the row's original inflections.
+        let snippet = h.snippet("the quick brown fox jumps over the lazy dog");
+        assert!(snippet.contains("<b>fox</b>"), "{snippet}");
+        assert!(snippet.contains("<b>jumps</b>"), "{snippet}");
+        // Non-matching text yields no snippet.
+        assert_eq!(h.snippet("completely unrelated words"), "");
+        // Unknown or non-text columns are config errors.
+        assert!(matches!(
+            idx.highlighter(&query, "nope", 60),
+            Err(FtsError::Config(_))
+        ));
     }
 }

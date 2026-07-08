@@ -1,14 +1,15 @@
 //! Engine-agnostic query model and its translation to Tantivy queries.
 //!
-//! The SQL layer builds a [`SearchQuery`] from `MATCH()` / `MATCH_PHRASE()`
-//! / `FUZZY()` / `SEARCH()` predicates; this module analyzes the text with
-//! each field's **query-time** analyzer (`search_analyzer`, falling back to
-//! the index-time one) and assembles the corresponding Tantivy query,
-//! applying per-field boosts.
+//! The SQL layer builds a [`SearchQuery`] from the `MATCH()` predicate
+//! family; this module analyzes the text with each field's **query-time**
+//! analyzer (`search_analyzer`, falling back to the index-time one) and
+//! assembles the corresponding Tantivy query, applying per-field boosts.
+//! Multi-field queries combine per-field scores with dis-max, matching
+//! Elasticsearch's `multi_match` `best_fields` default.
 
 use tantivy::query::{
-    BooleanQuery, BoostQuery, EmptyQuery, FuzzyTermQuery, Occur, PhraseQuery, Query, QueryParser,
-    TermQuery,
+    AllQuery, BooleanQuery, BoostQuery, DisjunctionMaxQuery, EmptyQuery, FuzzyTermQuery, Occur,
+    PhraseQuery, Query, QueryParser, RegexQuery, TermQuery,
 };
 use tantivy::schema::{Field, IndexRecordOption};
 use tantivy::{Index, Term};
@@ -37,6 +38,21 @@ pub enum SearchQuery {
         text: String,
         distance: u8,
     },
+    /// Term prefix match (ES `prefix`). The prefix is **not analyzed**: it
+    /// runs against the indexed terms, so with a lowercasing analyzer write
+    /// it lowercase.
+    Prefix { field: Option<String>, text: String },
+    /// `*` (any run) / `?` (any one char) glob over indexed terms (ES
+    /// `wildcard`). Not analyzed, like `Prefix`.
+    Wildcard {
+        field: Option<String>,
+        pattern: String,
+    },
+    /// Regular expression over indexed terms (ES `regexp`). Not analyzed.
+    Regexp {
+        field: Option<String>,
+        pattern: String,
+    },
     /// Query-string mini-language over the default fields
     /// (`title:"rust db" +performance -draft`).
     QueryString(String),
@@ -44,6 +60,10 @@ pub enum SearchQuery {
     All(Vec<SearchQuery>),
     /// At least one sub-query must match (SQL OR).
     Any(Vec<SearchQuery>),
+    /// Rows matching the sub-query are excluded (SQL NOT). Rows absent from
+    /// the index (none of the indexed columns present) are never returned —
+    /// the index cannot speak for rows it does not contain.
+    Not(Box<SearchQuery>),
 }
 
 /// What the query builder needs to know about one indexed field.
@@ -114,23 +134,54 @@ fn boosted(q: Box<dyn Query>, boost: f32) -> Box<dyn Query> {
     }
 }
 
-/// OR together one query per field, dropping fields where analysis yields
-/// no terms.
+/// Combine one query per field, dropping fields where analysis yields no
+/// terms. Multiple fields dis-max (a row scores as its best field, ES
+/// `best_fields`) — the match *set* is still the union.
 fn per_field_union(
     fields: Vec<&FieldRuntime>,
     mut build: impl FnMut(&FieldRuntime) -> Result<Option<Box<dyn Query>>, FtsError>,
 ) -> Result<Box<dyn Query>, FtsError> {
-    let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+    let mut clauses: Vec<Box<dyn Query>> = Vec::new();
     for rt in fields {
         if let Some(q) = build(rt)? {
-            clauses.push((Occur::Should, boosted(q, rt.boost)));
+            clauses.push(boosted(q, rt.boost));
         }
     }
     Ok(match clauses.len() {
         0 => Box::new(EmptyQuery),
-        1 => clauses.pop().expect("len checked").1,
-        _ => Box::new(BooleanQuery::new(clauses)),
+        1 => clauses.pop().expect("len checked"),
+        _ => Box::new(DisjunctionMaxQuery::new(clauses)),
     })
+}
+
+/// A [`RegexQuery`] over a field's indexed terms; pattern errors are user
+/// errors.
+fn regex_query(field: Field, pattern: &str) -> Result<Box<dyn Query>, FtsError> {
+    RegexQuery::from_pattern(pattern, field)
+        .map(|q| Box::new(q) as Box<dyn Query>)
+        .map_err(|e| FtsError::Config(format!("invalid pattern '{pattern}': {e}")))
+}
+
+/// Escape one char into `out` if it is a regex metacharacter.
+fn push_regex_literal(out: &mut String, c: char) {
+    if "\\.+*?()|[]{}^$#&-~<>".contains(c) {
+        out.push('\\');
+    }
+    out.push(c);
+}
+
+/// Translate an ES-style wildcard pattern (`*` any run, `?` any one char)
+/// into a regex.
+fn wildcard_to_regex(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len() + 4);
+    for c in pattern.chars() {
+        match c {
+            '*' => out.push_str(".*"),
+            '?' => out.push('.'),
+            c => push_regex_literal(&mut out, c),
+        }
+    }
+    out
 }
 
 pub(crate) fn build_query(
@@ -196,6 +247,28 @@ pub(crate) fn build_query(
                 Ok(Some(Box::new(BooleanQuery::new(clauses))))
             })
         }
+        SearchQuery::Prefix { field, text } => {
+            let pattern = {
+                let mut out = String::with_capacity(text.len() + 2);
+                text.chars().for_each(|c| push_regex_literal(&mut out, c));
+                out.push_str(".*");
+                out
+            };
+            per_field_union(fields.resolve(field)?, |rt| {
+                Some(regex_query(rt.field, &pattern)).transpose()
+            })
+        }
+        SearchQuery::Wildcard { field, pattern } => {
+            let pattern = wildcard_to_regex(pattern);
+            per_field_union(fields.resolve(field)?, |rt| {
+                Some(regex_query(rt.field, &pattern)).transpose()
+            })
+        }
+        SearchQuery::Regexp { field, pattern } => {
+            per_field_union(fields.resolve(field)?, |rt| {
+                Some(regex_query(rt.field, pattern)).transpose()
+            })
+        }
         SearchQuery::QueryString(text) => {
             // Text fields are the defaults for bare terms; typed fields
             // remain addressable as `field:value` / `field:[a TO b]`.
@@ -228,6 +301,16 @@ pub(crate) fn build_query(
                 clauses.push((Occur::Should, build_query(index, fields, sub)?));
             }
             Ok(Box::new(BooleanQuery::new(clauses)))
+        }
+        SearchQuery::Not(inner) => {
+            // must_not needs a positive base; AllQuery spans every indexed
+            // row (rows with none of the indexed columns are not in the
+            // index and can never be returned — see the variant docs).
+            let sub = build_query(index, fields, inner)?;
+            Ok(Box::new(BooleanQuery::new(vec![
+                (Occur::Must, Box::new(AllQuery) as Box<dyn Query>),
+                (Occur::MustNot, sub),
+            ])))
         }
     }
 }

@@ -4220,6 +4220,7 @@ impl Cluster for Coordinator {
         query: &skaidb_fts::SearchQuery,
         k: Option<usize>,
         filter: &Option<Expr>,
+        highlights: &[(String, usize)],
     ) -> EngineResult<Vec<(Vec<u8>, Document, f32)>> {
         // Phase 1 is single-node: scatter/merge of per-shard top-k (and the
         // internode messages it needs) is phase 4.
@@ -4234,7 +4235,7 @@ impl Cluster for Coordinator {
             .local
             .write()
             .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
-            .search_commit_if_dirty(table, query, k, filter)
+            .search_commit_if_dirty(table, query, k, filter, highlights)
     }
 
     fn matching_rows(

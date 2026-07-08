@@ -81,11 +81,30 @@ fn eval_func(name: &str, args: &[Expr], row: &Document) -> Result<Value> {
                 )
             })
         }
+        // `HIGHLIGHT(col [, max_chars])` reads the snippet the search gather
+        // injects for the column; outside a search query there is nothing to
+        // read.
+        "highlight" => {
+            let Some(Expr::Column(path)) = args.first() else {
+                return Err(EngineError::Type(
+                    "HIGHLIGHT(column [, max_chars]) takes a column as its first argument".into(),
+                ));
+            };
+            row.get(&format!("_highlight_{path}")).cloned().ok_or_else(|| {
+                EngineError::Type(
+                    "HIGHLIGHT() is only valid in a query with a MATCH()/SEARCH() predicate"
+                        .into(),
+                )
+            })
+        }
         // Search predicates are consumed by the search planner; one reaching
         // scalar evaluation sits in a position the index cannot serve.
-        "match" | "match_phrase" | "fuzzy" | "search" => Err(EngineError::Type(format!(
-            "{name}() must appear as a top-level AND condition in the WHERE clause of a search query"
-        ))),
+        "match" | "match_phrase" | "match_prefix" | "fuzzy" | "wildcard" | "regexp" | "search" => {
+            Err(EngineError::Type(format!(
+                "{name}() must appear in the WHERE clause of a search query, composed only \
+                 with AND/OR/NOT"
+            )))
+        }
         other => Err(EngineError::Type(format!("unknown function {other}()"))),
     }
 }

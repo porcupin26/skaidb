@@ -7,12 +7,13 @@ This documents the **shipped** state; the plan and pending phases live in
 [FTS_TODO.md](FTS_TODO.md), and the SQL grammar in
 [QUERY_SYNTAX.md](QUERY_SYNTAX.md#full-text-search-match--search).
 
-Status: **phase 2 (analysis & mappings)** — everything in phase 1
-(single-node core: DDL, index maintenance on put/delete,
-`MATCH`/`MATCH_PHRASE`/`FUZZY`/`SEARCH` predicates, `score()`, top-k
-pushdown, crash recovery, rebuild) plus the analyzer registry, per-column
-index configuration, typed (numeric/date/bool) fast fields, `.keyword`
-exact-match twins, and `copy_to` composite fields.
+Status: **phase 3 (query DSL)** — phases 1–2 (single-node core: DDL, index
+maintenance on put/delete, `score()`, top-k pushdown, crash recovery,
+rebuild; analysis & mappings: analyzer registry, per-column configuration,
+typed fast fields, `.keyword` twins, `copy_to`) plus the full predicate
+family (`MATCH`/`MATCH_PHRASE`/`MATCH_PREFIX`/`FUZZY`/`WILDCARD`/`REGEXP`/
+`SEARCH`), AND/OR/NOT composition of search predicates, dis-max multi-field
+scoring, and `HIGHLIGHT()` snippets.
 
 ## Using it
 
@@ -23,13 +24,17 @@ CREATE SEARCH INDEX articles_fts ON articles (title, body, year, published)
         title.copy_to = 'everything', body.copy_to = 'everything',
         year.type = 'long', published.type = 'bool');
 
-SELECT id, title, score() FROM articles
+SELECT id, title, score(), HIGHLIGHT(body, 120) AS snippet FROM articles
 WHERE MATCH(body, 'quick brown fox') AND published = true
 ORDER BY score() DESC LIMIT 10;
 
 SELECT id FROM articles
 WHERE SEARCH('title:"rust database" +body:performance year:[2020 TO 2024]')
 ORDER BY score() DESC LIMIT 20;
+
+-- Search predicates compose with AND/OR/NOT:
+SELECT id FROM articles
+WHERE (MATCH(body, 'rust') OR MATCH(title, 'rust')) AND NOT MATCH(body, 'draft');
 
 REBUILD SEARCH INDEX articles_fts;   -- re-index from the table
 DROP SEARCH INDEX articles_fts;
@@ -101,6 +106,43 @@ Query text is analyzed with the field's **query-time** analyzer:
   engine rebuilds automatically on open if the definition changed);
   `search_analyzer` is query-time-only and needs none.
 
+## Predicates
+
+Analyzed predicates (query text goes through the field's query-time
+analyzer):
+
+- `MATCH(col, 'text')` — any analyzed term matches (ES `match`).
+- `MATCH_PHRASE(col, 'text' [, slop])` — terms in order within `slop`
+  transpositions (ES `match_phrase`).
+- `FUZZY(col, 'text' [, distance])` — Levenshtein ≤ 2 per term (ES `fuzzy`).
+- `SEARCH('query-string')` — the mini-language: bare terms over text
+  columns, `"phrase"`, `col:term`, `+must`, `-must_not`, `AND`/`OR`, and
+  ranges over typed columns (`year:[2020 TO 2024]`, `published:true`).
+
+Term-level pattern predicates (**not analyzed** — they run against the
+indexed terms, so with a lowercasing analyzer write patterns lowercase):
+
+- `MATCH_PREFIX(col, 'qu')` — term prefix (ES `prefix`).
+- `WILDCARD(col, 'qu*ck')` — `*` any run, `?` any one char (ES `wildcard`).
+- `REGEXP(col, 'qu.[ck]+')` — regular expression (ES `regexp`).
+
+**Composition**: search predicates combine freely with `AND`/`OR`/`NOT`
+among themselves (ES bool `must`/`should`/`must_not`); ordinary SQL
+conditions join at the top level with `AND` and filter the hits afterward.
+Mixing a search predicate with an ordinary condition under `OR`/`NOT` is
+rejected — the index cannot serve it. A `NOT` search returns only rows the
+index knows: a row with none of the indexed columns present is never
+returned.
+
+**Multi-field scoring** is dis-max (a row scores as its best field, ES
+`best_fields`), with per-column boosts applied.
+
+**Highlighting**: `HIGHLIGHT(col [, max_chars])` in the projection returns
+the best-scoring snippet of the column's text (default 150 chars) with
+matching terms wrapped in `<b>…</b>` (HTML-escaped otherwise, empty string
+when the column didn't match). Stemming is respected — a query for
+`jumping` highlights `jumps`. Only valid together with a search predicate.
+
 ## Architecture
 
 - **`skaidb-fts` crate** wraps Tantivy behind an engine-agnostic API
@@ -141,16 +183,17 @@ Query text is analyzed with the field's **query-time** analyzer:
 - `/metrics` gauges: `skaidb_search_indexes`, `skaidb_search_docs_total`,
   `skaidb_search_disk_bytes`, `skaidb_search_rebuild_seconds`.
 
-## Limits (phase 2)
+## Limits (phase 3)
 
-- Search predicates must be top-level `AND` conditions; `OR`/`NOT` around
-  them is rejected (full bool composition is phase 3).
+- Search predicates compose with `AND`/`OR`/`NOT` among themselves; mixing
+  them with ordinary conditions under `OR`/`NOT` is rejected (top-level
+  `AND` with ordinary conditions works — they filter the hits).
 - `ORDER BY score() DESC` is the only ordering usable with search
   predicates and requires `LIMIT`.
 - No `JOIN`, `UNION`, aggregates/`GROUP BY`, `DISTINCT`, or `NEAREST` in
   the same query.
 - Per-shard BM25 statistics (like Elasticsearch's default); a global-stats
   mode is a later phase.
-- Highlighting (`HIGHLIGHT()`), wildcard/regexp/explain, cluster
+- Per-hit score explain, the ES side-by-side parity suite, cluster
   scatter-gather, aggregations, and suggesters land in phases 3–7 (see
   [FTS_TODO.md](FTS_TODO.md)).

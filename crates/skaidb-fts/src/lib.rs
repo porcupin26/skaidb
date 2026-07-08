@@ -17,7 +17,7 @@ mod index;
 mod query;
 
 pub use analyzer::Analyzer;
-pub use index::{SearchIndex, SearchIndexStats};
+pub use index::{Highlighter, SearchIndex, SearchIndexStats};
 pub use query::SearchQuery;
 
 /// Errors surfaced by the search crate. Engine code maps these onto

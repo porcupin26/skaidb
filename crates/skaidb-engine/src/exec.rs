@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use skaidb_sql::ast::{
     AggArg, AggFunc, AlterAction, AlterTable, BinaryOp, CreateSearchIndex, Delete, Expr, Insert,
-    JoinKind, OrderKey, Select, SelectItem, Statement, Update,
+    JoinKind, OrderKey, Select, SelectItem, Statement, UnaryOp, Update,
 };
 use skaidb_sql::parse;
 use std::sync::Arc;
@@ -785,12 +785,13 @@ impl Database {
         query: &SearchQuery,
         k: Option<usize>,
         filter: &Option<Expr>,
+        highlights: &[(String, usize)],
     ) -> Result<Vec<(Vec<u8>, Document, f32)>> {
         let name = self.search_index_for_query(table, query)?;
         if let Some(live) = self.search_indexes.get_mut(&name) {
             live.commit_if_dirty()?;
         }
-        self.search_with_index(&name, table, query, k, filter)
+        self.search_with_index(&name, table, query, k, filter, highlights)
     }
 
     /// Full-text search over the last-committed index state (see
@@ -801,16 +802,18 @@ impl Database {
         query: &SearchQuery,
         k: Option<usize>,
         filter: &Option<Expr>,
+        highlights: &[(String, usize)],
     ) -> Result<Vec<(Vec<u8>, Document, f32)>> {
         let name = self.search_index_for_query(table, query)?;
-        self.search_with_index(&name, table, query, k, filter)
+        self.search_with_index(&name, table, query, k, filter, highlights)
     }
 
     /// Run `query` against the named index and resolve hits to rows.
     /// `k = Some(n)`: the `n` best-scoring rows, best first (over-fetched when
     /// a residual `filter` will drop candidates, like filtered ANN).
     /// `k = None`: every matching row, order unspecified, scores 0.0 (the
-    /// pure-predicate path).
+    /// pure-predicate path). Each requested highlight column adds a
+    /// `_highlight_<column>` snippet field to every returned doc.
     fn search_with_index(
         &self,
         name: &str,
@@ -818,6 +821,7 @@ impl Database {
         query: &SearchQuery,
         k: Option<usize>,
         filter: &Option<Expr>,
+        highlights: &[(String, usize)],
     ) -> Result<Vec<(Vec<u8>, Document, f32)>> {
         let live = self
             .search_indexes
@@ -827,12 +831,27 @@ impl Database {
             .tables
             .get(table)
             .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+        // Snippet generators are per-(query, column), built once and applied
+        // to each hit's authoritative row text.
+        let highlighters = highlights
+            .iter()
+            .map(|(col, max_chars)| {
+                let h = live.index.highlighter(query, col, *max_chars)?;
+                Ok((col.as_str(), h))
+            })
+            .collect::<Result<Vec<_>>>()?;
         // The index only knows keys; re-read each hit's row (authoritative)
         // to apply the residual filter and return the document.
         let resolve = |key: &[u8]| -> Result<Option<Document>> {
             match table_engine.get(key)? {
                 Some(bytes) => match Value::decode(&bytes) {
-                    Ok(Value::Document(doc)) if matches_filter(filter, &doc)? => Ok(Some(doc)),
+                    Ok(Value::Document(mut doc)) if matches_filter(filter, &doc)? => {
+                        for (col, h) in &highlighters {
+                            let snippet = h.snippet(&doc_text_at(&doc, col));
+                            doc.insert(format!("_highlight_{col}"), Value::String(snippet));
+                        }
+                        Ok(Some(doc))
+                    }
                     _ => Ok(None),
                 },
                 None => Ok(None),
@@ -3273,15 +3292,17 @@ pub trait Cluster {
     /// `n` best BM25 scores, best first); `k = None` returns every matching
     /// row with score 0.0 and unspecified order (pure predicate). `filter` is
     /// the residual WHERE, applied authoritatively by the implementation.
-    /// `&mut self` so the write path can commit pending index writes first
-    /// (read-your-writes); read-only implementations serve the last-committed
-    /// state instead.
+    /// `highlights` are `(column, max_chars)` snippet requests; each hit doc
+    /// gets a `_highlight_<column>` field. `&mut self` so the write path can
+    /// commit pending index writes first (read-your-writes); read-only
+    /// implementations serve the last-committed state instead.
     fn search(
         &mut self,
         _table: &str,
         _query: &SearchQuery,
         _k: Option<usize>,
         _filter: &Option<Expr>,
+        _highlights: &[(String, usize)],
     ) -> Result<Vec<(Vec<u8>, Document, f32)>> {
         Err(EngineError::Unsupported(
             "full-text search is not supported on this deployment".into(),
@@ -3517,7 +3538,10 @@ fn run_nearest_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> 
 
 /// The `MATCH()`-family predicate functions (names arrive lowercased).
 fn is_search_func(name: &str) -> bool {
-    matches!(name, "match" | "match_phrase" | "fuzzy" | "search")
+    matches!(
+        name,
+        "match" | "match_phrase" | "match_prefix" | "fuzzy" | "wildcard" | "regexp" | "search"
+    )
 }
 
 /// Whether `score()` (no arguments) is called.
@@ -3564,7 +3588,10 @@ fn collect_search_fields(query: &SearchQuery, out: &mut Vec<String>) {
     match query {
         SearchQuery::Match { field, .. }
         | SearchQuery::Phrase { field, .. }
-        | SearchQuery::Fuzzy { field, .. } => {
+        | SearchQuery::Fuzzy { field, .. }
+        | SearchQuery::Prefix { field, .. }
+        | SearchQuery::Wildcard { field, .. }
+        | SearchQuery::Regexp { field, .. } => {
             if let Some(f) = field {
                 if !out.contains(f) {
                     out.push(f.clone());
@@ -3577,14 +3604,53 @@ fn collect_search_fields(query: &SearchQuery, out: &mut Vec<String>) {
                 collect_search_fields(sub, out);
             }
         }
+        SearchQuery::Not(sub) => collect_search_fields(sub, out),
+    }
+}
+
+/// Whether the expression is built purely of search predicates composed
+/// with AND/OR/NOT — i.e. the whole subtree can push to the index.
+fn is_pure_search(e: &Expr) -> bool {
+    match e {
+        Expr::Func { name, .. } => is_search_func(name),
+        Expr::Binary {
+            op: BinaryOp::And | BinaryOp::Or,
+            left,
+            right,
+        } => is_pure_search(left) && is_pure_search(right),
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } => is_pure_search(expr),
+        _ => false,
+    }
+}
+
+/// Convert a pure-search expression (see [`is_pure_search`]) into a
+/// [`SearchQuery`] tree.
+fn to_search_query(e: &Expr) -> Result<SearchQuery> {
+    match e {
+        Expr::Func { name, args } => search_query_from_func(name, args),
+        Expr::Binary { op, left, right } => {
+            let l = to_search_query(left)?;
+            let r = to_search_query(right)?;
+            Ok(match op {
+                BinaryOp::And => SearchQuery::All(vec![l, r]),
+                BinaryOp::Or => SearchQuery::Any(vec![l, r]),
+                _ => unreachable!("is_pure_search admits only AND/OR"),
+            })
+        }
+        Expr::Unary { expr, .. } => Ok(SearchQuery::Not(Box::new(to_search_query(expr)?))),
+        _ => unreachable!("is_pure_search admits only funcs and AND/OR/NOT"),
     }
 }
 
 /// Split a WHERE clause into search predicates and the residual filter. The
-/// filter must be a top-level AND chain: each leaf is either a search
-/// function (converted to a [`SearchQuery`]) or an ordinary predicate
-/// (recombined into the residual). A search function under OR/NOT or nested
-/// in an expression cannot be pushed to the index and is rejected.
+/// filter must be a top-level AND chain: each leaf is either a pure search
+/// subtree — search functions composed with AND/OR/NOT, converted to a
+/// [`SearchQuery`] — or an ordinary predicate (recombined into the
+/// residual). Mixing a search function with ordinary predicates under
+/// OR/NOT cannot be pushed to the index and is rejected.
 fn split_search_filter(filter: &Option<Expr>) -> Result<(Vec<SearchQuery>, Option<Expr>)> {
     let Some(expr) = filter else {
         return Ok((Vec::new(), None));
@@ -3607,15 +3673,15 @@ fn split_search_filter(filter: &Option<Expr>) -> Result<(Vec<SearchQuery>, Optio
     let mut queries = Vec::new();
     let mut residual: Option<Expr> = None;
     for leaf in ls {
-        if let Expr::Func { name, args } = leaf {
-            if is_search_func(name) {
-                queries.push(search_query_from_func(name, args)?);
-                continue;
-            }
+        if is_pure_search(leaf) {
+            queries.push(to_search_query(leaf)?);
+            continue;
         }
         if expr_has_func(leaf, &is_search_func) {
             return Err(EngineError::Unsupported(
-                "MATCH()/SEARCH() must be top-level AND conditions in the WHERE clause".into(),
+                "search predicates compose with AND/OR/NOT among themselves; mixing them \
+                 with ordinary conditions under OR/NOT is not supported"
+                    .into(),
             ));
         }
         residual = Some(match residual.take() {
@@ -3706,6 +3772,39 @@ fn search_query_from_func(name: &str, args: &[Expr]) -> Result<SearchQuery> {
                 distance,
             })
         }
+        "match_prefix" => {
+            let [col, q] = args else {
+                return Err(EngineError::Type(
+                    "MATCH_PREFIX(column, 'prefix') takes exactly two arguments".into(),
+                ));
+            };
+            Ok(SearchQuery::Prefix {
+                field: Some(column(col, "MATCH_PREFIX(column, 'prefix')")?),
+                text: text(q, "MATCH_PREFIX(column, 'prefix')")?,
+            })
+        }
+        "wildcard" => {
+            let [col, q] = args else {
+                return Err(EngineError::Type(
+                    "WILDCARD(column, 'pattern') takes exactly two arguments".into(),
+                ));
+            };
+            Ok(SearchQuery::Wildcard {
+                field: Some(column(col, "WILDCARD(column, 'pattern')")?),
+                pattern: text(q, "WILDCARD(column, 'pattern')")?,
+            })
+        }
+        "regexp" => {
+            let [col, q] = args else {
+                return Err(EngineError::Type(
+                    "REGEXP(column, 'pattern') takes exactly two arguments".into(),
+                ));
+            };
+            Ok(SearchQuery::Regexp {
+                field: Some(column(col, "REGEXP(column, 'pattern')")?),
+                pattern: text(q, "REGEXP(column, 'pattern')")?,
+            })
+        }
         "search" => {
             let [q] = args else {
                 return Err(EngineError::Type(
@@ -3774,7 +3873,8 @@ fn run_search_select(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSe
             ))
         }
     };
-    let hits = cluster.search(&sel.from, &query, k, &residual)?;
+    let highlights = collect_highlights(sel)?;
+    let hits = cluster.search(&sel.from, &query, k, &residual, &highlights)?;
     let docs: Vec<Document> = hits
         .into_iter()
         .map(|(_, mut doc, score)| {
@@ -3785,6 +3885,87 @@ fn run_search_select(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSe
     // `project` with `finalize` applies the ORDER BY (score() reads the
     // injected `_score`) and the OFFSET/LIMIT page.
     project(sel, docs, &HashSet::new(), true)
+}
+
+/// The `HIGHLIGHT(column [, max_chars])` requests in a search SELECT's
+/// projection, as `(column, max_chars)` (default 150 chars, the ES-ish
+/// fragment size). The search gather answers each with a
+/// `_highlight_<column>` snippet field on every hit.
+fn collect_highlights(sel: &Select) -> Result<Vec<(String, usize)>> {
+    fn walk(expr: &Expr, out: &mut Vec<(String, usize)>) -> Result<()> {
+        if let Expr::Func { name, args } = expr {
+            if name == "highlight" {
+                let (col, max_chars) = match args.as_slice() {
+                    [Expr::Column(col)] => (col.clone(), 150),
+                    [Expr::Column(col), Expr::Literal(Value::Int(n))] if *n > 0 => {
+                        (col.clone(), *n as usize)
+                    }
+                    _ => {
+                        return Err(EngineError::Type(
+                            "HIGHLIGHT(column [, max_chars]) takes a column and an optional \
+                             positive integer"
+                                .into(),
+                        ))
+                    }
+                };
+                match out.iter().find(|(c, _)| *c == col) {
+                    Some((_, prev)) if *prev != max_chars => {
+                        return Err(EngineError::Type(format!(
+                            "conflicting HIGHLIGHT lengths for column '{col}'"
+                        )))
+                    }
+                    Some(_) => {}
+                    None => out.push((col, max_chars)),
+                }
+                return Ok(());
+            }
+        }
+        match expr {
+            Expr::Func { args, .. } => args.iter().try_for_each(|a| walk(a, out)),
+            Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => walk(expr, out),
+            Expr::Binary { left, right, .. } => {
+                walk(left, out)?;
+                walk(right, out)
+            }
+            Expr::Aggregate {
+                arg: AggArg::Expr(e),
+                ..
+            } => walk(e, out),
+            Expr::Aggregate { .. } | Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) => {
+                Ok(())
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for item in &sel.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            walk(expr, &mut out)?;
+        }
+    }
+    Ok(out)
+}
+
+/// Every string reachable at `path` in the row, joined with spaces (arrays
+/// are multi-valued fields) — the text a highlight snippet is generated
+/// from, mirroring what the index saw at write time.
+fn doc_text_at(doc: &Document, path: &str) -> String {
+    fn collect(v: &Value, out: &mut String) {
+        match v {
+            Value::String(s) => {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(s);
+            }
+            Value::Array(items) => items.iter().for_each(|item| collect(item, out)),
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    if let Some(v) = doc.get_path(path) {
+        collect(v, &mut out);
+    }
+    out
 }
 
 /// Whether the query is in aggregate/grouped mode.
@@ -4337,8 +4518,10 @@ impl Cluster for LocalCluster<'_> {
         query: &SearchQuery,
         k: Option<usize>,
         filter: &Option<Expr>,
+        highlights: &[(String, usize)],
     ) -> Result<Vec<(Vec<u8>, Document, f32)>> {
-        self.db.search_commit_if_dirty(table, query, k, filter)
+        self.db
+            .search_commit_if_dirty(table, query, k, filter, highlights)
     }
 
     fn put(&mut self, table: &str, key: &[u8], doc: &Document) -> Result<()> {
@@ -4465,10 +4648,11 @@ impl Cluster for LocalRead<'_> {
         query: &SearchQuery,
         k: Option<usize>,
         filter: &Option<Expr>,
+        highlights: &[(String, usize)],
     ) -> Result<Vec<(Vec<u8>, Document, f32)>> {
         // Shared access: serve the last-committed index state (NRT — at most
         // `refresh_ms` stale) rather than committing pending writes.
-        self.db.search_read(table, query, k, filter)
+        self.db.search_read(table, query, k, filter, highlights)
     }
 
     fn put(&mut self, _table: &str, _key: &[u8], _doc: &Document) -> Result<()> {

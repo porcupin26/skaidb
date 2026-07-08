@@ -1618,11 +1618,12 @@ mod tests {
     #[test]
     fn search_invalid_positions_and_unindexed_columns_error() {
         let mut db = search_db();
-        // A search predicate under OR cannot be pushed to the index.
+        // A search predicate OR-ed with an ordinary condition cannot be
+        // pushed to the index (pure search-predicate OR/NOT trees can).
         let err = db
             .execute("SELECT id FROM articles WHERE MATCH(body, 'quick') OR flag = true")
             .unwrap_err();
-        assert!(err.to_string().contains("top-level AND"), "{err}");
+        assert!(err.to_string().contains("mixing them"), "{err}");
         // score() without a search predicate has nothing to read.
         let err = db
             .execute("SELECT id, score() FROM articles WHERE flag = true")
@@ -1854,6 +1855,106 @@ mod tests {
         // Nothing half-created sticks around.
         let rs = rows(db.execute("SHOW INDEXES").unwrap());
         assert!(rs.rows.is_empty());
+    }
+
+    // ---- phase 3: bool composition, pattern predicates, highlighting ----
+
+    #[test]
+    fn search_bool_composition_or_not() {
+        let mut db = search_db();
+        // OR of two search predicates pushes to the index.
+        let rs = rows(
+            db.execute(
+                "SELECT id FROM articles \
+                 WHERE MATCH(body, 'fox') OR MATCH(body, 'vegetables')",
+            )
+            .unwrap(),
+        );
+        assert_eq!(sorted_ids(rs), vec![1, 3]);
+        // NOT excludes matching rows (rows the index knows about).
+        let rs = rows(
+            db.execute("SELECT id FROM articles WHERE NOT MATCH(body, 'quick')").unwrap(),
+        );
+        assert_eq!(sorted_ids(rs), vec![3]);
+        // Composition under a residual AND: (quick OR slow) minus fox rows,
+        // filtered by flag.
+        let rs = rows(
+            db.execute(
+                "SELECT id FROM articles \
+                 WHERE (MATCH(body, 'quick') OR MATCH(body, 'slow')) \
+                   AND NOT MATCH(body, 'fox') AND flag = false",
+            )
+            .unwrap(),
+        );
+        assert_eq!(sorted_ids(rs), vec![2]);
+        // Mixing a search predicate with an ordinary condition under OR
+        // cannot push to the index — clear error.
+        assert!(db
+            .execute("SELECT id FROM articles WHERE MATCH(body, 'quick') OR flag = true")
+            .is_err());
+    }
+
+    #[test]
+    fn search_prefix_wildcard_regexp_predicates() {
+        let mut db = search_db();
+        let rs = rows(
+            db.execute("SELECT id FROM articles WHERE MATCH_PREFIX(body, 'veg')").unwrap(),
+        );
+        assert_eq!(sorted_ids(rs), vec![3]);
+        let rs = rows(
+            db.execute("SELECT id FROM articles WHERE WILDCARD(body, 'qu*k')").unwrap(),
+        );
+        assert_eq!(sorted_ids(rs), vec![1, 2]);
+        let rs = rows(db.execute("SELECT id FROM articles WHERE WILDCARD(body, 'f?x')").unwrap());
+        assert_eq!(sorted_ids(rs), vec![1]);
+        let rs = rows(
+            db.execute("SELECT id FROM articles WHERE REGEXP(body, 'ro(as|ck)ted?')").unwrap(),
+        );
+        assert_eq!(sorted_ids(rs), vec![3]);
+        // A broken regex is a user error, not a panic.
+        assert!(db.execute("SELECT id FROM articles WHERE REGEXP(body, 'ro(')").is_err());
+    }
+
+    #[test]
+    fn search_highlight_projects_snippets() {
+        let mut db = search_db();
+        let rs = rows(
+            db.execute(
+                "SELECT id, HIGHLIGHT(body, 40) AS snippet FROM articles \
+                 WHERE MATCH(body, 'quick fox') \
+                 ORDER BY score() DESC LIMIT 2",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.columns, vec!["id".to_string(), "snippet".to_string()]);
+        assert_eq!(rs.rows.len(), 2);
+        for row in &rs.rows {
+            let Value::String(snippet) = &row[1] else {
+                panic!("snippet must be a string, got {:?}", row[1]);
+            };
+            assert!(snippet.contains("<b>quick</b>"), "{snippet}");
+        }
+        // Also served on the unranked predicate-only path.
+        let rs = rows(
+            db.execute(
+                "SELECT HIGHLIGHT(body) AS s FROM articles WHERE MATCH(body, 'vegetables')",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(
+            rs.rows[0][0],
+            Value::String("slow roasted <b>vegetables</b>".into())
+        );
+        // Outside a search query there is nothing to highlight.
+        assert!(db.execute("SELECT HIGHLIGHT(body) FROM articles").is_err());
+        // Bad arguments are clear errors.
+        assert!(db
+            .execute("SELECT HIGHLIGHT(body, 0) FROM articles WHERE MATCH(body, 'quick')")
+            .is_err());
+        assert!(db
+            .execute("SELECT HIGHLIGHT('body') FROM articles WHERE MATCH(body, 'quick')")
+            .is_err());
     }
 
     #[test]

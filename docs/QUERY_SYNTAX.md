@@ -262,17 +262,20 @@ exists. Cannot combine with `JOIN`, `UNION`, aggregates/`GROUP BY`, or
 ## Full-text search (`MATCH` / `SEARCH`)
 
 Full-text predicates run against a [search index](SEARCH.md) on the table
-(BM25-ranked, Tantivy-backed). They are ordinary `WHERE` conditions, with the
-restriction that each must appear as a **top-level `AND` condition** (not
-under `OR`/`NOT`); the remaining conditions filter the matches afterward:
+(BM25-ranked, Tantivy-backed). They are ordinary `WHERE` conditions: search
+predicates **compose with `AND`/`OR`/`NOT` among themselves** and join
+ordinary conditions at the top level with `AND` (those filter the matches
+afterward). Mixing a search predicate with an ordinary condition under
+`OR`/`NOT` is rejected — the index cannot serve it.
 
 ```sql
 CREATE SEARCH INDEX articles_fts ON articles (title, body)
   WITH (analyzer = 'english', refresh_ms = 1000);
 
 -- Ranked retrieval: top-k pushed into the index, best first. The BM25
--- score is exposed as score() (and a _score field on the row).
-SELECT id, title, score() FROM articles
+-- score is exposed as score() (and a _score field on the row);
+-- HIGHLIGHT() projects a snippet with the matches marked.
+SELECT id, title, score(), HIGHLIGHT(body, 120) AS snippet FROM articles
 WHERE MATCH(body, 'quick brown fox') AND published = true
 ORDER BY score() DESC LIMIT 10;
 
@@ -281,11 +284,13 @@ SELECT id, score() FROM articles
 WHERE SEARCH('title:"rust database" +body:performance -draft')
 ORDER BY score() DESC LIMIT 20;
 
--- Unranked: MATCH as a plain predicate returns every matching row.
-SELECT id FROM articles WHERE MATCH(title, 'skaidb') AND year >= 2024;
+-- Bool composition of search predicates (must / should / must_not):
+SELECT id FROM articles
+WHERE (MATCH(body, 'rust') OR MATCH(title, 'rust'))
+  AND NOT MATCH_PHRASE(body, 'rust belt') AND year >= 2024;
 ```
 
-- **Predicates** (query text is analyzed with the field's query-time
+- **Analyzed predicates** (query text goes through the field's query-time
   analyzer — `search_analyzer` if set, else the index-time one):
   - `MATCH(<col>, '<text>')` — true if the column matches any term (OR).
   - `MATCH_PHRASE(<col>, '<text>' [, <slop>])` — terms in order, within
@@ -296,13 +301,25 @@ SELECT id FROM articles WHERE MATCH(title, 'skaidb') AND year >= 2024;
     columns: `term`, `"phrase"`, `col:term`, `+must`, `-must_not`,
     `AND`/`OR`, and ranges over typed columns (`year:[2020 TO 2024]`,
     `price:[30 TO *]`, `published:true`).
+- **Pattern predicates** (not analyzed — they run against the indexed
+  terms, so with a lowercasing analyzer write patterns lowercase):
+  - `MATCH_PREFIX(<col>, '<prefix>')` — term prefix.
+  - `WILDCARD(<col>, '<pattern>')` — `*` any run, `?` any one char.
+  - `REGEXP(<col>, '<pattern>')` — regular expression.
 - `<col>` may also be a declared `.keyword` twin (`title.keyword`, exact
   original string) or a `copy_to` composite field. Text predicates on a
   numeric/date/bool column error.
+- `NOT` returns only rows the index contains: a row with none of the
+  indexed columns present is never returned by a search query.
 - **`score()`** projects the BM25 relevance of the row against the search
   predicates; it is also injected as a `_score` field (like `_distance` for
   vector search). Only valid together with a search predicate — else an
-  error.
+  error. Multi-field matches score dis-max (best field wins, ES
+  `best_fields`).
+- **`HIGHLIGHT(<col> [, <max_chars>])`** projects the best-scoring snippet
+  of the column's text (default 150 chars), matches wrapped in `<b>…</b>`
+  (HTML-escaped otherwise; empty string if the column didn't match). Only
+  valid together with a search predicate.
 - **`ORDER BY score() DESC LIMIT k`** pushes top-k retrieval into the index
   (no full scan). It is the only `ORDER BY` form allowed with search
   predicates, and requires `LIMIT`. Without `ORDER BY`, matches return in

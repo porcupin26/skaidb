@@ -236,11 +236,27 @@ fleet-verified — the TS cadence)
   query-time-only. Analyzer conformance fixtures vs ES token streams
   (documented divergence: simple tokenizer splits `dog's`; ES keeps it
   whole); mixed-type corpus round-trips in engine tests.
-- [ ] **Phase 3 — query DSL parity**: phrase+slop, fuzzy, prefix, wildcard,
-  regexp, ranges, boosts, multi_match modes, full query_string syntax, bool
-  composition from SQL, explain, highlighting. Exit: curated 100-query
-  suite side-by-side vs ES — same result *sets* (top-k overlap ≥ 95%,
-  scoring-order differences documented).
+- [ ] **Phase 3 — query DSL parity** (core shipped, exit pending):
+  - [x] Predicates: `MATCH_PREFIX` (prefix), `WILDCARD`, `REGEXP` — term-
+    level via FST regex automata, not analyzed (documented); phrase+slop and
+    fuzzy shipped in phase 1, ranges/boosts via the query-string in phase 2.
+  - [x] Bool composition from SQL: search predicates compose with
+    AND/OR/NOT (`SearchQuery::All/Any/Not` ↔ must/should/must_not); mixing
+    with ordinary predicates under OR/NOT is rejected; NOT is documented as
+    index-only (rows with no indexed columns are absent from the index).
+  - [x] Multi-field scoring is dis-max (ES `best_fields` default) with
+    per-field boosts.
+  - [x] Highlighting: `HIGHLIGHT(col [, max_chars])` projection —
+    `SnippetGenerator` per (query, column) applied to the authoritative row
+    text at hit-resolve time, `_highlight_<col>` injected like `_score`
+    (cluster-ready: travels with the hit doc).
+  - [ ] `multi_match` `cross_fields` mode (best_fields is the shipped
+    default).
+  - [ ] Per-hit score explain.
+  - [ ] **Exit**: curated 100-query suite side-by-side vs ES — same result
+    *sets* (top-k overlap ≥ 95%, scoring-order differences documented).
+    Needs the ES container on the bench fleet; fold into the phase-5 bench
+    setup.
 - [ ] **Phase 4 — cluster**: per-replica local indexes over replicated
   writes; scatter-gather top-k merge at read consistency (vector-search
   pattern); rebuild on join/decommission/rebalance; anti-entropy = detect
