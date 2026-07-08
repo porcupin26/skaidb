@@ -12,8 +12,9 @@ index maintenance on put/delete, `score()`, top-k pushdown, crash
 recovery, rebuild; analysis & mappings: analyzer registry, per-column
 configuration, typed fast fields, `.keyword` twins, `copy_to`; query DSL:
 the full predicate family `MATCH`/`MATCH_PHRASE`/`MATCH_PREFIX`/`FUZZY`/
-`WILDCARD`/`REGEXP`/`SEARCH`, AND/OR/NOT composition, dis-max multi-field
-scoring, `HIGHLIGHT()` snippets; cluster: scatter-gather top-k,
+`WILDCARD`/`REGEXP`/`SEARCH`/`MATCH_CROSS`, AND/OR/NOT composition plus
+`BOOSTED()` optional scoring, dis-max multi-field scoring, `HIGHLIGHT()`
+snippets, per-hit BM25 explain over the ES subset, multi-word synonyms; cluster: scatter-gather top-k,
 per-replica indexes, topology continuity; performance: bulk ingest path,
 writer heap under `memory_target` — benchmarked vs Elasticsearch, see
 [BENCHMARKS.md](BENCHMARKS.md)) plus **aggregations**: GROUP BY and
