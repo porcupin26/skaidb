@@ -217,17 +217,25 @@ fleet-verified — the TS cadence)
   - (d) Query sanity at 1 M docs, worst-case postings: term p50 3 ms,
     bool-AND 16 ms, bool-OR 8 ms, phrase 47 ms (top-10). Realistic-corpus
     numbers (wiki abstracts) come with the phase-1 exit benchmark.
-- [ ] **Phase 1 — single-node core**: `skaidb-fts` crate; catalog +
+- [x] **Phase 1 — single-node core**: `skaidb-fts` crate; catalog +
   `CREATE/DROP SEARCH INDEX` DDL (broadcast like other DDL); maintenance on
   put/delete; `MATCH()`, `SEARCH()`, `score()`; top-k pushdown for
-  `ORDER BY score() DESC LIMIT k`; restart recovery (opstamp replay) +
-  `REBUILD SEARCH INDEX`. Exit: wiki-subset indexed; top-k parity with raw
-  Tantivy; kill -9 recovery test; QUERY_SYNTAX.md grammar locked.
-- [ ] **Phase 2 — analysis & mappings parity**: analyzer registry (WITH
-  options), per-field config, multi-field keyword twin, numeric/date/bool
-  fast fields, dotted-path indexing. Exit: analyzer conformance fixtures
-  (same token streams ES produces for the standard cases); mixed-type
-  corpus round-trips.
+  `ORDER BY score() DESC LIMIT k`; restart recovery (watermark replay) +
+  `REBUILD SEARCH INDEX`. Grammar locked into QUERY_SYNTAX.md; shipped
+  state in docs/SEARCH.md. (Wiki-subset benchmark rolls into the phase-5
+  ingest/query bench.)
+- [x] **Phase 2 — analysis & mappings parity**: analyzer registry resolved
+  from WITH-option spec strings (`standard`, `folding`, `whitespace`,
+  `keyword`, `ngram(min,max)`, `edge_ngram(min,max)`, 18 Snowball
+  languages); per-column config (`<path>.analyzer` / `search_analyzer` /
+  `type` / `boost` / `keyword` / `copy_to`); `.keyword` exact-match twins;
+  `copy_to` composites; `long`/`double`/`bool`/`date` fast fields
+  addressable from the query-string language; dotted-path indexing.
+  Catalog stores the raw declaration (phase-1 defs auto-migrate on load);
+  index-time config changes trigger rebuild-on-open, `search_analyzer` is
+  query-time-only. Analyzer conformance fixtures vs ES token streams
+  (documented divergence: simple tokenizer splits `dog's`; ES keeps it
+  whole); mixed-type corpus round-trips in engine tests.
 - [ ] **Phase 3 — query DSL parity**: phrase+slop, fuzzy, prefix, wildcard,
   regexp, ranges, boosts, multi_match modes, full query_string syntax, bool
   composition from SQL, explain, highlighting. Exit: curated 100-query

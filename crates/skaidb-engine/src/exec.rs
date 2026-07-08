@@ -21,7 +21,7 @@ use skaidb_types::{Document, Value};
 
 use skaidb_tsdb::{Tsdb, TsdbOptions};
 
-use skaidb_fts::{Analyzer, SearchIndex, SearchIndexConfig, SearchQuery, Watermark};
+use skaidb_fts::{SearchIndex, SearchIndexConfig, SearchQuery, Watermark};
 
 use crate::catalog::{AuthRoleDef, Catalog, IndexDef, RollupDef, SchemaVersion, SearchIndexDef, TableDef, TsTableDef, UserDef, VectorIndexDef};
 use skaidb_auth::{privilege_from_name, Object as AuthObject, Privilege as AuthPrivilege, RoleStore, ScramCredential};
@@ -260,10 +260,8 @@ impl Database {
         let rebuild_start = std::time::Instant::now();
         let mut search_indexes = HashMap::new();
         for (name, def) in &catalog.search_indexes {
-            let cfg = SearchIndexConfig {
-                fields: def.paths.clone(),
-                analyzer: Analyzer::parse(&def.analyzer)?,
-            };
+            let (cfg, refresh_ms) =
+                SearchIndexConfig::from_declaration(&def.paths, &def.options)?;
             let idx_dir = fts_dir(&dir, name);
             let mut index = match SearchIndex::open(&idx_dir, &cfg, FTS_WRITER_HEAP) {
                 Ok(index) => index,
@@ -313,7 +311,7 @@ impl Database {
                 LiveSearchIndex {
                     index,
                     last_commit: std::time::Instant::now(),
-                    refresh_ms: def.refresh_ms,
+                    refresh_ms,
                 },
             );
         }
@@ -464,36 +462,13 @@ impl Database {
             }
             return Err(EngineError::IndexExists(c.name.clone()));
         }
-        // Options: `analyzer` and `refresh_ms` only; anything else is a typo
-        // the user should hear about.
-        let mut analyzer = Analyzer::Standard;
-        let mut refresh_ms: u64 = 1000;
-        for (name, value) in &c.options {
-            match name.as_str() {
-                "analyzer" => analyzer = Analyzer::parse(value)?,
-                "refresh_ms" => {
-                    refresh_ms = value.parse().map_err(|_| {
-                        EngineError::Type(format!(
-                            "refresh_ms must be a non-negative integer, got '{value}'"
-                        ))
-                    })?;
-                }
-                other => {
-                    return Err(EngineError::Type(format!(
-                        "unknown search index option '{other}'"
-                    )))
-                }
-            }
-        }
+        // Validate the declaration up front (unknown options, bad analyzers,
+        // type/option conflicts) — the raw options are what the catalog keeps.
+        let (cfg, refresh_ms) = SearchIndexConfig::from_declaration(&c.paths, &c.options)?;
         let def = SearchIndexDef {
             table: c.table.clone(),
             paths: c.paths.clone(),
-            analyzer: analyzer.as_str().to_string(),
-            refresh_ms,
-        };
-        let cfg = SearchIndexConfig {
-            fields: def.paths.clone(),
-            analyzer,
+            options: c.options.clone(),
         };
         // Start from an empty directory (a leftover from a dropped index of
         // the same name must not leak into the new one) and backfill.
@@ -563,10 +538,7 @@ impl Database {
             .get(name)
             .ok_or_else(|| EngineError::IndexNotFound(name.to_string()))?
             .clone();
-        let cfg = SearchIndexConfig {
-            fields: def.paths.clone(),
-            analyzer: Analyzer::parse(&def.analyzer)?,
-        };
+        let (cfg, refresh_ms) = SearchIndexConfig::from_declaration(&def.paths, &def.options)?;
         self.search_indexes.remove(name); // drop the writer before the files
         let idx_dir = fts_dir(&self.dir, name);
         let _ = std::fs::remove_dir_all(&idx_dir);
@@ -584,7 +556,7 @@ impl Database {
             LiveSearchIndex {
                 index,
                 last_commit: std::time::Instant::now(),
-                refresh_ms: def.refresh_ms,
+                refresh_ms,
             },
         );
         Ok(())
@@ -764,9 +736,10 @@ impl Database {
         Ok(())
     }
 
-    /// Resolve the search index serving `query` on `table`: the index whose
-    /// paths cover every field the query names (a `QueryString` resolves its
-    /// fields inside the index, so any index on the table serves it).
+    /// Resolve the search index serving `query` on `table`: the index that
+    /// covers every field the query names — declared paths, `.keyword`
+    /// twins, and `copy_to` targets (a `QueryString` resolves its fields
+    /// inside the index, so any index on the table serves it).
     fn search_index_for_query(&self, table: &str, query: &SearchQuery) -> Result<String> {
         let mut fields = Vec::new();
         collect_search_fields(query, &mut fields);
@@ -782,7 +755,7 @@ impl Database {
             )));
         }
         for (name, def) in on_table {
-            if fields.iter().all(|f| def.paths.iter().any(|p| p == f)) {
+            if fields.iter().all(|f| def.covers(f)) {
                 return Ok(name.clone());
             }
         }
@@ -793,7 +766,7 @@ impl Database {
                     .catalog
                     .search_indexes
                     .values()
-                    .any(|def| def.table == table && def.paths.iter().any(|p| p == *f))
+                    .any(|def| def.table == table && def.covers(f))
             })
             .cloned()
             .unwrap_or_default();
@@ -1327,7 +1300,7 @@ impl Database {
             rows.push(vec![
                 Value::String(namespace::split(name).1.to_string()),
                 Value::String(namespace::split(&s.table).1.to_string()),
-                Value::String(format!("search({})", s.analyzer)),
+                Value::String(format!("search({})", s.analyzer())),
                 Value::String(s.paths.join(", ")),
             ]);
         }
@@ -2516,11 +2489,9 @@ impl Database {
             out.push((
                 db.to_string(),
                 format!(
-                    "CREATE SEARCH INDEX IF NOT EXISTS {bare} ON {table} ({}) \
-                     WITH (analyzer = '{}', refresh_ms = {})",
+                    "CREATE SEARCH INDEX IF NOT EXISTS {bare} ON {table} ({}){}",
                     s.paths.join(", "),
-                    s.analyzer,
-                    s.refresh_ms
+                    s.with_clause()
                 ),
                 ver(&format!("s:{name}")),
             ));
@@ -2649,11 +2620,9 @@ impl Database {
             out.push((
                 db.to_string(),
                 format!(
-                    "CREATE SEARCH INDEX IF NOT EXISTS {bare} ON {table} ({}) \
-                     WITH (analyzer = '{}', refresh_ms = {})",
+                    "CREATE SEARCH INDEX IF NOT EXISTS {bare} ON {table} ({}){}",
                     s.paths.join(", "),
-                    s.analyzer,
-                    s.refresh_ms
+                    s.with_clause()
                 ),
             ));
         }
@@ -2839,7 +2808,7 @@ impl Database {
             rows.push(vec![
                 Value::String(name.clone()),
                 Value::String(s.table.clone()),
-                Value::String(format!("search({})", s.analyzer)),
+                Value::String(format!("search({})", s.analyzer())),
                 Value::String(s.paths.join(", ")),
             ]);
         }

@@ -165,11 +165,13 @@ Implemented end-to-end and tested (202 tests):
 - **full-text search**: `CREATE SEARCH INDEX … ON t (title, body)` builds a
   **BM25** index (embedded Tantivy) queried straight from SQL —
   `WHERE MATCH(body, '…') ORDER BY score() DESC LIMIT k` pushes ranked top-k
-  into the index; `MATCH_PHRASE`/`FUZZY`/`SEARCH('query-string')` predicates;
-  `standard`/`english`/`whitespace`/`keyword` analyzers; near-real-time
-  refresh with WAL-replay crash recovery (the table is the source of truth).
-  Single-node core today; cluster scatter-gather is next — see
-  [docs/SEARCH.md](docs/SEARCH.md)
+  into the index; `MATCH_PHRASE`/`FUZZY`/`SEARCH('query-string')` predicates
+  with ranges over typed (`long`/`double`/`bool`/`date`) fast fields;
+  per-column analyzers (18 stemmed languages, ngram/edge-ngram, folding),
+  boosts, `.keyword` exact-match twins, and `copy_to` composites;
+  near-real-time refresh with WAL-replay crash recovery (the table is the
+  source of truth). Single-node core today; cluster scatter-gather is next —
+  see [docs/SEARCH.md](docs/SEARCH.md)
 - **time-series tables**: `CREATE TIMESERIES TABLE … (SERIES KEY (…),
   RETENTION 30d)` stores samples in a Prometheus-style engine
   (Gorilla-compressed chunks, ~1–1.5 B/sample, ≥2M samples/s ingest) with

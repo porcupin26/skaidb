@@ -1739,4 +1739,145 @@ mod tests {
         assert!(metric("search.articles_fts.disk_bytes").is_some());
         assert_eq!(metric("search.articles_fts.uncommitted"), Some(Value::Int(0)));
     }
+
+    /// `books(id, title, body, year)` with the phase-2 per-column options:
+    /// a boosted title with a `.keyword` twin, a `copy_to` composite, and a
+    /// typed numeric column.
+    fn phase2_db() -> Database {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE books (PRIMARY KEY (id))").unwrap();
+        db.execute(
+            "CREATE SEARCH INDEX books_fts ON books (title, body, year) WITH (\
+             title.boost = 5.0, title.keyword = true, \
+             title.copy_to = 'everything', body.copy_to = 'everything', \
+             year.type = 'long')",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO books (id, title, body, year) VALUES \
+             (1, 'Rust Handbook', 'nothing relevant here', 2020), \
+             (2, 'unrelated words', 'rust rust rust rust', 1999)",
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn search_per_field_boost_ranks_title_hits_first() {
+        let mut db = phase2_db();
+        // Both rows match "rust"; the boosted single title term must outrank
+        // the four body occurrences.
+        let rs = rows(
+            db.execute(
+                "SELECT id FROM books WHERE SEARCH('rust') \
+                 ORDER BY score() DESC LIMIT 2",
+            )
+            .unwrap(),
+        );
+        assert_eq!(ids(rs), vec![1, 2]);
+    }
+
+    #[test]
+    fn search_keyword_twin_matches_exact_string_only() {
+        let mut db = phase2_db();
+        let rs = rows(
+            db.execute("SELECT id FROM books WHERE MATCH(title.keyword, 'Rust Handbook')")
+                .unwrap(),
+        );
+        assert_eq!(ids(rs), vec![1]);
+        // Case differs → the raw twin does not match (the analyzed field does).
+        let rs = rows(
+            db.execute("SELECT id FROM books WHERE MATCH(title.keyword, 'rust handbook')")
+                .unwrap(),
+        );
+        assert!(rs.rows.is_empty());
+        let rs = rows(db.execute("SELECT id FROM books WHERE MATCH(title, 'rust handbook')").unwrap());
+        assert_eq!(ids(rs), vec![1]);
+    }
+
+    #[test]
+    fn search_copy_to_composite_and_typed_ranges() {
+        let mut db = phase2_db();
+        // The composite field sees text from both columns.
+        let rs = rows(db.execute("SELECT id FROM books WHERE MATCH(everything, 'handbook')").unwrap());
+        assert_eq!(ids(rs), vec![1]);
+        let rs = rows(db.execute("SELECT id FROM books WHERE MATCH(everything, 'relevant')").unwrap());
+        assert_eq!(ids(rs), vec![1]);
+        // The typed column serves range and exact queries from SEARCH().
+        let rs = rows(db.execute("SELECT id FROM books WHERE SEARCH('year:[2000 TO 2030]')").unwrap());
+        assert_eq!(ids(rs), vec![1]);
+        let rs = rows(db.execute("SELECT id FROM books WHERE SEARCH('year:1999')").unwrap());
+        assert_eq!(ids(rs), vec![2]);
+        // MATCH on the numeric column is a clear error.
+        assert!(db.execute("SELECT id FROM books WHERE MATCH(year, '1999')").is_err());
+    }
+
+    #[test]
+    fn search_phase2_options_survive_restart_and_rebuild() {
+        let dir = tempdir();
+        {
+            let mut db = Database::open(&dir).unwrap();
+            db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+            db.execute(
+                "CREATE SEARCH INDEX t_fts ON t (name) WITH (\
+                 name.analyzer = 'edge_ngram(2,10)', name.search_analyzer = 'standard')",
+            )
+            .unwrap();
+            db.execute("INSERT INTO t (id, name) VALUES (1, 'Elasticsearch'), (2, 'Postgres')")
+                .unwrap();
+            let rs = rows(db.execute("SELECT id FROM t WHERE MATCH(name, 'elastic')").unwrap());
+            assert_eq!(ids(rs), vec![1]);
+        }
+        // The declaration round-trips through the catalog: prefix search
+        // still works after reopen, and after an explicit rebuild.
+        let mut db = Database::open(&dir).unwrap();
+        let rs = rows(db.execute("SELECT id FROM t WHERE MATCH(name, 'elastic')").unwrap());
+        assert_eq!(ids(rs), vec![1]);
+        db.execute("REBUILD SEARCH INDEX t_fts").unwrap();
+        let rs = rows(db.execute("SELECT id FROM t WHERE MATCH(name, 'postg')").unwrap());
+        assert_eq!(ids(rs), vec![2]);
+    }
+
+    #[test]
+    fn search_create_rejects_bad_phase2_options() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        for ddl in [
+            "CREATE SEARCH INDEX x ON t (body) WITH (body.wat = 1)",
+            "CREATE SEARCH INDEX x ON t (body) WITH (other.boost = 2)",
+            "CREATE SEARCH INDEX x ON t (body) WITH (body.boost = -1)",
+            "CREATE SEARCH INDEX x ON t (body) WITH (analyzer = 'klingon')",
+            "CREATE SEARCH INDEX x ON t (n) WITH (n.type = 'long', n.keyword = true)",
+        ] {
+            assert!(db.execute(ddl).is_err(), "expected error for {ddl}");
+        }
+        // Nothing half-created sticks around.
+        let rs = rows(db.execute("SHOW INDEXES").unwrap());
+        assert!(rs.rows.is_empty());
+    }
+
+    #[test]
+    fn search_legacy_catalog_def_still_loads() {
+        // A phase-1 catalog stored `analyzer`/`refresh_ms` as dedicated
+        // fields; it must deserialize into the options-based def.
+        let legacy = r#"{
+            "table": "articles",
+            "paths": ["body"],
+            "analyzer": "english",
+            "refresh_ms": 250
+        }"#;
+        let def: crate::catalog::SearchIndexDef = serde_json::from_str(legacy).unwrap();
+        assert_eq!(def.analyzer(), "english");
+        assert_eq!(
+            def.options,
+            vec![
+                ("analyzer".to_string(), "english".to_string()),
+                ("refresh_ms".to_string(), "250".to_string()),
+            ]
+        );
+        assert_eq!(
+            def.with_clause(),
+            " WITH (analyzer = 'english', refresh_ms = '250')"
+        );
+    }
 }

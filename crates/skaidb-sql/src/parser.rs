@@ -576,9 +576,10 @@ impl Parser {
         }
     }
 
-    /// `[WITH (name = value, ...)]` — an optional options list. Values may be
-    /// string, integer, float, or boolean literals; each is captured as its
-    /// literal text and validated by the consumer of the statement.
+    /// `[WITH (name = value, ...)]` — an optional options list. Names may be
+    /// dotted (per-column options like `title.boost`); values may be string,
+    /// integer, float, or boolean literals. Each is captured as its literal
+    /// text and validated by the consumer of the statement.
     fn parse_with_options(&mut self) -> Result<Vec<(String, String)>, ParseError> {
         // `WITH` is contextual: only an options list when followed by `(`.
         if !(self.peek_ident_ci("with")
@@ -590,17 +591,14 @@ impl Parser {
         self.expect(&Token::LParen)?;
         let mut options = Vec::new();
         loop {
-            let name = self.expect_ident()?.to_ascii_lowercase();
+            let name = self.parse_path()?.to_ascii_lowercase();
             self.expect(&Token::Eq)?;
             let value = match self.advance() {
                 Token::Str(s) => s,
                 Token::Int(i) => i.to_string(),
                 Token::Float(x) => x.to_string(),
-                Token::Ident(s)
-                    if s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("false") =>
-                {
-                    s.to_ascii_lowercase()
-                }
+                Token::Keyword(Keyword::True) => "true".to_string(),
+                Token::Keyword(Keyword::False) => "false".to_string(),
                 other => {
                     return Err(ParseError::Other(format!(
                         "expected a literal value for option {name}, found {other:?}"

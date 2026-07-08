@@ -42,11 +42,12 @@ history in git.
 Elasticsearch-class search, SQL-first, Tantivy-cored (Rust Lucene — a JVM
 is a non-starter in a single-binary DB). Full plan, feature matrix, phased
 roadmap and benchmarks: [FTS_TODO.md](FTS_TODO.md). Phase 0 (Tantivy
-go/no-go spike) and phase 1 (single-node core: `skaidb-fts` crate,
+go/no-go spike), phase 1 (single-node core: `skaidb-fts` crate,
 `CREATE SEARCH INDEX` DDL, `MATCH`/`SEARCH`/`score()`, top-k pushdown,
-watermark crash recovery) are done — shipped state in
-[SEARCH.md](SEARCH.md). Next action: **phase 2** (analysis & mappings
-parity).
+watermark crash recovery), and phase 2 (analysis & mappings parity:
+analyzer registry, per-column options, typed fast fields, `.keyword`
+twins, `copy_to`) are done — shipped state in [SEARCH.md](SEARCH.md).
+Next action: **phase 3** (query DSL parity).
 
 ## 3. Other
 

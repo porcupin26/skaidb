@@ -7,22 +7,28 @@ This documents the **shipped** state; the plan and pending phases live in
 [FTS_TODO.md](FTS_TODO.md), and the SQL grammar in
 [QUERY_SYNTAX.md](QUERY_SYNTAX.md#full-text-search-match--search).
 
-Status: **phase 1 (single-node core)** — DDL, index maintenance on
-put/delete, `MATCH`/`MATCH_PHRASE`/`FUZZY`/`SEARCH` predicates, `score()`,
-top-k pushdown, crash recovery, rebuild.
+Status: **phase 2 (analysis & mappings)** — everything in phase 1
+(single-node core: DDL, index maintenance on put/delete,
+`MATCH`/`MATCH_PHRASE`/`FUZZY`/`SEARCH` predicates, `score()`, top-k
+pushdown, crash recovery, rebuild) plus the analyzer registry, per-column
+index configuration, typed (numeric/date/bool) fast fields, `.keyword`
+exact-match twins, and `copy_to` composite fields.
 
 ## Using it
 
 ```sql
-CREATE SEARCH INDEX articles_fts ON articles (title, body)
-  WITH (analyzer = 'english', refresh_ms = 1000);
+CREATE SEARCH INDEX articles_fts ON articles (title, body, year, published)
+  WITH (analyzer = 'english', refresh_ms = 1000,
+        title.boost = 2.0, title.keyword = true,
+        title.copy_to = 'everything', body.copy_to = 'everything',
+        year.type = 'long', published.type = 'bool');
 
 SELECT id, title, score() FROM articles
 WHERE MATCH(body, 'quick brown fox') AND published = true
 ORDER BY score() DESC LIMIT 10;
 
 SELECT id FROM articles
-WHERE SEARCH('title:"rust database" +body:performance -draft')
+WHERE SEARCH('title:"rust database" +body:performance year:[2020 TO 2024]')
 ORDER BY score() DESC LIMIT 20;
 
 REBUILD SEARCH INDEX articles_fts;   -- re-index from the table
@@ -30,17 +36,70 @@ DROP SEARCH INDEX articles_fts;
 ```
 
 - An index covers one or more **document paths** (dotted paths into nested
-  documents work: `meta.title`). String values are indexed; arrays of
-  strings index every element. Non-string values are skipped (numeric/date
-  fast fields are a later phase).
-- **Analyzers** (`analyzer = '...'`): `standard` (word split + lowercase,
-  the default), `english` (standard + stopwords + Snowball stemming),
-  `whitespace` (split only, case kept), `keyword` (whole value as one
-  term). Query text is analyzed with the same pipeline at query time.
+  documents work: `meta.title`). Arrays index every element (multi-valued
+  fields). Rows are schema-less — **the declaration is the mapping**: a
+  value that doesn't fit its column's declared type is simply not indexed
+  for that column.
 - `refresh_ms` (default 1000) controls how quickly writes become
   searchable — Elasticsearch-style near-real-time. On the single-node
   write path, a search after a write commits the index first, so you read
   your own writes immediately.
+
+## Analyzers
+
+Set the index default with `analyzer = '...'`, or per column with
+`<column>.analyzer = '...'`:
+
+- `standard` — word split + lowercase (the default). One documented
+  divergence from Elasticsearch's `standard`: ES uses Unicode word
+  segmentation and keeps `dog's` whole; our simple tokenizer splits on the
+  apostrophe (`dog`, `s`).
+- `folding` — `standard` + ASCII folding (`café` → `cafe`) for
+  accent-insensitive matching without stemming.
+- **Languages** (standard + stopwords where a list exists + Snowball
+  stemmer): `arabic`, `danish`, `dutch`, `english`, `finnish`, `french`,
+  `german`, `greek`, `hungarian`, `italian`, `norwegian`, `portuguese`,
+  `romanian`, `russian`, `spanish`, `swedish`, `tamil`, `turkish`.
+- `whitespace` — split only, case kept.
+- `keyword` — the whole value as one term.
+- `ngram(min,max)` — lowercased character ngrams (substring matching).
+- `edge_ngram(min,max)` — lowercased prefix ngrams (search-as-you-type);
+  pair with `search_analyzer = 'standard'` so queries aren't ngrammed too.
+
+Query text is analyzed with the field's **query-time** analyzer:
+`<column>.search_analyzer` if set, else the index-time analyzer.
+
+## Per-column options
+
+`WITH (...)` takes global options (`analyzer`, `refresh_ms`) and
+`<column>.<option>` per-column options:
+
+| option | meaning |
+|---|---|
+| `<col>.type` | `text` (default), `keyword`, `long`, `double`, `bool`, `date` |
+| `<col>.analyzer` | index-time analyzer for this text column |
+| `<col>.search_analyzer` | query-time analyzer override |
+| `<col>.boost` | score multiplier in multi-field queries (positive number) |
+| `<col>.keyword` | `true` adds a `<col>.keyword` exact-match twin |
+| `<col>.copy_to` | also index this text into a named composite field |
+
+- **Typed columns** (`long`, `double`, `date`, `bool`) become fast fields,
+  addressable from the `SEARCH()` query-string language (`year:1999`,
+  `price:[30 TO *]`, `published:true`). `double` accepts integer values;
+  `date` accepts `timestamp` and millisecond-integer values. `MATCH()` on a
+  non-text column is an error.
+- **`.keyword` twins** index the raw string alongside the analyzed text:
+  `MATCH(title, 'rust handbook')` matches analyzed terms while
+  `MATCH(title.keyword, 'Rust Handbook')` matches only the exact original
+  string.
+- **`copy_to`** aggregates several columns into one searchable composite
+  field (analyzed with the index default) — the ES `copy_to` pattern for
+  "search everything" fields. Several columns may share one target.
+- Options are validated at `CREATE` time; unknown options, unknown
+  analyzers, or analyzer/keyword/copy_to options on non-text columns error.
+- Changing columns, types, or index-time analyzers requires a rebuild (the
+  engine rebuilds automatically on open if the definition changed);
+  `search_analyzer` is query-time-only and needs none.
 
 ## Architecture
 
@@ -82,7 +141,7 @@ DROP SEARCH INDEX articles_fts;
 - `/metrics` gauges: `skaidb_search_indexes`, `skaidb_search_docs_total`,
   `skaidb_search_disk_bytes`, `skaidb_search_rebuild_seconds`.
 
-## Limits (phase 1)
+## Limits (phase 2)
 
 - Search predicates must be top-level `AND` conditions; `OR`/`NOT` around
   them is rejected (full bool composition is phase 3).
@@ -92,6 +151,6 @@ DROP SEARCH INDEX articles_fts;
   the same query.
 - Per-shard BM25 statistics (like Elasticsearch's default); a global-stats
   mode is a later phase.
-- Highlighting (`HIGHLIGHT()`), multi-field boosts, per-field analyzers,
-  numeric/date fast fields, aggregations, and suggesters land in phases
-  2–7 (see [FTS_TODO.md](FTS_TODO.md)).
+- Highlighting (`HIGHLIGHT()`), wildcard/regexp/explain, cluster
+  scatter-gather, aggregations, and suggesters land in phases 3–7 (see
+  [FTS_TODO.md](FTS_TODO.md)).

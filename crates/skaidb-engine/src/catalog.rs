@@ -62,15 +62,96 @@ pub struct VectorIndexDef {
 /// WITH (...)`), backing `MATCH()`/`SEARCH()` predicates over the text at
 /// `paths`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "SearchIndexDefWire")]
 pub struct SearchIndexDef {
     pub table: String,
-    /// Dotted paths into the row document indexed as text.
+    /// Dotted paths into the row document to index.
     pub paths: Vec<String>,
-    /// Analyzer name (`standard`, `english`, `whitespace`, `keyword`).
-    pub analyzer: String,
-    /// NRT refresh cadence: uncommitted index writes become visible (and
-    /// durable) after at most this many milliseconds.
-    pub refresh_ms: u64,
+    /// Raw `WITH (...)` options as declared — the declaration is the mapping;
+    /// parsed and validated by `SearchIndexConfig::from_declaration`.
+    pub options: Vec<(String, String)>,
+}
+
+impl SearchIndexDef {
+    /// The index's default analyzer name, for display (`SHOW INDEXES`).
+    /// Options apply last-wins, hence the reverse scan.
+    pub fn analyzer(&self) -> &str {
+        self.options
+            .iter()
+            .rev()
+            .find(|(k, _)| k == "analyzer")
+            .map_or("standard", |(_, v)| v.as_str())
+    }
+
+    /// Whether the index serves queries naming `field`: a declared path, a
+    /// declared `<path>.keyword` exact-match twin, or a `copy_to` composite
+    /// target.
+    pub fn covers(&self, field: &str) -> bool {
+        if self.paths.iter().any(|p| p == field) {
+            return true;
+        }
+        // The twin's option key is literally the queryable field name
+        // (`<path>.keyword = true`); options apply last-wins.
+        if field
+            .strip_suffix(".keyword")
+            .is_some_and(|base| self.paths.iter().any(|p| p == base))
+            && self
+                .options
+                .iter()
+                .rev()
+                .find(|(k, _)| k == field)
+                .is_some_and(|(_, v)| v == "true")
+        {
+            return true;
+        }
+        self.options
+            .iter()
+            .any(|(k, v)| k.ends_with(".copy_to") && v == field)
+    }
+
+    /// Render the `WITH (...)` clause for DDL regeneration (schema
+    /// replication/repair). Every value is quoted as a string literal; the
+    /// option parser accepts strings for all value types.
+    pub fn with_clause(&self) -> String {
+        if self.options.is_empty() {
+            return String::new();
+        }
+        let opts: Vec<String> = self
+            .options
+            .iter()
+            .map(|(k, v)| format!("{k} = '{}'", v.replace('\'', "''")))
+            .collect();
+        format!(" WITH ({})", opts.join(", "))
+    }
+}
+
+/// Loader shim: phase-1 catalogs stored `analyzer`/`refresh_ms` as dedicated
+/// fields; fold them into `options` so old defs keep their behavior.
+#[derive(Deserialize)]
+struct SearchIndexDefWire {
+    table: String,
+    paths: Vec<String>,
+    #[serde(default)]
+    options: Vec<(String, String)>,
+    analyzer: Option<String>,
+    refresh_ms: Option<u64>,
+}
+
+impl From<SearchIndexDefWire> for SearchIndexDef {
+    fn from(w: SearchIndexDefWire) -> SearchIndexDef {
+        let mut options = w.options;
+        if let Some(analyzer) = w.analyzer {
+            options.push(("analyzer".to_string(), analyzer));
+        }
+        if let Some(refresh_ms) = w.refresh_ms {
+            options.push(("refresh_ms".to_string(), refresh_ms.to_string()));
+        }
+        SearchIndexDef {
+            table: w.table,
+            paths: w.paths,
+            options,
+        }
+    }
 }
 
 /// A table definition: just its primary key columns.

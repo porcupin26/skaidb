@@ -15,13 +15,15 @@ use std::path::{Path, PathBuf};
 use skaidb_types::{Document, Value};
 use tantivy::collector::{DocSetCollector, TopDocs};
 use tantivy::schema::{
-    BytesOptions, Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions,
-    Value as _,
+    BytesOptions, DateOptions, Field, IndexRecordOption, NumericOptions, Schema,
+    TextFieldIndexing, TextOptions, Value as _,
 };
-use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
+use tantivy::{DateTime, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
-use crate::query::{build_query, QueryFields};
-use crate::{analyzer, FtsError, SearchHit, SearchIndexConfig, SearchQuery, Watermark};
+use crate::query::{build_query, FieldRuntime, QueryFields};
+use crate::{
+    analyzer, Analyzer, FieldType, FtsError, SearchHit, SearchIndexConfig, SearchQuery, Watermark,
+};
 
 /// Reserved field holding the row's primary-key bytes.
 const KEY_FIELD: &str = "_key";
@@ -42,6 +44,17 @@ pub struct SearchIndexStats {
     pub uncommitted: u64,
 }
 
+/// How one declared column feeds the tantivy document at write time.
+struct IndexedColumn {
+    path: String,
+    field: Field,
+    ftype: FieldType,
+    /// `<path>.keyword` exact-match twin, if declared.
+    twin: Option<Field>,
+    /// `copy_to` composite target, if declared.
+    copy_to: Option<Field>,
+}
+
 /// A live full-text index over one table.
 pub struct SearchIndex {
     dir: PathBuf,
@@ -50,8 +63,12 @@ pub struct SearchIndex {
     writer: IndexWriter,
     reader: IndexReader,
     key_field: Field,
-    /// `(dotted path, tantivy field)` for each indexed column.
-    fields: Vec<(String, Field)>,
+    /// Write-side view: one entry per declared column.
+    columns: Vec<IndexedColumn>,
+    /// Query-side view: declared columns plus `.keyword` twins and
+    /// `copy_to` targets, each with its resolved query-time analyzer and
+    /// boost.
+    runtimes: Vec<FieldRuntime>,
     /// Max HLC applied to the writer but not yet committed.
     pending_watermark: Option<Watermark>,
     /// Max HLC durable in the last commit (from the commit payload).
@@ -70,28 +87,83 @@ impl fmt::Debug for SearchIndex {
     }
 }
 
+/// The text options for an analyzed field using `analyzer`.
+fn text_options(analyzer: &Analyzer) -> TextOptions {
+    TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer(&analyzer.tokenizer_name())
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+    )
+}
+
+/// The options for an exact-match (keyword) field: raw single term, indexed
+/// with freqs, raw fast column for later sorting/facets.
+fn keyword_options() -> TextOptions {
+    TextOptions::default()
+        .set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer(&Analyzer::Keyword.tokenizer_name())
+                .set_index_option(IndexRecordOption::WithFreqs),
+        )
+        .set_fast(None)
+}
+
 fn build_schema(config: &SearchIndexConfig) -> Schema {
     let mut builder = Schema::builder();
     builder.add_bytes_field(
         KEY_FIELD,
         BytesOptions::default().set_indexed().set_stored(),
     );
-    let text = TextOptions::default().set_indexing_options(
-        TextFieldIndexing::default()
-            .set_tokenizer(config.analyzer.tokenizer_name())
-            .set_index_option(IndexRecordOption::WithFreqsAndPositions),
-    );
-    for path in &config.fields {
-        builder.add_text_field(path, text.clone());
+    let numeric = || NumericOptions::default().set_indexed().set_fast();
+    for fc in &config.fields {
+        match fc.ftype {
+            FieldType::Text => {
+                let analyzer = fc.analyzer.as_ref().unwrap_or(&config.default_analyzer);
+                builder.add_text_field(&fc.path, text_options(analyzer));
+            }
+            FieldType::Keyword => {
+                builder.add_text_field(&fc.path, keyword_options());
+            }
+            FieldType::Long => {
+                builder.add_i64_field(&fc.path, numeric());
+            }
+            FieldType::Double => {
+                builder.add_f64_field(&fc.path, numeric());
+            }
+            FieldType::Bool => {
+                builder.add_bool_field(&fc.path, numeric());
+            }
+            FieldType::Date => {
+                builder.add_date_field(
+                    &fc.path,
+                    DateOptions::default().set_indexed().set_fast(),
+                );
+            }
+        }
+        if fc.keyword_twin {
+            builder.add_text_field(&format!("{}.keyword", fc.path), keyword_options());
+        }
+    }
+    // `copy_to` composite targets: analyzed with the index default. Several
+    // columns may share one target; declare it once.
+    let mut targets: Vec<&str> = config
+        .fields
+        .iter()
+        .filter_map(|f| f.copy_to.as_deref())
+        .collect();
+    targets.sort_unstable();
+    targets.dedup();
+    for target in targets {
+        builder.add_text_field(target, text_options(&config.default_analyzer));
     }
     builder.build()
 }
 
 impl SearchIndex {
     /// Open the index at `dir`, creating it if the directory is empty. If an
-    /// existing index does not match `config` (columns or analyzer changed),
-    /// returns [`FtsError::NeedsRebuild`] — the caller wipes the directory
-    /// and rebuilds from the table.
+    /// existing index does not match `config` (columns, types, or analyzers
+    /// changed), returns [`FtsError::NeedsRebuild`] — the caller wipes the
+    /// directory and rebuilds from the table.
     pub fn open(
         dir: &Path,
         config: &SearchIndexConfig,
@@ -122,14 +194,71 @@ impl SearchIndex {
                 Index::create_in_dir(dir, schema.clone())?
             }
         };
-        analyzer::register_all(&index);
+        // Register every index-time analyzer the schema references.
+        let mut used: Vec<Analyzer> = vec![config.default_analyzer.clone(), Analyzer::Keyword];
+        used.extend(config.fields.iter().filter_map(|f| f.analyzer.clone()));
+        used.dedup();
+        analyzer::register(&index, used.into_iter());
 
         let key_field = schema.get_field(KEY_FIELD).expect("schema owns _key");
-        let fields = config
+        let field_of = |path: &str| schema.get_field(path).expect("schema owns declared field");
+
+        let mut columns = Vec::with_capacity(config.fields.len());
+        let mut runtimes = Vec::new();
+        for fc in &config.fields {
+            let field = field_of(&fc.path);
+            let twin = fc
+                .keyword_twin
+                .then(|| field_of(&format!("{}.keyword", fc.path)));
+            let copy_to = fc.copy_to.as_deref().map(field_of);
+            columns.push(IndexedColumn {
+                path: fc.path.clone(),
+                field,
+                ftype: fc.ftype,
+                twin,
+                copy_to,
+            });
+            let index_analyzer = match fc.ftype {
+                FieldType::Keyword => Analyzer::Keyword,
+                _ => fc
+                    .analyzer
+                    .clone()
+                    .unwrap_or_else(|| config.default_analyzer.clone()),
+            };
+            runtimes.push(FieldRuntime {
+                path: fc.path.clone(),
+                field,
+                ftype: fc.ftype,
+                query_analyzer: fc.search_analyzer.clone().unwrap_or(index_analyzer),
+                boost: fc.boost,
+            });
+            if let Some(twin) = twin {
+                runtimes.push(FieldRuntime {
+                    path: format!("{}.keyword", fc.path),
+                    field: twin,
+                    ftype: FieldType::Keyword,
+                    query_analyzer: Analyzer::Keyword,
+                    boost: 1.0,
+                });
+            }
+        }
+        // Deduplicated copy_to targets, queryable like declared text columns.
+        let mut targets: Vec<&str> = config
             .fields
             .iter()
-            .map(|p| (p.clone(), schema.get_field(p).expect("schema owns field")))
+            .filter_map(|f| f.copy_to.as_deref())
             .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        for target in targets {
+            runtimes.push(FieldRuntime {
+                path: target.to_string(),
+                field: field_of(target),
+                ftype: FieldType::Text,
+                query_analyzer: config.default_analyzer.clone(),
+                boost: 1.0,
+            });
+        }
 
         let writer = index.writer(writer_heap_bytes.max(MIN_WRITER_HEAP))?;
         let reader = index
@@ -151,7 +280,8 @@ impl SearchIndex {
             writer,
             reader,
             key_field,
-            fields,
+            columns,
+            runtimes,
             pending_watermark: None,
             committed_watermark,
             uncommitted: 0,
@@ -169,19 +299,19 @@ impl SearchIndex {
     }
 
     /// Index (or re-index) one row. Any previous posting for `key` is
-    /// removed; a row with no indexed text is simply removed.
+    /// removed; a row with no indexable values is simply removed.
     pub fn put(&mut self, key: &[u8], doc: &Document, stamp: Watermark) -> Result<(), FtsError> {
         self.writer
             .delete_term(Term::from_field_bytes(self.key_field, key));
         let mut tdoc = TantivyDocument::default();
         tdoc.add_bytes(self.key_field, key);
-        let mut has_text = false;
-        for (path, field) in &self.fields {
-            if let Some(value) = doc.get_path(path) {
-                has_text |= add_text_values(&mut tdoc, *field, value);
+        let mut any = false;
+        for col in &self.columns {
+            if let Some(value) = doc.get_path(&col.path) {
+                any |= add_typed_values(&mut tdoc, col, value);
             }
         }
-        if has_text {
+        if any {
             self.writer.add_document(tdoc)?;
         }
         self.note_write(stamp);
@@ -241,7 +371,7 @@ impl SearchIndex {
         let q = build_query(
             &self.index,
             &QueryFields {
-                fields: &self.fields,
+                fields: &self.runtimes,
             },
             query,
         )?;
@@ -266,7 +396,7 @@ impl SearchIndex {
         let q = build_query(
             &self.index,
             &QueryFields {
-                fields: &self.fields,
+                fields: &self.runtimes,
             },
             query,
         )?;
@@ -298,22 +428,48 @@ impl SearchIndex {
     }
 }
 
-/// Add every string reachable in `value` to the document (a string, an array
-/// of strings, arrays of arrays, ...). Non-string scalars are not indexed in
-/// phase 1 (numeric/date/bool fast fields are phase 2). Returns true if
-/// anything was added.
-fn add_text_values(tdoc: &mut TantivyDocument, field: Field, value: &Value) -> bool {
-    match value {
-        Value::String(s) => {
-            tdoc.add_text(field, s);
+/// Add `value` to the document according to the column's declared type,
+/// recursing into arrays (multi-valued fields). Values that don't fit the
+/// type are skipped — skaidb rows are schema-less, the declaration is the
+/// mapping. Returns true if anything was added.
+fn add_typed_values(tdoc: &mut TantivyDocument, col: &IndexedColumn, value: &Value) -> bool {
+    if let Value::Array(items) = value {
+        let mut added = false;
+        for item in items {
+            added |= add_typed_values(tdoc, col, item);
+        }
+        return added;
+    }
+    match (col.ftype, value) {
+        (FieldType::Text | FieldType::Keyword, Value::String(s)) => {
+            tdoc.add_text(col.field, s);
+            if let Some(twin) = col.twin {
+                tdoc.add_text(twin, s);
+            }
+            if let Some(target) = col.copy_to {
+                tdoc.add_text(target, s);
+            }
             true
         }
-        Value::Array(items) => {
-            let mut added = false;
-            for item in items {
-                added |= add_text_values(tdoc, field, item);
-            }
-            added
+        (FieldType::Long, Value::Int(i)) => {
+            tdoc.add_i64(col.field, *i);
+            true
+        }
+        (FieldType::Double, Value::Float(x)) => {
+            tdoc.add_f64(col.field, *x);
+            true
+        }
+        (FieldType::Double, Value::Int(i)) => {
+            tdoc.add_f64(col.field, *i as f64);
+            true
+        }
+        (FieldType::Bool, Value::Bool(b)) => {
+            tdoc.add_bool(col.field, *b);
+            true
+        }
+        (FieldType::Date, Value::Timestamp(ms)) | (FieldType::Date, Value::Int(ms)) => {
+            tdoc.add_date(col.field, DateTime::from_timestamp_millis(*ms));
+            true
         }
         _ => false,
     }
@@ -322,16 +478,28 @@ fn add_text_values(tdoc: &mut TantivyDocument, field: Field, value: &Value) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Analyzer;
 
-    fn config(fields: &[&str], analyzer: Analyzer) -> SearchIndexConfig {
-        SearchIndexConfig {
-            fields: fields.iter().map(|s| s.to_string()).collect(),
-            analyzer,
-        }
+    /// Build a config through the same path the engine uses.
+    fn config(paths: &[&str], options: &[(&str, &str)]) -> SearchIndexConfig {
+        let paths: Vec<String> = paths.iter().map(|s| s.to_string()).collect();
+        let options: Vec<(String, String)> = options
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        SearchIndexConfig::from_declaration(&paths, &options)
+            .expect("valid declaration")
+            .0
     }
 
-    fn doc(pairs: &[(&str, &str)]) -> Document {
+    fn doc(pairs: &[(&str, Value)]) -> Document {
+        let mut d = Document::default();
+        for (k, v) in pairs {
+            d.0.insert(k.to_string(), v.clone());
+        }
+        d
+    }
+
+    fn text_doc(pairs: &[(&str, &str)]) -> Document {
         let mut d = Document::default();
         for (k, v) in pairs {
             d.0.insert(k.to_string(), Value::String(v.to_string()));
@@ -350,20 +518,27 @@ mod tests {
         SearchIndex::open(dir, cfg, 0).expect("open index")
     }
 
+    fn matches(field: &str, text: &str) -> SearchQuery {
+        SearchQuery::Match {
+            field: Some(field.into()),
+            text: text.into(),
+        }
+    }
+
     #[test]
     fn put_commit_search_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
-        let cfg = config(&["title", "body"], Analyzer::Standard);
+        let cfg = config(&["title", "body"], &[]);
         let mut idx = open(tmp.path(), &cfg);
         idx.put(
             b"k1",
-            &doc(&[("title", "Rust database"), ("body", "fast full text search")]),
+            &text_doc(&[("title", "Rust database"), ("body", "fast full text search")]),
             wm(1),
         )
         .unwrap();
         idx.put(
             b"k2",
-            &doc(&[("title", "Cooking"), ("body", "slow roasted vegetables")]),
+            &text_doc(&[("title", "Cooking"), ("body", "slow roasted vegetables")]),
             wm(2),
         )
         .unwrap();
@@ -398,36 +573,35 @@ mod tests {
     #[test]
     fn update_and_delete() {
         let tmp = tempfile::tempdir().unwrap();
-        let cfg = config(&["body"], Analyzer::Standard);
+        let cfg = config(&["body"], &[]);
         let mut idx = open(tmp.path(), &cfg);
-        idx.put(b"k1", &doc(&[("body", "old words")]), wm(1)).unwrap();
+        idx.put(b"k1", &text_doc(&[("body", "old words")]), wm(1)).unwrap();
         idx.commit().unwrap();
-        idx.put(b"k1", &doc(&[("body", "new words")]), wm(2)).unwrap();
+        idx.put(b"k1", &text_doc(&[("body", "new words")]), wm(2)).unwrap();
         idx.commit().unwrap();
-        let q = |t: &str| SearchQuery::Match {
-            field: None,
-            text: t.into(),
-        };
-        assert!(idx.search_keys(&q("old")).unwrap().is_empty());
-        assert_eq!(idx.search_keys(&q("new")).unwrap(), vec![b"k1".to_vec()]);
+        assert!(idx.search_keys(&matches("body", "old")).unwrap().is_empty());
+        assert_eq!(
+            idx.search_keys(&matches("body", "new")).unwrap(),
+            vec![b"k1".to_vec()]
+        );
 
         idx.delete(b"k1", wm(3));
         idx.commit().unwrap();
-        assert!(idx.search_keys(&q("new")).unwrap().is_empty());
+        assert!(idx.search_keys(&matches("body", "new")).unwrap().is_empty());
         assert_eq!(idx.stats().docs, 0);
     }
 
     #[test]
     fn watermark_survives_reopen_uncommitted_writes_do_not() {
         let tmp = tempfile::tempdir().unwrap();
-        let cfg = config(&["body"], Analyzer::Standard);
+        let cfg = config(&["body"], &[]);
         {
             let mut idx = open(tmp.path(), &cfg);
-            idx.put(b"k1", &doc(&[("body", "committed row")]), wm(10))
+            idx.put(b"k1", &text_doc(&[("body", "committed row")]), wm(10))
                 .unwrap();
             idx.commit().unwrap();
             // Applied but never committed: a crash loses it.
-            idx.put(b"k2", &doc(&[("body", "uncommitted row")]), wm(20))
+            idx.put(b"k2", &text_doc(&[("body", "uncommitted row")]), wm(20))
                 .unwrap();
             // Dropped without commit == kill -9 for durability purposes.
         }
@@ -441,52 +615,61 @@ mod tests {
     fn schema_change_needs_rebuild() {
         let tmp = tempfile::tempdir().unwrap();
         {
-            let mut idx = open(tmp.path(), &config(&["body"], Analyzer::Standard));
-            idx.put(b"k1", &doc(&[("body", "text")]), wm(1)).unwrap();
+            let mut idx = open(tmp.path(), &config(&["body"], &[]));
+            idx.put(b"k1", &text_doc(&[("body", "text")]), wm(1)).unwrap();
             idx.commit().unwrap();
         }
         // Different columns → rebuild.
-        let err = SearchIndex::open(tmp.path(), &config(&["title"], Analyzer::Standard), 0)
+        let err = SearchIndex::open(tmp.path(), &config(&["title"], &[]), 0)
             .expect_err("schema mismatch");
         assert!(matches!(err, FtsError::NeedsRebuild(_)));
         // Different analyzer → rebuild.
-        let err = SearchIndex::open(tmp.path(), &config(&["body"], Analyzer::English), 0)
-            .expect_err("analyzer mismatch");
+        let err =
+            SearchIndex::open(tmp.path(), &config(&["body"], &[("analyzer", "english")]), 0)
+                .expect_err("analyzer mismatch");
         assert!(matches!(err, FtsError::NeedsRebuild(_)));
+        // Different type → rebuild.
+        let err =
+            SearchIndex::open(tmp.path(), &config(&["body"], &[("body.type", "keyword")]), 0)
+                .expect_err("type mismatch");
+        assert!(matches!(err, FtsError::NeedsRebuild(_)));
+        // A query-time-only change (search_analyzer) is NOT a rebuild.
+        let cfg = config(&["body"], &[("body.search_analyzer", "whitespace")]);
+        assert!(SearchIndex::open(tmp.path(), &cfg, 0).is_ok());
     }
 
     #[test]
     fn english_analyzer_stems_and_drops_stopwords() {
         let tmp = tempfile::tempdir().unwrap();
-        let cfg = config(&["body"], Analyzer::English);
+        let cfg = config(&["body"], &[("analyzer", "english")]);
         let mut idx = open(tmp.path(), &cfg);
-        idx.put(b"k1", &doc(&[("body", "the runner was running quickly")]), wm(1))
-            .unwrap();
+        idx.put(
+            b"k1",
+            &text_doc(&[("body", "the runner was running quickly")]),
+            wm(1),
+        )
+        .unwrap();
         idx.commit().unwrap();
-        let q = |t: &str| SearchQuery::Match {
-            field: None,
-            text: t.into(),
-        };
         // Query analyzed with the same pipeline: "runs" stems to "run".
-        assert_eq!(idx.search_keys(&q("runs")).unwrap().len(), 1);
+        assert_eq!(idx.search_keys(&matches("body", "runs")).unwrap().len(), 1);
         // Stopword-only query matches nothing instead of everything.
-        assert!(idx.search_keys(&q("the was")).unwrap().is_empty());
+        assert!(idx.search_keys(&matches("body", "the was")).unwrap().is_empty());
     }
 
     #[test]
     fn phrase_fuzzy_and_query_string() {
         let tmp = tempfile::tempdir().unwrap();
-        let cfg = config(&["title", "body"], Analyzer::Standard);
+        let cfg = config(&["title", "body"], &[]);
         let mut idx = open(tmp.path(), &cfg);
         idx.put(
             b"k1",
-            &doc(&[("title", "quick brown fox"), ("body", "jumps over the lazy dog")]),
+            &text_doc(&[("title", "quick brown fox"), ("body", "jumps over the lazy dog")]),
             wm(1),
         )
         .unwrap();
         idx.put(
             b"k2",
-            &doc(&[("title", "brown quick fox"), ("body", "unrelated")]),
+            &text_doc(&[("title", "brown quick fox"), ("body", "unrelated")]),
             wm(2),
         )
         .unwrap();
@@ -522,10 +705,7 @@ mod tests {
 
         // Field not in the index is a config error.
         let err = idx
-            .search_keys(&SearchQuery::Match {
-                field: Some("nope".into()),
-                text: "x".into(),
-            })
+            .search_keys(&matches("nope", "x"))
             .expect_err("unknown field");
         assert!(matches!(err, FtsError::Config(_)));
     }
@@ -533,21 +713,23 @@ mod tests {
     #[test]
     fn clear_supports_rebuild() {
         let tmp = tempfile::tempdir().unwrap();
-        let cfg = config(&["body"], Analyzer::Standard);
+        let cfg = config(&["body"], &[]);
         let mut idx = open(tmp.path(), &cfg);
-        idx.put(b"k1", &doc(&[("body", "stale")]), wm(1)).unwrap();
+        idx.put(b"k1", &text_doc(&[("body", "stale")]), wm(1)).unwrap();
         idx.commit().unwrap();
         idx.clear().unwrap();
-        idx.put(b"k2", &doc(&[("body", "fresh")]), wm(2)).unwrap();
+        idx.put(b"k2", &text_doc(&[("body", "fresh")]), wm(2)).unwrap();
         idx.commit().unwrap();
-        let all = idx.search_keys(&SearchQuery::QueryString("stale fresh".into())).unwrap();
+        let all = idx
+            .search_keys(&SearchQuery::QueryString("stale fresh".into()))
+            .unwrap();
         assert_eq!(all, vec![b"k2".to_vec()]);
     }
 
     #[test]
     fn nested_paths_and_arrays() {
         let tmp = tempfile::tempdir().unwrap();
-        let cfg = config(&["meta.tags"], Analyzer::Standard);
+        let cfg = config(&["meta.tags"], &[]);
         let mut idx = open(tmp.path(), &cfg);
         let mut inner = Document::default();
         inner.0.insert(
@@ -562,12 +744,172 @@ mod tests {
         idx.put(b"k1", &row, wm(1)).unwrap();
         idx.commit().unwrap();
         assert_eq!(
-            idx.search_keys(&SearchQuery::Match {
-                field: Some("meta.tags".into()),
-                text: "beta".into()
-            })
-            .unwrap(),
+            idx.search_keys(&matches("meta.tags", "beta")).unwrap(),
             vec![b"k1".to_vec()]
         );
+    }
+
+    // ---- phase 2: typed fields, twins, copy_to, analyzer splits, boosts ----
+
+    #[test]
+    fn typed_fields_index_and_query_string_ranges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = config(
+            &["title", "year", "price", "published", "created"],
+            &[
+                ("year.type", "long"),
+                ("price.type", "double"),
+                ("published.type", "bool"),
+                ("created.type", "date"),
+            ],
+        );
+        let mut idx = open(tmp.path(), &cfg);
+        idx.put(
+            b"k1",
+            &doc(&[
+                ("title", Value::String("old book".into())),
+                ("year", Value::Int(1999)),
+                ("price", Value::Int(20)), // int coerces into a double field
+                ("published", Value::Bool(true)),
+                ("created", Value::Timestamp(946_684_800_000)),
+            ]),
+            wm(1),
+        )
+        .unwrap();
+        idx.put(
+            b"k2",
+            &doc(&[
+                ("title", Value::String("new book".into())),
+                ("year", Value::Int(2024)),
+                ("price", Value::Float(49.5)),
+                ("published", Value::Bool(false)),
+                ("created", Value::Timestamp(1_700_000_000_000)),
+            ]),
+            wm(2),
+        )
+        .unwrap();
+        // A row whose value doesn't fit the declared type still indexes the
+        // fields that do fit.
+        idx.put(
+            b"k3",
+            &doc(&[
+                ("title", Value::String("odd row".into())),
+                ("year", Value::String("not a year".into())),
+            ]),
+            wm(3),
+        )
+        .unwrap();
+        idx.commit().unwrap();
+
+        // Typed fields are addressable from the query-string language.
+        let q = |s: &str| SearchQuery::QueryString(s.into());
+        assert_eq!(idx.search_keys(&q("year:[2000 TO 2030]")).unwrap(), vec![b"k2".to_vec()]);
+        assert_eq!(idx.search_keys(&q("published:true")).unwrap(), vec![b"k1".to_vec()]);
+        assert_eq!(idx.search_keys(&q("price:[30 TO *]")).unwrap(), vec![b"k2".to_vec()]);
+        assert_eq!(idx.search_keys(&q("year:1999")).unwrap(), vec![b"k1".to_vec()]);
+        assert_eq!(idx.search_keys(&matches("title", "odd")).unwrap(), vec![b"k3".to_vec()]);
+
+        // MATCH on a numeric column is a clear error.
+        let err = idx.search_keys(&matches("year", "1999")).expect_err("not texty");
+        assert!(matches!(err, FtsError::Config(_)));
+    }
+
+    #[test]
+    fn keyword_twin_exact_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = config(&["title"], &[("title.keyword", "true")]);
+        let mut idx = open(tmp.path(), &cfg);
+        idx.put(b"k1", &text_doc(&[("title", "Quick Brown Fox")]), wm(1)).unwrap();
+        idx.put(b"k2", &text_doc(&[("title", "quick")]), wm(2)).unwrap();
+        idx.commit().unwrap();
+        // Analyzed field matches both rows on a term...
+        assert_eq!(idx.search_keys(&matches("title", "quick")).unwrap().len(), 2);
+        // ...the twin only on the exact original string.
+        assert_eq!(
+            idx.search_keys(&matches("title.keyword", "Quick Brown Fox")).unwrap(),
+            vec![b"k1".to_vec()]
+        );
+        assert!(idx
+            .search_keys(&matches("title.keyword", "quick brown fox"))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn copy_to_composite_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = config(
+            &["title", "body"],
+            &[("title.copy_to", "everything"), ("body.copy_to", "everything")],
+        );
+        let mut idx = open(tmp.path(), &cfg);
+        idx.put(
+            b"k1",
+            &text_doc(&[("title", "alpha"), ("body", "beta")]),
+            wm(1),
+        )
+        .unwrap();
+        idx.commit().unwrap();
+        // One composite field sees text from both columns.
+        assert_eq!(idx.search_keys(&matches("everything", "alpha")).unwrap().len(), 1);
+        assert_eq!(idx.search_keys(&matches("everything", "beta")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn edge_ngram_with_search_analyzer_split() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Search-as-you-type: prefixes at index time, whole terms at query
+        // time.
+        let cfg = config(
+            &["name"],
+            &[
+                ("name.analyzer", "edge_ngram(2,10)"),
+                ("name.search_analyzer", "standard"),
+            ],
+        );
+        let mut idx = open(tmp.path(), &cfg);
+        idx.put(b"k1", &text_doc(&[("name", "Elasticsearch")]), wm(1)).unwrap();
+        idx.put(b"k2", &text_doc(&[("name", "Postgres")]), wm(2)).unwrap();
+        idx.commit().unwrap();
+        for prefix in ["el", "elas", "elastic"] {
+            assert_eq!(
+                idx.search_keys(&matches("name", prefix)).unwrap(),
+                vec![b"k1".to_vec()],
+                "prefix {prefix}"
+            );
+        }
+        assert!(idx.search_keys(&matches("name", "search")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn per_field_boost_orders_multi_field_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = config(&["title", "body"], &[("title.boost", "5.0")]);
+        let mut idx = open(tmp.path(), &cfg);
+        idx.put(
+            b"body_hit",
+            &text_doc(&[("title", "unrelated words"), ("body", "rust rust rust rust")]),
+            wm(1),
+        )
+        .unwrap();
+        idx.put(
+            b"title_hit",
+            &text_doc(&[("title", "rust handbook"), ("body", "nothing relevant")]),
+            wm(2),
+        )
+        .unwrap();
+        idx.commit().unwrap();
+        let hits = idx
+            .search_top(
+                &SearchQuery::Match {
+                    field: None,
+                    text: "rust".into(),
+                },
+                10,
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        // The boosted title match outranks the repeated body match.
+        assert_eq!(hits[0].key, b"title_hit");
     }
 }

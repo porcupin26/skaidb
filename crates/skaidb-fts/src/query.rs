@@ -2,15 +2,18 @@
 //!
 //! The SQL layer builds a [`SearchQuery`] from `MATCH()` / `MATCH_PHRASE()`
 //! / `FUZZY()` / `SEARCH()` predicates; this module analyzes the text with
-//! the index's own tokenizer and assembles the corresponding Tantivy query.
+//! each field's **query-time** analyzer (`search_analyzer`, falling back to
+//! the index-time one) and assembles the corresponding Tantivy query,
+//! applying per-field boosts.
 
 use tantivy::query::{
-    BooleanQuery, EmptyQuery, FuzzyTermQuery, Occur, PhraseQuery, Query, QueryParser,
+    BooleanQuery, BoostQuery, EmptyQuery, FuzzyTermQuery, Occur, PhraseQuery, Query, QueryParser,
+    TermQuery,
 };
-use tantivy::schema::Field;
+use tantivy::schema::{Field, IndexRecordOption};
 use tantivy::{Index, Term};
 
-use crate::FtsError;
+use crate::{Analyzer, FieldType, FtsError};
 
 /// Maximum Levenshtein distance Tantivy's FST automata support.
 const MAX_FUZZY_DISTANCE: u8 = 2;
@@ -20,7 +23,7 @@ const MAX_FUZZY_DISTANCE: u8 = 2;
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum SearchQuery {
     /// Analyzed terms OR-ed together (ES `match`). `field: None` searches
-    /// every indexed field.
+    /// every text-searchable field.
     Match { field: Option<String>, text: String },
     /// Terms in order within `slop` transpositions (ES `match_phrase`).
     Phrase {
@@ -43,51 +46,84 @@ pub enum SearchQuery {
     Any(Vec<SearchQuery>),
 }
 
-/// Field lookup the builder needs from the index.
+/// What the query builder needs to know about one indexed field.
+#[derive(Debug, Clone)]
+pub(crate) struct FieldRuntime {
+    /// Dotted path (and tantivy field name). Synthetic `copy_to` targets and
+    /// `.keyword` twins appear here too, so they are directly queryable.
+    pub path: String,
+    pub field: Field,
+    pub ftype: FieldType,
+    /// Query-time analyzer (already resolved: search_analyzer, else the
+    /// index-time analyzer, else the index default).
+    pub query_analyzer: Analyzer,
+    pub boost: f32,
+}
+
 pub(crate) struct QueryFields<'a> {
-    pub fields: &'a [(String, Field)],
+    pub fields: &'a [FieldRuntime],
 }
 
 impl QueryFields<'_> {
-    /// Resolve a field name to the tantivy fields to search: a named field
-    /// must exist in the index; `None` means all indexed fields.
-    fn resolve(&self, name: &Option<String>) -> Result<Vec<Field>, FtsError> {
+    /// Resolve a field name for a text predicate: a named field must exist
+    /// and be text-searchable; `None` means every text-searchable field.
+    fn resolve(&self, name: &Option<String>) -> Result<Vec<&FieldRuntime>, FtsError> {
         match name {
-            None => Ok(self.fields.iter().map(|(_, f)| *f).collect()),
-            Some(name) => self
-                .fields
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, f)| vec![*f])
-                .ok_or_else(|| {
-                    FtsError::Config(format!("column '{name}' is not covered by the search index"))
-                }),
+            None => Ok(self.fields.iter().filter(|f| f.ftype.is_texty()).collect()),
+            Some(name) => {
+                let field = self
+                    .fields
+                    .iter()
+                    .find(|f| &f.path == name)
+                    .ok_or_else(|| {
+                        FtsError::Config(format!(
+                            "column '{name}' is not covered by the search index"
+                        ))
+                    })?;
+                if !field.ftype.is_texty() {
+                    return Err(FtsError::Config(format!(
+                        "column '{name}' is declared {:?} — text predicates need a text or \
+                         keyword column",
+                        field.ftype
+                    )));
+                }
+                Ok(vec![field])
+            }
         }
     }
 }
 
-/// Analyze `text` with the field's tokenizer, returning `(position, term)`
-/// pairs.
-fn analyze(index: &Index, field: Field, text: &str) -> Result<Vec<(usize, Term)>, FtsError> {
-    let mut analyzer = index.tokenizer_for_field(field)?;
+/// Analyze `text` with the field's query-time analyzer, returning
+/// `(position, term)` pairs.
+fn analyze(rt: &FieldRuntime, text: &str) -> Vec<(usize, Term)> {
+    let mut analyzer = rt.query_analyzer.build();
     let mut stream = analyzer.token_stream(text);
     let mut terms = Vec::new();
     while let Some(token) = stream.next() {
-        terms.push((token.position, Term::from_field_text(field, &token.text)));
+        terms.push((token.position, Term::from_field_text(rt.field, &token.text)));
     }
-    Ok(terms)
+    terms
+}
+
+/// Apply the field boost to a built query.
+fn boosted(q: Box<dyn Query>, boost: f32) -> Box<dyn Query> {
+    if (boost - 1.0).abs() < f32::EPSILON {
+        q
+    } else {
+        Box::new(BoostQuery::new(q, boost))
+    }
 }
 
 /// OR together one query per field, dropping fields where analysis yields
 /// no terms.
 fn per_field_union(
-    fields: Vec<Field>,
-    mut build: impl FnMut(Field) -> Result<Option<Box<dyn Query>>, FtsError>,
+    fields: Vec<&FieldRuntime>,
+    mut build: impl FnMut(&FieldRuntime) -> Result<Option<Box<dyn Query>>, FtsError>,
 ) -> Result<Box<dyn Query>, FtsError> {
     let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-    for field in fields {
-        if let Some(q) = build(field)? {
-            clauses.push((Occur::Should, q));
+    for rt in fields {
+        if let Some(q) = build(rt)? {
+            clauses.push((Occur::Should, boosted(q, rt.boost)));
         }
     }
     Ok(match clauses.len() {
@@ -103,34 +139,30 @@ pub(crate) fn build_query(
     query: &SearchQuery,
 ) -> Result<Box<dyn Query>, FtsError> {
     match query {
-        SearchQuery::Match { field, text } => {
-            per_field_union(fields.resolve(field)?, |f| {
-                let terms = analyze(index, f, text)?;
-                if terms.is_empty() {
-                    return Ok(None);
-                }
-                let clauses: Vec<(Occur, Box<dyn Query>)> = terms
-                    .into_iter()
-                    .map(|(_, term)| {
-                        let q: Box<dyn Query> = Box::new(tantivy::query::TermQuery::new(
-                            term,
-                            tantivy::schema::IndexRecordOption::WithFreqs,
-                        ));
-                        (Occur::Should, q)
-                    })
-                    .collect();
-                Ok(Some(Box::new(BooleanQuery::new(clauses))))
-            })
-        }
+        SearchQuery::Match { field, text } => per_field_union(fields.resolve(field)?, |rt| {
+            let terms = analyze(rt, text);
+            if terms.is_empty() {
+                return Ok(None);
+            }
+            let clauses: Vec<(Occur, Box<dyn Query>)> = terms
+                .into_iter()
+                .map(|(_, term)| {
+                    let q: Box<dyn Query> =
+                        Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
+                    (Occur::Should, q)
+                })
+                .collect();
+            Ok(Some(Box::new(BooleanQuery::new(clauses))))
+        }),
         SearchQuery::Phrase { field, text, slop } => {
-            per_field_union(fields.resolve(field)?, |f| {
-                let terms = analyze(index, f, text)?;
+            per_field_union(fields.resolve(field)?, |rt| {
+                let terms = analyze(rt, text);
                 Ok(match terms.len() {
                     0 => None,
                     // A one-term "phrase" is just a term query.
-                    1 => Some(Box::new(tantivy::query::TermQuery::new(
+                    1 => Some(Box::new(TermQuery::new(
                         terms.into_iter().next().expect("len checked").1,
-                        tantivy::schema::IndexRecordOption::WithFreqs,
+                        IndexRecordOption::WithFreqs,
                     ))),
                     _ => Some(Box::new(PhraseQuery::new_with_offset_and_slop(
                         terms, *slop,
@@ -148,8 +180,8 @@ pub(crate) fn build_query(
                     "fuzzy distance {distance} exceeds the maximum of {MAX_FUZZY_DISTANCE}"
                 )));
             }
-            per_field_union(fields.resolve(field)?, |f| {
-                let terms = analyze(index, f, text)?;
+            per_field_union(fields.resolve(field)?, |rt| {
+                let terms = analyze(rt, text);
                 if terms.is_empty() {
                     return Ok(None);
                 }
@@ -165,8 +197,20 @@ pub(crate) fn build_query(
             })
         }
         SearchQuery::QueryString(text) => {
-            let default_fields = fields.fields.iter().map(|(_, f)| *f).collect();
-            let parser = QueryParser::for_index(index, default_fields);
+            // Text fields are the defaults for bare terms; typed fields
+            // remain addressable as `field:value` / `field:[a TO b]`.
+            let default_fields: Vec<Field> = fields
+                .fields
+                .iter()
+                .filter(|f| f.ftype.is_texty())
+                .map(|f| f.field)
+                .collect();
+            let mut parser = QueryParser::for_index(index, default_fields);
+            for rt in fields.fields {
+                if (rt.boost - 1.0).abs() >= f32::EPSILON {
+                    parser.set_field_boost(rt.field, rt.boost);
+                }
+            }
             parser
                 .parse_query(text)
                 .map_err(|e| FtsError::Config(format!("invalid search query: {e}")))

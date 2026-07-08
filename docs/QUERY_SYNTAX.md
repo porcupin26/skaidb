@@ -31,6 +31,7 @@ CREATE VECTOR INDEX [IF NOT EXISTS] <name> ON <table> (<path>) DIM <n> [USING <m
 DROP   VECTOR INDEX [IF EXISTS] <name>
 CREATE SEARCH INDEX [IF NOT EXISTS] <name> ON <table> (<path> [, <path> ...])
        [WITH (<option> = <literal> [, <option> = <literal> ...])]
+       -- options are global (analyzer, refresh_ms) or per-column (<path>.<option>)
 DROP    SEARCH INDEX [IF EXISTS] <name>
 REBUILD SEARCH INDEX <name>
 ALTER  TABLE <table> RENAME TO <new_table>
@@ -93,10 +94,17 @@ SHOW DATABASES
   `USING <metric>` is `cosine` (default), `l2`, or `dot`. It broadcasts across
   the cluster so every node indexes its shard. Query it with the `NEAREST`
   clause (see *Vector search* below and [VECTOR.md](VECTOR.md)).
-- `CREATE SEARCH INDEX` builds a **full-text (BM25) index** over the text at
-  the listed document paths. Options: `analyzer` (`'standard'` default,
-  `'english'`, `'whitespace'`, `'keyword'`) and `refresh_ms` (integer,
-  default `1000` — how quickly writes become searchable). Query it with
+- `CREATE SEARCH INDEX` builds a **full-text (BM25) index** over the listed
+  document paths. Global options: `analyzer` (`'standard'` default,
+  `'folding'`, `'whitespace'`, `'keyword'`, `'ngram(min,max)'`,
+  `'edge_ngram(min,max)'`, or a language like `'english'` — full list in
+  [SEARCH.md](SEARCH.md)) and `refresh_ms` (integer, default `1000` — how
+  quickly writes become searchable). Per-column options use the path as
+  prefix: `<path>.type` (`'text'` default, `'keyword'`, `'long'`,
+  `'double'`, `'bool'`, `'date'`), `<path>.analyzer`,
+  `<path>.search_analyzer`, `<path>.boost` (number), `<path>.keyword`
+  (boolean — adds a `<path>.keyword` exact-match twin), and
+  `<path>.copy_to` (composite target field). Query it with
   `MATCH()`/`SEARCH()` predicates and `score()` (see *Full-text search*
   below and [SEARCH.md](SEARCH.md)); `REBUILD SEARCH INDEX` re-indexes the
   table from scratch (recovery escape hatch).
@@ -277,14 +285,20 @@ ORDER BY score() DESC LIMIT 20;
 SELECT id FROM articles WHERE MATCH(title, 'skaidb') AND year >= 2024;
 ```
 
-- **Predicates** (query text is analyzed with the index's analyzer):
+- **Predicates** (query text is analyzed with the field's query-time
+  analyzer — `search_analyzer` if set, else the index-time one):
   - `MATCH(<col>, '<text>')` — true if the column matches any term (OR).
   - `MATCH_PHRASE(<col>, '<text>' [, <slop>])` — terms in order, within
     `<slop>` transpositions (default 0).
   - `FUZZY(<col>, '<text>' [, <distance>])` — Levenshtein-fuzzy terms,
     distance ≤ 2 (default 1).
-  - `SEARCH('<query-string>')` — mini-language over all indexed columns:
-    `term`, `"phrase"`, `col:term`, `+must`, `-must_not`, `AND`/`OR`.
+  - `SEARCH('<query-string>')` — mini-language, bare terms over the text
+    columns: `term`, `"phrase"`, `col:term`, `+must`, `-must_not`,
+    `AND`/`OR`, and ranges over typed columns (`year:[2020 TO 2024]`,
+    `price:[30 TO *]`, `published:true`).
+- `<col>` may also be a declared `.keyword` twin (`title.keyword`, exact
+  original string) or a `copy_to` composite field. Text predicates on a
+  numeric/date/bool column error.
 - **`score()`** projects the BM25 relevance of the row against the search
   predicates; it is also injected as a `_score` field (like `_distance` for
   vector search). Only valid together with a search predicate — else an
