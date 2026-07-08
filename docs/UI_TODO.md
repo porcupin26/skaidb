@@ -198,9 +198,18 @@ doc as phases land.
   refresh. Tab visibility comes from probing `/admin/config` at login
   (server-side RBAC stays the boundary). Node-join-from-UI check rides
   the cluster verification pass.
-- [ ] **Phase 5 — polish & hardening**: CSP/XSS audit pass, keyboard UX,
+- [x] **Phase 5 — polish & hardening**: CSP/XSS audit pass, keyboard UX,
   dark mode, `docs/UI.md` feature doc + README screenshot; fleet
   verification rides a release rollout.
+  *Shipped notes*: audit found no HTML sinks (no innerHTML /
+  insertAdjacentHTML / inline handlers; 55 textContent call sites; the
+  highlight-token renderer is the only non-textContent path). Assets
+  total ~35 KB against the ~100 KB budget. Keyboard: Enter submits the
+  config-set and node add/remove inputs, the query tab focuses the
+  editor. Dark mode was in from phase 1 (prefers-color-scheme).
+  `docs/UI.md` is the feature doc; README links it (no screenshot —
+  binary-embedded docs stay text-only). Remaining exit item: the
+  release-rollout verification on the test cluster (below).
 
 ---
 

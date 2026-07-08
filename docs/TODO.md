@@ -33,13 +33,12 @@ hardening, and tracked extras.
 
 ## Web UI
 
-- [ ] **[ui] Built-in admin UI** — status, stats, configuration, and a
-  SQL query console served by the node itself, reusing REST Basic auth +
-  RBAC unchanged; `[ui] enabled` config knob, live-toggleable via
-  `\config set ui.enabled`. Full plan and phased roadmap:
-  [UI_TODO.md](UI_TODO.md). Phase 1 (skeleton + status page, `/ui`
-  routes + CSP, login flow, `\ui` CLI command, live toggle) shipped.
-  Next action: phase 2 (query console).
+- [ ] **[ui] Built-in admin UI** — all five phases shipped (status,
+  query console, stats dashboards, config editor, admin ops, hardening
+  pass); feature doc: [UI.md](UI.md), plan history:
+  [UI_TODO.md](UI_TODO.md). Remaining: verify the UI on the 3-node test
+  cluster after the next release rollout (login, status vs `/status`,
+  a node join driven from the admin tab, read-only role sees denials).
 
 ## Full-text search
 

@@ -80,8 +80,10 @@ curl 127.0.0.1:7080/metrics
 ```
 
 The node also serves a **built-in web UI** at `http://127.0.0.1:7080/ui` —
+status, SQL console, stats dashboards, config editor, and admin ops,
 embedded in the binary (no external assets), same Basic auth + RBAC as
 `/query`, live-toggleable with `\ui on|off` (or `config set ui.enabled`).
+See [docs/UI.md](docs/UI.md).
 
 Or use the shell — `skaidbsh` connects over the network, picking the nearest
 reachable node and failing over to another if the connected one dies. Pointed at

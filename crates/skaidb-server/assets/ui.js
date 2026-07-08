@@ -143,6 +143,7 @@ function showTab(name) {
   const authFail = (e) => { if (e instanceof AuthError) logout(); };
   if (name === "config") loadConfig().catch(authFail);
   if (name === "admin") loadSlow().catch(authFail);
+  if (name === "query") $("q-sql").focus();
 }
 
 document.querySelector("#tabs").addEventListener("click", (ev) => {
@@ -635,6 +636,17 @@ async function loadSlow() {
 
 $("ad-slow-refresh").addEventListener("click", () =>
   loadSlow().catch((e) => { if (e instanceof AuthError) logout(); }));
+
+// Enter submits the single-input forms.
+$("cfg-value").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") $("cfg-set").click();
+});
+$("ad-add-addr").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") $("ad-add").click();
+});
+$("ad-rm-id").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") $("ad-rm").click();
+});
 
 // Hide the config/admin tabs when the role lacks Admin. The server stays
 // the boundary — this only trims chrome the role cannot use.
