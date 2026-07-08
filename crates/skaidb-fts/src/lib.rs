@@ -349,8 +349,9 @@ impl SearchIndexConfig {
     }
 }
 
-/// Parse the `synonyms` option: groups separated by `;`, single-word
-/// terms separated by `,` within a group.
+/// Parse the `synonyms` option: groups separated by `;`, terms separated
+/// by `,` within a group. Multi-word entries are allowed — at query time
+/// they match as consecutive token sequences and expand as phrases.
 fn parse_synonyms(spec: &str) -> Result<Vec<Vec<String>>, FtsError> {
     let mut groups = Vec::new();
     for group in spec.split(';') {
@@ -366,11 +367,6 @@ fn parse_synonyms(spec: &str) -> Result<Vec<Vec<String>>, FtsError> {
         if terms.len() < 2 {
             return Err(FtsError::Config(format!(
                 "synonym group '{group}' needs at least two comma-separated terms"
-            )));
-        }
-        if let Some(bad) = terms.iter().find(|t| t.contains(char::is_whitespace)) {
-            return Err(FtsError::Config(format!(
-                "multi-word synonyms are not supported yet ('{bad}')"
             )));
         }
         groups.push(terms);

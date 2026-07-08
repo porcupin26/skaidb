@@ -168,26 +168,74 @@ fn match_terms_query(
     if terms.is_empty() {
         return Ok(None);
     }
+    // Multi-word peers expand as phrase alternatives, not term bags.
+    let mut phrase_alts: Vec<Vec<Term>> = Vec::new();
     if !fields.synonyms.is_empty() {
+        let qtokens: Vec<String> = terms
+            .iter()
+            .filter_map(|(_, t)| t.value().as_str().map(str::to_string))
+            .collect();
         let mut extra = Vec::new();
-        for (pos, term) in &terms {
-            let Some(token) = term.value().as_str().map(str::to_string) else {
-                continue;
-            };
-            for peer in synonym_expansions(fields.synonyms, rt, &token) {
-                extra.push((*pos, Term::from_field_text(rt.field, &peer)));
+        for group in fields.synonyms {
+            // Analyze every entry with the field's own pipeline so stemming
+            // lines up; multi-word entries keep all their tokens.
+            let entries: Vec<Vec<String>> = group
+                .iter()
+                .map(|entry| {
+                    analyze(rt, entry)
+                        .into_iter()
+                        .filter_map(|(_, t)| t.value().as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .filter(|tokens: &Vec<String>| !tokens.is_empty())
+                .collect();
+            for (ei, entry) in entries.iter().enumerate() {
+                // The entry must occur in the query as a consecutive token
+                // sequence (a single word is a length-1 sequence).
+                let occurs = entry.len() <= qtokens.len()
+                    && qtokens.windows(entry.len()).any(|w| w == &entry[..]);
+                if !occurs {
+                    continue;
+                }
+                for (pi, peer) in entries.iter().enumerate() {
+                    if pi == ei {
+                        continue;
+                    }
+                    if let [word] = peer.as_slice() {
+                        extra.push((0, Term::from_field_text(rt.field, word)));
+                    } else {
+                        let phrase: Vec<Term> = peer
+                            .iter()
+                            .map(|w| Term::from_field_text(rt.field, w))
+                            .collect();
+                        if !phrase_alts.contains(&phrase) {
+                            phrase_alts.push(phrase);
+                        }
+                    }
+                }
             }
         }
         terms.extend(extra);
         terms.dedup_by(|a, b| a.1 == b.1);
     }
-    let clauses: Vec<(Occur, Box<dyn Query>)> = terms
+    let mut clauses: Vec<(Occur, Box<dyn Query>)> = terms
         .into_iter()
         .map(|(_, term)| {
             let q: Box<dyn Query> = Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
             (Occur::Should, q)
         })
         .collect();
+    for phrase in phrase_alts {
+        let q: Box<dyn Query> = if phrase.len() == 1 {
+            Box::new(TermQuery::new(
+                phrase.into_iter().next().expect("len checked"),
+                IndexRecordOption::WithFreqs,
+            ))
+        } else {
+            Box::new(PhraseQuery::new(phrase))
+        };
+        clauses.push((Occur::Should, q));
+    }
     Ok(Some(Box::new(BooleanQuery::new(clauses))))
 }
 
@@ -218,28 +266,6 @@ fn per_field_union(
         1 => clauses.pop().expect("len checked"),
         _ => Box::new(DisjunctionMaxQuery::new(clauses)),
     })
-}
-
-/// The analyzed peers of `token` from any synonym group containing it
-/// (each entry run through the field's query pipeline, first token kept).
-fn synonym_expansions(synonyms: &[Vec<String>], rt: &FieldRuntime, token: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for group in synonyms {
-        let analyzed: Vec<String> = group
-            .iter()
-            .filter_map(|entry| {
-                let mut analyzer = rt.query_analyzer.build();
-                let mut stream = analyzer.token_stream(entry);
-                stream.next().map(|t| t.text.clone())
-            })
-            .collect();
-        if analyzed.iter().any(|t| t == token) {
-            out.extend(analyzed.into_iter().filter(|t| t != token));
-        }
-    }
-    out.sort();
-    out.dedup();
-    out
 }
 
 /// A [`RegexQuery`] over a field's indexed terms; pattern errors are user

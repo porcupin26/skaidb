@@ -2375,6 +2375,50 @@ mod tests {
     }
 
     #[test]
+    fn search_multi_word_synonyms_expand_both_ways() {
+        let dir = tempdir();
+        let mut db = Database::open(&dir).unwrap();
+        db.execute("CREATE TABLE places (PRIMARY KEY (id))").unwrap();
+        db.execute("CREATE SEARCH INDEX places_fts ON places (body)")
+            .unwrap();
+        db.execute(
+            "INSERT INTO places (id, body) VALUES \
+             (1, 'flights to new york tonight'), \
+             (2, 'the nyc marathon'), \
+             (3, 'new car in york county'), \
+             (4, 'boston tea')",
+        )
+        .unwrap();
+        db.execute(
+            "ALTER SEARCH INDEX places_fts SET (synonyms = 'new york,nyc,big apple')",
+        )
+        .unwrap();
+
+        // Single word → multi-word peers as PHRASES: 'nyc' matches the
+        // literal doc and the "new york" phrase doc — but NOT doc 3, whose
+        // 'new' and 'york' are not adjacent.
+        let rs = rows(db.execute("SELECT id FROM places WHERE MATCH(body, 'nyc')").unwrap());
+        assert_eq!(sorted_ids(rs), vec![1, 2]);
+
+        // Multi-word sequence in the query → single-word peer: the query
+        // 'new york' contains the group entry as consecutive tokens, so
+        // the nyc doc matches too (docs 1, 2 via synonym; 3 via its own
+        // 'new'/'york' terms — MATCH is an OR of terms).
+        let rs = rows(
+            db.execute("SELECT id FROM places WHERE MATCH(body, 'new york')")
+                .unwrap(),
+        );
+        assert_eq!(sorted_ids(rs), vec![1, 2, 3]);
+
+        // 'big apple' → both peers.
+        let rs = rows(
+            db.execute("SELECT id FROM places WHERE MATCH(body, 'big apple')")
+                .unwrap(),
+        );
+        assert_eq!(sorted_ids(rs), vec![1, 2]);
+    }
+
+    #[test]
     fn search_alter_index_synonyms_hot_reload() {
         let dir = tempdir();
         let mut db = Database::open(&dir).unwrap();

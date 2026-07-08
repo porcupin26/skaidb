@@ -39,8 +39,10 @@ extras below.
   fallback (this also gates per-hit explain on sharded clusters).
 - [ ] **[fts] top_hits** (per-group top documents): wants a SQL surface —
   window functions or a dedicated per-group-top-k clause.
-- [ ] **[fts] Multi-word synonyms + phrase expansion** (single-word groups
-  ship today; multi-word needs query-time phrase rewriting).
+- [x] **[fts] Multi-word synonyms + phrase expansion** — shipped:
+  multi-word group entries match as consecutive query-token sequences
+  and expand as phrase alternatives (both directions), analyzed with the
+  field's own pipeline; still `MATCH`-only, hot-reloadable.
 - [ ] **[fts] Approximate cardinality opt-in** (e.g.
   `APPROX_COUNT_DISTINCT()`) if `COUNT(DISTINCT)`'s exact terms-bucket
   bail ever hurts on very high cardinality. Conditional — no demand yet.

@@ -86,11 +86,14 @@ Set the index default with `analyzer = '...'`, or per column with
 Query text is analyzed with the field's **query-time** analyzer:
 `<column>.search_analyzer` if set, else the index-time analyzer.
 
-**Synonyms** (`synonyms = 'quick,fast,speedy; car,automobile'`) expand at
-query time in `MATCH` — each group entry is analyzed with the field's own
-pipeline so stemming lines up; phrases and the query-string language do
-not expand, and entries are single words for now. Because expansion is
-query-time, synonyms **hot-reload**:
+**Synonyms** (`synonyms = 'quick,fast,speedy; new york,nyc,big apple'`)
+expand at query time in `MATCH` — each group entry is analyzed with the
+field's own pipeline so stemming lines up. **Multi-word entries** work in
+both directions: an entry that occurs in the query as a consecutive token
+sequence expands to its peers, and multi-word peers expand as **phrase**
+alternatives (a query for `nyc` matches "new york" only where the words
+are adjacent). `MATCH_PHRASE` and the query-string language do not
+expand. Because expansion is query-time, synonyms **hot-reload**:
 
 ```sql
 ALTER SEARCH INDEX articles_fts SET (synonyms = 'quick,fast; car,auto');
