@@ -1822,19 +1822,21 @@ mod tests {
 
         // MORE_LIKE_THIS: docs sharing the like-text's distinctive terms
         // rank; the bread docs don't match a database-flavored like-text.
-        let hits = idx
-            .search_top(
-                &SearchQuery::MoreLikeThis {
-                    field: Some("body".into()),
-                    text: "rust database engine".into(),
-                },
-                10,
-            )
-            .unwrap();
+        let mlt = SearchQuery::MoreLikeThis {
+            field: Some("body".into()),
+            text: "rust database engine".into(),
+        };
+        let hits = idx.search_top(&mlt, 10).unwrap();
         assert!(hits.len() >= 3, "{hits:?}");
         let keys: Vec<u8> = hits.iter().map(|h| h.key[0]).collect();
         assert!(keys.contains(&0) && keys.contains(&1) && keys.contains(&2));
         assert!(!keys.contains(&4)); // "bread baking basics" shares nothing
+
+        // MLT must also serve the scoring-disabled paths (key sets — the
+        // v0.43 fleet smoke found tantivy refusing to build its weight
+        // there; the ForceScoring shim covers it).
+        let keys = idx.search_keys(&mlt).unwrap();
+        assert!(keys.len() >= 3, "{keys:?}");
     }
 
     #[test]

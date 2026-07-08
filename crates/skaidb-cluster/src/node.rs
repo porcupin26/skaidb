@@ -2672,7 +2672,9 @@ impl Node {
         // Read-only catalog/stat introspection: the catalog is identical on every
         // node (DDL is broadcast), so answer from the local engine, filtered to
         // the current database, without fan-out — under a shared lock, so it
-        // never queues behind (or blocks) writers.
+        // never queues behind (or blocks) writers. SUGGEST reads the local
+        // shard's term dictionary the same way (complete when RF >= members;
+        // per-shard otherwise).
         if matches!(
             stmt,
             Statement::ShowTables
@@ -2680,6 +2682,7 @@ impl Node {
                 | Statement::ShowStatus
                 | Statement::ShowDatabases
                 | Statement::ShowGrants { .. }
+                | Statement::Suggest { .. }
         ) {
             return self
                 .local
@@ -5292,6 +5295,13 @@ mod tests {
                 "snippet: {row:?}"
             );
         }
+
+        // SUGGEST routes to the coordinator's local term dictionary on the
+        // cluster path (the v0.43 fleet smoke found it mis-routed to the
+        // data-plane executor).
+        let rs = rows(nb.execute("SUGGEST 'vegetbles' ON articles_fts LIMIT 1").unwrap());
+        assert_eq!(rs.rows.len(), 1, "{:?}", rs.rows);
+        assert_eq!(rs.rows[0][1], Value::String("vegetables".into()));
     }
 
     #[test]

@@ -318,6 +318,36 @@ pub(crate) fn build_query(
             })
         }
         SearchQuery::MoreLikeThis { field, text } => {
+            /// Tantivy's more_like_this refuses to build a weight with
+            /// scoring disabled, but the unranked paths (key sets,
+            /// aggregations, fast-field sort) disable scoring for speed.
+            /// This shim re-enables it for the inner MLT query — the
+            /// Disabled variant still carries the searcher.
+            #[derive(Debug, Clone)]
+            struct ForceScoring(tantivy::query::MoreLikeThisQuery);
+            impl Query for ForceScoring {
+                fn weight(
+                    &self,
+                    enabled: tantivy::query::EnableScoring<'_>,
+                ) -> tantivy::Result<Box<dyn tantivy::query::Weight>> {
+                    match enabled {
+                        tantivy::query::EnableScoring::Disabled {
+                            searcher_opt: Some(searcher),
+                            ..
+                        } => self.0.weight(
+                            tantivy::query::EnableScoring::enabled_from_searcher(searcher),
+                        ),
+                        other => self.0.weight(other),
+                    }
+                }
+                fn query_terms<'a>(
+                    &'a self,
+                    visitor: &mut dyn FnMut(&'a tantivy::Term, bool),
+                ) {
+                    self.0.query_terms(visitor);
+                }
+            }
+
             // Tantivy's MLT picks the like-text's most distinctive terms
             // by in-index document frequency. Defaults lean permissive
             // (ES's min_term_freq=2 silently empties short like-texts):
@@ -333,13 +363,13 @@ pub(crate) fn build_query(
                     )
                 })
                 .collect();
-            Ok(Box::new(
+            Ok(Box::new(ForceScoring(
                 tantivy::query::MoreLikeThisQuery::builder()
                     .with_min_term_frequency(1)
                     .with_min_doc_frequency(2)
                     .with_max_query_terms(25)
                     .with_document_fields(field_values),
-            ))
+            )))
         }
         SearchQuery::QueryString(text) => {
             // Text fields are the defaults for bare terms; typed fields
