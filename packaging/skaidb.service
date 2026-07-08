@@ -27,9 +27,12 @@ LogsDirectory=skaidb
 LogsDirectoryMode=0750
 ReadWritePaths=/var/log/skaidb
 
-# Hardening — skaidb only needs to read its config and write its data dir.
+# Hardening — skaidb needs its data dir, its logs, and (for runtime
+# `config set` persistence) its own config directory; nothing else is
+# writable. The `-` tolerates a build/host without /etc/skaidb.
 NoNewPrivileges=true
 ProtectSystem=full
+ReadWritePaths=-/etc/skaidb
 ProtectHome=true
 PrivateTmp=true
 ProtectControlGroups=true

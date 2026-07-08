@@ -661,6 +661,38 @@ mod tests {
         assert!(get("/ui").starts_with("HTTP/1.1 200"));
     }
 
+    /// An unwritable config file must not block a live-mutable key from
+    /// applying (packaged installs may run with a read-only /etc): the set
+    /// succeeds with `persisted: false` + a warning. A restart-required key
+    /// in the same situation took no effect at all and errors.
+    #[test]
+    fn config_set_applies_live_when_persist_fails() {
+        let ctx = Arc::new(Context {
+            backend: Backend::Local(Box::new(RwLock::new(Database::open(temp_dir()).unwrap()))),
+            metrics: Metrics::new(),
+            audit: RwLock::new(quiet_audit()),
+            authn: AuthState::disabled(),
+            superuser_role: "superuser".into(),
+            admin_lock: Mutex::new(()),
+            start: Instant::now(),
+            slow_log: crate::slowlog::SlowLog::new(),
+            config: RwLock::new(Config::default()),
+            // A directory is never writable as a file.
+            config_path: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+        });
+
+        let (status, body) = ctx.config_set("ui.enabled", "false");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["applied"], serde_json::json!(true));
+        assert_eq!(body["persisted"], serde_json::json!(false));
+        assert!(body["warning"].as_str().unwrap().contains("not persisted"));
+        assert!(!ctx.config.read().unwrap().ui.enabled, "must be live");
+
+        // Restart-required key + failed persist = nothing happened → error.
+        let (status, body) = ctx.config_set("server.rest_port", "9999");
+        assert_eq!(status, 500, "{body}");
+    }
+
     /// The query console's per-request session database: `{"sql", "db"}`
     /// runs the statement with `db` current (the stateless gateway carries
     /// no session), and a bad name errors like `USE` would.

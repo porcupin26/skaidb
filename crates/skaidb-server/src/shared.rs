@@ -270,6 +270,13 @@ impl Context {
 
     /// `config set <key> <value>`: validate, apply live if mutable, and persist
     /// to the config file if one is known. Reports what actually happened.
+    ///
+    /// Live application comes first, persistence second: a read-only config
+    /// file (containerized /etc, systemd `ProtectSystem` without the
+    /// `ReadWritePaths` hole) must not block a live-mutable key from taking
+    /// effect — the failure is reported as a `warning` with
+    /// `persisted: false`. Only when *nothing* took effect (restart-required
+    /// key and the write failed) is the whole call an error.
     pub fn config_set(&self, key: &str, value: &str) -> (u16, Json) {
         let updated = match self.config_snapshot().with_key_set(key, value) {
             Ok(u) => u,
@@ -281,27 +288,32 @@ impl Context {
             *self.audit.write().unwrap_or_else(|e| e.into_inner()) =
                 AuditSettings::from(&updated.observability);
         }
+        *self.config.write().unwrap_or_else(|e| e.into_inner()) = updated.clone();
         // Persist to disk when we know where the config lives.
-        let persisted = match &self.config_path {
-            Some(path) => {
-                if let Err(e) = std::fs::write(path, updated.to_toml_string()) {
-                    return (500, json!({ "error": format!("could not write {path}: {e}") }));
-                }
-                true
-            }
-            None => false,
+        let (persisted, persist_error) = match &self.config_path {
+            Some(path) => match std::fs::write(path, updated.to_toml_string()) {
+                Ok(()) => (true, None),
+                Err(e) => (false, Some(format!("could not write {path}: {e}"))),
+            },
+            None => (false, None),
         };
-        *self.config.write().unwrap_or_else(|e| e.into_inner()) = updated;
-        (
-            200,
-            json!({
-                "ok": true,
-                "key": key,
-                "applied": applied,
-                "restart_required": !applied,
-                "persisted": persisted,
-            }),
-        )
+        if let Some(err) = &persist_error {
+            if !applied {
+                // Restart-required key that also failed to persist: no effect.
+                return (500, json!({ "error": err }));
+            }
+        }
+        let mut out = json!({
+            "ok": true,
+            "key": key,
+            "applied": applied,
+            "restart_required": !applied,
+            "persisted": persisted,
+        });
+        if let Some(err) = persist_error {
+            out["warning"] = json!(format!("applied live but not persisted: {err}"));
+        }
+        (200, out)
     }
 }
 

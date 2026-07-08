@@ -33,12 +33,18 @@ hardening, and tracked extras.
 
 ## Web UI
 
-- [ ] **[ui] Built-in admin UI** — all five phases shipped (status,
+- [x] **[ui] Built-in admin UI** — all five phases shipped (status,
   query console, stats dashboards, config editor, admin ops, hardening
   pass); feature doc: [UI.md](UI.md), plan history:
-  [UI_TODO.md](UI_TODO.md). Remaining: verify the UI on the 3-node test
-  cluster after the next release rollout (login, status vs `/status`,
-  a node join driven from the admin tab, read-only role sees denials).
+  [UI_TODO.md](UI_TODO.md). Verified on the 3-node test cluster at
+  v0.46.0: `/ui` + `/ui/meta` on every node, auth (bad password 401),
+  read-only role gets admin-probe 403 + clean insert denial, live
+  `ui.enabled` toggle 404s and back, node remove/re-join driven through
+  the UI's admin endpoints (members 3→2→3, data intact). The rollout
+  also caught that packaged installs couldn't persist `config set`
+  (read-only /etc under systemd hardening + root-owned config) — fixed
+  in packaging (`ReadWritePaths=-/etc/skaidb`, group-writable config)
+  and in `config_set` (apply-live-first, persist failure = warning).
 
 ## Full-text search
 

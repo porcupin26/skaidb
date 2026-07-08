@@ -24,11 +24,13 @@ mkdir -p /var/log/skaidb
 chown skaidb:skaidb /var/log/skaidb
 chmod 0750 /var/log/skaidb
 
-# Config readable by the service but not world-readable (it may hold a password).
+# Config readable by the service but not world-readable (it may hold a
+# password). Group-writable so runtime `config set` can persist changes
+# (the unit opens /etc/skaidb via ReadWritePaths for the same reason).
 if [ -d /etc/skaidb ]; then
     chown -R root:skaidb /etc/skaidb
-    chmod 0750 /etc/skaidb
-    [ -f /etc/skaidb/skaidb.toml ] && chmod 0640 /etc/skaidb/skaidb.toml
+    chmod 0770 /etc/skaidb
+    [ -f /etc/skaidb/skaidb.toml ] && chmod 0660 /etc/skaidb/skaidb.toml
 fi
 
 # Is this an upgrade or a fresh install? deb and rpm signal it differently:
