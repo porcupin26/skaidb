@@ -6,9 +6,11 @@ cluster query performance that matches or beats Elasticsearch on the same
 hardware. Search stays SQL-first (like time-series did), with an optional
 ES-compatible REST subset later.
 
-This is the working plan + pending-items list for the effort. Shipped state
-will move to a `docs/SEARCH.md` feature doc as phases land (the TIMESERIES.md
-pattern); this file tracks what's left.
+This file is the phase plan and its historical record — **phases 0–7 are
+complete with every exit met** (details per phase below). Shipped state
+lives in `docs/SEARCH.md`, benchmark results in `docs/BENCHMARKS.md`, and
+**all pending FTS work is consolidated in [TODO.md](TODO.md)** (phase-8
+decision, phase-9 hardening, tracked extras).
 
 ---
 
@@ -236,7 +238,7 @@ fleet-verified — the TS cadence)
   query-time-only. Analyzer conformance fixtures vs ES token streams
   (documented divergence: simple tokenizer splits `dog's`; ES keeps it
   whole); mixed-type corpus round-trips in engine tests.
-- [ ] **Phase 3 — query DSL parity** (core shipped, exit pending):
+- [x] **Phase 3 — query DSL parity** (exit met; leftover niceties in TODO.md):
   - [x] Predicates: `MATCH_PREFIX` (prefix), `WILDCARD`, `REGEXP` — term-
     level via FST regex automata, not analyzed (documented); phrase+slop and
     fuzzy shipped in phase 1, ranges/boosts via the query-string in phase 2.
@@ -263,7 +265,7 @@ fleet-verified — the TS cadence)
   - [ ] `multi_match` `cross_fields` mode (best_fields is the shipped
     default).
   - [ ] Per-hit score explain.
-- [ ] **Phase 4 — cluster** (core shipped, fleet smoke pending):
+- [x] **Phase 4 — cluster**:
   - [x] Per-replica local indexes over replicated writes: the replicated
     apply paths (`apply_put`/`apply_delete` + batched variants) maintain
     search indexes, so replication, rebalance, drain, hinted replay, and
@@ -290,8 +292,7 @@ fleet-verified — the TS cadence)
     hit counts from every coordinator, NRT 149 ms cluster-wide;
     kill -9 one node → searches stay complete, a quorum write during the
     outage lands, and the rejoined node serves the converged result.
-- [ ] **Phase 5 — NRT + ingest performance** (code core shipped, fleet
-  bench pending):
+- [x] **Phase 5 — NRT + ingest performance** (exit met):
   - [x] Bulk ingest path: one search-index pass and one NRT refresh check
     per statement batch instead of per row, on the single-node `put_batch`,
     the replicated `apply_batch` (engine-side now), and the async
@@ -329,7 +330,7 @@ fleet-verified — the TS cadence)
     worst case).
   - [ ] Merge-policy tuning on LXC-class disks: the win over ES leaves no
     urgency; revisit if an ingest-heavy workload surfaces merge stalls.
-- [ ] **Phase 6 — aggregations/facets** (core shipped):
+- [x] **Phase 6 — aggregations/facets** (exit met; extras in TODO.md):
   - [x] Grouped/aggregate search SELECTs work everywhere:
     `SELECT region, COUNT(*), SUM(units) … WHERE MATCH(…) GROUP BY region`.
     Two serving paths with identical output: an **exact fast-field
@@ -378,7 +379,7 @@ fleet-verified — the TS cadence)
   - [ ] top_hits (wants a SQL surface — window functions or a dedicated
     per-group-top-k clause); approximate HLL cardinality as an opt-in
     function if COUNT(DISTINCT)'s exact bail ever hurts.
-- [ ] **Phase 7 — search UX extras** (in progress):
+- [x] **Phase 7 — search UX extras**:
   - [x] Fast-field sort: `ORDER BY <col> [ASC|DESC] LIMIT k` over search
     queries. Index-ordered top-k pushdown for declared fast columns
     (keyword/long/double/bool/date) with the residual-filter over-fetch
