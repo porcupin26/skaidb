@@ -68,13 +68,15 @@ extras below.
   pushed instead and the next pass reclaims. Rollup series co-place with
   their source (placement ignores `__field__`), so they reclaim by the
   same rule.
-- [ ] **[ts] Label postings index + regex matchers** — matchers scan the
-  per-block series list (fine at moderate cardinality); postings unlock
-  regex and high-cardinality matching.
-- [ ] **[ts] PromQL extras** — regex matchers (`=~`/`!~`), `offset`,
-  vector arithmetic, `histogram_quantile`; then the node-exporter
-  dashboard panel-by-panel diff against a real Prometheus (the original
-  phase-7 exit criterion).
+- [ ] **[ts] Label postings index** — regex matchers shipped (scan-based,
+  fine at moderate cardinality); a postings index remains the perf
+  unlock for high-cardinality matching.
+- [ ] **[ts] PromQL extras, round 2** — shipped: regex matchers
+  (anchored `=~`/`!~`; coordinator-applied on clusters), `offset`,
+  vector arithmetic (`+ - * /`, scalar and 1:1 vector matching),
+  `histogram_quantile`. Remaining: subqueries, `group_left`/right,
+  `topk`; then the node-exporter dashboard panel-by-panel diff against
+  a real Prometheus (the original phase-7 exit criterion).
 - [ ] **[ts] PromQL partial gather** — the `/api/v1` evaluator still
   ships raw samples cluster-wide (per-step lookback windows don't align
   with fixed buckets); teach `query_range` to reuse the v0.31.0 partial

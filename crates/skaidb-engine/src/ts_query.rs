@@ -680,6 +680,8 @@ fn run_partials(
         .iter()
         .map(|m| match m {
             Matcher::Eq(k, _) | Matcher::Ne(k, _) => k,
+            // The SQL surface never builds regex matchers; keys still count.
+            Matcher::Re(k, _) | Matcher::NotRe(k, _) => k,
         })
         .filter(|k| *k != FIELD_LABEL)
         .collect();

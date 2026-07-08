@@ -47,16 +47,52 @@ impl Default for TsdbOptions {
     }
 }
 
-/// A label matcher (phase 1: equality forms; regex arrives with the SQL
-/// surface). A series matches when every matcher accepts it; a missing
-/// label reads as the empty string, Prometheus-style.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A label matcher. A series matches when every matcher accepts it; a
+/// missing label reads as the empty string, Prometheus-style. The regex
+/// forms are **anchored** (`=~ "api.*"` must match the whole value, like
+/// Prometheus) and carry their compiled regex, so matching per series is
+/// cheap — build them with [`Matcher::re`] / [`Matcher::not_re`].
+#[derive(Debug, Clone)]
 pub enum Matcher {
     Eq(String, String),
     Ne(String, String),
+    Re(String, regex::Regex),
+    NotRe(String, regex::Regex),
 }
 
+impl PartialEq for Matcher {
+    fn eq(&self, other: &Matcher) -> bool {
+        match (self, other) {
+            (Matcher::Eq(k, v), Matcher::Eq(k2, v2))
+            | (Matcher::Ne(k, v), Matcher::Ne(k2, v2)) => k == k2 && v == v2,
+            (Matcher::Re(k, r), Matcher::Re(k2, r2))
+            | (Matcher::NotRe(k, r), Matcher::NotRe(k2, r2)) => {
+                k == k2 && r.as_str() == r2.as_str()
+            }
+            _ => false,
+        }
+    }
+}
+impl Eq for Matcher {}
+
 impl Matcher {
+    /// An anchored regex matcher (`label =~ "pattern"`).
+    pub fn re(key: impl Into<String>, pattern: &str) -> Result<Matcher> {
+        Ok(Matcher::Re(key.into(), compile_anchored(pattern)?))
+    }
+
+    /// An anchored negated regex matcher (`label !~ "pattern"`).
+    pub fn not_re(key: impl Into<String>, pattern: &str) -> Result<Matcher> {
+        Ok(Matcher::NotRe(key.into(), compile_anchored(pattern)?))
+    }
+
+    /// Whether this matcher accepts a series with `labels` (missing label
+    /// = empty string). Public so a scatter coordinator can re-apply the
+    /// regex forms that could not ship over the wire.
+    pub fn accepts(&self, labels: &Labels) -> bool {
+        self.matches(labels)
+    }
+
     fn matches(&self, labels: &Labels) -> bool {
         let get = |k: &str| {
             labels
@@ -67,8 +103,15 @@ impl Matcher {
         match self {
             Matcher::Eq(k, v) => get(k) == v,
             Matcher::Ne(k, v) => get(k) != v,
+            Matcher::Re(k, r) => r.is_match(get(k)),
+            Matcher::NotRe(k, r) => !r.is_match(get(k)),
         }
     }
+}
+
+fn compile_anchored(pattern: &str) -> Result<regex::Regex> {
+    regex::Regex::new(&format!("^(?:{pattern})$"))
+        .map_err(|e| TsdbError::Corrupt(format!("bad regex matcher: {e}")))
 }
 
 fn matches_all(matchers: &[Matcher], labels: &Labels) -> bool {

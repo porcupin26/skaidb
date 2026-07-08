@@ -84,11 +84,15 @@ stored as its own compressed stream. Full grammar and semantics:
   `/api/v1/query_range` evaluate a PromQL subset — instant selectors with
   `=`/`!=` matchers, `rate`/`increase`/`delta` over range selectors
   (counter-reset-aware, matching the SQL aggregates), and
-  `sum/avg/min/max/count [by|without (...)]` — over the remote_write
-  `metrics` table. `/api/v1/labels`, `/api/v1/label/<n>/values`,
-  `/api/v1/series`, buildinfo and metadata stubs power Grafana's
-  autocomplete. Not yet: regex matchers, `offset`, vector arithmetic,
-  `histogram_quantile`. A fresh datasource with no ingest sees empty
+  `sum/avg/min/max/count [by|without (...)]` — plus **regex matchers**
+  (`=~`/`!~`, anchored like Prometheus), **`offset`**, **vector
+  arithmetic** (`+ - * /`; scalar∘vector and one-to-one vector∘vector on
+  identical label sets), and **`histogram_quantile`** — over the
+  remote_write `metrics` table. `/api/v1/labels`,
+  `/api/v1/label/<n>/values`, `/api/v1/series`, buildinfo and metadata
+  stubs power Grafana's autocomplete. On a cluster, regex matchers are
+  applied by the coordinator (peers answer the equality-matched
+  superset). A fresh datasource with no ingest sees empty
   results, not errors. Datasource setup recipes: [GRAFANA.md](GRAFANA.md).
 - **Rollups / downsampling** (v0.27.0): `CREATE ROLLUP r30m ON cpu BUCKET
   30m RETENTION 90d` — per-bucket partials (`<field>_{count,sum,min,max,

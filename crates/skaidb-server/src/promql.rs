@@ -27,10 +27,13 @@ const LOOKBACK_MS: i64 = 5 * 60 * 1000;
 
 #[derive(Debug, Clone, PartialEq)]
 enum PExpr {
-    /// `metric{l="v", l2!="w"}` with an optional `[range]`.
+    /// `metric{l="v", l2=~"a.*"} [range] [offset d]`. `slot` indexes the
+    /// pre-fetched data for this selector (assigned after parsing).
     Selector {
         matchers: Vec<Matcher>,
         range_ms: Option<i64>,
+        offset_ms: i64,
+        slot: usize,
     },
     /// `rate(sel[5m])` / `increase(...)` / `delta(...)`.
     RangeFn { func: RangeFn, arg: Box<PExpr> },
@@ -41,8 +44,37 @@ enum PExpr {
         without: Option<Vec<String>>,
         arg: Box<PExpr>,
     },
+    /// `lhs + rhs` and friends: scalar∘scalar, scalar∘vector, and
+    /// vector∘vector matched one-to-one on identical label sets
+    /// (ignoring `__name__`, which the result drops — PromQL semantics).
+    Binary {
+        op: BinOp,
+        lhs: Box<PExpr>,
+        rhs: Box<PExpr>,
+    },
+    /// `histogram_quantile(φ, expr)` over `_bucket` series with `le`.
+    HistogramQuantile { phi: f64, arg: Box<PExpr> },
     /// A bare number.
     Number(f64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+impl BinOp {
+    fn apply(self, l: f64, r: f64) -> f64 {
+        match self {
+            BinOp::Add => l + r,
+            BinOp::Sub => l - r,
+            BinOp::Mul => l * r,
+            BinOp::Div => l / r,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -185,8 +217,65 @@ impl<'a> P<'a> {
         Ok(expr)
     }
 
-    fn expr(&mut self) -> Result<PExpr, String> {
+    /// Peek-and-eat a keyword (backtracks when it does not match).
+    fn keyword(&mut self, want: &str) -> bool {
         self.ws();
+        let save = self.i;
+        match self.ident() {
+            Some(w) if w == want => true,
+            _ => {
+                self.i = save;
+                false
+            }
+        }
+    }
+
+    /// `expr := term (('+'|'-') term)*`
+    fn expr(&mut self) -> Result<PExpr, String> {
+        let mut lhs = self.term()?;
+        loop {
+            let op = match self.peek() {
+                Some(b'+') => BinOp::Add,
+                Some(b'-') => BinOp::Sub,
+                _ => return Ok(lhs),
+            };
+            self.i += 1;
+            let rhs = self.term()?;
+            lhs = PExpr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+    }
+
+    /// `term := factor (('*'|'/') factor)*`
+    fn term(&mut self) -> Result<PExpr, String> {
+        let mut lhs = self.factor()?;
+        loop {
+            let op = match self.peek() {
+                Some(b'*') => BinOp::Mul,
+                Some(b'/') => BinOp::Div,
+                _ => return Ok(lhs),
+            };
+            self.i += 1;
+            let rhs = self.factor()?;
+            lhs = PExpr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+    }
+
+    fn factor(&mut self) -> Result<PExpr, String> {
+        self.ws();
+        // Parenthesized sub-expression.
+        if self.eat(b'(') {
+            let inner = self.expr()?;
+            self.expect(b')')?;
+            return Ok(inner);
+        }
         // Number literal.
         if self
             .peek()
@@ -210,6 +299,20 @@ impl<'a> P<'a> {
                 .map_err(|_| format!("bad number {text:?}"));
         }
         let name = self.ident().ok_or("expected expression")?;
+        // histogram_quantile(φ, expr).
+        if name == "histogram_quantile" {
+            self.expect(b'(')?;
+            let PExpr::Number(phi) = self.factor()? else {
+                return Err("histogram_quantile needs a number as its first argument".into());
+            };
+            self.expect(b',')?;
+            let arg = self.expr()?;
+            self.expect(b')')?;
+            return Ok(PExpr::HistogramQuantile {
+                phi,
+                arg: Box::new(arg),
+            });
+        }
         // Aggregations.
         let agg = match name.as_str() {
             "sum" => Some(AggOp::Sum),
@@ -277,23 +380,34 @@ impl<'a> P<'a> {
                 loop {
                     let label = self.ident().ok_or("expected label name")?;
                     self.ws();
-                    let negated = if self.eat(b'=') {
-                        // `=~` / `!~` are regex forms — unsupported.
-                        if self.peek() == Some(b'~') {
-                            return Err("regex matchers are not supported yet".into());
+                    enum Op {
+                        Eq,
+                        Ne,
+                        Re,
+                        NotRe,
+                    }
+                    let op = if self.eat(b'=') {
+                        if self.eat(b'~') {
+                            Op::Re
+                        } else {
+                            Op::Eq
                         }
-                        false
                     } else if self.eat(b'!') {
-                        self.expect(b'=')?;
-                        true
+                        if self.eat(b'~') {
+                            Op::NotRe
+                        } else {
+                            self.expect(b'=')?;
+                            Op::Ne
+                        }
                     } else {
-                        return Err("expected '=' or '!='".into());
+                        return Err("expected '=', '!=', '=~' or '!~'".into());
                     };
                     let value = self.string()?;
-                    matchers.push(if negated {
-                        Matcher::Ne(label, value)
-                    } else {
-                        Matcher::Eq(label, value)
+                    matchers.push(match op {
+                        Op::Eq => Matcher::Eq(label, value),
+                        Op::Ne => Matcher::Ne(label, value),
+                        Op::Re => Matcher::re(label, &value).map_err(|e| e.to_string())?,
+                        Op::NotRe => Matcher::not_re(label, &value).map_err(|e| e.to_string())?,
                     });
                     if !self.eat(b',') {
                         break;
@@ -307,7 +421,17 @@ impl<'a> P<'a> {
             range_ms = Some(self.duration()?);
             self.expect(b']')?;
         }
-        Ok(PExpr::Selector { matchers, range_ms })
+        let offset_ms = if self.keyword("offset") {
+            self.duration()?
+        } else {
+            0
+        };
+        Ok(PExpr::Selector {
+            matchers,
+            range_ms,
+            offset_ms,
+            slot: 0,
+        })
     }
 }
 
@@ -316,33 +440,128 @@ impl<'a> P<'a> {
 /// One output series: its labels and per-step values (NaN = absent).
 type Vector = Vec<(Labels, f64)>;
 
-/// Pre-fetched data for the expression's selector.
+/// One step's evaluation result: an instant vector, or a scalar (from a
+/// number literal or scalar arithmetic).
+enum StepVal {
+    Scalar(f64),
+    Vector(Vector),
+}
+
+/// Pre-fetched data for one selector.
 struct Fetched {
     series: Vec<(Labels, Vec<Sample>)>,
 }
 
-/// The single selector inside `expr` (v1 supports one data source per query).
-fn selector_of(expr: &PExpr) -> Result<(&Vec<Matcher>, Option<i64>), String> {
+/// Assign each selector a fetch slot (pre-order) and return the fetch
+/// specs `(matchers, range, offset)` in slot order.
+fn assign_slots(expr: &mut PExpr, specs: &mut Vec<(Vec<Matcher>, Option<i64>, i64)>) {
     match expr {
-        PExpr::Selector { matchers, range_ms } => Ok((matchers, *range_ms)),
-        PExpr::RangeFn { arg, .. } | PExpr::Agg { arg, .. } => selector_of(arg),
+        PExpr::Selector {
+            matchers,
+            range_ms,
+            offset_ms,
+            slot,
+        } => {
+            *slot = specs.len();
+            specs.push((matchers.clone(), *range_ms, *offset_ms));
+        }
+        PExpr::RangeFn { arg, .. }
+        | PExpr::Agg { arg, .. }
+        | PExpr::HistogramQuantile { arg, .. } => assign_slots(arg, specs),
+        PExpr::Binary { lhs, rhs, .. } => {
+            assign_slots(lhs, specs);
+            assign_slots(rhs, specs);
+        }
+        PExpr::Number(_) => {}
+    }
+}
+
+/// The first selector's matchers (the `/api/v1/series` entry point).
+fn selector_of(expr: &PExpr) -> Result<&Vec<Matcher>, String> {
+    match expr {
+        PExpr::Selector { matchers, .. } => Ok(matchers),
+        PExpr::RangeFn { arg, .. }
+        | PExpr::Agg { arg, .. }
+        | PExpr::HistogramQuantile { arg, .. } => selector_of(arg),
+        PExpr::Binary { lhs, .. } => selector_of(lhs),
         PExpr::Number(_) => Err("number-only expressions are not supported".into()),
     }
 }
 
-/// Evaluate `expr` at each step in `steps` (ms). Returns per-step vectors.
-fn eval_steps(expr: &PExpr, fetched: &Fetched, steps: &[i64]) -> Result<Vec<Vector>, String> {
+/// Match-key for binary operations: labels sans `__name__` (PromQL drops
+/// the metric name from arithmetic results and matches ignoring it).
+fn match_key(labels: &Labels) -> Labels {
+    labels
+        .iter()
+        .filter(|(k, _)| k != "__name__")
+        .cloned()
+        .collect()
+}
+
+/// Evaluate `expr` at each step in `steps` (ms). Returns per-step values.
+fn eval_steps(expr: &PExpr, fetched: &[Fetched], steps: &[i64]) -> Result<Vec<StepVal>, String> {
     match expr {
-        PExpr::Number(_) => Err("number-only expressions are not supported".into()),
+        PExpr::Number(n) => Ok(steps.iter().map(|_| StepVal::Scalar(*n)).collect()),
+        PExpr::Binary { op, lhs, rhs } => {
+            let l = eval_steps(lhs, fetched, steps)?;
+            let r = eval_steps(rhs, fetched, steps)?;
+            Ok(l.into_iter()
+                .zip(r)
+                .map(|(lv, rv)| match (lv, rv) {
+                    (StepVal::Scalar(a), StepVal::Scalar(b)) => StepVal::Scalar(op.apply(a, b)),
+                    (StepVal::Scalar(a), StepVal::Vector(v)) => StepVal::Vector(
+                        v.into_iter()
+                            .map(|(labels, b)| (match_key(&labels), op.apply(a, b)))
+                            .collect(),
+                    ),
+                    (StepVal::Vector(v), StepVal::Scalar(b)) => StepVal::Vector(
+                        v.into_iter()
+                            .map(|(labels, a)| (match_key(&labels), op.apply(a, b)))
+                            .collect(),
+                    ),
+                    (StepVal::Vector(lv), StepVal::Vector(rv)) => {
+                        // One-to-one on identical label sets sans __name__.
+                        let rhs_by: BTreeMap<Labels, f64> = rv
+                            .into_iter()
+                            .map(|(labels, v)| (match_key(&labels), v))
+                            .collect();
+                        StepVal::Vector(
+                            lv.into_iter()
+                                .filter_map(|(labels, a)| {
+                                    let key = match_key(&labels);
+                                    rhs_by.get(&key).map(|b| (key, op.apply(a, *b)))
+                                })
+                                .collect(),
+                        )
+                    }
+                })
+                .collect())
+        }
+        PExpr::HistogramQuantile { phi, arg } => {
+            let inner = eval_steps(arg, fetched, steps)?;
+            Ok(inner
+                .into_iter()
+                .map(|val| {
+                    let StepVal::Vector(vector) = val else {
+                        return StepVal::Vector(Vec::new());
+                    };
+                    StepVal::Vector(histogram_quantile(*phi, vector))
+                })
+                .collect())
+        }
         PExpr::Selector { range_ms, .. } => {
             if range_ms.is_some() {
                 return Err("range selectors need rate()/increase()/delta()".into());
             }
+            let PExpr::Selector { slot, .. } = expr else {
+                unreachable!()
+            };
+            let data = &fetched[*slot];
             Ok(steps
                 .iter()
                 .map(|&t| {
                     let mut v = Vec::new();
-                    for (labels, samples) in &fetched.series {
+                    for (labels, samples) in &data.series {
                         // Latest sample at or before t, within the lookback.
                         let idx = samples.partition_point(|s| s.ts <= t);
                         if idx > 0 {
@@ -352,24 +571,26 @@ fn eval_steps(expr: &PExpr, fetched: &Fetched, steps: &[i64]) -> Result<Vec<Vect
                             }
                         }
                     }
-                    v
+                    StepVal::Vector(v)
                 })
                 .collect())
         }
         PExpr::RangeFn { func, arg } => {
             let PExpr::Selector {
                 range_ms: Some(window),
+                slot,
                 ..
             } = arg.as_ref()
             else {
                 return Err("rate()/increase()/delta() need a range selector like m[5m]".into());
             };
             let window = *window;
+            let data = &fetched[*slot];
             Ok(steps
                 .iter()
                 .map(|&t| {
                     let mut v = Vec::new();
-                    for (labels, samples) in &fetched.series {
+                    for (labels, samples) in &data.series {
                         let lo = samples.partition_point(|s| s.ts < t - window);
                         let hi = samples.partition_point(|s| s.ts <= t);
                         let win = &samples[lo..hi];
@@ -401,7 +622,7 @@ fn eval_steps(expr: &PExpr, fetched: &Fetched, steps: &[i64]) -> Result<Vec<Vect
                         // rate() drops the metric name, PromQL-style.
                         v.push((clean_labels(labels, false), value));
                     }
-                    v
+                    StepVal::Vector(v)
                 })
                 .collect())
         }
@@ -414,7 +635,10 @@ fn eval_steps(expr: &PExpr, fetched: &Fetched, steps: &[i64]) -> Result<Vec<Vect
             let inner = eval_steps(arg, fetched, steps)?;
             Ok(inner
                 .into_iter()
-                .map(|vector| {
+                .map(|val| {
+                    let StepVal::Vector(vector) = val else {
+                        return Vec::new();
+                    };
                     let mut groups: BTreeMap<Labels, Vec<f64>> = BTreeMap::new();
                     for (labels, value) in vector {
                         let key: Labels = match (by, without) {
@@ -446,11 +670,68 @@ fn eval_steps(expr: &PExpr, fetched: &Fetched, steps: &[i64]) -> Result<Vec<Vect
                             };
                             (labels, value)
                         })
-                        .collect()
+                        .collect::<Vector>()
                 })
+                .map(StepVal::Vector)
                 .collect())
         }
     }
+}
+
+/// Prometheus `histogram_quantile`: group `_bucket` series by their labels
+/// sans `le`, order the cumulative buckets, and interpolate linearly
+/// inside the bucket containing the φ-rank. Needs a `+Inf` bucket; counts
+/// are made monotone (double-counted resets clamp) like Prometheus does.
+fn histogram_quantile(phi: f64, vector: Vector) -> Vector {
+    let mut groups: BTreeMap<Labels, Vec<(f64, f64)>> = BTreeMap::new();
+    for (labels, value) in vector {
+        let Some(le) = labels.iter().find(|(k, _)| k == "le").map(|(_, v)| v) else {
+            continue;
+        };
+        let Ok(le) = le.trim_start_matches('+').parse::<f64>() else {
+            continue;
+        };
+        let base: Labels = labels.iter().filter(|(k, _)| k != "le").cloned().collect();
+        groups.entry(base).or_default().push((le, value));
+    }
+    let mut out = Vec::new();
+    for (labels, mut buckets) in groups {
+        buckets.sort_by(|a, b| a.0.total_cmp(&b.0));
+        if buckets.len() < 2 || buckets.last().map(|(le, _)| *le) != Some(f64::INFINITY) {
+            continue;
+        }
+        // Monotone counts (merged/raced buckets can dip).
+        let mut max_so_far = 0.0f64;
+        for (_, c) in &mut buckets {
+            max_so_far = max_so_far.max(*c);
+            *c = max_so_far;
+        }
+        let total = buckets.last().expect("len checked").1;
+        if total.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+            continue; // empty histogram (or NaN counts)
+        }
+        let value = if phi < 0.0 {
+            f64::NEG_INFINITY
+        } else if phi > 1.0 {
+            f64::INFINITY
+        } else {
+            let rank = phi * total;
+            let idx = buckets.partition_point(|(_, c)| *c < rank).min(buckets.len() - 1);
+            let (end, count) = buckets[idx];
+            if end.is_infinite() {
+                buckets[idx - 1].0
+            } else {
+                let (start, count_start) = if idx == 0 { (0.0, 0.0) } else { buckets[idx - 1] };
+                if count <= count_start {
+                    end
+                } else {
+                    start + (end - start) * (rank - count_start) / (count - count_start)
+                }
+            }
+        };
+        out.push((labels, value));
+    }
+    out
 }
 
 /// Output labels: drop skaidb-internal pairs; `name` renders as `__name__`
@@ -484,23 +765,43 @@ fn labels_json(labels: &Labels) -> Json {
 
 // ---- HTTP entry points ----
 
-fn fetch(ctx: &Shared, expr: &PExpr, t0: i64, t1: i64) -> Result<Fetched, String> {
-    let (matchers, _) = selector_of(expr)?;
-    // The evaluator needs history behind the first step: the range window
-    // (or instant lookback), whichever the expression uses.
-    let (_, range) = selector_of(expr)?;
-    let back = range.unwrap_or(LOOKBACK_MS);
-    let series = match ctx
-        .backend
-        .ts_query(TABLE, matchers, t0.saturating_sub(back), t1)
-    {
-        Ok(series) => series,
-        // No ingest yet: an empty result, not an error — a fresh Grafana
-        // datasource should see empty panels, matching Prometheus.
-        Err(e) if e.to_string().contains("does not exist") => Vec::new(),
-        Err(e) => return Err(e.to_string()),
-    };
-    Ok(Fetched { series })
+/// Fetch every selector's data. `offset` shifts the fetched window into
+/// the past and then shifts the sample timestamps forward by the same
+/// amount, so the evaluator's step arithmetic needs no offset awareness.
+fn fetch_all(
+    ctx: &Shared,
+    specs: &[(Vec<Matcher>, Option<i64>, i64)],
+    t0: i64,
+    t1: i64,
+) -> Result<Vec<Fetched>, String> {
+    let mut out = Vec::with_capacity(specs.len());
+    for (matchers, range, offset) in specs {
+        // The evaluator needs history behind the first step: the range
+        // window (or instant lookback), whichever the selector uses.
+        let back = range.unwrap_or(LOOKBACK_MS) + offset;
+        let mut series = match ctx.backend.ts_query(
+            TABLE,
+            matchers,
+            t0.saturating_sub(back),
+            t1.saturating_sub(*offset),
+        ) {
+            Ok(series) => series,
+            // No ingest yet: an empty result, not an error — a fresh
+            // Grafana datasource should see empty panels, matching
+            // Prometheus.
+            Err(e) if e.to_string().contains("does not exist") => Vec::new(),
+            Err(e) => return Err(e.to_string()),
+        };
+        if *offset != 0 {
+            for (_, samples) in &mut series {
+                for sample in samples {
+                    sample.ts += offset;
+                }
+            }
+        }
+        out.push(Fetched { series });
+    }
+    Ok(out)
 }
 
 /// `/api/v1/query`: evaluate at one instant.
@@ -512,17 +813,33 @@ pub fn query(ctx: &Shared, params: &BTreeMap<String, String>) -> (u16, Json) {
         .get("time")
         .and_then(|t| parse_prom_time(t))
         .unwrap_or_else(wall_ms);
-    let expr = match P::new(q).parse() {
+    let mut expr = match P::new(q).parse() {
         Ok(e) => e,
         Err(e) => return err_json(&e),
     };
-    let fetched = match fetch(ctx, &expr, t, t) {
+    let mut specs = Vec::new();
+    assign_slots(&mut expr, &mut specs);
+    if specs.is_empty() {
+        return err_json("number-only expressions are not supported");
+    }
+    let fetched = match fetch_all(ctx, &specs, t, t) {
         Ok(f) => f,
         Err(e) => return err_json(&e),
     };
     match eval_steps(&expr, &fetched, &[t]) {
-        Ok(mut vectors) => {
-            let vector = vectors.pop().unwrap_or_default();
+        Ok(mut vals) => {
+            let vector = match vals.pop() {
+                Some(StepVal::Vector(v)) => v,
+                Some(StepVal::Scalar(v)) => {
+                    return (
+                        200,
+                        json!({"status": "success",
+                               "data": {"resultType": "scalar",
+                                        "result": [t as f64 / 1000.0, format!("{v}")]}}),
+                    )
+                }
+                None => Vec::new(),
+            };
             let result: Vec<Json> = vector
                 .into_iter()
                 .filter(|(_, v)| v.is_finite())
@@ -562,20 +879,29 @@ pub fn query_range(ctx: &Shared, params: &BTreeMap<String, String>) -> (u16, Jso
     if end < start || (end - start) / step_ms > 50_000 {
         return err_json("bad or too-wide range");
     }
-    let expr = match P::new(q).parse() {
+    let mut expr = match P::new(q).parse() {
         Ok(e) => e,
         Err(e) => return err_json(&e),
     };
+    let mut specs = Vec::new();
+    assign_slots(&mut expr, &mut specs);
+    if specs.is_empty() {
+        return err_json("number-only expressions are not supported");
+    }
     let steps: Vec<i64> = (0..).map(|i| start + i * step_ms).take_while(|t| *t <= end).collect();
-    let fetched = match fetch(ctx, &expr, start, end) {
+    let fetched = match fetch_all(ctx, &specs, start, end) {
         Ok(f) => f,
         Err(e) => return err_json(&e),
     };
     match eval_steps(&expr, &fetched, &steps) {
-        Ok(vectors) => {
+        Ok(vals) => {
             // Pivot per-step vectors into per-series time series.
             let mut by_series: BTreeMap<Labels, Vec<(i64, f64)>> = BTreeMap::new();
-            for (t, vector) in steps.iter().zip(vectors) {
+            for (t, val) in steps.iter().zip(vals) {
+                let vector = match val {
+                    StepVal::Vector(v) => v,
+                    StepVal::Scalar(v) => vec![(Vec::new(), v)],
+                };
                 for (labels, value) in vector {
                     if value.is_finite() {
                         by_series.entry(labels).or_default().push((*t, value));
@@ -640,7 +966,7 @@ pub fn series(ctx: &Shared, params: &BTreeMap<String, String>) -> (u16, Json) {
     let matchers = match params.get("match[]") {
         Some(sel) => match P::new(sel).parse() {
             Ok(expr) => match selector_of(&expr) {
-                Ok((m, _)) => m.clone(),
+                Ok(m) => m.clone(),
                 Err(e) => return err_json(&e),
             },
             Err(e) => return err_json(&e),
@@ -745,15 +1071,92 @@ mod tests {
         assert_eq!(by, Some(vec!["job".into()]));
         let PExpr::RangeFn { func, arg } = *arg else { panic!() };
         assert_eq!(func, RangeFn::Rate);
-        let PExpr::Selector { matchers, range_ms } = *arg else { panic!() };
+        let PExpr::Selector { matchers, range_ms, .. } = *arg else { panic!() };
         assert_eq!(range_ms, Some(300_000));
         assert_eq!(matchers.len(), 3); // name + 2 label matchers
     }
 
     #[test]
-    fn rejects_regex_and_trailing() {
-        assert!(P::new(r#"m{l=~"x.*"}"#).parse().is_err());
-        assert!(P::new("m offset 5m").parse().is_err());
+    fn parses_regex_offset_arithmetic_and_quantile() {
+        // Regex matchers compile anchored.
+        let e = P::new(r#"m{job=~"api.*",env!~"dev|test"}"#).parse().unwrap();
+        let PExpr::Selector { matchers, .. } = e else { panic!() };
+        assert!(matches!(&matchers[1], Matcher::Re(k, r) if k == "job" && r.is_match("api-2")));
+        assert!(matches!(&matchers[1], Matcher::Re(_, r) if !r.is_match("xapi")), "anchored");
+        assert!(matches!(&matchers[2], Matcher::NotRe(k, _) if k == "env"));
+        // A bad pattern is a parse error, not a panic.
+        assert!(P::new(r#"m{l=~"["}"#).parse().is_err());
+
+        // offset.
+        let e = P::new("rate(m[5m] offset 1h)").parse().unwrap();
+        let PExpr::RangeFn { arg, .. } = e else { panic!() };
+        let PExpr::Selector { offset_ms, range_ms, .. } = *arg else { panic!() };
+        assert_eq!(offset_ms, 3_600_000);
+        assert_eq!(range_ms, Some(300_000));
+
+        // Arithmetic precedence: a + b * c parses as a + (b * c).
+        let e = P::new("a + b * c").parse().unwrap();
+        let PExpr::Binary { op: BinOp::Add, rhs, .. } = e else { panic!() };
+        assert!(matches!(*rhs, PExpr::Binary { op: BinOp::Mul, .. }));
+        // Parens override.
+        let e = P::new("(a + b) / c").parse().unwrap();
+        assert!(matches!(e, PExpr::Binary { op: BinOp::Div, .. }));
+
+        // histogram_quantile.
+        let e = P::new(r#"histogram_quantile(0.9, rate(req_bucket[5m]))"#).parse().unwrap();
+        let PExpr::HistogramQuantile { phi, .. } = e else { panic!() };
+        assert_eq!(phi, 0.9);
+    }
+
+    #[test]
+    fn evaluates_arithmetic_and_quantile() {
+        // Two selectors' worth of fetched data, one sample each at t=1000.
+        let series = |name: &str, extra: &[(&str, &str)], value: f64| {
+            let mut labels: Labels = vec![("name".into(), name.into())];
+            labels.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+            labels.sort();
+            (labels, vec![Sample { ts: 1000, value }])
+        };
+        let mut a = P::new("a / b").parse().unwrap();
+        let mut specs = Vec::new();
+        assign_slots(&mut a, &mut specs);
+        assert_eq!(specs.len(), 2);
+        let fetched = vec![
+            Fetched { series: vec![series("a", &[("job", "x")], 10.0)] },
+            Fetched { series: vec![series("b", &[("job", "x")], 4.0)] },
+        ];
+        let vals = eval_steps(&a, &fetched, &[1000]).unwrap();
+        let StepVal::Vector(v) = &vals[0] else { panic!() };
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].1, 2.5);
+        assert_eq!(v[0].0, vec![("job".to_string(), "x".to_string())]);
+
+        // scalar * vector.
+        let mut e = P::new("2 * a").parse().unwrap();
+        let mut specs = Vec::new();
+        assign_slots(&mut e, &mut specs);
+        let fetched = vec![Fetched { series: vec![series("a", &[], 21.0)] }];
+        let vals = eval_steps(&e, &fetched, &[1000]).unwrap();
+        let StepVal::Vector(v) = &vals[0] else { panic!() };
+        assert_eq!(v[0].1, 42.0);
+
+        // histogram_quantile: uniform 0..100 over two buckets + Inf.
+        let buckets: Vector = vec![
+            (vec![("le".to_string(), "50".to_string())], 5.0),
+            (vec![("le".to_string(), "100".to_string())], 10.0),
+            (vec![("le".to_string(), "+Inf".to_string())], 10.0),
+        ];
+        let q = histogram_quantile(0.5, buckets.clone());
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].1, 50.0);
+        let q = histogram_quantile(0.75, buckets);
+        assert_eq!(q[0].1, 75.0);
+    }
+
+    #[test]
+    fn rejects_trailing() {
+        assert!(P::new("m }").parse().is_err());
+        assert!(P::new("1 + 2").parse().is_ok());
     }
 
     #[test]

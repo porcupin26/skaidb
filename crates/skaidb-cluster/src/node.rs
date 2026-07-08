@@ -1108,13 +1108,7 @@ impl Node {
             }
             responders += 1;
         }
-        let wire_matchers: Vec<(bool, String, String)> = matchers
-            .iter()
-            .map(|m| match m {
-                skaidb_tsdb::Matcher::Eq(k, v) => (false, k.clone(), v.clone()),
-                skaidb_tsdb::Matcher::Ne(k, v) => (true, k.clone(), v.clone()),
-            })
-            .collect();
+        let (wire_matchers, post_matchers) = split_wire_matchers(matchers);
         let addrs = self.peer_addrs();
         let shards = scatter(&addrs, |addr| {
             self.counters.peer_requests.fetch_add(1, Ordering::Relaxed);
@@ -1136,6 +1130,9 @@ impl Node {
         });
         for shard in shards.into_iter().flatten() {
             for (labels, samples) in shard {
+                if !post_matchers.iter().all(|m| m.accepts(&labels)) {
+                    continue; // peers only saw the equality forms
+                }
                 let entry = merged.entry(labels).or_default();
                 for (ts, value) in samples {
                     entry.insert(ts, value);
@@ -1207,13 +1204,7 @@ impl Node {
             absorb(db.ts_partials(table, matchers, t0, t1, bucket_ms)?);
             responders += 1;
         }
-        let wire_matchers: Vec<(bool, String, String)> = matchers
-            .iter()
-            .map(|m| match m {
-                skaidb_tsdb::Matcher::Eq(k, v) => (false, k.clone(), v.clone()),
-                skaidb_tsdb::Matcher::Ne(k, v) => (true, k.clone(), v.clone()),
-            })
-            .collect();
+        let (wire_matchers, post_matchers) = split_wire_matchers(matchers);
         let addrs = self.peer_addrs();
         let shards = scatter(&addrs, |addr| {
             self.counters.peer_requests.fetch_add(1, Ordering::Relaxed);
@@ -1238,6 +1229,7 @@ impl Node {
             absorb(
                 shard
                     .into_iter()
+                    .filter(|(labels, _)| post_matchers.iter().all(|m| m.accepts(labels)))
                     .map(|(labels, partials)| {
                         (labels, partials.iter().map(partial_from_wire).collect())
                     })
@@ -4207,6 +4199,25 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// Ring-placement key for a series: its labels minus the reserved
 /// `__field__` discriminator, so every field stream of a logical series
 /// lands on the same replica set.
+/// Split matchers for a scatter: the internode requests carry equality
+/// forms only, so regex matchers stay behind — peers answer with the
+/// equality-matched superset and the coordinator re-applies the regex
+/// forms on the gathered series labels.
+fn split_wire_matchers(
+    matchers: &[skaidb_tsdb::Matcher],
+) -> (Vec<(bool, String, String)>, Vec<skaidb_tsdb::Matcher>) {
+    let mut wire = Vec::new();
+    let mut post = Vec::new();
+    for m in matchers {
+        match m {
+            skaidb_tsdb::Matcher::Eq(k, v) => wire.push((false, k.clone(), v.clone())),
+            skaidb_tsdb::Matcher::Ne(k, v) => wire.push((true, k.clone(), v.clone())),
+            other => post.push(other.clone()),
+        }
+    }
+    (wire, post)
+}
+
 fn ts_placement_key(labels: &[(String, String)]) -> Vec<u8> {
     let mut key = Vec::new();
     for (k, v) in labels {

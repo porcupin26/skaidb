@@ -52,14 +52,18 @@ SELECT rate(value) FROM metrics WHERE name = 'http_requests_total' AND job = 'ap
 
 ### Supported PromQL (v1 subset)
 
-Instant selectors with `=`/`!=` label matchers, `rate` / `increase` /
-`delta` over range selectors (`[5m]`), and
-`sum/avg/min/max/count [by|without (...)]`. Typical dashboard panels —
-`sum by (job) (rate(http_requests_total[5m]))` — work as-is.
+Instant selectors with `=`/`!=`/`=~`/`!~` label matchers (regex forms
+anchored, Prometheus-style), `offset`, `rate` / `increase` / `delta`
+over range selectors (`[5m]`), `sum/avg/min/max/count
+[by|without (...)]`, vector arithmetic (`+ - * /`, one-to-one matching),
+and `histogram_quantile`. Typical dashboard panels —
+`sum by (job) (rate(http_requests_total[5m]))`,
+`histogram_quantile(0.9, sum by (le) (rate(req_bucket[5m])))` — work
+as-is.
 
-**Not supported (yet)**: regex matchers (`=~`), `offset`, subqueries,
-vector arithmetic, `histogram_quantile`. Panels using those need the
-fallback below.
+**Not supported (yet)**: subqueries, `group_left`/`group_right`
+many-to-one matching, `topk`/`bottomk` and friends. Panels using those
+need the fallback below.
 
 ### Monitoring skaidb itself
 

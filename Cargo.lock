@@ -1210,6 +1210,7 @@ dependencies = [
 name = "skaidb-tsdb"
 version = "0.51.0"
 dependencies = [
+ "regex",
  "serde",
  "serde_json",
  "thiserror",
