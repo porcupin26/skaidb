@@ -200,10 +200,11 @@ SHOW DATABASES
   7. multiplicative: `*`, `/`
   8. unary: `-<expr>`, `NOT <expr>`
   9. parentheses `( … )`
-- **Aggregate functions:** `COUNT(*)` / `COUNT(<expr>)`, `SUM`, `AVG`, `MIN`,
-  `MAX`, and the time-series aggregates `RATE`, `INCREASE`, `DELTA`, `FIRST`,
-  `LAST` (see *Time-series tables* below). Using an aggregate (or `GROUP BY`)
-  puts the query in aggregate mode.
+- **Aggregate functions:** `COUNT(*)` / `COUNT(<expr>)` /
+  `COUNT(DISTINCT <expr>)` (exact distinct non-null values), `SUM`, `AVG`,
+  `MIN`, `MAX`, and the time-series aggregates `RATE`, `INCREASE`, `DELTA`,
+  `FIRST`, `LAST` (see *Time-series tables* below). Using an aggregate (or
+  `GROUP BY`) puts the query in aggregate mode.
 - **Duration literals:** an integer immediately followed by a unit — `250ms`,
   `15s`, `5m`, `2h`, `30d`, `1w` — is a duration, valued as integer
   milliseconds (`5m` = `300000`). Usable anywhere an integer is.
@@ -327,11 +328,15 @@ WHERE (MATCH(body, 'rust') OR MATCH(title, 'rust'))
 - The named column(s) must be covered by a search index on the table —
   errors if none exists. Query text may be a bind parameter (`?`).
 - **Aggregates / `GROUP BY` work over search queries**
-  (`SELECT region, COUNT(*) … WHERE MATCH(…) GROUP BY region`) — simple
-  keyword-column groupings with `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` push down
-  as exact fast-field facets; every other shape (HAVING, `time_bucket`,
-  text-column grouping, residual predicates) aggregates the gathered
-  matching rows. See [SEARCH.md](SEARCH.md#aggregations).
+  (`SELECT region, COUNT(*) … WHERE MATCH(…) GROUP BY region`) — keyword
+  and `time_bucket(step, date-col)` groupings with
+  `COUNT`/`COUNT(DISTINCT col)`/`SUM`/`AVG`/`MIN`/`MAX` push down as exact
+  fast-field facets; every other shape (HAVING, text-column grouping,
+  residual predicates) aggregates the gathered matching rows. See
+  [SEARCH.md](SEARCH.md#aggregations).
+- **`COUNT(DISTINCT <expr>)`** counts distinct non-null values, exactly —
+  in any aggregate query, search or not. `DISTINCT` arguments to other
+  aggregate functions are not supported.
 - Cannot combine with `JOIN`, `UNION`, `DISTINCT`, or `NEAREST`. Residual
   `WHERE` conditions, `LIMIT`, and `OFFSET` apply normally, post-search.
 - **Visibility:** writes become searchable within `refresh_ms` (default

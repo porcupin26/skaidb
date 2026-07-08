@@ -444,10 +444,18 @@ impl SearchIndex {
                 .find(|c| c.path == col)
                 .map(|c| c.ftype)
         };
-        if let Some(col) = &req.group_by {
-            if ftype_of(col) != Some(FieldType::Keyword) {
+        match &req.group_by {
+            Some(crate::AggGroupBy::Keyword(col))
+                if ftype_of(col) != Some(FieldType::Keyword) =>
+            {
                 return Ok(None); // only keyword fast fields bucket exactly
             }
+            Some(crate::AggGroupBy::DateHistogram { column, interval_ms })
+                if ftype_of(column) != Some(FieldType::Date) || *interval_ms <= 0 =>
+            {
+                return Ok(None);
+            }
+            _ => {}
         }
         // Metric sub-requests: m{i} per metric (+ a value-count companion
         // for SUM, to null it over empty value sets).
@@ -456,11 +464,26 @@ impl SearchIndex {
             let Some(col) = &metric.column else {
                 continue; // Count reads doc_count
             };
+            if metric.func == AggMetricFunc::CountDistinct {
+                // Exact distinct = the number of nested terms buckets;
+                // works over keyword and numeric fast fields alike.
+                if !matches!(
+                    ftype_of(col),
+                    Some(FieldType::Keyword | FieldType::Long | FieldType::Double)
+                ) {
+                    return Ok(None);
+                }
+                metric_aggs.insert(
+                    format!("m{i}"),
+                    serde_json::json!({"terms": {"field": col, "size": MAX_BUCKETS}}),
+                );
+                continue;
+            }
             if !matches!(ftype_of(col), Some(FieldType::Long | FieldType::Double)) {
                 return Ok(None);
             }
             let name = match metric.func {
-                AggMetricFunc::Count => continue,
+                AggMetricFunc::Count | AggMetricFunc::CountDistinct => continue,
                 AggMetricFunc::ValueCount => "value_count",
                 AggMetricFunc::Sum => "sum",
                 AggMetricFunc::Avg => "avg",
@@ -479,12 +502,23 @@ impl SearchIndex {
             }
         }
         let request = match &req.group_by {
-            Some(col) => serde_json::json!({
+            Some(crate::AggGroupBy::Keyword(col)) => serde_json::json!({
                 "g": {
                     "terms": {"field": col, "size": MAX_BUCKETS, "missing": MISSING},
                     "aggs": metric_aggs,
                 }
             }),
+            Some(crate::AggGroupBy::DateHistogram { column, interval_ms }) => {
+                serde_json::json!({
+                    "g": {
+                        "date_histogram": {
+                            "field": column,
+                            "fixed_interval": format!("{interval_ms}ms"),
+                        },
+                        "aggs": metric_aggs,
+                    }
+                })
+            }
             None => serde_json::Value::Object(metric_aggs),
         };
         let aggs: Aggregations = serde_json::from_value(request)
@@ -512,16 +546,27 @@ impl SearchIndex {
         // Extract one metric row from a bucket (or the root) object, typing
         // each value by the metric's declared column (so the pushdown's
         // output is indistinguishable from the row-materialization path's).
-        let metrics_of = |obj: &serde_json::Value, count: u64| -> Vec<Value> {
+        // `None` = a count-distinct term set truncated → not exact → the
+        // whole request falls back.
+        let metrics_of = |obj: &serde_json::Value, count: u64| -> Option<Vec<Value>> {
             req.metrics
                 .iter()
                 .enumerate()
                 .map(|(i, metric)| {
                     let raw = obj[format!("m{i}")]["value"].as_f64();
-                    match metric.func {
+                    Some(match metric.func {
                         AggMetricFunc::Count => Value::Int(count as i64),
                         AggMetricFunc::ValueCount => {
                             Value::Int(raw.unwrap_or(0.0) as i64)
+                        }
+                        AggMetricFunc::CountDistinct => {
+                            let sub = &obj[format!("m{i}")];
+                            if sub["sum_other_doc_count"].as_u64().unwrap_or(0) != 0 {
+                                return None;
+                            }
+                            Value::Int(
+                                sub["buckets"].as_array().map_or(0, |b| b.len()) as i64
+                            )
                         }
                         AggMetricFunc::Sum
                             if obj[format!("m{i}n")]["value"].as_f64() == Some(0.0) =>
@@ -541,18 +586,23 @@ impl SearchIndex {
                                 Some(v) => Value::Float(v),
                             }
                         }
-                    }
+                    })
                 })
                 .collect()
         };
 
         match &req.group_by {
-            None => Ok(Some(vec![AggRow {
-                key: Value::Null,
-                count: total as u64,
-                metrics: metrics_of(&results, total as u64),
-            }])),
-            Some(_) => {
+            None => {
+                let Some(metrics) = metrics_of(&results, total as u64) else {
+                    return Ok(None);
+                };
+                Ok(Some(vec![AggRow {
+                    key: Value::Null,
+                    count: total as u64,
+                    metrics,
+                }]))
+            }
+            Some(group_by) => {
                 let g = &results["g"];
                 if g["sum_other_doc_count"].as_u64().unwrap_or(0) != 0 {
                     return Ok(None); // truncated: not exact, fall back
@@ -565,18 +615,38 @@ impl SearchIndex {
                 for bucket in buckets {
                     let count = bucket["doc_count"].as_u64().unwrap_or(0);
                     bucketed += count;
-                    let key = match bucket["key"].as_str() {
-                        Some(MISSING) | None => Value::Null,
-                        Some(k) => Value::String(k.to_string()),
+                    // Histograms emit gap-filling empty buckets (ES
+                    // semantics); SQL GROUP BY only has non-empty groups.
+                    if count == 0 {
+                        continue;
+                    }
+                    let key = match group_by {
+                        crate::AggGroupBy::Keyword(_) => match bucket["key"].as_str() {
+                            Some(MISSING) | None => Value::Null,
+                            Some(k) => Value::String(k.to_string()),
+                        },
+                        crate::AggGroupBy::DateHistogram { .. } => {
+                            // Bucket keys are floored millisecond timestamps
+                            // — `time_bucket`'s exact output.
+                            match bucket["key"].as_f64() {
+                                Some(ms) => Value::Timestamp(ms as i64),
+                                None => return Ok(None),
+                            }
+                        }
+                    };
+                    let Some(metrics) = metrics_of(bucket, count) else {
+                        return Ok(None);
                     };
                     rows.push(AggRow {
                         key,
                         count,
-                        metrics: metrics_of(bucket, count),
+                        metrics,
                     });
                 }
                 // Exactness cross-check: every matching doc must be in some
-                // bucket (guards against silent drops).
+                // bucket — a date histogram silently skips rows missing the
+                // date column (the fallback's NULL group), which this
+                // catches.
                 if bucketed != total as u64 {
                     return Ok(None);
                 }
@@ -1288,7 +1358,7 @@ mod tests {
         idx.commit().unwrap();
 
         let req = AggRequest {
-            group_by: Some("category".into()),
+            group_by: Some(crate::AggGroupBy::Keyword("category".into())),
             metrics: vec![
                 AggMetric {
                     func: AggMetricFunc::Count,
@@ -1341,22 +1411,103 @@ mod tests {
         assert_eq!(rows[0].metrics[1], Value::Float(20.0));
         assert_eq!(rows[0].metrics[2], Value::Float(15.0));
 
+        // COUNT(DISTINCT category) — exact, via nested terms buckets.
+        let distinct = AggRequest {
+            group_by: None,
+            metrics: vec![AggMetric {
+                func: AggMetricFunc::CountDistinct,
+                column: Some("category".into()),
+            }],
+        };
+        let rows = idx
+            .aggregate(&matches("body", "red"), &distinct)
+            .unwrap()
+            .expect("exact");
+        assert_eq!(rows[0].metrics[0], Value::Int(2)); // fruit, building
+
         // Unsupported shapes bail to the fallback, never approximate:
         // grouping by an analyzed text column...
         let bad = AggRequest {
-            group_by: Some("body".into()),
+            group_by: Some(crate::AggGroupBy::Keyword("body".into())),
             metrics: vec![],
         };
         assert!(idx.aggregate(&matches("body", "red"), &bad).unwrap().is_none());
         // ...or a metric over a non-numeric column.
         let bad = AggRequest {
-            group_by: Some("category".into()),
+            group_by: Some(crate::AggGroupBy::Keyword("category".into())),
             metrics: vec![AggMetric {
                 func: AggMetricFunc::Sum,
                 column: Some("body".into()),
             }],
         };
         assert!(idx.aggregate(&matches("body", "red"), &bad).unwrap().is_none());
+    }
+
+    #[test]
+    fn aggregate_date_histogram_buckets() {
+        use crate::AggMetric;
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = config(
+            &["body", "ts", "v"],
+            &[("ts.type", "date"), ("v.type", "long")],
+        );
+        let mut idx = open(tmp.path(), &cfg);
+        const HOUR: i64 = 3_600_000;
+        for (i, (t, v)) in [(0, 1), (HOUR / 2, 2), (HOUR, 4), (3 * HOUR, 8)]
+            .iter()
+            .enumerate()
+        {
+            idx.put(
+                &[i as u8],
+                &doc(&[
+                    ("body", Value::String("event log".into())),
+                    ("ts", Value::Timestamp(1_700_000_000_000 + t)),
+                    ("v", Value::Int(*v)),
+                ]),
+                wm(i as u64 + 1),
+            )
+            .unwrap();
+        }
+        idx.commit().unwrap();
+
+        let base = 1_700_000_000_000i64;
+        let floor = base - base.rem_euclid(HOUR);
+        let req = AggRequest {
+            group_by: Some(crate::AggGroupBy::DateHistogram {
+                column: "ts".into(),
+                interval_ms: HOUR,
+            }),
+            metrics: vec![AggMetric {
+                func: AggMetricFunc::Sum,
+                column: Some("v".into()),
+            }],
+        };
+        let rows = idx
+            .aggregate(&matches("body", "event"), &req)
+            .unwrap()
+            .expect("exact");
+        // Buckets are hour-floored ms timestamps; gap-filling empty buckets
+        // (hour +2) are dropped, matching SQL GROUP BY.
+        let flat: Vec<(Value, u64, Value)> = rows
+            .iter()
+            .map(|r| (r.key.clone(), r.count, r.metrics[0].clone()))
+            .collect();
+        assert_eq!(flat.len(), 3, "{flat:?}");
+        assert!(flat.contains(&(Value::Timestamp(floor), 2, Value::Int(3))));
+        assert!(flat.contains(&(Value::Timestamp(floor + HOUR), 1, Value::Int(4))));
+        assert!(flat.contains(&(Value::Timestamp(floor + 3 * HOUR), 1, Value::Int(8))));
+
+        // A matching row without the date column would vanish from the
+        // histogram while the fallback groups it under NULL — the
+        // bucketed-vs-total check catches it and bails.
+        idx.put(
+            b"nodate",
+            &doc(&[("body", Value::String("event without time".into()))]),
+            wm(99),
+        )
+        .unwrap();
+        idx.commit().unwrap();
+        assert!(idx.aggregate(&matches("body", "event"), &req).unwrap().is_none());
     }
 
     #[test]

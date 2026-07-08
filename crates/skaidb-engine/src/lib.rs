@@ -2105,6 +2105,122 @@ mod tests {
     }
 
     #[test]
+    fn search_count_distinct_exact_on_both_paths() {
+        let mut db = agg_db();
+        // Global COUNT(DISTINCT) over the match set — pushdown path.
+        let rs = rows(
+            db.execute(
+                "SELECT COUNT(DISTINCT region) FROM sales WHERE MATCH(product, 'red')",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(2)]]); // east, west (NULL ignored)
+        // Grouped, and again with a residual predicate forcing the row
+        // fallback — identical results.
+        let pushed = sorted_groups(rows(
+            db.execute(
+                "SELECT region, COUNT(DISTINCT product) FROM sales \
+                 WHERE MATCH(product, 'widget') GROUP BY region",
+            )
+            .unwrap(),
+        ));
+        let fell = sorted_groups(rows(
+            db.execute(
+                "SELECT region, COUNT(DISTINCT product) FROM sales \
+                 WHERE MATCH(product, 'widget') AND id >= 0 GROUP BY region",
+            )
+            .unwrap(),
+        ));
+        assert_eq!(pushed, fell);
+        assert_eq!(
+            pushed,
+            vec![
+                vec![Value::String("east".into()), Value::Int(2)],
+                vec![Value::String("west".into()), Value::Int(1)],
+            ]
+        );
+    }
+
+    #[test]
+    fn search_time_bucket_histogram_pushdown() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE events (PRIMARY KEY (id))").unwrap();
+        db.execute(
+            "CREATE SEARCH INDEX events_fts ON events (msg, ts, v) WITH (\
+             ts.type = 'date', v.type = 'long')",
+        )
+        .unwrap();
+        const HOUR: i64 = 3_600_000;
+        let base: i64 = 1_700_000_000_000;
+        let floor = base - base.rem_euclid(HOUR);
+        for (i, (t, v)) in [(0, 1), (HOUR / 2, 2), (HOUR, 4), (3 * HOUR, 8)]
+            .iter()
+            .enumerate()
+        {
+            db.execute(&format!(
+                "INSERT INTO events (id, msg, ts, v) VALUES ({i}, 'alert fired', {}, {v})",
+                base + t
+            ))
+            .unwrap();
+        }
+        // Pushdown: date-histogram buckets, keys typed as timestamps (a
+        // `date` column's semantics). Documented typing nuance: integer-
+        // stored ts values come back Int from the row-fallback path
+        // (`time_bucket` preserves its input type per row) but Timestamp
+        // from the pushdown — the same instants either way.
+        let rs = rows(
+            db.execute(
+                "SELECT time_bucket(1h, ts), COUNT(*), SUM(v) FROM events \
+                 WHERE MATCH(msg, 'alert') GROUP BY time_bucket(1h, ts)",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            sorted_groups(rs),
+            vec![
+                vec![Value::Timestamp(floor), Value::Int(2), Value::Int(3)],
+                vec![Value::Timestamp(floor + HOUR), Value::Int(1), Value::Int(4)],
+                vec![Value::Timestamp(floor + 3 * HOUR), Value::Int(1), Value::Int(8)],
+            ]
+        );
+        // The fallback (HAVING) computes the same buckets and numbers,
+        // Int-keyed for these integer-stored rows.
+        let rs = rows(
+            db.execute(
+                "SELECT time_bucket(1h, ts), COUNT(*), SUM(v) FROM events \
+                 WHERE MATCH(msg, 'alert') GROUP BY time_bucket(1h, ts) \
+                 HAVING COUNT(*) >= 1",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            sorted_groups(rs),
+            vec![
+                vec![Value::Int(floor), Value::Int(2), Value::Int(3)],
+                vec![Value::Int(floor + HOUR), Value::Int(1), Value::Int(4)],
+                vec![Value::Int(floor + 3 * HOUR), Value::Int(1), Value::Int(8)],
+            ]
+        );
+        // A row missing ts makes the histogram inexact (it would lose the
+        // NULL group) — the pushdown detects that and the fallback serves
+        // it, NULL group included.
+        db.execute("INSERT INTO events (id, msg, v) VALUES (99, 'alert without time', 16)")
+            .unwrap();
+        let rs = rows(
+            db.execute(
+                "SELECT time_bucket(1h, ts), COUNT(*) FROM events \
+                 WHERE MATCH(msg, 'alert') GROUP BY time_bucket(1h, ts)",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows.len(), 4, "{:?}", rs.rows);
+        assert!(rs
+            .rows
+            .iter()
+            .any(|r| r[0] == Value::Null && r[1] == Value::Int(1)));
+    }
+
+    #[test]
     fn search_refresh_tick_commits_idle_writes() {
         // Write-path refresh checks only run on the next write: with no
         // follow-up traffic, the read-only path would never see the last

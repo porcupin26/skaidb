@@ -4127,10 +4127,26 @@ fn map_search_aggregate(sel: &Select) -> Option<(skaidb_fts::AggRequest, Vec<Agg
     if sel.having.is_some() || !sel.order_by.is_empty() || sel.offset.is_some() {
         return None;
     }
-    let group_by = match sel.group_by.as_slice() {
+    let group_expr = match sel.group_by.as_slice() {
         [] => None,
-        [Expr::Column(c)] => Some(c.clone()),
+        [g] => Some(g),
         _ => return None,
+    };
+    let group_by = match group_expr {
+        None => None,
+        Some(Expr::Column(c)) => Some(skaidb_fts::AggGroupBy::Keyword(c.clone())),
+        // `time_bucket(step, col)` over a declared date column becomes a
+        // fixed-interval date histogram (duration literals lex to ms ints).
+        Some(Expr::Func { name, args }) if name == "time_bucket" => match args.as_slice() {
+            [Expr::Literal(Value::Int(ms)), Expr::Column(c)] if *ms > 0 => {
+                Some(skaidb_fts::AggGroupBy::DateHistogram {
+                    column: c.clone(),
+                    interval_ms: *ms,
+                })
+            }
+            _ => return None,
+        },
+        Some(_) => return None,
     };
     let mut metrics = Vec::new();
     let mut outs = Vec::with_capacity(sel.items.len());
@@ -4138,14 +4154,26 @@ fn map_search_aggregate(sel: &Select) -> Option<(skaidb_fts::AggRequest, Vec<Agg
         let SelectItem::Expr { expr, .. } = item else {
             return None;
         };
+        if Some(expr) == group_expr {
+            outs.push(AggOut::GroupKey);
+            continue;
+        }
         match expr {
-            Expr::Column(c) if Some(c) == group_by.as_ref() => outs.push(AggOut::GroupKey),
             Expr::Aggregate { func, arg } => {
                 let metric = match (func, arg) {
                     (AggFunc::Count, AggArg::Star) => skaidb_fts::AggMetric {
                         func: skaidb_fts::AggMetricFunc::Count,
                         column: None,
                     },
+                    (AggFunc::Count, AggArg::Distinct(e)) => {
+                        let Expr::Column(col) = &**e else {
+                            return None;
+                        };
+                        skaidb_fts::AggMetric {
+                            func: skaidb_fts::AggMetricFunc::CountDistinct,
+                            column: Some(col.clone()),
+                        }
+                    }
                     (func, AggArg::Expr(e)) => {
                         let Expr::Column(col) = &**e else {
                             return None;
@@ -5751,9 +5779,26 @@ fn lower_aggregates(expr: &Expr, docs: &[Document]) -> Result<Expr> {
 }
 
 fn eval_aggregate(func: AggFunc, arg: &AggArg, docs: &[Document]) -> Result<Value> {
+    // `DISTINCT` is exact and COUNT-only (SQL semantics; an approximate
+    // HLL-style cardinality would need its own opt-in function).
+    if let AggArg::Distinct(e) = arg {
+        if func != AggFunc::Count {
+            return Err(EngineError::Unsupported(
+                "DISTINCT aggregate arguments are supported for COUNT only".into(),
+            ));
+        }
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        for doc in docs {
+            let v = eval(e, doc)?;
+            if !v.is_null() {
+                seen.insert(v.encode_key());
+            }
+        }
+        return Ok(Value::Int(seen.len() as i64));
+    }
     // Collect the (non-null) argument values for the group.
     let values: Vec<Value> = match arg {
-        AggArg::Star => Vec::new(),
+        AggArg::Star | AggArg::Distinct(_) => Vec::new(),
         AggArg::Expr(e) => {
             let mut vs = Vec::new();
             for doc in docs {
@@ -5769,7 +5814,7 @@ fn eval_aggregate(func: AggFunc, arg: &AggArg, docs: &[Document]) -> Result<Valu
     Ok(match func {
         AggFunc::Count => match arg {
             AggArg::Star => Value::Int(docs.len() as i64),
-            AggArg::Expr(_) => Value::Int(values.len() as i64),
+            AggArg::Expr(_) | AggArg::Distinct(_) => Value::Int(values.len() as i64),
         },
         AggFunc::Sum => sum_values(&values),
         AggFunc::Avg => {

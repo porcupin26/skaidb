@@ -170,22 +170,29 @@ WHERE SEARCH('+widget -clearance');   -- one global row
 Two serving paths produce identical results:
 
 - **Fast-field pushdown** (no row materialization): when the GROUP BY is a
-  single declared `keyword` column (or absent) and the items are that
-  column plus `COUNT(*)`/`COUNT(col)`/`SUM`/`AVG`/`MIN`/`MAX` over
-  declared numeric columns, the facets compute inside the index over fast
-  fields (Tantivy aggregations, ES's own machinery).
-- **Row fallback**: any other shape — text-column grouping, `time_bucket`
-  buckets, residual predicates, HAVING, ORDER BY — gathers the matching
-  rows (deduped by key at the coordinator, so correct at any replication
-  factor) and runs the ordinary grouped executor.
+  single declared `keyword` column, a `time_bucket(step, col)` over a
+  declared `date` column (a fixed-interval date histogram), or absent, and
+  the items are the group expression plus
+  `COUNT(*)`/`COUNT(col)`/`COUNT(DISTINCT col)`/`SUM`/`AVG`/`MIN`/`MAX`
+  over declared columns, the facets compute inside the index over fast
+  fields (Tantivy aggregations, ES's own machinery). `COUNT(DISTINCT)` is
+  **exact** — a nested terms-bucket count, never an HLL approximation.
+- **Row fallback**: any other shape — text-column grouping, residual
+  predicates, HAVING, ORDER BY — gathers the matching rows (deduped by
+  key at the coordinator, so correct at any replication factor) and runs
+  the ordinary grouped executor.
 
 SQL semantics hold on both paths: rows missing the group column form the
 NULL group, `SUM` over no values is NULL (ES-style aggregations would say
 0), and metric types follow the column declarations (`SUM` of a `long` is
 an integer). The pushdown is **exact or declined** — on a truncated bucket
-list or any count mismatch it silently falls back rather than
-approximate. Cluster mode pushes down when one index holds every row
-(single node, or RF ≥ member count); sharded corpora take the fallback.
+list or any count mismatch (e.g. a date histogram that would lose rows
+missing the date column) it silently falls back rather than approximate.
+Cluster mode pushes down when one index holds every row (single node, or
+RF ≥ member count); sharded corpora take the fallback. One typing nuance:
+`time_bucket` pushdown keys are timestamps (a `date` column's semantics),
+while the fallback preserves each row's stored type — store timestamp
+values (not bare integers) in date columns for consistent typing.
 
 ## Architecture
 

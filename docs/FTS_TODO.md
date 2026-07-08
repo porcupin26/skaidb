@@ -347,10 +347,22 @@ fleet-verified — the TS cadence)
     or a bucketed-vs-total mismatch — it never approximates.
   - [x] Cluster gate: pushdown serves locally when one index holds every
     row (single node, or RF ≥ members); sharded corpora take the fallback.
+  - [x] `time_bucket(step, col)` GROUP BY pushes down as a fixed-interval
+    date histogram over declared `date` columns (keys = floored ms
+    timestamps; gap-filling empty buckets dropped to match SQL; rows
+    missing the date column make it inexact → detected via
+    bucketed-vs-total, falls back so the NULL group survives). One
+    documented typing nuance: the pushdown keys are Timestamps while the
+    fallback preserves each row's stored type (Int for integer-stored ms).
+  - [x] `COUNT(DISTINCT col)` — new grammar (AggArg::Distinct, COUNT
+    only), **exact** on both paths: HashSet on the row fallback, nested
+    terms-bucket count in the pushdown (bails on truncation rather than
+    approximate à la HLL; keyword and numeric columns).
   - [ ] Sharded per-shard partials (needs per-key ownership filters — e.g.
     a ring-hash fast field — to avoid double-counting replicas).
-  - [ ] histogram/date_histogram pushdown (`time_bucket` GROUP BY works
-    today via the fallback), cardinality (HLL++), top_hits.
+  - [ ] top_hits (wants a SQL surface — window functions or a dedicated
+    per-group-top-k clause); approximate HLL cardinality as an opt-in
+    function if COUNT(DISTINCT)'s exact bail ever hurts.
   - [ ] **Exit**: agg parity + perf vs ES on the logs track (bench-pair
     campaign, same setup as the phase-5 exit).
 - [ ] **Phase 7 — search UX extras**: search_after, fast-field sort,

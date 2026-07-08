@@ -58,9 +58,20 @@ pub struct Watermark {
 /// cluster layer can ship it to peers.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AggRequest {
-    /// Keyword column to bucket by; `None` = a single global row.
-    pub group_by: Option<String>,
+    /// How to bucket; `None` = a single global row.
+    pub group_by: Option<AggGroupBy>,
     pub metrics: Vec<AggMetric>,
+}
+
+/// The bucketing of an [`AggRequest`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum AggGroupBy {
+    /// Terms buckets over a declared keyword column (SQL `GROUP BY col`).
+    Keyword(String),
+    /// Fixed-interval buckets over a declared date column (SQL
+    /// `GROUP BY time_bucket(step, col)`); keys are floored millisecond
+    /// timestamps, exactly like `time_bucket`.
+    DateHistogram { column: String, interval_ms: i64 },
 }
 
 /// One metric within an [`AggRequest`].
@@ -79,6 +90,10 @@ pub enum AggMetricFunc {
     Count,
     /// `COUNT(col)` — number of present values.
     ValueCount,
+    /// `COUNT(DISTINCT col)` — **exact** distinct count, computed as a
+    /// nested terms bucket count (bails to the row fallback rather than
+    /// approximate à la HLL when the term set would truncate).
+    CountDistinct,
     Sum,
     Avg,
     Min,

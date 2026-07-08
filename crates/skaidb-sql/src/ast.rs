@@ -417,6 +417,8 @@ pub enum AggArg {
     Star,
     /// An expression argument.
     Expr(Box<Expr>),
+    /// `COUNT(DISTINCT expr)` — distinct non-null values of the expression.
+    Distinct(Box<Expr>),
 }
 
 /// Aggregate functions (SPEC §3).

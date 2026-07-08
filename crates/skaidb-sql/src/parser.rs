@@ -1125,6 +1125,8 @@ impl Parser {
                 self.expect(&Token::LParen)?;
                 let arg = if self.eat(&Token::Star) {
                     AggArg::Star
+                } else if self.eat_keyword(Keyword::Distinct) {
+                    AggArg::Distinct(Box::new(self.parse_expr()?))
                 } else {
                     AggArg::Expr(Box::new(self.parse_expr()?))
                 };
