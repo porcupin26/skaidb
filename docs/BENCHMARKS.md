@@ -340,6 +340,27 @@ come from `cargo run --release --example index_bench -p skaidb-engine`
 Write consistency is set per node via `cluster.default_write_consistency`
 (`ONE` | `QUORUM` | `ALL`) and replication factor via `cluster.replication_factor`.
 
+## Sharded scatter partials — fleet verification (v0.57.0, 2026-07-09)
+
+3-LXC fleet on shared hardware (1 GB memory target each), **RF = 2 over 3
+members** — a genuinely sharded corpus, every document replicated twice.
+100,000 deterministic log docs (text `msg`, keyword `level`, long
+`bytes`) ingested over the ES bulk endpoint; ground truth computed
+independently from the generator.
+
+- **Parity**: grouped per-level counts, global
+  `COUNT(*)`/`SUM`/`MIN`/`MAX` (24,998 matching docs), and `AVG` (row
+  fallback) — exact from **every** coordinator. Double replication never
+  double-counted: the ownership arcs tile the key-space.
+- **Latency** (grouped count over `MATCH`, p50/p95 of 15 runs, warm):
+  partials **169 / 180 ms** vs forced row fallback **598 / 668 ms** —
+  ~3.5× at this size, and the gap itself proves which path served.
+- **Kill**: with one member down the scatter declines and the fallback
+  answers **exactly** (RF = 2 keeps every key on a survivor) at ~990 ms;
+  after rejoin the partials path restores (169 ms, exact).
+- **Reshard**: live remove-node → 2 members (RF ≥ members local path,
+  exact) → re-add at a new epoch → sharded path back, exact.
+
 ## Performance engineering notes
 
 *Absorbed from the standalone performance audit (originally 2026-07-03,
