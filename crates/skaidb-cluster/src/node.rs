@@ -30,6 +30,7 @@ use skaidb_storage::{Hlc, HlcClock, WalCommit, WalSync};
 use skaidb_types::{Document, Value};
 
 use crate::internode::{self, Pending, Request, Response};
+use crate::memguard::MemoryGuard;
 use crate::quorum::Consistency;
 use crate::ring::{NodeId, Ring};
 use crate::transport::Authenticator;
@@ -176,6 +177,10 @@ pub struct Node {
     /// this sender and the worker exits — the same lifetime the detached
     /// per-write threads had.
     bg: mpsc::SyncSender<BgTask>,
+    /// Memory-pressure load shedding: under memory pressure the write path
+    /// rejects new writes so the node can drain and survive instead of being
+    /// OOM-killed. Sampled by a background thread ([`MemoryGuard`]).
+    mem: MemoryGuard,
     /// Whether a [`BgTask::FlushHints`] is already queued — coalesces the
     /// per-write flush trigger into at most one outstanding task.
     hint_flush_queued: AtomicBool,
@@ -266,6 +271,11 @@ pub struct ClusterStats {
     pub hints_replayed: u64,
     pub peer_requests: u64,
     pub peer_errors: u64,
+    /// Memory-pressure load shedding: whether the node is currently rejecting
+    /// writes, and its last sampled usage / limit (bytes; limit 0 = no limit).
+    pub shedding_writes: bool,
+    pub memory_used_bytes: u64,
+    pub memory_limit_bytes: u64,
 }
 
 /// A buffered write awaiting handoff to a recovered replica:
@@ -443,11 +453,22 @@ impl Node {
             write_watermark: AtomicU64::new(0),
             membership_lock: Mutex::new(()),
             bg,
+            mem: MemoryGuard::new(),
             hint_flush_queued: AtomicBool::new(false),
             migration_batch: AtomicUsize::new(1024),
             migration_pause_ms: AtomicU64::new(0),
             counters: Counters::default(),
             cfg,
+        });
+        // Memory-pressure sampler: holds a `Weak`, so it exits when the node is
+        // dropped. Updates the shedding flag every `SAMPLE_INTERVAL`.
+        let mem_weak = Arc::downgrade(&node);
+        thread::spawn(move || {
+            while let Some(node) = mem_weak.upgrade() {
+                node.mem.sample();
+                drop(node); // don't hold the node alive across the sleep
+                thread::sleep(crate::memguard::SAMPLE_INTERVAL);
+            }
         });
         // The background worker holds only a `Weak`, so it can't keep the node
         // alive; it exits when the node is dropped (the sender closes).
@@ -655,7 +676,16 @@ impl Node {
             hints_replayed: c.hints_replayed.load(Ordering::Relaxed),
             peer_requests: c.peer_requests.load(Ordering::Relaxed),
             peer_errors: c.peer_errors.load(Ordering::Relaxed),
+            shedding_writes: self.mem.shedding(),
+            memory_used_bytes: self.mem.snapshot().0,
+            memory_limit_bytes: self.mem.snapshot().1,
         }
+    }
+
+    /// Force the memory-shedding flag (tests only).
+    #[cfg(test)]
+    pub(crate) fn set_shedding_for_test(&self, on: bool) {
+        self.mem.force(on);
     }
 
     /// Host system statistics for every member: this node sampled locally,
@@ -3048,6 +3078,15 @@ impl Node {
                     _ => Response::Err("bad search-agg request".into()),
                 }
             }
+            // Inbound replica writes are shed under memory pressure too, so a
+            // pressured node stops accepting the coordinator's replication
+            // (which then hints it for handoff once it recovers) — not just
+            // its own client writes. Reads and DDL are never shed.
+            Request::ApplyPut { .. } | Request::ApplyDelete { .. } | Request::ApplyBatch { .. }
+                if self.mem.shedding() =>
+            {
+                Response::Err(shed_error().to_string())
+            }
             Request::ApplyPut {
                 table,
                 key,
@@ -3418,6 +3457,9 @@ impl Node {
         hlc: Hlc,
         oc: Option<Consistency>,
     ) -> EngineResult<()> {
+        if self.mem.shedding() {
+            return Err(shed_error());
+        }
         self.counters.writes_total.fetch_add(1, Ordering::Relaxed);
         self.note_local_write(hlc);
         let replicas = self.replicas_for(key);
@@ -3570,6 +3612,9 @@ impl Node {
     ) -> EngineResult<()> {
         if rows.is_empty() {
             return Ok(());
+        }
+        if self.mem.shedding() {
+            return Err(shed_error());
         }
         self.counters
             .writes_total
@@ -4636,6 +4681,13 @@ fn write_response(result: EngineResult<()>) -> Response {
         Ok(()) => Response::Ack,
         Err(e) => Response::Err(e.to_string()),
     }
+}
+
+/// The error returned for a write rejected by memory-pressure load shedding.
+/// Retryable — the client (or coordinator, which then hints the replica)
+/// should back off and retry once the node has drained and recovered.
+fn shed_error() -> EngineError {
+    EngineError::Cluster("memory pressure: node is shedding writes, retry".into())
 }
 
 /// Path of the per-joiner migration checkpoint file in a node's data directory.
@@ -7864,5 +7916,88 @@ mod tests {
         // Reads meet read quorum (a + b respond).
         let rs = rows(nb.execute("SELECT id FROM t ORDER BY id").unwrap());
         assert_eq!(rs.rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+    }
+
+    /// Under memory pressure the node sheds *writes* (with a retryable
+    /// error) so it can drain and survive instead of being OOM-killed —
+    /// while reads and DDL keep working. Recovery re-enables writes.
+    #[test]
+    fn memory_pressure_sheds_writes_not_reads() {
+        let (a, b) = (free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b)];
+        let na = Node::new(
+            Database::open(temp_dir("shed_a")).unwrap(),
+            cfg("a", &a, &members, Consistency::One, Consistency::One),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("shed_b")).unwrap(),
+            cfg("b", &b, &members, Consistency::One, Consistency::One),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        na.execute("INSERT INTO t (id) VALUES (1)").unwrap();
+
+        // Enter memory pressure: writes are rejected with a retryable error.
+        na.set_shedding_for_test(true);
+        let err = na.execute("INSERT INTO t (id) VALUES (2)").unwrap_err();
+        assert!(err.to_string().contains("memory pressure"), "got: {err}");
+        assert!(na.stats().shedding_writes);
+        // Reads are never shed.
+        let rs = rows(na.execute("SELECT count(*) FROM t").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::Int(1)]]);
+
+        // Recovered: writes resume.
+        na.set_shedding_for_test(false);
+        na.execute("INSERT INTO t (id) VALUES (2)").unwrap();
+        let rs = rows(na.execute("SELECT count(*) FROM t").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::Int(2)]]);
+    }
+
+    /// A replica that is *up but unresponsive* — it accepts the TCP
+    /// connection but never answers (a node thrashing under memory pressure,
+    /// a kernel that accepted the socket while the process is stalled) — must
+    /// not hang a quorum write. Distinct from a *refused* connection (the
+    /// test above), which fails fast on connect; this one connects, so
+    /// without a socket read timeout the coordinator's `recv` would block on
+    /// it forever. The write must still succeed via the two live replicas and
+    /// hint the black hole. Bounded by `transport::IO_TIMEOUT` (1s in tests).
+    #[test]
+    fn quorum_write_survives_unresponsive_replica() {
+        let (a, b, blackhole) = (free_addr(), free_addr(), free_addr());
+        // Black hole: accept connections and hold them open, never replying.
+        let listener = TcpListener::bind(&blackhole).unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming().flatten() {
+                held.push(stream); // keep the socket open; never read/respond
+            }
+        });
+
+        let members = vec![member("a", &a), member("b", &b), member("bh", &blackhole)];
+        let na = Node::new(
+            Database::open(temp_dir("bh_a")).unwrap(),
+            cfg("a", &a, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("bh_b")).unwrap(),
+            cfg("b", &b, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        // The write must return Ok (quorum: a + b), and must not hang on the
+        // black hole — bounded by the socket read timeout.
+        let start = std::time::Instant::now();
+        na.execute("INSERT INTO t (id, v) VALUES (1, 'x')").unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(8),
+            "write hung on the unresponsive replica: {elapsed:?}"
+        );
+        // The two live replicas hold the data.
+        let rs = rows(nb.execute("SELECT v FROM t WHERE id = 1").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::String("x".into())]]);
     }
 }

@@ -6,6 +6,7 @@
 
 pub mod host;
 pub mod internode;
+pub mod memguard;
 mod node;
 mod quorum;
 mod ring;

@@ -511,6 +511,10 @@ pub fn collect_runtime_metrics(ctx: &Shared) {
         m.set("skaidb_cluster_members", c.members as u64);
         m.set("skaidb_cluster_resharding", u64::from(c.resharding_active));
         m.set("skaidb_cluster_hints_pending", c.hints_pending as u64);
+        // Memory-pressure load shedding.
+        m.set("skaidb_memory_shedding_writes", u64::from(c.shedding_writes));
+        m.set("skaidb_memory_used_bytes", c.memory_used_bytes);
+        m.set("skaidb_memory_limit_bytes", c.memory_limit_bytes);
         m.set(
             &format!("skaidb_cluster_writes_total{{consistency=\"{}\"}}", c.write_consistency),
             c.writes_total,

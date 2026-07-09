@@ -360,6 +360,28 @@ same material on every node and restart them together. Client auth is separate �
 SCRAM on the binary endpoint and HTTP Basic on REST, plus RBAC; see the
 [README](../README.md).
 
+## Resilience
+
+- **A slow or unresponsive replica cannot hang a write.** Every internode
+  connection has a bounded read/write timeout, so a peer that is *up but
+  not answering* (thrashing under memory pressure, a kernel that accepted
+  the socket while the process is stalled) is failed fast — the coordinator
+  meets the write quorum from the responsive replicas and hints the slow
+  one for handoff, rather than blocking on it. (A *refused* connection
+  already failed fast on connect; this covers the connected-but-silent
+  case.)
+- **Memory-pressure load shedding.** A node watches its memory against its
+  limit (cgroup when set, else system RAM). Past 85% it **sheds writes** —
+  rejecting new writes (client and inbound-replica) with a retryable
+  "memory pressure" error — so it can flush the memtable and commit/merge
+  search segments, shrink its footprint, and leave the OS headroom, instead
+  of allocating until the OOM killer takes the whole container down. It
+  clears the flag at 70% (hysteresis). Reads and DDL are never shed; a
+  coordinator that gets a shed rejection from a replica hints it and
+  proceeds at quorum. Watch `skaidb_memory_shedding_writes` /
+  `skaidb_memory_used_bytes` (METRICS.md); a node stuck shedding is
+  undersized for its workload.
+
 ## Operational notes & limitations
 
 - **Same RF and seed list on every node.** A node's own `bind_addr:internode_port`

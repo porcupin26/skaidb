@@ -30,6 +30,22 @@ use skaidb_proto::{read_frame, write_frame};
 /// generate node certs with `DNS:skaidb`.)
 const TLS_SERVER_NAME: &str = "skaidb";
 
+/// Read/write timeout on every internode connection, including the pooled
+/// data-path ones. Without it, a peer that is connected but unresponsive (a
+/// node thrashing under memory pressure, a kernel that accepted the socket
+/// while the process is stalled) would block a coordinator's `recv` on that
+/// peer **forever** — so a single sick replica hangs the whole write instead
+/// of the coordinator failing it fast and proceeding at quorum + hinted
+/// handoff. Generous enough that a healthy-but-busy peer still answers within
+/// it (a slow response only costs an unnecessary hint, which repair
+/// reconciles); short enough that a truly hung peer can't stall a quorum
+/// write past a client's patience.
+#[cfg(not(test))]
+pub const IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Tests use a short bound so a black-hole peer fails fast.
+#[cfg(test)]
+pub const IO_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// An authenticated internode connection: plain TCP, or TLS over TCP. Reads go
 /// through an internal buffer so a length-prefixed frame read doesn't hit the
 /// stream twice per message (once for the length, once for the payload); writes
@@ -204,6 +220,14 @@ impl Authenticator {
             }
             None => TcpStream::connect(addr)?,
         };
+        // Bound reads/writes on every connection (the probe path set its own
+        // above; the pooled data path had none, so a hung peer blocked a
+        // coordinator's recv forever — see `IO_TIMEOUT`). Explicit probe
+        // timeouts, when shorter, are kept.
+        if timeout.is_none() {
+            tcp.set_read_timeout(Some(IO_TIMEOUT)).ok();
+            tcp.set_write_timeout(Some(IO_TIMEOUT)).ok();
+        }
         tcp.set_nodelay(true).ok();
 
         match self {

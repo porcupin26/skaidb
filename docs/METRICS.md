@@ -152,6 +152,8 @@ coordinator at scrape time.
 | `skaidb_cluster_hints_replayed_total` | counter | — | Hinted-handoff writes successfully replayed. |
 | `skaidb_cluster_hints_pending` | gauge | — | Hints currently buffered (all peers). |
 | `skaidb_cluster_hints_pending_peer` | gauge | `peer` | Hints buffered **per peer** — exact replication backlog for that node. |
+| `skaidb_memory_shedding_writes` | gauge | — | 1 while the node is shedding writes under memory pressure (rejecting new writes so it can drain instead of being OOM-killed). **Alert on sustained 1.** |
+| `skaidb_memory_used_bytes` / `skaidb_memory_limit_bytes` | gauge | — | Sampled memory usage vs. the node's limit (cgroup when set, else system RAM); shedding starts at 85% and clears at 70%. |
 | `skaidb_cluster_replication_lag_ms` | gauge | `peer` | Approx. ms between this node's HLC frontier and the latest write it has confirmed `peer` applied. |
 | `skaidb_cluster_peer_requests_total` | counter | — | Internode RPCs issued by the coordinator. |
 | `skaidb_cluster_peer_errors_total` | counter | — | Internode RPCs that errored or timed out. |
