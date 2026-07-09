@@ -1158,6 +1158,62 @@ mod tests {
         assert!(body.contains("hello"), "got: {body}");
     }
 
+    /// `POST /insert` writes whole JSON documents — including nested
+    /// objects/arrays that SQL `INSERT` cannot express — into a chosen
+    /// database, and overwrites on the primary key (upsert).
+    #[test]
+    fn rest_json_insert_end_to_end() {
+        let ctx = temp_ctx();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
+
+        let post = |path: &str, body: &str| -> (u16, String) {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            let req = format!(
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(req.as_bytes()).unwrap();
+            let mut resp = String::new();
+            stream.read_to_string(&mut resp).unwrap();
+            let status = resp.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let b = resp.split_once("\r\n\r\n").map(|(_, x)| x.to_string()).unwrap_or_default();
+            (status, b)
+        };
+
+        assert!(http_post(addr, "CREATE DATABASE app").contains("\"ok\":true"));
+        assert!(
+            http_post(addr, "{\"sql\":\"CREATE TABLE cache (PRIMARY KEY (k))\",\"db\":\"app\"}")
+                .contains("\"ok\":true")
+        );
+
+        // Insert two docs with a nested `data` object + array, into db `app`.
+        let (st, body) = post(
+            "/insert",
+            r#"{"db":"app","table":"cache","rows":[
+                 {"k":"a","data":{"page":2,"products":[{"id":1},{"id":2}]}},
+                 {"k":"b","data":{"page":0,"products":[]}}
+               ]}"#,
+        );
+        assert_eq!(st, 200, "{body}");
+        assert!(body.contains("\"inserted\":2"), "{body}");
+
+        // Read back: the nested doc round-trips, and a dotted path into it
+        // is queryable (proving it's a real document, not an opaque blob).
+        let got = http_post(addr, "{\"sql\":\"SELECT data.page FROM cache WHERE k = 'a'\",\"db\":\"app\"}");
+        assert!(got.contains('2'), "nested path not queryable: {got}");
+
+        // Same PK overwrites (upsert).
+        let (st, _) = post("/insert", r#"{"db":"app","table":"cache","rows":[{"k":"a","data":{"page":9}}]}"#);
+        assert_eq!(st, 200);
+        let got = http_post(addr, "{\"sql\":\"SELECT data.page FROM cache WHERE k = 'a'\",\"db\":\"app\"}");
+        assert!(got.contains('9'), "upsert did not overwrite: {got}");
+
+        // Empty rows is a no-op; a missing table is a 400.
+        assert_eq!(post("/insert", r#"{"db":"app","table":"cache","rows":[]}"#).0, 200);
+        assert_eq!(post("/insert", r#"{"db":"app","rows":[{"k":"z"}]}"#).0, 400);
+    }
+
     #[test]
     fn metrics_endpoint_reports_query_counts() {
         let ctx = temp_ctx();

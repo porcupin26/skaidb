@@ -229,11 +229,34 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) -> io::Result<()> {
         }
     }
 
+    // JSON-native document insert/upsert: `POST /insert` with
+    // `{"db": "...", "table": "...", "rows": [{...}, ...]}`. Writes whole
+    // documents — including nested objects and arrays, which SQL `INSERT`
+    // cannot express as literals — the document-store-native write path.
+    // Overwrites on the primary key (last-writer-wins), so it is also the
+    // upsert. RBAC and replication go through the ordinary session path
+    // (needs `Insert` on the target table/database).
+    if req.method == "POST" && req.path.starts_with("/insert") {
+        let role = if ctx.authn.required {
+            match basic_auth_role(&ctx, req.authorization.as_deref()) {
+                Some(role) => role,
+                None => return write_unauthorized(&mut stream),
+            }
+        } else {
+            ctx.superuser_role.clone()
+        };
+        let (status, payload) = handle_insert(&ctx, &role, &req.body);
+        let body = payload.to_string();
+        ctx.metrics
+            .add_bytes_returned(Endpoint::Rest, body.len() as u64);
+        return write_json_body(&mut stream, status, &body);
+    }
+
     if req.method != "POST" || !req.path.starts_with("/query") {
         return write_response(
             &mut stream,
             404,
-            &json!({"error": "use POST /query with a SQL body, or GET /metrics"}),
+            &json!({"error": "use POST /query with a SQL body, POST /insert with JSON rows, or GET /metrics"}),
         );
     }
 
@@ -373,6 +396,95 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// Handle `POST /insert`: `{"db"?: "...", "table": "...", "rows": [{...}]}`.
+/// Each row is a JSON object; its fields become columns and its values —
+/// including nested objects/arrays — become the stored document (via
+/// `Value::from_json`, the same conversion the ES gateway uses). Rows with
+/// the same set of columns are batched into one multi-row `INSERT` so a
+/// homogeneous load is one replicated batch. Returns `{"inserted": n}`.
+fn handle_insert(ctx: &Shared, role: &str, body: &[u8]) -> (u16, Json) {
+    use skaidb_sql::ast::{Expr, Insert, Statement};
+    use skaidb_types::Value;
+
+    let parsed: Json = match serde_json::from_slice(body) {
+        Ok(j) => j,
+        Err(e) => return (400, json!({"error": format!("invalid JSON body: {e}")})),
+    };
+    let obj = match parsed.as_object() {
+        Some(o) => o,
+        None => return (400, json!({"error": "body must be a JSON object"})),
+    };
+    let table = match obj.get("table").and_then(|v| v.as_str()) {
+        Some(t) if !t.is_empty() => t.to_string(),
+        _ => return (400, json!({"error": "missing \"table\""})),
+    };
+    let db = match obj.get("db") {
+        Some(Json::String(d)) if !d.is_empty() => d.clone(),
+        _ => skaidb_engine::DEFAULT_DATABASE.to_string(),
+    };
+    let rows = match obj.get("rows").and_then(|v| v.as_array()) {
+        Some(r) if !r.is_empty() => r,
+        Some(_) => return (200, json!({"inserted": 0})),
+        None => return (400, json!({"error": "missing \"rows\" array"})),
+    };
+
+    // Group rows by their (sorted) column set so a homogeneous batch becomes
+    // one multi-row INSERT; heterogeneous docs fall into separate groups.
+    // First-seen order is preserved for determinism.
+    let mut groups: Vec<(Vec<String>, Vec<Vec<Expr>>)> = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let Some(fields) = row.as_object() else {
+            return (400, json!({"error": format!("row {i} is not a JSON object")}));
+        };
+        let mut cols: Vec<String> = fields.keys().cloned().collect();
+        cols.sort();
+        let values: Vec<Expr> = cols
+            .iter()
+            .map(|c| Expr::Literal(Value::from_json(fields[c].clone())))
+            .collect();
+        match groups.iter_mut().find(|(c, _)| *c == cols) {
+            Some((_, rows)) => rows.push(values),
+            None => groups.push((cols, vec![values])),
+        }
+    }
+
+    let mut inserted = 0usize;
+    for (columns, group_rows) in groups {
+        let n = group_rows.len();
+        let stmt = Statement::Insert(Insert {
+            table: table.clone(),
+            columns,
+            rows: group_rows,
+        });
+        let mut current_db = db.clone();
+        let resp = crate::shared::execute_session_statement_as(
+            ctx,
+            role,
+            &mut current_db,
+            "INSERT (JSON)",
+            Ok(stmt),
+            None,
+        );
+        match resp {
+            Response::Mutation { .. } | Response::Ddl => inserted += n,
+            Response::Error(e) => {
+                let status = if e.contains("permission denied") { 403 } else { 400 };
+                return (
+                    status,
+                    json!({"error": e, "inserted": inserted}),
+                );
+            }
+            other => {
+                return (
+                    500,
+                    json!({"error": format!("unexpected response: {other:?}"), "inserted": inserted}),
+                );
+            }
+        }
+    }
+    (200, json!({"inserted": inserted}))
 }
 
 /// Accept either a raw SQL body or `{"sql": "..."}`.
