@@ -45,6 +45,21 @@ pub struct HostStats {
     /// The filesystem holding the data directory.
     pub disk_total_bytes: u64,
     pub disk_available_bytes: u64,
+    /// Seconds since this node's process started.
+    #[serde(default)]
+    pub uptime_secs: u64,
+    /// Process starts since the data directory was created (persisted
+    /// counter), minus the first — i.e. restarts.
+    #[serde(default)]
+    pub restarts: u64,
+    /// Kernel OOM kills observed in this node's cgroup across its lifetime
+    /// (why a node restarted, when the cause was memory).
+    #[serde(default)]
+    pub oom_kills: u64,
+    /// Set by a coordinator when this snapshot was served from cache because
+    /// the node missed a probe: seconds since it last answered. 0 = fresh.
+    #[serde(default)]
+    pub stale_secs: u64,
 }
 
 /// Baseline for rate computation, plus the rates computed at the last
@@ -80,6 +95,9 @@ pub fn sample(data_dir: &Path) -> HostStats {
     let (mem_total, mem_used) = memory().unwrap_or((0, 0));
     s.mem_total_bytes = mem_total;
     s.mem_used_bytes = mem_used;
+    s.uptime_secs = process_uptime_secs().unwrap_or(0);
+    s.restarts = read_runtime_counter(data_dir, "starts").saturating_sub(1);
+    s.oom_kills = cgroup_oom_kills().unwrap_or(0);
     if let Some((total, avail)) = fs_space(data_dir) {
         s.disk_total_bytes = total;
         s.disk_available_bytes = avail;
@@ -258,9 +276,75 @@ fn fs_space(dir: &Path) -> Option<(u64, u64)> {
     Some((total * 1024, avail * 1024))
 }
 
+/// Seconds since this process started (`/proc/self/stat` field 22, jiffies
+/// since boot, against `/proc/uptime`). `None` off Linux.
+fn process_uptime_secs() -> Option<u64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // Field 2 (comm) may contain spaces — parse after the closing paren.
+    let after = &stat[stat.rfind(')')? + 2..];
+    let start_jiffies: u64 = after.split_whitespace().nth(19)?.parse().ok()?;
+    let uptime: f64 = std::fs::read_to_string("/proc/uptime")
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    let hz = 100.0; // USER_HZ; universal on the targets we ship
+    Some((uptime - start_jiffies as f64 / hz).max(0.0) as u64)
+}
+
+/// Kernel OOM kills in this cgroup (cgroup v2 `memory.events`).
+fn cgroup_oom_kills() -> Option<u64> {
+    let s = std::fs::read_to_string("/sys/fs/cgroup/memory.events").ok()?;
+    s.lines()
+        .find_map(|l| l.strip_prefix("oom_kill "))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// Read a persisted runtime counter (`<data_dir>/runtime/<name>`), 0 if absent.
+pub fn read_runtime_counter(data_dir: &Path, name: &str) -> u64 {
+    std::fs::read_to_string(data_dir.join("runtime").join(name))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Record a process start in `<data_dir>/runtime/`: bump the persistent
+/// `starts` counter and diff the cgroup's lifetime OOM-kill count against the
+/// value saved at the previous start. Returns `(starts, new_oom_kills)` —
+/// a nonzero second value means the previous run (or its container peers)
+/// died to the kernel OOM killer since the last start, which is the reason
+/// worth logging for an unexplained restart.
+pub fn record_start(data_dir: &Path) -> (u64, u64) {
+    let dir = data_dir.join("runtime");
+    let _ = std::fs::create_dir_all(&dir);
+    let starts = read_runtime_counter(data_dir, "starts") + 1;
+    let _ = std::fs::write(dir.join("starts"), starts.to_string());
+    let ooms_now = cgroup_oom_kills().unwrap_or(0);
+    let ooms_prev = read_runtime_counter(data_dir, "oom_kills_at_start");
+    let _ = std::fs::write(dir.join("oom_kills_at_start"), ooms_now.to_string());
+    (starts, ooms_now.saturating_sub(ooms_prev))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_start_counts_and_detects_oom_delta() {
+        let dir = std::env::temp_dir().join(format!("skaidb-runtime-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (starts1, ooms1) = record_start(&dir);
+        assert_eq!(starts1, 1);
+        let _ = ooms1; // depends on the host's cgroup — just must not panic
+        let (starts2, ooms2) = record_start(&dir);
+        assert_eq!(starts2, 2);
+        // Same boot, no new OOM kills between the two calls.
+        assert_eq!(ooms2, 0);
+        assert_eq!(read_runtime_counter(&dir, "starts"), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn sample_reads_something() {

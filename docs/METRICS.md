@@ -177,6 +177,29 @@ and the UI **members** panel renders a **backlog** column (buffered writes owed 
 that node — nonzero is flagged) and a **lag** column (that node's replication lag),
 so you can see at a glance how far behind each node is.
 
+## The `node_stats` table (replicated host statistics)
+
+With `observability.node_stats` (default **on**), every node INSERTs its own
+host statistics — CPU, load, memory, disk I/O and space, uptime, **restart
+count**, and **cgroup OOM kills** — into the replicated `node_stats` table
+every `node_stats_interval_secs` (default 1 s, live-mutable): one row per
+node, keyed on the node id, stamped with the sample time (`ts`, epoch ms).
+The row replicates like any write, so any member serves the whole cluster's
+picture from a local read, and it is plain SQL:
+
+```sql
+SELECT node, ts, mem_used_bytes, restarts, oom_kills FROM node_stats;
+```
+
+The UI's stats **NODES** table reads this (falling back to live probes for
+members without a fresh row, e.g. mid rolling-upgrade) and shows each row's
+**age** — a silently struggling node dims and its age climbs, instead of the
+old behavior where one missed probe flapped a live node to "unreachable".
+Node restarts log their start number, and when the cgroup's OOM-kill count
+advanced since the previous start, the log says the prior run likely died to
+the OOM killer. Probe-loss/recovery transitions and circuit-breaker events
+are logged on the coordinator as well.
+
 ## Logs
 
 Audit/query/login logs are written to stderr in human-readable text by default.

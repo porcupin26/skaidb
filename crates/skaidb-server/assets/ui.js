@@ -799,12 +799,24 @@ function renderHosts(hosts, status) {
     if (!n.reachable) {
       tr.append(cell(n.id));
       const td = cell("unreachable");
-      td.colSpan = 8;
+      td.colSpan = 11;
       td.className = "muted";
       tr.append(td);
       tbody.append(tr);
       continue;
     }
+    // Stale rows (node hasn't reported recently) dim instead of vanishing —
+    // last-known data plus its age beats a flapping "unreachable".
+    const age = n.stale_secs || 0;
+    if (age > 10) tr.style.opacity = "0.55";
+    const restarts = cell(
+      n.oom_kills > 0 ? `${n.restarts || 0} (${n.oom_kills} oom)` : `${n.restarts || 0}`,
+    );
+    if (n.oom_kills > 0) restarts.className = "warn";
+    const ageCell = cell(age > 0 ? fmtDuration(age) : "now");
+    if (age > 60) ageCell.className = "bad";
+    else if (age > 10) ageCell.className = "warn";
+    else ageCell.className = "muted";
     tr.append(
       cell(n.id),
       cell(`${n.cpu_percent.toFixed(1)}% of ${n.cpus}`),
@@ -815,6 +827,9 @@ function renderHosts(hosts, status) {
       cell(`${fmtBytes(n.disk_write_bps)}/s`),
       cell(usedOfTotal(n.disk_total_bytes - n.disk_available_bytes, n.disk_total_bytes)),
       replLagCell(peers.get(n.id), n.id === selfId),
+      cell(n.uptime_secs ? fmtDuration(n.uptime_secs) : "—"),
+      restarts,
+      ageCell,
     );
     tbody.append(tr);
   }
@@ -831,6 +846,9 @@ function renderHosts(hosts, status) {
       cell(`${fmtBytes(c.disk_read_bps)}/s`),
       cell(`${fmtBytes(c.disk_write_bps)}/s`),
       cell(usedOfTotal(c.disk_total_bytes - c.disk_available_bytes, c.disk_total_bytes)),
+      cell(""),
+      cell(""),
+      cell(""),
       cell(""),
     );
     tbody.append(tr);

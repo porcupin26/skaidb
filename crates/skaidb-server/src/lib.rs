@@ -12,6 +12,7 @@ pub mod authn;
 mod es;
 pub mod binary;
 pub mod memory;
+mod nodestats;
 mod promql;
 mod promwrite;
 pub mod metrics;
@@ -163,6 +164,24 @@ pub fn run(
     };
     let db = Database::open_with_options(&config.server.data_dir, storage_opts)?;
 
+    // Restart accounting: bump the persistent start counter and, when the
+    // cgroup's OOM-kill count moved since the previous start, say so — the
+    // most common "why did this node restart" answer on small nodes, and
+    // otherwise invisible (the OOM killer leaves no trace in our own logs).
+    {
+        let (starts, new_ooms) = skaidb_cluster::host::record_start(std::path::Path::new(
+            &config.server.data_dir,
+        ));
+        if new_ooms > 0 {
+            skaidb_types::slog!(
+                "skaidb: start #{starts} — {new_ooms} kernel OOM kill(s) in this cgroup since \
+                 the previous start (the last run likely died to the OOM killer)"
+            );
+        } else if starts > 1 {
+            skaidb_types::slog!("skaidb: start #{starts}");
+        }
+    }
+
     // Require auth only when SCRAM is enabled and a superuser password is set.
     let auth_required = config.auth.scram_enabled && !config.auth.superuser_password.is_empty();
     let mut authn = if auth_required {
@@ -303,6 +322,46 @@ pub fn run(
                 if let Err(e) = crate::promwrite::self_scrape_tick(&ctx) {
                     eprintln!("skaidb self-scrape: {e}");
                 }
+            }
+        });
+    }
+
+    // Node-stats publishing (`observability.node_stats`, live-mutable):
+    // INSERT this node's host stats into the replicated `node_stats` table
+    // every `node_stats_interval_secs` (default 1s), timestamped — the
+    // dashboard reads the table (data + age) instead of probing peers, so a
+    // missed probe can't flap a live node to "unreachable".
+    {
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let mut ensured = false;
+            let mut last = std::time::Instant::now();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let (on, every) = ctx
+                    .config
+                    .read()
+                    .map(|c| {
+                        (
+                            c.observability.node_stats,
+                            c.observability.node_stats_interval_secs.max(1),
+                        )
+                    })
+                    .unwrap_or((false, 1));
+                if !on || last.elapsed().as_secs() < every {
+                    continue;
+                }
+                last = std::time::Instant::now();
+                if !ensured {
+                    // The cluster may not be ready at boot; keep trying.
+                    ensured = crate::nodestats::ensure_table(&ctx).is_ok();
+                    if !ensured {
+                        continue;
+                    }
+                }
+                // Best-effort: a shedding/degraded tick is skipped, and the
+                // row's age surfaces exactly that on the dashboard.
+                let _ = crate::nodestats::publish_tick(&ctx);
             }
         });
     }
@@ -1030,6 +1089,31 @@ mod tests {
             }
             other => panic!("expected rows, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn node_stats_publish_and_read_back() {
+        let ctx = temp_ctx();
+        crate::nodestats::ensure_table(&ctx).unwrap();
+        crate::nodestats::publish_tick(&ctx).unwrap();
+        // Read back through the dashboard path: one fresh row for this node,
+        // with real host numbers and ~zero age.
+        let rows = crate::nodestats::read_all(&ctx);
+        assert_eq!(rows.len(), 1, "one row per node");
+        let (node, stats, age) = &rows[0];
+        assert!(!node.is_empty());
+        assert!(stats.mem_total_bytes > 0, "host stats round-trip");
+        assert!(*age <= 2, "fresh row, age {age}s");
+        // Re-publishing overwrites the same row (PK = node), never grows.
+        crate::nodestats::publish_tick(&ctx).unwrap();
+        assert_eq!(crate::nodestats::read_all(&ctx).len(), 1);
+        // The stats view is plain SQL — exactly what the dashboard reads.
+        let resp = crate::shared::execute_as(
+            &ctx,
+            "superuser",
+            "SELECT node, restarts FROM node_stats",
+        );
+        assert!(matches!(resp, Response::Rows { rows, .. } if rows.len() == 1));
     }
 
     #[test]

@@ -122,6 +122,11 @@ pub struct Cli {
     pub self_scrape: Option<bool>,
     #[arg(long, env = "SKAIDB_SELF_SCRAPE_INTERVAL_SECS")]
     pub self_scrape_interval_secs: Option<u64>,
+    /// Publish this node's host stats into the replicated `node_stats` table.
+    #[arg(long, env = "SKAIDB_NODE_STATS")]
+    pub node_stats: Option<bool>,
+    #[arg(long, env = "SKAIDB_NODE_STATS_INTERVAL_SECS")]
+    pub node_stats_interval_secs: Option<u64>,
     /// Serve the embedded web UI at /ui (live-toggleable later).
     #[arg(long, env = "SKAIDB_UI_ENABLED")]
     pub ui_enabled: Option<bool>,
@@ -216,6 +221,8 @@ impl Cli {
             prometheus_port => config.observability.prometheus_port,
             self_scrape => config.observability.self_scrape,
             self_scrape_interval_secs => config.observability.self_scrape_interval_secs,
+            node_stats => config.observability.node_stats,
+            node_stats_interval_secs => config.observability.node_stats_interval_secs,
             ui_enabled => config.ui.enabled,
             slow_query_ms => config.observability.slow_query_ms,
             query_log_enabled => config.observability.query_log_enabled,

@@ -17,7 +17,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::thread;
 
 use skaidb_engine::{
@@ -167,6 +167,10 @@ pub struct Node {
     /// per-peer replication-lag metric. Peers absent from the map have no
     /// confirmed write yet (their lag is reported as unknown).
     acked: Mutex<HashMap<NodeId, Hlc>>,
+    /// Last host-stats snapshot per peer `(stats, taken_at, was_reachable)` —
+    /// smooths dashboard liveness over missed probes (see
+    /// [`Node::cluster_host_stats`]).
+    host_cache: Mutex<HashMap<NodeId, (crate::host::HostStats, Instant, bool)>>,
     /// Physical-time (ms) high-water mark of data writes this node has
     /// *coordinated*. Replication lag for a peer is `watermark − acked[peer]`
     /// (both track data writes). Unlike the HLC frontier (`clock.peek()`), this advances
@@ -464,6 +468,7 @@ impl Node {
             disk_hints: AtomicU64::new(0),
             ts_hints: Mutex::new(HashMap::new()),
             acked: Mutex::new(HashMap::new()),
+            host_cache: Mutex::new(HashMap::new()),
             write_watermark: AtomicU64::new(0),
             membership_lock: Mutex::new(()),
             bg,
@@ -720,9 +725,17 @@ impl Node {
     }
 
     /// Host system statistics for every member: this node sampled locally,
-    /// peers over internode. `None` marks an unreachable peer. Ordered by
-    /// node id.
+    /// peers over internode. Ordered by node id.
+    ///
+    /// A peer that misses one probe is **not** immediately reported down —
+    /// that made the dashboard flap between "live" and "unreachable" on any
+    /// transient network blip or busy scrape. Instead its last snapshot is
+    /// served with `stale_secs` set (the UI dims it and shows "last seen"),
+    /// and only past [`HOST_STALE_HORIZON`] does it become `None`
+    /// (unreachable). Transitions are logged once each way.
     pub fn cluster_host_stats(self: &Arc<Self>) -> Vec<(String, Option<crate::host::HostStats>)> {
+        /// Serve cached stats for a silent peer this long before calling it down.
+        const HOST_STALE_HORIZON: Duration = Duration::from_secs(120);
         let dir = self
             .local
             .read()
@@ -738,12 +751,41 @@ impl Node {
         let addrs: Vec<String> = peers.iter().map(|(_, a)| a.clone()).collect();
         let stats = scatter(&addrs, |addr| {
             match self.pool.call_timeout(addr, &Request::HostStats, PROBE_TIMEOUT) {
-                Ok(Response::HostStats { json }) => serde_json::from_str(&json).ok(),
+                Ok(Response::HostStats { json }) => {
+                    serde_json::from_str::<crate::host::HostStats>(&json).ok()
+                }
                 _ => None,
             }
         });
+        let mut cache = self.host_cache.lock().expect("host cache lock");
         for ((id, _), stat) in peers.into_iter().zip(stats) {
-            out.push((id.0, stat));
+            let entry = match stat {
+                Some(s) => {
+                    if matches!(cache.get(&id), Some((_, _, false))) {
+                        skaidb_types::slog!("skaidb: peer {} answering probes again", id.0);
+                    }
+                    cache.insert(id.clone(), (s.clone(), Instant::now(), true));
+                    Some(s)
+                }
+                None => match cache.get_mut(&id) {
+                    Some((cached, last_ok, was_ok)) if last_ok.elapsed() < HOST_STALE_HORIZON => {
+                        if *was_ok {
+                            skaidb_types::slog!(
+                                "skaidb: peer {} missed a stats probe — serving cached stats \
+                                 until it answers or {}s pass",
+                                id.0,
+                                HOST_STALE_HORIZON.as_secs()
+                            );
+                            *was_ok = false;
+                        }
+                        let mut s = cached.clone();
+                        s.stale_secs = last_ok.elapsed().as_secs().max(1);
+                        Some(s)
+                    }
+                    _ => None,
+                },
+            };
+            out.push((id.0, entry));
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out

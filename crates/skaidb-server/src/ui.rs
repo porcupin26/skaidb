@@ -138,7 +138,38 @@ pub fn schema_json(ctx: &Shared, role: &str) -> (u16, String) {
 /// `GET /ui/hosts` (authenticated; rest.rs resolves the role first —
 /// nothing here is table data, so any authenticated role may read it).
 pub fn hosts_json(ctx: &Shared) -> (u16, String) {
-    let nodes = ctx.backend.host_stats();
+    // Primary source: the replicated `node_stats` table every member writes
+    // itself into (data + age — no probe fan-out, so a missed probe can't
+    // flap a live node to "unreachable"). Members without a fresh row (older
+    // version in a rolling upgrade, publishing disabled, or silent past the
+    // horizon) fall back to the live probe path, which itself serves the
+    // coordinator's cached snapshot before reporting a peer unreachable.
+    let published = crate::nodestats::read_all(ctx);
+    let mut nodes: Vec<(String, Option<skaidb_cluster::host::HostStats>)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (node, stats, age) in published {
+        if age <= crate::nodestats::STALE_HORIZON_SECS {
+            seen.insert(node.clone());
+            nodes.push((node, Some(stats)));
+        }
+    }
+    let member_ids: Vec<String> = ctx
+        .backend
+        .cluster_stats()
+        .map(|c| {
+            let mut ids: Vec<String> = c.peers.iter().map(|p| p.id.clone()).collect();
+            ids.push(c.node_id);
+            ids
+        })
+        .unwrap_or_else(|| vec!["local".to_string()]);
+    if member_ids.iter().any(|id| !seen.contains(id)) {
+        for (id, stat) in ctx.backend.host_stats() {
+            if !seen.contains(&id) {
+                nodes.push((id, stat));
+            }
+        }
+    }
+    nodes.sort_by(|a, b| a.0.cmp(&b.0));
     let mut agg_cpu = 0.0f64;
     let mut agg_cpu_n = 0u32;
     let (mut mem_total, mut mem_used) = (0u64, 0u64);
@@ -171,6 +202,12 @@ pub fn hosts_json(ctx: &Shared) -> (u16, String) {
                     "disk_write_bps": h.disk_write_bps,
                     "disk_total_bytes": h.disk_total_bytes,
                     "disk_available_bytes": h.disk_available_bytes,
+                    "uptime_secs": h.uptime_secs,
+                    "restarts": h.restarts,
+                    "oom_kills": h.oom_kills,
+                    // Seconds since this node last reported; the UI shows the
+                    // age and dims stale rows instead of dropping them.
+                    "stale_secs": h.stale_secs,
                 })
             }
             None => json!({"id": id, "reachable": false}),

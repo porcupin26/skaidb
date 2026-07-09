@@ -198,6 +198,15 @@ pub struct ObservabilityConfig {
     pub self_scrape: bool,
     /// Seconds between self-scrapes (minimum 1). **Live-mutable.**
     pub self_scrape_interval_secs: u64,
+    /// Publish this node's host statistics (CPU, memory, disk, uptime,
+    /// restarts, OOM kills) into the replicated `node_stats` table — one row
+    /// per node, keyed on the node id, stamped with the sample time. Any
+    /// member then serves the whole cluster's dashboard from a local read
+    /// (with per-node data age) instead of probing peers on every page load.
+    /// **Live-mutable.**
+    pub node_stats: bool,
+    /// Seconds between node-stats rows (minimum 1). **Live-mutable.**
+    pub node_stats_interval_secs: u64,
     pub slow_query_ms: u64,
     pub query_log_enabled: bool,
     pub query_log_masked: bool,
@@ -300,6 +309,8 @@ impl Config {
 pub const RUNTIME_MUTABLE_KEYS: &[&str] = &[
     "observability.self_scrape",
     "observability.self_scrape_interval_secs",
+    "observability.node_stats",
+    "observability.node_stats_interval_secs",
     "observability.slow_query_ms",
     "observability.query_log_enabled",
     "observability.query_log_masked",
@@ -445,6 +456,8 @@ impl Default for ObservabilityConfig {
             prometheus_port: 9090,
             self_scrape: false,
             self_scrape_interval_secs: 15,
+            node_stats: true,
+            node_stats_interval_secs: 1,
             slow_query_ms: 200,
             query_log_enabled: true,
             query_log_masked: true,

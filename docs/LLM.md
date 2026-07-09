@@ -304,6 +304,12 @@ WHERE ts >= now() - 6h GROUP BY t;
   the node ingest its own `/metrics` every
   `observability.self_scrape_interval_secs` — self-dashboarding without an
   external Prometheus.
+- **Node stats table**: every node INSERTs its host stats (cpu, mem, disk,
+  uptime, restarts, oom_kills) into the replicated `node_stats` table every
+  `observability.node_stats_interval_secs` (default 1s; on by default, live
+  keys `observability.node_stats*`). One timestamped row per node, PK=node.
+  The UI NODES view reads it and shows per-row age (no probe flapping);
+  query it: `SELECT node, restarts, oom_kills FROM node_stats`.
 
 ---
 
@@ -383,9 +389,9 @@ memory_target (`"auto"`, `"1GB"` — budgets memtable + read cache + FTS
 writer heaps + TS heads; set explicitly in containers), memtable_size_mb,
 read_cache_entries; `[observability]` slow_query_ms, query_log_*,
 log_format/log_file, per_table_metrics, prometheus_port, self_scrape,
-self_scrape_interval_secs; `[ui]` enabled.
+self_scrape_interval_secs, node_stats, node_stats_interval_secs; `[ui]` enabled.
 **Live-mutable** (no restart): all `observability.*` log/slow-query keys,
-`observability.self_scrape*`, `ui.enabled`.
+`observability.self_scrape*`, `observability.node_stats*`, `ui.enabled`.
 
 Every admin endpoint above also has a SQL spelling (section 3: `SHOW
 CLUSTER`, `SHOW CONFIG`/`SET CONFIG`, `SHOW SLOW QUERIES`, `REPAIR
