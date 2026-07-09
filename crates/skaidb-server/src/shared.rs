@@ -745,6 +745,12 @@ fn record_metrics(
             let cells = (rows.len() * columns.len().max(1)) as u64;
             ctx.metrics.add_rows_scanned(cells);
         }
+        Response::Mutation { affected } => {
+            // Write volume: without this a bulk import (many rows per
+            // multi-row INSERT) is nearly invisible — `queries/s` counts
+            // statements, not rows.
+            ctx.metrics.add_rows_written(*affected);
+        }
         Response::Error(msg) => {
             ctx.metrics.incr_query_error(error_class(msg));
         }

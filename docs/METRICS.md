@@ -64,6 +64,7 @@ vars; unset → `"unknown"`.
 | `skaidb_queries_in_flight` | gauge | — | Statements currently executing. |
 | `skaidb_query_errors_total` | counter | `class` | Failed statements by class: `parse`, `constraint`, `storage`, `timeout`, `permission`, `other`. |
 | `skaidb_rows_returned_total` | counter | — | Rows returned to clients. |
+| `skaidb_rows_written_total` | counter | — | Rows written (inserted/updated/deleted) — the write-throughput signal a bulk import shows up in (`queries/s` counts statements, so a multi-row batch is one query). |
 | `skaidb_rows_scanned_total` | counter | — | Result cells examined (rows × width) — a proxy for result volume. |
 | `skaidb_slow_queries_total` | counter | — | Statements slower than `slow_query_ms`. |
 | `skaidb_transactions_total` | counter | `kind` | `begin`/`commit`/`rollback` (embedded engine). |

@@ -319,6 +319,7 @@ struct HotMetrics {
     query_errors_total: [Cell; ErrorClass::ALL.len()],
     transactions_total: [Cell; TxKind::ALL.len()],
     rows_returned_total: Cell,
+    rows_written_total: Cell,
     rows_scanned_total: Cell,
     slow_queries_total: Cell,
     authz_denied_total: Cell,
@@ -344,6 +345,7 @@ impl HotMetrics {
             out.push((k.series(), &self.transactions_total[k as usize]));
         }
         out.push(("skaidb_rows_returned_total", &self.rows_returned_total));
+        out.push(("skaidb_rows_written_total", &self.rows_written_total));
         out.push(("skaidb_rows_scanned_total", &self.rows_scanned_total));
         out.push(("skaidb_slow_queries_total", &self.slow_queries_total));
         out.push(("skaidb_authz_denied_total", &self.authz_denied_total));
@@ -486,6 +488,11 @@ impl Metrics {
     /// Add to `skaidb_rows_scanned_total`.
     pub fn add_rows_scanned(&self, n: u64) {
         self.hot.rows_scanned_total.add(n);
+    }
+
+    /// Add to `skaidb_rows_written_total` (rows affected by a write).
+    pub fn add_rows_written(&self, n: u64) {
+        self.hot.rows_written_total.add(n);
     }
 
     /// Add to `skaidb_bytes_returned_total{endpoint=…}`.
@@ -786,6 +793,11 @@ const KNOWN_METRICS: &[(&str, MetricType, &str)] = &[
         "skaidb_rows_returned_total",
         MetricType::Counter,
         "Rows returned to clients.",
+    ),
+    (
+        "skaidb_rows_written_total",
+        MetricType::Counter,
+        "Rows written (inserted/updated/deleted) by mutations.",
     ),
     (
         "skaidb_bytes_returned_total",

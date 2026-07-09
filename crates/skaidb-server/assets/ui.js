@@ -668,6 +668,7 @@ async function refreshStats() {
 
   const qRates = rateSeries("skaidb_queries_total");
   const scanRates = rateSeries("skaidb_rows_scanned_total");
+  const writeRates = rateSeries("skaidb_rows_written_total");
   const byteRates = rateSeries("skaidb_bytes_returned_total");
   // Mean latency over the last interval: Δsum / Δcount.
   let latency = "—";
@@ -684,6 +685,7 @@ async function refreshStats() {
     ["mean latency (5s)", latency],
     ["in flight", m.get("skaidb_queries_in_flight") ?? 0],
     ["rows scanned/s", withSpark(fmtRate(scanRates.at(-1) ?? 0), scanRates)],
+    ["rows written/s", withSpark(fmtRate(writeRates.at(-1) ?? 0), writeRates)],
     ["bytes returned/s", withSpark(fmtBytes(byteRates.at(-1) ?? 0), byteRates)],
     ["connections", m.get("skaidb_connections_active") ?? 0],
   ]);

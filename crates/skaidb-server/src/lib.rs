@@ -1235,6 +1235,12 @@ mod tests {
             metrics.contains("skaidb_queries_total{type=\"ddl\"} 1"),
             "got: {metrics}"
         );
+        // The INSERT affected 1 row — recorded as write volume (not just a
+        // statement count), so bulk imports are visible on the dashboard.
+        assert!(
+            metrics.contains("skaidb_rows_written_total 1"),
+            "got: {metrics}"
+        );
     }
 
     #[test]
