@@ -1563,7 +1563,28 @@ impl Node {
                         continue;
                     }
                     let Some(addr) = addr_of.get(&replica) else { continue };
-                    self.ts_push_series(addr, &table, &labels)?;
+                    // Retry past a transient failure window (e.g. the peer's
+                    // circuit breaker cooling down mid-drain), then log and
+                    // continue: samples are immutable facts union-merged on
+                    // read, so a missed series converges via ts repair —
+                    // aborting the whole decommission over one push doesn't.
+                    let mut pushed = false;
+                    for wait_ms in [0u64, 2_000, 12_000] {
+                        if wait_ms > 0 {
+                            thread::sleep(Duration::from_millis(wait_ms));
+                        }
+                        if self.ts_push_series(addr, &table, &labels).is_ok() {
+                            pushed = true;
+                            break;
+                        }
+                    }
+                    if !pushed {
+                        skaidb_types::slog!(
+                            "skaidb: ts drain: series in {table} not pushed to {} — \
+                             ts repair will converge it",
+                            replica.0
+                        );
+                    }
                 }
             }
         }
