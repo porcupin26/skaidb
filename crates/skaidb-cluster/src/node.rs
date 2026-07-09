@@ -1920,7 +1920,31 @@ impl Node {
         let joiner = NodeId::new(id);
         let old_members = self.members_snapshot();
         if old_members.iter().any(|(mid, _)| *mid == joiner) {
-            return Ok(()); // already a member
+            // Already in the ring. If a previous join attempt died between
+            // its begin and finalize broadcasts (e.g. the joiner bootstrap
+            // failed), the dual-placement window is still open on every
+            // member and nothing would ever close it — a re-announce landed
+            // here and returned Ok without healing. Finalize it now.
+            let pending = self.topo.read().expect("topo lock").prev.is_some();
+            if pending {
+                let wire = wire_of(&old_members);
+                let epoch_final = self.current_epoch() + 1;
+                self.set_membership(&old_members, &[], epoch_final);
+                for (mid, maddr) in &old_members {
+                    if *mid == self.id {
+                        continue;
+                    }
+                    let _ = self.pool.call(
+                        maddr,
+                        &Request::SetMembership {
+                            epoch: epoch_final,
+                            members: wire.clone(),
+                            prev_members: Vec::new(),
+                        },
+                    );
+                }
+            }
+            return Ok(());
         }
         let mut new_members = old_members.clone();
         new_members.push((joiner.clone(), addr.to_string()));
@@ -7715,6 +7739,42 @@ mod tests {
         nb.execute("INSERT INTO t (id, v) VALUES (61, 610)").unwrap();
         let rs = rows(na.execute("SELECT v FROM t WHERE id = 61").unwrap());
         assert_eq!(rs.rows, vec![vec![Value::Int(610)]]);
+    }
+
+    /// A join that died between its begin and finalize broadcasts leaves
+    /// the dual-placement window open on every member with nothing to
+    /// close it. The joiner's re-announce (`add_member` on an existing
+    /// member) must finalize the pending transition, not no-op.
+    #[test]
+    fn reannounce_finalizes_stuck_dual_ring() {
+        let (a, b) = (free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b)];
+        let na = Node::new(
+            Database::open(temp_dir("dual_a")).unwrap(),
+            cfg("a", &a, &members, Consistency::One, Consistency::One),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("dual_b")).unwrap(),
+            cfg("b", &b, &members, Consistency::One, Consistency::One),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+
+        // Re-open the dual window everywhere, as a join of `b` that failed
+        // after its begin broadcast would have left it.
+        let prev = vec![member("a", &a)];
+        let epoch = na.membership_epoch() + 1;
+        assert!(na.set_membership(&members, &prev, epoch));
+        assert!(nb.set_membership(&members, &prev, epoch));
+        assert!(na.stats().resharding_active, "window open");
+
+        // b re-announces; a's add_member sees an existing member with a
+        // pending transition and finalizes it cluster-wide.
+        na.add_member("b", &b).unwrap();
+        assert!(!na.stats().resharding_active, "a finalized");
+        assert!(!nb.stats().resharding_active, "b finalized");
+        assert_eq!(na.stats().members, 2);
+        assert!(na.membership_epoch() > epoch, "finalize bumped the epoch");
     }
 
     /// EXPLAIN on a cluster: engine plan rows plus appended cluster

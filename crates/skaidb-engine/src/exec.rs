@@ -2509,6 +2509,38 @@ impl Database {
                 std::fs::remove_dir_all(idir)?;
             }
         }
+        // Search and vector indexes cascade too. An orphan here isn't just
+        // clutter: schema bootstrap replays every live object on a joining
+        // node, and a CREATE ... ON <dropped table> fails the whole join
+        // (bit the production join, 2026-07-09).
+        let dropped_search: Vec<String> = self
+            .catalog
+            .search_indexes
+            .iter()
+            .filter(|(_, sdef)| sdef.table == name)
+            .map(|(n, _)| n.clone())
+            .collect();
+        for sname in dropped_search {
+            self.catalog.search_indexes.remove(&sname);
+            self.search_indexes.remove(&sname); // drop the writer before the files
+            self.record_schema(format!("s:{sname}"), hlc, true);
+            let sdir = fts_dir(&self.dir, &sname);
+            if sdir.exists() {
+                std::fs::remove_dir_all(sdir)?;
+            }
+        }
+        let dropped_vector: Vec<String> = self
+            .catalog
+            .vector_indexes
+            .iter()
+            .filter(|(_, vdef)| vdef.table == name)
+            .map(|(n, _)| n.clone())
+            .collect();
+        for vname in dropped_vector {
+            self.catalog.vector_indexes.remove(&vname);
+            self.vector_indexes.remove(&vname);
+            self.record_schema(format!("v:{vname}"), hlc, true);
+        }
         self.record_schema(key, hlc, true);
         self.save_catalog()?;
         let dir = table_dir(&self.dir, name);

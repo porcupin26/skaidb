@@ -26,6 +26,7 @@ CREATE TIMESERIES TABLE [IF NOT EXISTS] <table>
 CREATE ROLLUP [IF NOT EXISTS] <name> ON <ts-table> BUCKET <duration>
        [RETENTION <duration>]
 DROP   TABLE [IF EXISTS] <table>
+       -- cascades to every derived index on the table (secondary, search, vector)
 CREATE INDEX [IF NOT EXISTS] <name> ON <table> (<path> [, <path> ...])
 DROP   INDEX [IF EXISTS] <name>
 CREATE VECTOR INDEX [IF NOT EXISTS] <name> ON <table> (<path>) DIM <n> [USING <metric>]

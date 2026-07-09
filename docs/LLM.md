@@ -91,7 +91,8 @@ embedding <-> [..]` (use `NEAREST`).
 CREATE TABLE [IF NOT EXISTS] t (PRIMARY KEY (col [, col ...])) [WITH (ttl = dur)]
 --   ttl: rows expire <dur> after their last write — immediately invisible to
 --   every read; space reclaimed lazily by compaction. Converges at any RF.
-DROP TABLE [IF EXISTS] t
+DROP TABLE [IF EXISTS] t                    -- cascades to the table's
+--   secondary/search/vector indexes
 ALTER TABLE t RENAME TO t2
 ALTER TABLE t RENAME COLUMN a TO b          -- rewrites rows, rebuilds indexes
 CREATE INDEX [IF NOT EXISTS] i ON t (path [, path ...])   -- composite = leftmost-prefix

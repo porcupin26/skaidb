@@ -1971,6 +1971,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// DROP TABLE cascades to ALL derived indexes — secondary, search,
+    /// and vector. An orphan is not just clutter: a joining node replays
+    /// every live schema object, and `CREATE ... ON <dropped table>`
+    /// fails the whole join (bit the production join, 2026-07-09).
+    #[test]
+    fn drop_table_cascades_all_index_kinds() {
+        let dir = tempdir();
+        let mut db = Database::open(&dir).unwrap();
+        db.execute("CREATE TABLE doomed (PRIMARY KEY (id))").unwrap();
+        db.execute("CREATE INDEX doomed_age ON doomed (age)").unwrap();
+        db.execute("CREATE SEARCH INDEX doomed_fts ON doomed (body)").unwrap();
+        db.execute("CREATE VECTOR INDEX doomed_emb ON doomed (emb) DIM 3").unwrap();
+        db.execute("INSERT INTO doomed (id, age, body, emb) VALUES (1, 3, 'x', [1.0,0.0,0.0])")
+            .unwrap();
+        db.execute("DROP TABLE doomed").unwrap();
+
+        let rs = rows(db.execute("SHOW INDEXES").unwrap());
+        assert!(rs.rows.is_empty(), "no orphans: {:?}", rs.rows);
+        // The versioned schema must contain no CREATE referencing the
+        // dropped table — replaying it on a fresh node (joiner bootstrap)
+        // must succeed entry by entry.
+        let mut fresh = Database::open(tempdir()).unwrap();
+        for (dbname, sql, hlc) in db.schema_sync() {
+            fresh
+                .execute_session_with_hlc(&dbname, &sql, hlc)
+                .unwrap_or_else(|e| panic!("bootstrap replay failed on {sql:?}: {e}"));
+        }
+        // Recreating the same names works (tombstones advanced, not stuck).
+        db.execute("CREATE TABLE doomed (PRIMARY KEY (id))").unwrap();
+        db.execute("CREATE SEARCH INDEX doomed_fts ON doomed (body)").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// GROUP BY ... TOP k BY <expr> [ASC|DESC]: per-group top-k rows —
     /// each group returns its k best rows instead of one aggregated row;
     /// ranks by score() under a search predicate.

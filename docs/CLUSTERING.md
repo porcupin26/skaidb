@@ -260,6 +260,12 @@ A long migration keeps the `skaidbsh` request open until it finishes; tune the
 push rate per node with the migration throttle (see
 [RESHARDING.md](RESHARDING.md)). Run one membership change at a time.
 
+A join that fails partway (e.g. the joiner became unreachable during its
+schema bootstrap) leaves the ring in its dual-placement phase — `/status`
+shows `"resharding": true` indefinitely. Recovery is automatic on the
+joiner's next announce (restart the joining node: the re-announce
+finalizes the pending transition); or remove and re-add the node.
+
 ### Backups on a cluster
 
 `BACKUP TO '/path'` backs up **the answering node's shard** (a
