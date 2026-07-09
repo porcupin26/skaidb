@@ -45,6 +45,10 @@ pub struct HostStats {
     /// The filesystem holding the data directory.
     pub disk_total_bytes: u64,
     pub disk_available_bytes: u64,
+    /// CPU pressure (PSI `some avg10`, %): share of the last 10s in which at
+    /// least one task stalled waiting for CPU — saturation, not just usage.
+    #[serde(default)]
+    pub cpu_pressure_pct: f64,
     /// Seconds since this node's process started.
     #[serde(default)]
     pub uptime_secs: u64,
@@ -95,6 +99,7 @@ pub fn sample(data_dir: &Path) -> HostStats {
     let (mem_total, mem_used) = memory().unwrap_or((0, 0));
     s.mem_total_bytes = mem_total;
     s.mem_used_bytes = mem_used;
+    s.cpu_pressure_pct = psi_cpu_some_avg10().unwrap_or(0.0);
     s.uptime_secs = process_uptime_secs().unwrap_or(0);
     s.restarts = read_runtime_counter(data_dir, "starts").saturating_sub(1);
     s.oom_kills = cgroup_oom_kills().unwrap_or(0);
@@ -291,6 +296,15 @@ fn process_uptime_secs() -> Option<u64> {
         .ok()?;
     let hz = 100.0; // USER_HZ; universal on the targets we ship
     Some((uptime - start_jiffies as f64 / hz).max(0.0) as u64)
+}
+
+/// CPU pressure: PSI `some avg10` from `/proc/pressure/cpu` (Linux 4.20+).
+fn psi_cpu_some_avg10() -> Option<f64> {
+    let s = std::fs::read_to_string("/proc/pressure/cpu").ok()?;
+    let line = s.lines().find(|l| l.starts_with("some"))?;
+    line.split_whitespace()
+        .find_map(|f| f.strip_prefix("avg10="))
+        .and_then(|v| v.parse().ok())
 }
 
 /// Kernel OOM kills in this cgroup (cgroup v2 `memory.events`).

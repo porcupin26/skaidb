@@ -171,6 +171,8 @@ pub struct Node {
     /// smooths dashboard liveness over missed probes (see
     /// [`Node::cluster_host_stats`]).
     host_cache: Mutex<HashMap<NodeId, (crate::host::HostStats, Instant, bool)>>,
+    /// QoS: bounds concurrent inbound bulk appliers (see [`BulkGate`]).
+    bulk_gate: BulkGate,
     /// Physical-time (ms) high-water mark of data writes this node has
     /// *coordinated*. Replication lag for a peer is `watermark − acked[peer]`
     /// (both track data writes). Unlike the HLC frontier (`clock.peek()`), this advances
@@ -326,6 +328,57 @@ const MIGRATE_PAGE_ROWS: usize = 2_000;
 #[cfg(test)]
 const MIGRATE_PAGE_ROWS: usize = 8;
 
+/// QoS admission control for inbound bulk work: at most `max` concurrent
+/// `ApplyBatch` appliers run at once (excess connection threads wait).
+///
+/// Decode + memtable + WAL + index updates per batch are CPU-heavy, and the
+/// internode server runs one thread per connection — during a decommission
+/// drain an unbounded flood of appliers monopolized every core and starved
+/// foreground queries (measured: cpu PSI ~80%, io PSI ~0, on nodes that were
+/// answering probes fine). Capping appliers keeps cores free for queries;
+/// senders that queue too long hit their I/O timeout and degrade to hints —
+/// backpressure with a durable fallback, not silent loss.
+#[derive(Debug)]
+struct BulkGate {
+    max: usize,
+    active: std::sync::Mutex<usize>,
+    cv: std::sync::Condvar,
+}
+
+impl BulkGate {
+    fn new() -> Self {
+        // Half the cores, clamped: bulk work can use real parallelism on big
+        // hosts but never the whole machine.
+        let max = std::thread::available_parallelism()
+            .map(|n| (n.get() / 2).clamp(1, 4))
+            .unwrap_or(2);
+        BulkGate {
+            max,
+            active: std::sync::Mutex::new(0),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) -> BulkPermit<'_> {
+        let mut n = self.active.lock().expect("bulk gate lock");
+        while *n >= self.max {
+            n = self.cv.wait(n).expect("bulk gate wait");
+        }
+        *n += 1;
+        BulkPermit(self)
+    }
+}
+
+/// RAII permit from [`BulkGate::acquire`].
+struct BulkPermit<'a>(&'a BulkGate);
+
+impl Drop for BulkPermit<'_> {
+    fn drop(&mut self) {
+        *self.0.active.lock().expect("bulk gate lock") -= 1;
+        self.0.cv.notify_one();
+    }
+}
+
 /// Why reconciling one table with one peer stopped.
 enum RepairPeerError {
     /// Peer predates the paged scan RPC (rolling upgrade).
@@ -469,6 +522,7 @@ impl Node {
             ts_hints: Mutex::new(HashMap::new()),
             acked: Mutex::new(HashMap::new()),
             host_cache: Mutex::new(HashMap::new()),
+            bulk_gate: BulkGate::new(),
             write_watermark: AtomicU64::new(0),
             membership_lock: Mutex::new(()),
             bg,
@@ -1969,6 +2023,10 @@ impl Node {
         }
         let rf = self.cfg.replication_factor;
         let batch = self.migration_batch.load(Ordering::Relaxed).max(1);
+        // QoS: breathe between chunks (configured pause, floor 10ms) so the
+        // receivers' cores aren't monopolized by back-to-back batch applies —
+        // the drain is a background op; foreground queries are not.
+        let pause = self.migration_pause_ms.load(Ordering::Relaxed).max(10);
 
         let tables = self
             .local
@@ -2016,24 +2074,26 @@ impl Node {
                         // anti-entropy repair backstop missed writes on every
                         // other path — the drain is no different, and the
                         // remaining replicas still hold every drained key.
-                        if self.send_batch(addr, &table, chunk)
-                            || self.send_batch(addr, &table, chunk)
-                        {
-                            continue;
+                        let sent = self.send_batch(addr, &table, chunk)
+                            || self.send_batch(addr, &table, chunk);
+                        if !sent {
+                            skaidb_types::slog!(
+                                "skaidb: drain: {} rows for {} not acked — hinted for replay/repair",
+                                chunk.len(),
+                                replica.0
+                            );
+                            for (k, v, hlc, is_put) in chunk {
+                                let op = if *is_put {
+                                    WriteOp::Put(v.clone())
+                                } else {
+                                    WriteOp::Delete
+                                };
+                                self.store_hint(&replica, &table, k, &op, *hlc);
+                            }
                         }
-                        skaidb_types::slog!(
-                            "skaidb: drain: {} rows for {} not acked — hinted for replay/repair",
-                            chunk.len(),
-                            replica.0
-                        );
-                        for (k, v, hlc, is_put) in chunk {
-                            let op = if *is_put {
-                                WriteOp::Put(v.clone())
-                            } else {
-                                WriteOp::Delete
-                            };
-                            self.store_hint(&replica, &table, k, &op, *hlc);
-                        }
+                        // Per-chunk breather on every path, so back-to-back
+                        // applies never monopolize the receivers' cores.
+                        thread::sleep(Duration::from_millis(pause));
                     }
                 }
                 if done {
@@ -3434,6 +3494,9 @@ impl Node {
                 write_response(self.apply_write_local(&table, &key, &WriteOp::Delete, hlc))
             }
             Request::ApplyBatch { table, rows } => {
+                // QoS: bounded concurrency for bulk appliers — queries keep
+                // cores even under a drain/rebalance/repair flood.
+                let _permit = self.bulk_gate.acquire();
                 write_response(self.apply_batch_local(&table, &rows))
             }
             Request::ApplyDdl { db, sql, hlc } => {

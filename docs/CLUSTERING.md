@@ -415,6 +415,15 @@ SCRAM on the binary endpoint and HTTP Basic on REST, plus RBAC; see the
   embedded engine; the cluster coordinator autocommits per statement.
 - **Joins gather to the coordinator.** A single-table `WHERE` is pushed to the
   shards, but a SQL `JOIN` pulls the tables to the coordinating node.
+- **Bulk-apply QoS.** Inbound bulk batch appliers (drain, rebalance, hint
+  replay, repair) run under admission control — at most half the cores
+  (clamped 1–4) apply batches concurrently, so a migration flood can't
+  monopolize the CPU and starve foreground queries (measured during a
+  decommission: cpu PSI ~80% with io ~0 — pure CPU saturation from
+  FTS-indexing inbound rows). Senders that queue past their I/O timeout
+  degrade to hints, which repair backstops. The drain also pauses
+  `migration_pause_ms` (floor 10 ms) between chunks. `node_stats` now
+  carries `cpu_pressure_pct` (PSI) so saturation is visible per node.
 - **Broad filters resolve in one merged scan.** A pushed-down `WHERE` (or an
   index scan) gathers candidate keys per member and re-reads them for the
   authoritative LWW version. Few candidates re-read as quorum point reads;

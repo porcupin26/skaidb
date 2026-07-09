@@ -55,8 +55,8 @@ pub fn publish_tick(ctx: &Shared) -> Result<(), String> {
     let sql = format!(
         "INSERT INTO {TABLE} (node, ts, cpu_percent, cpus, load1, mem_total_bytes, \
          mem_used_bytes, rss_bytes, disk_read_bps, disk_write_bps, disk_total_bytes, \
-         disk_available_bytes, uptime_secs, restarts, oom_kills) VALUES \
-         ('{}', {ts_ms}, {:.2}, {}, {:.2}, {}, {}, {}, {:.0}, {:.0}, {}, {}, {}, {}, {})",
+         disk_available_bytes, uptime_secs, restarts, oom_kills, cpu_pressure_pct) VALUES \
+         ('{}', {ts_ms}, {:.2}, {}, {:.2}, {}, {}, {}, {:.0}, {:.0}, {}, {}, {}, {}, {}, {:.2})",
         node.replace('\'', "''"),
         h.cpu_percent,
         h.cpus,
@@ -71,6 +71,7 @@ pub fn publish_tick(ctx: &Shared) -> Result<(), String> {
         h.uptime_secs,
         h.restarts,
         h.oom_kills,
+        h.cpu_pressure_pct,
     );
     exec(ctx, &sql).map(|_| ())
 }
@@ -123,6 +124,7 @@ pub fn read_all(ctx: &Shared) -> Vec<(String, skaidb_cluster::host::HostStats, u
             uptime_secs: get("uptime_secs") as u64,
             restarts: get("restarts") as u64,
             oom_kills: get("oom_kills") as u64,
+            cpu_pressure_pct: get("cpu_pressure_pct"),
             stale_secs: age_secs,
             ..Default::default()
         };

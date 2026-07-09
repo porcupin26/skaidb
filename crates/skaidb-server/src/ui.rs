@@ -202,6 +202,7 @@ pub fn hosts_json(ctx: &Shared) -> (u16, String) {
                     "disk_write_bps": h.disk_write_bps,
                     "disk_total_bytes": h.disk_total_bytes,
                     "disk_available_bytes": h.disk_available_bytes,
+                    "cpu_pressure_pct": h.cpu_pressure_pct,
                     "uptime_secs": h.uptime_secs,
                     "restarts": h.restarts,
                     "oom_kills": h.oom_kills,
