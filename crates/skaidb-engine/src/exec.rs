@@ -280,7 +280,10 @@ impl Database {
                     // delete was uncommitted stays removed).
                     Some(w) => {
                         let watermark = watermark_to_hlc(w);
-                        for (key, hlc, value) in engine.scan_versioned_with_tombstones()? {
+                        // Stream the shard: a full `Vec` gather here OOM'd small
+                        // nodes catching up an index over a large table.
+                        for row in engine.scan_versioned_with_tombstones_iter() {
+                            let (key, hlc, value) = row?;
                             if hlc <= watermark {
                                 continue;
                             }
@@ -297,7 +300,8 @@ impl Database {
                     // Never committed: full rebuild from the table.
                     None => {
                         index.clear()?;
-                        for (key, bytes, hlc) in engine.scan_versioned()? {
+                        for row in engine.scan_versioned_iter() {
+                            let (key, bytes, hlc) = row?;
                             if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
                                 index.put(&key, &doc, hlc_to_watermark(hlc))?;
                             }
@@ -482,7 +486,11 @@ impl Database {
             .tables
             .get(&c.table)
             .ok_or_else(|| EngineError::TableNotFound(c.table.clone()))?;
-        for (row_key, bytes, row_hlc) in engine.scan_versioned()? {
+        // Stream the shard rather than collecting it: a full `Vec` gather here
+        // OOM'd a small node building an index over 100k+ rows (DB workload
+        // must never OOM — only the writer heap + one row are held at a time).
+        for row in engine.scan_versioned_iter() {
+            let (row_key, bytes, row_hlc) = row?;
             if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
                 index.put(&row_key, &doc, hlc_to_watermark(row_hlc))?;
             }
@@ -597,7 +605,10 @@ impl Database {
         let _ = std::fs::remove_dir_all(&idx_dir);
         let mut index = SearchIndex::open(&idx_dir, &cfg, self.storage_opts.search_writer_heap_bytes)?;
         if let Some(engine) = self.tables.get(&def.table) {
-            for (row_key, bytes, row_hlc) in engine.scan_versioned()? {
+            // Stream the shard (see create_search_index): collecting a large
+            // table into a `Vec` to rebuild an index OOM'd small nodes.
+            for row in engine.scan_versioned_iter() {
+                let (row_key, bytes, row_hlc) = row?;
                 if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
                     index.put(&row_key, &doc, hlc_to_watermark(row_hlc))?;
                 }

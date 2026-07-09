@@ -385,6 +385,12 @@ SCRAM on the binary endpoint and HTTP Basic on REST, plus RBAC; see the
   proceeds at quorum. Watch `skaidb_memory_shedding_writes` /
   `skaidb_memory_used_bytes` (METRICS.md); a node stuck shedding is
   undersized for its workload.
+- **Bulk index builds stream the table.** Building or rebuilding a search
+  index (`CREATE SEARCH INDEX`, startup catch-up, or an automatic rebuild)
+  reads the source table one row at a time rather than gathering the whole
+  shard into memory first, so indexing a large table stays within a bounded
+  footprint (the writer heap, sized from `memory_target`, plus one row) and
+  does not OOM a small node. DB workload must never OOM a node.
 
 ## Operational notes & limitations
 

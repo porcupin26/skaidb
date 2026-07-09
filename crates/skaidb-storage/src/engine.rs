@@ -401,14 +401,21 @@ impl Engine {
     /// Like [`Engine::scan`] but also returns each row's version stamp, so a
     /// coordinator can resolve replicas by last-writer-wins (SPEC §5).
     pub fn scan_versioned(&self) -> Result<Vec<VersionedRow>> {
-        self.merged_iter()
-            .filter_map(|item| match item {
-                Ok((_, hlc, VersionValue::Put(_))) if self.is_expired(hlc) => None,
-                Ok((k, hlc, VersionValue::Put(bytes))) => Some(Ok((k, bytes, hlc))),
-                Ok((_, _, VersionValue::Delete)) => None,
-                Err(e) => Some(Err(e)),
-            })
-            .collect()
+        self.scan_versioned_iter().collect()
+    }
+
+    /// Streaming [`Engine::scan_versioned`] — yields live `(key, value, hlc)`
+    /// rows lazily instead of collecting the whole shard. A bulk consumer that
+    /// reads the whole table (search-index backfill/rebuild) must use this:
+    /// collecting a large shard into a `Vec` first is unbounded and OOM'd a
+    /// small node building an index over 100k+ rows.
+    pub fn scan_versioned_iter(&self) -> impl Iterator<Item = Result<VersionedRow>> + '_ {
+        self.merged_iter().filter_map(|item| match item {
+            Ok((_, hlc, VersionValue::Put(_))) if self.is_expired(hlc) => None,
+            Ok((k, hlc, VersionValue::Put(bytes))) => Some(Ok((k, bytes, hlc))),
+            Ok((_, _, VersionValue::Delete)) => None,
+            Err(e) => Some(Err(e)),
+        })
     }
 
     /// Like [`Engine::scan_versioned`] but **includes tombstones** (as

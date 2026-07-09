@@ -624,8 +624,12 @@ fn write_text(stream: &mut TcpStream, status: u16, body: &str) -> io::Result<()>
 /// Write an embedded UI asset with the UI's Content-Security-Policy header.
 fn write_asset(stream: &mut TcpStream, asset: &crate::ui::Asset) -> io::Result<()> {
     let reason = http_reason(asset.status);
+    // `no-cache` = the browser may keep a copy but must revalidate before use,
+    // so a server upgrade always serves the new UI instead of a stale cached
+    // bundle (the assets are embedded and change per build, and carry no
+    // ETag/version in their URL). They are tiny, so re-fetching is cheap.
     let head = format!(
-        "HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\nContent-Security-Policy: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nContent-Security-Policy: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
         asset.status,
         asset.content_type,
         asset.body.len(),
