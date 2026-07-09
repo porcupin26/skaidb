@@ -15,8 +15,8 @@ pub mod vector;
 
 pub use error::EngineError;
 pub use exec::{
-    filter_rows, run, statement_is_read_only, Cluster, Database, DbStats, IndexScanRange,
-    pk_point_key, TableStats, TsRollupInfo,
+    filter_rows, filter_search_query, run, statement_is_read_only, Cluster, Database, DbStats,
+    IndexScanRange, pk_point_key, TableStats, TsRollupInfo,
 };
 pub use skaidb_storage::{Codec, EngineOptions, DEFAULT_SEARCH_WRITER_HEAP};
 pub use namespace::DEFAULT_DATABASE;

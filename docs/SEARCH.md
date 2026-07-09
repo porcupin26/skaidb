@@ -244,8 +244,14 @@ only for losslessly mergeable metrics (`COUNT(*)`/`COUNT(col)`/`SUM`/
 guard stands), requires a stable membership epoch across the whole gather
 and **every member answering** — a silent peer, an epoch change, or a
 membership change in flight (dual-ring placement) falls back to the
-deduped row gather. AVG and the distinct counts keep the fallback (their
-partials don't merge losslessly). Upgrade note: `_ring` was a schema
+deduped row gather. AVG scatters as SUM+COUNT pairs and the coordinator
+divides after the merge; the distinct counts keep the fallback (their
+partials don't merge losslessly). **Sorted top-k** (`ORDER BY <fast
+column> LIMIT k`) scatters the same way — each member resolves its
+primary-owned top k (highlights included) and the coordinator k-way
+merges; a residual SQL filter declines the scatter (filters don't
+travel). **Per-hit explain** routes to a replica of the key (ring
+order), so `"explain": true` works at any RF. Upgrade note: `_ring` was a schema
 change, so each search index rebuilds from its table once on first open
 after upgrading. One typing nuance:
 `time_bucket` pushdown keys are timestamps (a `date` column's semantics),

@@ -10,13 +10,12 @@ git history.
 
 ## Full-text search
 
-- [ ] **[fts] Sharded scatter, remaining surface** — the aggregation
-  scatter **shipped** (per-key ownership via the `_ring` placement-hash
-  fast field; arcs tile the key-space; epoch-gated, all-members-or-
-  fallback; mergeable metrics only — see SEARCH.md). Remaining: sorted
-  top-k over the same ownership machinery (per-shard `search_sorted`
-  rows k-way-merged), AVG via sum+count partial pairs, and per-hit
-  explain on sharded clusters (route the explain to the key's primary).
+- [ ] **[fts] Sharded scatter, residue** — aggregations (incl. AVG via
+  the sum+count rewrite), sorted top-k, and key-routed per-hit explain
+  all shipped (see SEARCH.md). Remaining niceties: residual SQL filters
+  on the sorted scatter (needs a serializable predicate subset on the
+  wire), grouped per-bucket metrics (blocked on the tantivy#2992 guard),
+  and distinct counts (need term-set/sketch partials).
 - [ ] **[fts] Lift the grouped-metrics pushdown guard** when
   [quickwit-oss/tantivy#2992](https://github.com/quickwit-oss/tantivy/issues/2992)
   is fixed upstream (per-bucket metrics currently take the exact row

@@ -61,6 +61,9 @@ pub struct NodeConfig {
 
 /// The cluster's placement view: the hash ring plus peer addresses. Held behind
 /// a lock so membership can change at runtime (resharding).
+/// Resolved rows of a sorted search shard: `(key, row document)`.
+type SortedRows = Vec<(Vec<u8>, Document)>;
+
 #[derive(Debug)]
 struct Topology {
     /// Membership version: a higher epoch supersedes a lower one, so stale or
@@ -869,16 +872,43 @@ impl Node {
         agg: &skaidb_fts::AggRequest,
     ) -> EngineResult<Option<Vec<skaidb_fts::AggRow>>> {
         use skaidb_fts::AggMetricFunc as F;
-        // Mergeable shapes only. AVG partials would need sum+count pairs,
-        // COUNT(DISTINCT)/APPROX_COUNT_DISTINCT would need term sets or
-        // sketches on the wire — none of which AggRow carries.
+        // Mergeable shapes only. COUNT(DISTINCT)/APPROX_COUNT_DISTINCT
+        // would need term sets or sketches on the wire — decline. AVG
+        // merges via a rewrite: each AVG(col) scatters as SUM(col) +
+        // COUNT(col) and the coordinator divides after the merge.
         if agg
             .metrics
             .iter()
-            .any(|m| !matches!(m.func, F::Count | F::ValueCount | F::Sum | F::Min | F::Max))
+            .any(|m| matches!(m.func, F::CountDistinct | F::ApproxCountDistinct))
         {
             return Ok(None);
         }
+        let has_avg = agg.metrics.iter().any(|m| m.func == F::Avg);
+        let original_funcs: Vec<F> = agg.metrics.iter().map(|m| m.func).collect();
+        let scatter_agg = if has_avg {
+            let mut metrics = Vec::with_capacity(agg.metrics.len() + 1);
+            for m in &agg.metrics {
+                if m.func == F::Avg {
+                    metrics.push(skaidb_fts::AggMetric {
+                        func: F::Sum,
+                        column: m.column.clone(),
+                    });
+                    metrics.push(skaidb_fts::AggMetric {
+                        func: F::ValueCount,
+                        column: m.column.clone(),
+                    });
+                } else {
+                    metrics.push(m.clone());
+                }
+            }
+            std::borrow::Cow::Owned(skaidb_fts::AggRequest {
+                group_by: agg.group_by.clone(),
+                metrics,
+            })
+        } else {
+            std::borrow::Cow::Borrowed(agg)
+        };
+        let agg = scatter_agg.as_ref();
         let (epoch, resharding) = {
             let topo = self.topo.read().expect("topo lock");
             (topo.epoch, topo.prev.is_some())
@@ -929,7 +959,206 @@ impl Node {
                 return Ok(None);
             }
         }
-        Ok(Some(merge_agg_shards(agg, parts)))
+        let mut rows = merge_agg_shards(agg, parts);
+        if has_avg {
+            // Collapse each scattered SUM+COUNT pair back into the
+            // requested AVG (Float; NULL over an empty value set — SQL
+            // semantics, matching the unsharded pushdown).
+            for row in &mut rows {
+                let mut merged = row.metrics.drain(..);
+                let mut out = Vec::with_capacity(original_funcs.len());
+                for func in &original_funcs {
+                    if *func == F::Avg {
+                        let sum = merged.next().unwrap_or(skaidb_types::Value::Null);
+                        let count = merged.next().unwrap_or(skaidb_types::Value::Null);
+                        let n = match count {
+                            skaidb_types::Value::Int(n) => n,
+                            _ => 0,
+                        };
+                        let total = match sum {
+                            skaidb_types::Value::Int(v) => Some(v as f64),
+                            skaidb_types::Value::Float(v) => Some(v),
+                            _ => None,
+                        };
+                        out.push(match total {
+                            Some(t) if n > 0 => skaidb_types::Value::Float(t / n as f64),
+                            _ => skaidb_types::Value::Null,
+                        });
+                    } else {
+                        out.push(merged.next().unwrap_or(skaidb_types::Value::Null));
+                    }
+                }
+                drop(merged);
+                row.metrics = out;
+            }
+        }
+        Ok(Some(rows))
+    }
+
+    /// One node's shard of a sharded sorted-top-k: fast-field-ordered top
+    /// `k` of its primary-owned key-space, rows fully resolved (with any
+    /// requested highlights). Declines like [`Node::search_agg_shard`].
+    pub(crate) fn search_sorted_shard(
+        &self,
+        table: &str,
+        query: &skaidb_fts::SearchQuery,
+        sort: &skaidb_fts::SortSpec,
+        k: usize,
+        highlights: &[(String, usize)],
+        epoch: u64,
+    ) -> EngineResult<Option<SortedRows>> {
+        let arcs = {
+            let topo = self.topo.read().expect("topo lock");
+            if topo.epoch != epoch || topo.prev.is_some() {
+                return Ok(None);
+            }
+            topo.ring.primary_arcs(&self.id)
+        };
+        if arcs.is_empty() {
+            return Ok(None);
+        }
+        self.local
+            .write()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .search_sorted(table, query, sort, k, &None, highlights, Some(&arcs))
+    }
+
+    /// Sharded sorted top-k (RF < members): every member resolves its own
+    /// primary-owned top `k` and the coordinator k-way merges by the sort
+    /// column — the global top-k rows each live in exactly one member's
+    /// owned set, so the union of per-shard top-k lists contains them all.
+    /// Exact-or-decline like the aggregation scatter; additionally
+    /// declines when a residual SQL filter is present (filters do not
+    /// travel; the fallback applies them at the coordinator).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn search_sorted_sharded(
+        &self,
+        table: &str,
+        query: &skaidb_fts::SearchQuery,
+        sort: &skaidb_fts::SortSpec,
+        k: usize,
+        filter: &Option<Expr>,
+        highlights: &[(String, usize)],
+    ) -> EngineResult<Option<SortedRows>> {
+        if filter.is_some() {
+            return Ok(None);
+        }
+        let (epoch, resharding) = {
+            let topo = self.topo.read().expect("topo lock");
+            (topo.epoch, topo.prev.is_some())
+        };
+        if resharding {
+            return Ok(None);
+        }
+        let Some(local) = self.search_sorted_shard(table, query, sort, k, highlights, epoch)?
+        else {
+            return Ok(None);
+        };
+        let peers = self.peers_with_ids();
+        let query_json = serde_json::to_string(query)
+            .map_err(|e| EngineError::Cluster(format!("encode query: {e}")))?;
+        let sort_json = serde_json::to_string(sort)
+            .map_err(|e| EngineError::Cluster(format!("encode sort: {e}")))?;
+        let wire_highlights: Vec<(String, u32)> = highlights
+            .iter()
+            .map(|(c, m)| (c.clone(), *m as u32))
+            .collect();
+        let shards = scatter(&peers, |(_, addr)| {
+            self.counters.peer_requests.fetch_add(1, Ordering::Relaxed);
+            match self.pool.call(
+                addr,
+                &Request::SearchSorted {
+                    table: table.to_string(),
+                    query: query_json.clone(),
+                    sort: sort_json.clone(),
+                    k: k as u32,
+                    highlights: wire_highlights.clone(),
+                    epoch,
+                },
+            ) {
+                Ok(Response::SortedRows { rows: Some(rows) }) => {
+                    crate::internode::decode_sorted_rows(&rows).ok()
+                }
+                _ => None,
+            }
+        });
+        let mut parts = vec![local];
+        for shard in shards {
+            match shard {
+                Some(rows) => parts.push(rows),
+                None => return Ok(None),
+            }
+        }
+        {
+            let topo = self.topo.read().expect("topo lock");
+            if topo.epoch != epoch || topo.prev.is_some() {
+                return Ok(None);
+            }
+        }
+        // Merge by the sort column's key-encoded order (order-preserving
+        // for a single fast-field type, exactly what each shard sorted by);
+        // rows missing the column cannot occur — every shard declined if
+        // any of its matching rows lacked it.
+        let mut all: Vec<(Vec<u8>, Document)> = parts.into_iter().flatten().collect();
+        all.sort_by(|(_, a), (_, b)| {
+            let ka = a.get_path(&sort.column).map(|v| v.encode_key());
+            let kb = b.get_path(&sort.column).map(|v| v.encode_key());
+            let ord = ka.cmp(&kb);
+            if sort.descending {
+                ord.reverse()
+            } else {
+                ord
+            }
+        });
+        all.truncate(k);
+        Ok(Some(all))
+    }
+
+    /// Per-hit score explain, routed to a **replica of the key**: the
+    /// local index when this node replicates the row, else a forward to
+    /// its owners in ring order. Works at any RF — the answering index
+    /// only needs to hold that one row.
+    pub fn search_explain(
+        &self,
+        table: &str,
+        filter: &Option<skaidb_sql::ast::Expr>,
+        pk_value: &skaidb_types::Value,
+    ) -> EngineResult<Option<String>> {
+        let Some(query) = skaidb_engine::filter_search_query(filter)? else {
+            return Err(EngineError::Type(
+                "score explain needs a MATCH()/SEARCH() predicate".into(),
+            ));
+        };
+        let key = skaidb_types::Value::Array(vec![pk_value.clone()]).encode_key();
+        let replicas = self.replicas_for(&key);
+        if replicas.contains(&self.id) {
+            return self
+                .local
+                .write()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+                .search_explain_query(table, &query, pk_value);
+        }
+        let query_json = serde_json::to_string(&query)
+            .map_err(|e| EngineError::Cluster(format!("encode query: {e}")))?;
+        let pk = pk_value.encode();
+        for owner in &replicas {
+            let Some(addr) = self.peer_addr(owner) else {
+                continue;
+            };
+            if let Ok(Response::Explanation { text }) = self.pool.call(
+                &addr,
+                &Request::SearchExplain {
+                    table: table.to_string(),
+                    query: query_json.clone(),
+                    pk: pk.clone(),
+                },
+            ) {
+                return Ok(text);
+            }
+        }
+        Err(EngineError::Cluster(
+            "no replica of the row is reachable for explain".into(),
+        ))
     }
 
     fn peers_with_ids(&self) -> Vec<(NodeId, String)> {
@@ -2674,6 +2903,59 @@ impl Node {
                 },
                 Err(_) => Response::Err("local lock poisoned".into()),
             },
+            Request::SearchSorted {
+                table,
+                query,
+                sort,
+                k,
+                highlights,
+                epoch,
+            } => {
+                let parsed = (
+                    serde_json::from_str::<skaidb_fts::SearchQuery>(&query),
+                    serde_json::from_str::<skaidb_fts::SortSpec>(&sort),
+                );
+                match parsed {
+                    (Ok(query), Ok(sort)) => {
+                        let highlights: Vec<(String, usize)> = highlights
+                            .into_iter()
+                            .map(|(c, m)| (c, m as usize))
+                            .collect();
+                        match self.search_sorted_shard(
+                            &table,
+                            &query,
+                            &sort,
+                            k as usize,
+                            &highlights,
+                            epoch,
+                        ) {
+                            Ok(rows) => Response::SortedRows {
+                                rows: rows.map(|r| crate::internode::encode_sorted_rows(&r)),
+                            },
+                            Err(e) => Response::Err(e.to_string()),
+                        }
+                    }
+                    _ => Response::Err("bad search-sorted request".into()),
+                }
+            }
+            Request::SearchExplain { table, query, pk } => {
+                let parsed = (
+                    serde_json::from_str::<skaidb_fts::SearchQuery>(&query),
+                    skaidb_types::Value::decode(&pk),
+                );
+                match parsed {
+                    (Ok(query), Ok(pk_value)) => match self.local.write() {
+                        Ok(mut db) => {
+                            match db.search_explain_query(&table, &query, &pk_value) {
+                                Ok(text) => Response::Explanation { text },
+                                Err(e) => Response::Err(e.to_string()),
+                            }
+                        }
+                        Err(_) => Response::Err("local lock poisoned".into()),
+                    },
+                    _ => Response::Err("bad search-explain request".into()),
+                }
+            }
             Request::SearchAgg {
                 table,
                 query,
@@ -3328,30 +3610,6 @@ impl Node {
     /// See [`Node::table_primary_key`].
     pub fn search_index_fields(&self, table: &str) -> Option<Vec<(String, String)>> {
         self.local.read().ok()?.search_index_fields(table)
-    }
-
-    /// Per-hit score explanation from the **local** search index. Gated
-    /// like the other whole-corpus local-index paths: a sole member or
-    /// RF ≥ members. On a sharded corpus (RF < members) the row may live
-    /// on another node — declined rather than answered wrong.
-    pub fn search_explain(
-        &self,
-        table: &str,
-        filter: &Option<skaidb_sql::ast::Expr>,
-        pk_value: &skaidb_types::Value,
-    ) -> EngineResult<Option<String>> {
-        let members = self.member_count();
-        if members > 1 && self.cfg.replication_factor < members {
-            return Err(EngineError::Unsupported(
-                "score explain on a sharded cluster (replication_factor < members) \
-                 is not supported"
-                    .into(),
-            ));
-        }
-        self.local
-            .write()
-            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
-            .search_explain(table, filter, pk_value)
     }
 
     /// One background NRT tick over the local shard's search indexes (the
@@ -4734,18 +4992,21 @@ impl Cluster for Coordinator {
         filter: &Option<Expr>,
         highlights: &[(String, usize)],
     ) -> EngineResult<Option<Vec<(Vec<u8>, Document)>>> {
-        // Index-ordered top-k needs one index holding every row; sharded
-        // corpora fall back to the coordinator's gather-and-sort (scatter
-        // with per-shard sort merge is future work).
+        // One index holding every row serves locally; a sharded corpus
+        // scatters per-shard sorted top-k over ownership arcs and merges —
+        // declining (to the coordinator's gather-and-sort) when a residual
+        // filter is present or any member cannot answer.
         let members = self.node.member_count();
         if members > 1 && self.node.cfg.replication_factor < members {
-            return Ok(None);
+            return self
+                .node
+                .search_sorted_sharded(table, query, sort, k, filter, highlights);
         }
         self.node
             .local
             .write()
             .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
-            .search_sorted(table, query, sort, k, filter, highlights)
+            .search_sorted(table, query, sort, k, filter, highlights, None)
     }
 
     fn search_aggregate(
@@ -5811,12 +6072,76 @@ mod tests {
             ]
         );
 
-        // Unmergeable partials decline (AVG needs sum+count pairs).
+        // AVG merges via the SUM+COUNT rewrite (Float, exact).
         let avg = AggRequest {
             group_by: None,
-            metrics: vec![units(AggMetricFunc::Avg)],
+            metrics: vec![units(AggMetricFunc::Avg), units(AggMetricFunc::Max)],
         };
-        assert!(na.search_aggregate_sharded("s", &query, &avg).unwrap().is_none());
+        let avg_rows = na
+            .search_aggregate_sharded("s", &query, &avg)
+            .unwrap()
+            .expect("sharded AVG must serve via the sum+count rewrite");
+        assert_eq!(
+            avg_rows[0].metrics,
+            vec![Value::Float(30.5), Value::Int(n)],
+            "avg collapses, neighbours keep their slots"
+        );
+        // Distinct counts still decline (no mergeable partial).
+        let distinct = AggRequest {
+            group_by: None,
+            metrics: vec![AggMetric {
+                func: AggMetricFunc::CountDistinct,
+                column: Some("region".into()),
+            }],
+        };
+        assert!(na
+            .search_aggregate_sharded("s", &query, &distinct)
+            .unwrap()
+            .is_none());
+
+        // Sharded sorted top-k: per-shard fast-field top-k merged by the
+        // sort column — the ids with the largest `units` in exact order.
+        let sort = skaidb_fts::SortSpec {
+            column: "units".into(),
+            descending: true,
+        };
+        let sorted = na
+            .search_sorted_sharded("s", &query, &sort, 5, &None, &[])
+            .unwrap()
+            .expect("sharded sorted top-k must serve");
+        let got_units: Vec<i64> = sorted
+            .iter()
+            .map(|(_, doc)| match doc.get_path("units") {
+                Some(Value::Int(u)) => *u,
+                other => panic!("bad units {other:?}"),
+            })
+            .collect();
+        assert_eq!(got_units, vec![60, 59, 58, 57, 56]);
+        // A residual filter declines (filters do not travel).
+        let residual = Some(skaidb_sql::ast::Expr::Literal(Value::Bool(true)));
+        assert!(na
+            .search_sorted_sharded("s", &query, &sort, 5, &residual, &[])
+            .unwrap()
+            .is_none());
+
+        // Per-hit explain routes to a replica of the key — every row
+        // explains from every coordinator, wherever it lives.
+        let filter = Some(skaidb_sql::ast::Expr::Func {
+            name: "match".into(),
+            args: vec![
+                skaidb_sql::ast::Expr::Column("product".into()),
+                skaidb_sql::ast::Expr::Literal(Value::String("widget".into())),
+            ],
+        });
+        for coord in [&na, &nb, &nc] {
+            for id in [1i64, 17, 42, 60] {
+                let text = coord
+                    .search_explain("s", &filter, &Value::Int(id))
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("row {id} must explain"));
+                assert!(text.contains("TermQuery"), "row {id}: {text}");
+            }
+        }
 
         // End-to-end over SQL from every coordinator: the sharded path and
         // the fallback must be indistinguishable.

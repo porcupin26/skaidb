@@ -981,6 +981,7 @@ impl Database {
     /// resolving hits to rows with the residual-filter over-fetch
     /// discipline. `Ok(None)` = the index cannot serve this ordering
     /// exactly; the caller falls back.
+    #[allow(clippy::too_many_arguments)]
     pub fn search_sorted(
         &mut self,
         table: &str,
@@ -989,15 +990,17 @@ impl Database {
         k: usize,
         filter: &Option<Expr>,
         highlights: &[(String, usize)],
+        ownership: Option<&[(u64, u64)]>,
     ) -> Result<Option<SortedSearchRows>> {
         let name = self.search_index_for_query(table, query)?;
         if let Some(live) = self.search_indexes.get_mut(&name) {
             live.commit_if_dirty()?;
         }
-        self.search_sorted_read(table, query, sort, k, filter, highlights)
+        self.search_sorted_read(table, query, sort, k, filter, highlights, ownership)
     }
 
     /// [`Database::search_sorted`] over the last-committed index state.
+    #[allow(clippy::too_many_arguments)]
     pub fn search_sorted_read(
         &self,
         table: &str,
@@ -1006,6 +1009,7 @@ impl Database {
         k: usize,
         filter: &Option<Expr>,
         highlights: &[(String, usize)],
+        ownership: Option<&[(u64, u64)]>,
     ) -> Result<Option<SortedSearchRows>> {
         let name = self.search_index_for_query(table, query)?;
         let live = self
@@ -1021,7 +1025,7 @@ impl Database {
         } else {
             k
         };
-        let Some(hits) = live.index.search_sorted(query, sort, fetch)? else {
+        let Some(hits) = live.index.search_sorted(query, sort, fetch, ownership)? else {
             return Ok(None);
         };
         let highlighters = highlights
@@ -1069,17 +1073,24 @@ impl Database {
         filter: &Option<Expr>,
         pk_value: &Value,
     ) -> Result<Option<String>> {
-        let (mut queries, _residual) = split_search_filter(filter)?;
-        if queries.is_empty() {
+        let Some(query) = filter_search_query(filter)? else {
             return Err(EngineError::Type(
                 "score explain needs a MATCH()/SEARCH() predicate".into(),
             ));
-        }
-        let query = match queries.len() {
-            1 => queries.pop().expect("len checked"),
-            _ => SearchQuery::All(queries),
         };
-        let index_name = self.search_index_for_query(table, &query)?;
+        self.search_explain_query(table, &query, pk_value)
+    }
+
+    /// [`Database::search_explain`] for an already-extracted search query —
+    /// the form a coordinator can route to a remote replica (the SQL
+    /// filter itself does not travel; the [`SearchQuery`] does).
+    pub fn search_explain_query(
+        &mut self,
+        table: &str,
+        query: &SearchQuery,
+        pk_value: &Value,
+    ) -> Result<Option<String>> {
+        let index_name = self.search_index_for_query(table, query)?;
         if let Some(live) = self.search_indexes.get_mut(&index_name) {
             live.commit_if_dirty()?;
         }
@@ -1088,7 +1099,7 @@ impl Database {
             .get(&index_name)
             .ok_or_else(|| EngineError::IndexNotFound(index_name.clone()))?;
         let key = Value::Array(vec![pk_value.clone()]).encode_key();
-        Ok(live.index.explain(&query, &key)?)
+        Ok(live.index.explain(query, &key)?)
     }
 
     fn suggest_cmd_mut(
@@ -4277,6 +4288,19 @@ fn is_pure_search(e: &Expr) -> bool {
     }
 }
 
+/// The combined search query of a WHERE clause, for callers outside the
+/// executor (e.g. a cluster coordinator routing a per-hit explain): the
+/// search predicates AND-ed into one [`SearchQuery`], `None` when the
+/// filter has none, `Err` on unpushable mixing.
+pub fn filter_search_query(filter: &Option<Expr>) -> Result<Option<SearchQuery>> {
+    let (mut queries, _residual) = split_search_filter(filter)?;
+    Ok(match queries.len() {
+        0 => None,
+        1 => Some(queries.pop().expect("len checked")),
+        _ => Some(SearchQuery::All(queries)),
+    })
+}
+
 /// Convert a pure-search expression (see [`is_pure_search`]) into a
 /// [`SearchQuery`] tree.
 fn to_search_query(e: &Expr) -> Result<SearchQuery> {
@@ -5454,7 +5478,7 @@ impl Cluster for LocalCluster<'_> {
         highlights: &[(String, usize)],
     ) -> Result<Option<SortedSearchRows>> {
         self.db
-            .search_sorted(table, query, sort, k, filter, highlights)
+            .search_sorted(table, query, sort, k, filter, highlights, None)
     }
 
     fn put(&mut self, table: &str, key: &[u8], doc: &Document) -> Result<()> {
@@ -5605,7 +5629,7 @@ impl Cluster for LocalRead<'_> {
         highlights: &[(String, usize)],
     ) -> Result<Option<SortedSearchRows>> {
         self.db
-            .search_sorted_read(table, query, sort, k, filter, highlights)
+            .search_sorted_read(table, query, sort, k, filter, highlights, None)
     }
 
     fn put(&mut self, _table: &str, _key: &[u8], _doc: &Document) -> Result<()> {

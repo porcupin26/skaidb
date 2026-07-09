@@ -449,11 +449,16 @@ impl SearchIndex {
     /// **any matching row missing the sort column**: SQL puts NULLs first
     /// on DESC while the index sorts them last, so mixed data falls back
     /// to the row path rather than reorder.
+    /// `ownership`: restrict to documents whose `_ring` hash falls in the
+    /// given arcs (a sharded scatter's per-node primary key-space) — the
+    /// NULL-sort-column exactness check then applies to the owned subset,
+    /// which is exactly the subset this shard answers for.
     pub fn search_sorted(
         &self,
         query: &SearchQuery,
         sort: &crate::SortSpec,
         k: usize,
+        ownership: Option<&[(u64, u64)]>,
     ) -> Result<Option<SortedHits>, FtsError> {
         use tantivy::aggregation::agg_req::Aggregations;
         use tantivy::aggregation::{AggContextParams, AggregationCollector};
@@ -463,7 +468,7 @@ impl SearchIndex {
         let Some(col) = self.columns.iter().find(|c| c.path == sort.column) else {
             return Ok(None);
         };
-        let q = build_query(
+        let mut q = build_query(
             &self.index,
             &QueryFields {
                 fields: &self.runtimes,
@@ -471,6 +476,12 @@ impl SearchIndex {
             },
             query,
         )?;
+        if let Some(arcs) = ownership {
+            q = Box::new(tantivy::query::BooleanQuery::new(vec![
+                (tantivy::query::Occur::Must, q),
+                (tantivy::query::Occur::Must, ring_arcs_query(self.ring_field, arcs)),
+            ]));
+        }
         let order = if sort.descending {
             Order::Desc
         } else {
@@ -2015,7 +2026,7 @@ mod tests {
 
         // Numeric sort, both directions, top-k.
         let desc = idx
-            .search_sorted(&q, &crate::SortSpec { column: "price".into(), descending: true }, 2)
+            .search_sorted(&q, &crate::SortSpec { column: "price".into(), descending: true }, 2, None)
             .unwrap()
             .expect("servable");
         assert_eq!(
@@ -2023,14 +2034,14 @@ mod tests {
             vec![Value::Float(30.0), Value::Float(20.0)]
         );
         let asc = idx
-            .search_sorted(&q, &crate::SortSpec { column: "price".into(), descending: false }, 3)
+            .search_sorted(&q, &crate::SortSpec { column: "price".into(), descending: false }, 3, None)
             .unwrap()
             .expect("servable");
         assert_eq!(asc[0].1, Value::Float(10.0));
 
         // Keyword sort.
         let by_cat = idx
-            .search_sorted(&q, &crate::SortSpec { column: "category".into(), descending: false }, 3)
+            .search_sorted(&q, &crate::SortSpec { column: "category".into(), descending: false }, 3, None)
             .unwrap()
             .expect("servable");
         assert_eq!(by_cat[0].1, Value::String("a".into()));
@@ -2042,11 +2053,11 @@ mod tests {
         idx.put(b"x", &d, wm(9)).unwrap();
         idx.commit().unwrap();
         assert!(idx
-            .search_sorted(&q, &crate::SortSpec { column: "price".into(), descending: true }, 2)
+            .search_sorted(&q, &crate::SortSpec { column: "price".into(), descending: true }, 2, None)
             .unwrap()
             .is_none());
         assert!(idx
-            .search_sorted(&q, &crate::SortSpec { column: "body".into(), descending: true }, 2)
+            .search_sorted(&q, &crate::SortSpec { column: "body".into(), descending: true }, 2, None)
             .unwrap()
             .is_none());
     }

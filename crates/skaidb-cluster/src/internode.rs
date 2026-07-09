@@ -142,6 +142,26 @@ pub enum Request {
         agg: String,
         epoch: u64,
     },
+    /// Sharded sorted-top-k shard: fast-field-ordered top `k` over the
+    /// responder's primary-owned key-space at `epoch`, rows fully resolved
+    /// (residual filters do not travel — the coordinator declines the
+    /// scatter when one is present). `sort` is a serde_json `SortSpec`;
+    /// `highlights` are `(column, max_chars)` pairs resolved per shard.
+    SearchSorted {
+        table: String,
+        query: String,
+        sort: String,
+        k: u32,
+        highlights: Vec<(String, u32)>,
+        epoch: u64,
+    },
+    /// Per-hit score explain routed to a replica of the key: `query` is a
+    /// serde_json `SearchQuery`, `pk` a `Value::encode`d primary-key value.
+    SearchExplain {
+        table: String,
+        query: String,
+        pk: Vec<u8>,
+    },
     ApplyDdl {
         /// The coordinator's current database, so table/index names in `sql`
         /// resolve to the same internal namespace on every node.
@@ -228,6 +248,13 @@ pub enum Response {
     /// Per-shard aggregation rows from a [`Request::SearchAgg`], encoded
     /// with [`encode_agg_rows`]; `None` = declined, fall back.
     SearchAggRows { rows: Option<Vec<u8>> },
+    /// Per-shard resolved rows from a [`Request::SearchSorted`], encoded
+    /// with [`encode_sorted_rows`]; `None` = declined, fall back.
+    SortedRows { rows: Option<Vec<u8>> },
+    /// The BM25 breakdown from a [`Request::SearchExplain`]; `None` = the
+    /// key does not match the query (or is absent) on the answering
+    /// replica.
+    Explanation { text: Option<String> },
     /// `(key, BM25 score)` hits from a [`Request::Search`], best-first
     /// (scores 0.0 on the unranked path).
     SearchHits {
@@ -314,6 +341,8 @@ const REQ_TSSUMMARY: u8 = 23;
 const REQ_TSPARTIALS: u8 = 24;
 const REQ_SEARCH: u8 = 25;
 const REQ_SEARCHAGG: u8 = 26;
+const REQ_SEARCHSORTED: u8 = 27;
+const REQ_SEARCHEXPLAIN: u8 = 28;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
@@ -329,6 +358,8 @@ const RES_TSSUMMARIES: u8 = 10;
 const RES_TSPARTIALS: u8 = 11;
 const RES_SHITS: u8 = 12;
 const RES_SAGG: u8 = 13;
+const RES_SORTEDROWS: u8 = 14;
+const RES_EXPLAIN: u8 = 15;
 
 impl Request {
     pub fn encode(&self) -> Vec<u8> {
@@ -476,6 +507,32 @@ impl Request {
                 put_str(o, query);
                 put_str(o, agg);
                 o.extend_from_slice(&epoch.to_le_bytes());
+            }
+            Request::SearchSorted {
+                table,
+                query,
+                sort,
+                k,
+                highlights,
+                epoch,
+            } => {
+                o.push(REQ_SEARCHSORTED);
+                put_str(o, table);
+                put_str(o, query);
+                put_str(o, sort);
+                o.extend_from_slice(&k.to_le_bytes());
+                o.extend_from_slice(&(highlights.len() as u32).to_le_bytes());
+                for (col, max_chars) in highlights {
+                    put_str(o, col);
+                    o.extend_from_slice(&max_chars.to_le_bytes());
+                }
+                o.extend_from_slice(&epoch.to_le_bytes());
+            }
+            Request::SearchExplain { table, query, pk } => {
+                o.push(REQ_SEARCHEXPLAIN);
+                put_str(o, table);
+                put_str(o, query);
+                put_bytes(o, pk);
             }
             Request::ApplyDdl { db, sql, hlc } => {
                 o.push(REQ_DDL);
@@ -637,6 +694,31 @@ impl Request {
                 agg: c.string()?,
                 epoch: c.u64()?,
             },
+            REQ_SEARCHSORTED => {
+                let table = c.string()?;
+                let query = c.string()?;
+                let sort = c.string()?;
+                let k = c.u32()?;
+                let n = c.u32()? as usize;
+                let mut highlights = Vec::with_capacity(n.min(64));
+                for _ in 0..n {
+                    let col = c.string()?;
+                    highlights.push((col, c.u32()?));
+                }
+                Request::SearchSorted {
+                    table,
+                    query,
+                    sort,
+                    k,
+                    highlights,
+                    epoch: c.u64()?,
+                }
+            }
+            REQ_SEARCHEXPLAIN => Request::SearchExplain {
+                table: c.string()?,
+                query: c.string()?,
+                pk: c.bytes()?,
+            },
             REQ_DDL => Request::ApplyDdl {
                 db: c.string()?,
                 sql: c.string()?,
@@ -728,6 +810,26 @@ impl Response {
                     Some(rows) => {
                         o.push(1);
                         put_bytes(o, rows);
+                    }
+                    None => o.push(0),
+                }
+            }
+            Response::SortedRows { rows } => {
+                o.push(RES_SORTEDROWS);
+                match rows {
+                    Some(rows) => {
+                        o.push(1);
+                        put_bytes(o, rows);
+                    }
+                    None => o.push(0),
+                }
+            }
+            Response::Explanation { text } => {
+                o.push(RES_EXPLAIN);
+                match text {
+                    Some(text) => {
+                        o.push(1);
+                        put_str(o, text);
                     }
                     None => o.push(0),
                 }
@@ -858,6 +960,14 @@ impl Response {
             RES_SAGG => {
                 let rows = if c.u8()? == 1 { Some(c.bytes()?) } else { None };
                 Response::SearchAggRows { rows }
+            }
+            RES_SORTEDROWS => {
+                let rows = if c.u8()? == 1 { Some(c.bytes()?) } else { None };
+                Response::SortedRows { rows }
+            }
+            RES_EXPLAIN => {
+                let text = if c.u8()? == 1 { Some(c.string()?) } else { None };
+                Response::Explanation { text }
             }
             RES_SCHEMA => {
                 let n = c.u32()? as usize;
@@ -1360,6 +1470,36 @@ pub fn decode_agg_rows(buf: &[u8]) -> Result<Vec<skaidb_fts::AggRow>, WireError>
             );
         }
         rows.push(skaidb_fts::AggRow { key, count, metrics });
+    }
+    Ok(rows)
+}
+
+/// Binary encoding for shard sorted rows: `u32` count, then per row a
+/// length-prefixed key and a length-prefixed `Value::encode`d document.
+pub fn encode_sorted_rows(rows: &[(Vec<u8>, skaidb_types::Document)]) -> Vec<u8> {
+    let mut o = Vec::new();
+    o.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+    for (key, doc) in rows {
+        put_bytes(&mut o, key);
+        put_bytes(&mut o, &skaidb_types::Value::Document(doc.clone()).encode());
+    }
+    o
+}
+
+/// Inverse of [`encode_sorted_rows`].
+pub fn decode_sorted_rows(
+    buf: &[u8],
+) -> Result<Vec<(Vec<u8>, skaidb_types::Document)>, WireError> {
+    let mut c = Cur::new(buf);
+    let n = c.u32()? as usize;
+    let mut rows = Vec::with_capacity(n.min(1 << 20));
+    for _ in 0..n {
+        let key = c.bytes()?;
+        let doc = match skaidb_types::Value::decode(&c.bytes()?) {
+            Ok(skaidb_types::Value::Document(doc)) => doc,
+            _ => return Err(WireError::Malformed("bad sorted-row document")),
+        };
+        rows.push((key, doc));
     }
     Ok(rows)
 }
