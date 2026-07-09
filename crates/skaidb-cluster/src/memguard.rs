@@ -113,10 +113,44 @@ fn detected_limit() -> Option<u64> {
         .or_else(meminfo_total)
 }
 
-/// Current usage in bytes: the cgroup charge when available (which includes
-/// the page cache the kernel counts toward the limit), else this process's RSS.
+/// Current usage in bytes: the cgroup charge **minus reclaimable file-backed
+/// page cache**, else this process's RSS.
+///
+/// `memory.current` counts mmap'd SSTable/WAL/search-segment page cache, which
+/// the kernel evicts before it ever OOM-kills. Counting it toward the shed
+/// threshold falsely sheds a node whose real (anon + kernel + unreclaimable
+/// slab) footprint has ample headroom — e.g. after a search-index build fills
+/// the cache, a node at 76% real usage reads as 96% and rejects every write.
+/// Subtracting the reclaimable file cache leaves the footprint that actually
+/// risks OOM, so shedding tracks real pressure instead of cache.
 fn current_usage() -> Option<u64> {
-    cgroup_read("memory.current").or_else(self_rss)
+    match cgroup_read("memory.current") {
+        Some(current) => {
+            let reclaimable = cgroup_stat_sum(&["inactive_file", "active_file"]).unwrap_or(0);
+            Some(current.saturating_sub(reclaimable))
+        }
+        None => self_rss(),
+    }
+}
+
+/// Sum the named counters from cgroup v2 `memory.stat` (bytes). `None` if the
+/// file is unavailable or none of the keys are present.
+fn cgroup_stat_sum(keys: &[&str]) -> Option<u64> {
+    let s = std::fs::read_to_string("/sys/fs/cgroup/memory.stat").ok()?;
+    let mut total = 0u64;
+    let mut found = false;
+    for line in s.lines() {
+        let mut it = line.split_whitespace();
+        if let (Some(k), Some(v)) = (it.next(), it.next()) {
+            if keys.contains(&k) {
+                if let Ok(n) = v.parse::<u64>() {
+                    total += n;
+                    found = true;
+                }
+            }
+        }
+    }
+    found.then_some(total)
 }
 
 fn cgroup_read(file: &str) -> Option<u64> {

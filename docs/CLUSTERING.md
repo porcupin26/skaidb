@@ -375,7 +375,10 @@ SCRAM on the binary endpoint and HTTP Basic on REST, plus RBAC; see the
   already failed fast on connect; this covers the connected-but-silent
   case.)
 - **Memory-pressure load shedding.** A node watches its memory against its
-  limit (cgroup when set, else system RAM). Past 85% it **sheds writes** —
+  limit (cgroup when set, else system RAM), measuring **non-reclaimable**
+  usage — the cgroup charge minus reclaimable file-backed page cache (mmap'd
+  SSTable/WAL/search segments the kernel evicts before OOM), so a cache-filled
+  node isn't falsely shed while it still has real headroom. Past 85% it **sheds writes** —
   rejecting new writes (client and inbound-replica) with a retryable
   "memory pressure" error — so it can flush the memtable and commit/merge
   search segments, shrink its footprint, and leave the OS headroom, instead
