@@ -69,6 +69,34 @@ git history.
   side-by-side with its own TSDB, zero-loss comparison (the TS phase-4
   exit criterion; deferred with the other soaks).
 
+## SQL surface gaps (capabilities with no native SQL form)
+
+Everything below works today through another surface (HTTP admin,
+`skaidbsh` backslash commands, config file, or the ES subset) but cannot
+be spoken in SQL. Each row carries the suggested SQL extension.
+
+| Capability | Today | Suggested SQL extension |
+|---|---|---|
+| Query-plan inspection | nothing (only `EXPLAIN SCORE`) | `EXPLAIN <statement>` — index selection, pushdown/scatter/fallback decisions, per-node fan-out |
+| Cluster membership | `/admin/add-node`, `\node add` | `ALTER CLUSTER ADD NODE 'host:7100'` / `ALTER CLUSTER REMOVE NODE 'id'` |
+| Cluster health | `/status`, `/admin/status`, `\cluster` | `SHOW CLUSTER` (members, epoch, ring, hints, liveness) |
+| Anti-entropy / space | `/admin/repair`, `/admin/reclaim` | `REPAIR CLUSTER` / `RECLAIM` (async, returns a job row) |
+| Runtime configuration | `/admin/config*`, `\config` | `SHOW CONFIG [LIKE 'observability.%']` / `SET CONFIG key = 'value'` (ALTER SYSTEM-style) |
+| Slow-query log | `/admin/slow` | `SHOW SLOW QUERIES [LIMIT n]` |
+| Session consistency | driver/shell (`\consistency`) | `SET CONSISTENCY { ONE \| QUORUM \| ALL }` as a statement |
+| Per-group top documents | ES `top_hits` sub-agg only | window functions (`ROW_NUMBER() OVER (PARTITION BY g ORDER BY score() DESC)`), or a dedicated `TOP k BY <expr>` group clause |
+| Field-subset dis-max match | internal `match_best` (ES multi_match best_fields) | document/expose `MATCH_BEST(col, col, ..., 'text')` |
+| Vector index tuning | fixed ef/M | `ALTER VECTOR INDEX v SET (ef = 128, m = 16)` |
+| Row TTL on regular tables | only TS `RETENTION` | `CREATE TABLE t (PRIMARY KEY (id)) WITH (ttl = 30d)` |
+| Backup / snapshot | nothing anywhere | `BACKUP [DATABASE d] TO '<path>'` / `RESTORE FROM '<path>'` |
+| Batch scripts | one statement per call | multi-statement bodies are a protocol decision, not grammar — probably keep as-is |
+
+Ordered by expected value: `EXPLAIN`, `SHOW CONFIG`/`SET CONFIG`, and
+`SHOW CLUSTER` close the biggest day-to-day gaps (they make skaidbsh and
+any SQL-only client fully self-sufficient); `BACKUP`/`RESTORE` is the
+biggest missing capability outright; TTL and window functions are the
+biggest language features.
+
 ## Performance
 
 (The audit record — what already holds, measured dead ends, methodology —

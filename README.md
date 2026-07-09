@@ -145,6 +145,9 @@ Types: `null, bool, int64, float64, decimal, string, bytes, uuid, timestamp`
 (unixtime ms), `array`, `document`, plus JSON-like values.
 
 Full grammar reference: **[docs/QUERY_SYNTAX.md](docs/QUERY_SYNTAX.md)**.
+Building with an LLM or agent? **[docs/LLM.md](docs/LLM.md)** is the
+single-file reference designed for machine consumption — the whole query
+surface, APIs, cluster semantics, and pitfalls in one place.
 
 ## Status & deferred work
 
