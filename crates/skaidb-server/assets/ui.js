@@ -716,7 +716,9 @@ async function refreshStats() {
     ["vector indexes", s.get("vector_indexes")],
   ]);
 
-  renderStatGroup("st-tables", statusResult.rows, /^table\.(.+)\.(live_keys|tombstones|disk_bytes)$/,
+  // `table.<db>.<table>.<field>` → a database column + a table column.
+  renderStatGroup("st-tables", statusResult.rows,
+    /^table\.([^.]+)\.([^.]+)\.(live_keys|tombstones|disk_bytes)$/,
     ["live_keys", "tombstones", "disk_bytes"]);
   renderStatGroup("st-indexes", statusResult.rows, /^search\.(.+)\.(docs|disk_bytes|uncommitted)$/,
     ["docs", "disk_bytes", "uncommitted"]);
@@ -776,25 +778,32 @@ function renderHosts(hosts) {
   }
 }
 
-// Rows like `table.<name>.<field>` → one table row per <name>.
+// Rows like `<prefix>.<label>[.<label>...].<field>` → one row per label
+// tuple. The pattern's leading captures are label columns (e.g. database +
+// table); its final capture is the field name.
 function renderStatGroup(tableId, rows, pattern, fields) {
   const groups = new Map();
   for (const [metric, value] of rows) {
     const match = String(metric).match(pattern);
     if (!match) continue;
-    if (!groups.has(match[1])) groups.set(match[1], {});
-    groups.get(match[1])[match[2]] = value;
+    const labels = match.slice(1, match.length - 1);
+    const field = match[match.length - 1];
+    const key = labels.join(" ");
+    if (!groups.has(key)) groups.set(key, { labels, vals: {} });
+    groups.get(key).vals[field] = value;
   }
   const tbody = $(tableId).querySelector("tbody");
   tbody.textContent = "";
-  for (const [name, vals] of [...groups].sort((a, b) => a[0].localeCompare(b[0]))) {
+  for (const [, g] of [...groups].sort((a, b) => a[0].localeCompare(b[0]))) {
     const tr = document.createElement("tr");
-    const nameCell = document.createElement("td");
-    nameCell.textContent = name;
-    tr.append(nameCell);
+    for (const label of g.labels) {
+      const td = document.createElement("td");
+      td.textContent = label;
+      tr.append(td);
+    }
     for (const f of fields) {
       const td = document.createElement("td");
-      const v = vals[f];
+      const v = g.vals[f];
       td.textContent = v === undefined ? "—" : f.includes("bytes") ? fmtBytes(v) : String(v);
       tr.append(td);
     }

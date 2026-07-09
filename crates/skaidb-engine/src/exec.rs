@@ -175,6 +175,9 @@ pub struct DbStats {
 /// Per-table live-key / tombstone / size breakdown.
 #[derive(Debug, Clone, Default)]
 pub struct TableStats {
+    /// The database the table belongs to (`default` for unqualified tables).
+    pub database: String,
+    /// The bare table name (without the database qualifier).
     pub name: String,
     pub live_keys: u64,
     pub tombstones: u64,
@@ -3756,9 +3759,10 @@ impl Database {
             row("cache_evictions", Value::Int(s.cache_evictions as i64));
             row("bloom_negatives", Value::Int(s.bloom_negatives as i64));
             for t in &s.per_table {
-                row(&format!("table.{}.live_keys", t.name), Value::Int(t.live_keys as i64));
-                row(&format!("table.{}.tombstones", t.name), Value::Int(t.tombstones as i64));
-                row(&format!("table.{}.disk_bytes", t.name), Value::Int(t.disk_bytes as i64));
+                let q = format!("{}.{}", t.database, t.name);
+                row(&format!("table.{q}.live_keys"), Value::Int(t.live_keys as i64));
+                row(&format!("table.{q}.tombstones"), Value::Int(t.tombstones as i64));
+                row(&format!("table.{q}.disk_bytes"), Value::Int(t.disk_bytes as i64));
             }
             // Per-search-index breakdown, in catalog (name) order.
             for name in self.catalog.search_indexes.keys() {
@@ -3766,13 +3770,15 @@ impl Database {
                     continue;
                 };
                 let fs = live.index.stats();
-                row(&format!("search.{name}.docs"), Value::Int(fs.docs as i64));
-                row(&format!("search.{name}.disk_bytes"), Value::Int(fs.disk_bytes as i64));
-                row(&format!("search.{name}.uncommitted"), Value::Int(fs.uncommitted as i64));
+                let d = namespace::display_name(name, DEFAULT_DATABASE);
+                row(&format!("search.{d}.docs"), Value::Int(fs.docs as i64));
+                row(&format!("search.{d}.disk_bytes"), Value::Int(fs.disk_bytes as i64));
+                row(&format!("search.{d}.uncommitted"), Value::Int(fs.uncommitted as i64));
             }
             row("timeseries_tables", Value::Int(self.timeseries.len() as i64));
             for (name, store) in &self.timeseries {
                 let ts = store.stats();
+                let name = namespace::display_name(name, DEFAULT_DATABASE);
                 row(&format!("timeseries.{name}.series"), Value::Int(ts.series as i64));
                 row(&format!("timeseries.{name}.blocks"), Value::Int(ts.blocks as i64));
                 row(
@@ -3831,15 +3837,19 @@ impl Database {
             for (name, engine) in &self.tables {
                 let s = engine.stats();
                 let ks = engine.key_stats().unwrap_or_default();
+                let (db, bare) = namespace::split(name);
                 agg.per_table.push(TableStats {
-                    name: name.clone(),
+                    database: db.to_string(),
+                    name: bare.to_string(),
                     live_keys: ks.live_keys as u64,
                     tombstones: ks.tombstones as u64,
                     disk_bytes: s.disk_bytes,
                     sstables: s.sstable_count as u64,
                 });
             }
-            agg.per_table.sort_by(|a, b| a.name.cmp(&b.name));
+            agg
+                .per_table
+                .sort_by(|a, b| (&a.database, &a.name).cmp(&(&b.database, &b.name)));
         }
         agg
     }

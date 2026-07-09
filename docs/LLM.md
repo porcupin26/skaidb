@@ -156,7 +156,7 @@ SHOW GRANTS [FOR r]
 SHOW TABLES        -- (table, primary_key)
 SHOW INDEXES       -- (index, table, kind, columns)
 SHOW STATUS        -- (metric, value): disk/memtable/wal/cache/compactions,
-                   -- per-table table.<n>.*, per-index search.<n>.*
+                   -- per-table table.<db>.<table>.*, per-index search.<name>.*
 SHOW DATABASES
 
 -- Admin statements (SQL spellings of the HTTP admin surface; need ADMIN

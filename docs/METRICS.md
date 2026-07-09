@@ -117,14 +117,14 @@ throughput are computed over the window since the previous sample.
 
 ### Per-table (opt-in)
 
-Enabled with `observability.per_table_metrics = true`. Each carries a `table`
-label — only turn this on when the table set is small and known.
+Enabled with `observability.per_table_metrics = true`. Each carries `db` and
+`table` labels — only turn this on when the table set is small and known.
 
 | Metric | Type | Labels | Meaning |
 |--------|------|--------|---------|
-| `skaidb_table_live_keys` | gauge | `table` | Live keys (full merged scan; O(rows) at scrape). |
-| `skaidb_table_tombstones` | gauge | `table` | Tombstones awaiting compaction. |
-| `skaidb_table_disk_bytes` | gauge | `table` | On-disk bytes for the table. |
+| `skaidb_table_live_keys` | gauge | `db`, `table` | Live keys (full merged scan; O(rows) at scrape). |
+| `skaidb_table_tombstones` | gauge | `db`, `table` | Tombstones awaiting compaction. |
+| `skaidb_table_disk_bytes` | gauge | `db`, `table` | On-disk bytes for the table. |
 
 ## Vector index
 

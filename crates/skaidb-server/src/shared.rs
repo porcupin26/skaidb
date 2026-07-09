@@ -478,19 +478,12 @@ pub fn collect_runtime_metrics(ctx: &Shared) {
             s.search_rebuild_ms / 1000,
         );
         for t in &s.per_table {
-            let label = escape_label(&t.name);
-            m.set(
-                &format!("skaidb_table_live_keys{{table=\"{label}\"}}"),
-                t.live_keys,
-            );
-            m.set(
-                &format!("skaidb_table_tombstones{{table=\"{label}\"}}"),
-                t.tombstones,
-            );
-            m.set(
-                &format!("skaidb_table_disk_bytes{{table=\"{label}\"}}"),
-                t.disk_bytes,
-            );
+            let table = escape_label(&t.name);
+            let db = escape_label(&t.database);
+            let labels = format!("db=\"{db}\",table=\"{table}\"");
+            m.set(&format!("skaidb_table_live_keys{{{labels}}}"), t.live_keys);
+            m.set(&format!("skaidb_table_tombstones{{{labels}}}"), t.tombstones);
+            m.set(&format!("skaidb_table_disk_bytes{{{labels}}}"), t.disk_bytes);
         }
     }
 
