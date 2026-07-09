@@ -77,15 +77,12 @@ be spoken in SQL. Each row carries the suggested SQL extension.
 
 | Capability | Today | Suggested SQL extension |
 |---|---|---|
-| Query-plan inspection | nothing (only `EXPLAIN SCORE`) | `EXPLAIN <statement>` — index selection, pushdown/scatter/fallback decisions, per-node fan-out |
 | Per-group top documents | ES `top_hits` sub-agg only | window functions (`ROW_NUMBER() OVER (PARTITION BY g ORDER BY score() DESC)`), or a dedicated `TOP k BY <expr>` group clause |
 | Batch scripts | one statement per call | multi-statement bodies are a protocol decision, not grammar — probably keep as-is |
 
-Ordered by expected value: `EXPLAIN`, `SHOW CONFIG`/`SET CONFIG`, and
-`SHOW CLUSTER` close the biggest day-to-day gaps (they make skaidbsh and
-any SQL-only client fully self-sufficient); `BACKUP`/`RESTORE` is the
-biggest missing capability outright; TTL and window functions are the
-biggest language features.
+Window functions / per-group top-k is the remaining language feature
+with real pull (everything else from the original gap list — `EXPLAIN`,
+admin statements, `BACKUP`/`RESTORE`, TTL — has shipped).
 
 ## Performance
 

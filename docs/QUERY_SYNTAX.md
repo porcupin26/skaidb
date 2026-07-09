@@ -41,6 +41,7 @@ ALTER   SEARCH INDEX <name> SET (<option> = <literal> [, ...])
         -- <col>.search_analyzer, <col>.boost (applied live, no reindex)
 SUGGEST '<text>' ON <index> [COLUMN <col>] [LIMIT <n>]
 EXPLAIN SCORE <select> FOR <pk-literal>
+EXPLAIN <statement>
 ALTER  TABLE <table> RENAME TO <new_table>
 ALTER  TABLE <table> RENAME COLUMN <from> TO <to>
 
@@ -376,6 +377,17 @@ WHERE (MATCH(body, 'rust') OR MATCH(title, 'rust'))
   `<required>` matches; each `<optional>` predicate only **raises the
   score** of rows that already match. Every argument must itself be a
   search predicate (possibly AND/OR/NOT-composed).
+- **`EXPLAIN <statement>`** — the plan the executor would choose for any
+  SELECT/DML statement, as `(aspect, decision)` rows: the access path
+  (primary-key point read, secondary-index scan with its bounds, full
+  table scan, BM25 top-k / index-ordered / unranked search pushdown,
+  search-aggregation pushdown vs. row-gather fallback, HNSW vector
+  search), residual-filter and join-strategy notes, and — on a cluster —
+  appended `cluster.*` rows (members, replication factor, fan-out:
+  point-routed / served locally / scatter-gather). Advisory: it mirrors
+  the planner's decision logic without executing anything, so `EXPLAIN
+  DELETE ...` is safe. Gated by the wrapped statement's own privilege.
+  `EXPLAIN EXPLAIN` is rejected.
 - **`EXPLAIN SCORE <select> FOR <pk literal>`** — a standalone statement
   returning the BM25 breakdown (`explanation` column, tantivy's JSON —
   per-term K1 / idf(n, N) / tf-normalization) of how the row with that

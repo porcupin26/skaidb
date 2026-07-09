@@ -894,6 +894,9 @@ fn required_privilege(stmt: &Statement) -> Option<(Privilege, Object)> {
         Statement::ExplainScore { select, .. } => {
             (Privilege::Select, Object::Table(select.from.clone()))
         }
+        // The plan describes what the wrapped statement would touch — gate
+        // exactly as the wrapped statement itself is gated.
+        Statement::Explain { statement } => return required_privilege(statement),
         Statement::Insert(i) => (Privilege::Insert, Object::Table(i.table.clone())),
         Statement::Update(u) => (Privilege::Update, Object::Table(u.table.clone())),
         Statement::Delete(d) => (Privilege::Delete, Object::Table(d.table.clone())),

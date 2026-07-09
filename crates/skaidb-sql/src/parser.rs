@@ -252,9 +252,16 @@ impl Parser {
         if self.peek_ident_ci("explain") {
             self.advance();
             if !self.eat_ident_ci("score") {
-                return Err(ParseError::Other(
-                    "EXPLAIN supports only EXPLAIN SCORE <select> FOR <pk>".into(),
-                ));
+                // `EXPLAIN <statement>` — plan inspection.
+                let inner = self.parse_statement()?;
+                if matches!(inner, Statement::Explain { .. } | Statement::ExplainScore { .. }) {
+                    return Err(ParseError::Other(
+                        "EXPLAIN cannot wrap another EXPLAIN".into(),
+                    ));
+                }
+                return Ok(Statement::Explain {
+                    statement: Box::new(inner),
+                });
             }
             let select = self.parse_select()?;
             self.expect_keyword(Keyword::For).map_err(|_| {

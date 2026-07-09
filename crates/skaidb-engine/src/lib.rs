@@ -1886,6 +1886,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// EXPLAIN <statement>: the advisory plan rows track the planner's
+    /// actual access-path choices (point read / index scan / full scan /
+    /// search pushdowns / vector search) without executing anything.
+    #[test]
+    fn explain_plan() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE e (PRIMARY KEY (id))").unwrap();
+        db.execute("CREATE INDEX e_age ON e (age)").unwrap();
+        db.execute("CREATE SEARCH INDEX e_fts ON e (body)").unwrap();
+        db.execute("CREATE VECTOR INDEX e_emb ON e (emb) DIM 3").unwrap();
+        db.execute("INSERT INTO e (id, age, body, emb) VALUES (1, 30, 'hello world', [1.0, 0.0, 0.0])")
+            .unwrap();
+
+        let mut decision = |sql: &str, aspect: &str| -> String {
+            let rs = rows(db.execute(sql).unwrap());
+            assert_eq!(rs.columns, vec!["aspect", "decision"]);
+            rs.rows
+                .iter()
+                .find(|r| r[0] == Value::String(aspect.into()))
+                .map(|r| match &r[1] {
+                    Value::String(s) => s.clone(),
+                    other => format!("{other:?}"),
+                })
+                .unwrap_or_default()
+        };
+        // Access-path classification mirrors the executor's choices.
+        assert!(decision("EXPLAIN SELECT * FROM e WHERE id = 1", "access").contains("point read"));
+        assert!(decision("EXPLAIN SELECT * FROM e WHERE age > 10", "access").contains("e_age"));
+        assert!(decision("EXPLAIN SELECT * FROM e WHERE name = 'x'", "access")
+            .contains("full table scan"));
+        assert!(decision(
+            "EXPLAIN SELECT id, score() FROM e WHERE MATCH(body, 'hello') ORDER BY score() DESC LIMIT 5",
+            "access"
+        )
+        .contains("BM25 top-k"));
+        assert!(decision(
+            "EXPLAIN SELECT count(*) FROM e WHERE MATCH(body, 'hello') GROUP BY tag",
+            "access"
+        )
+        .contains("aggregation"));
+        assert!(decision("EXPLAIN SELECT id FROM e NEAREST (emb, [1.0, 0.0, 0.0], 1)", "access")
+            .contains("e_emb"));
+        // DML explains as a write plan; nothing executes.
+        assert!(decision("EXPLAIN DELETE FROM e WHERE id = 1", "access").contains("point read"));
+        let rs = rows(db.execute("SELECT id FROM e").unwrap());
+        assert_eq!(rs.rows.len(), 1, "EXPLAIN DELETE must not delete");
+        // Nested EXPLAIN is rejected at parse time.
+        assert!(db.execute("EXPLAIN EXPLAIN SELECT * FROM e").is_err());
+    }
+
     /// ALTER VECTOR INDEX SET (ef = n): live recall/latency tuning;
     /// build-time parameters decline with a rebuild pointer.
     #[test]

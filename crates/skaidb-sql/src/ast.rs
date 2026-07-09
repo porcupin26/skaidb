@@ -59,6 +59,11 @@ pub enum Statement {
         select: Box<Select>,
         key: skaidb_types::Value,
     },
+    /// `EXPLAIN <statement>` — the plan the executor would choose (access
+    /// path, pushdown/fallback decisions, cluster fan-out), as
+    /// `(aspect, decision)` rows. Advisory: it mirrors the planner's
+    /// decision logic without executing.
+    Explain { statement: Box<Statement> },
     /// `SHOW CLUSTER` — ring/membership detail (needs ADMIN; served by the
     /// server layer, not the engine).
     ShowCluster,
@@ -204,6 +209,7 @@ impl Statement {
             Statement::Update(u) => f(&mut u.table),
             Statement::Delete(d) => f(&mut d.table),
             Statement::Select(s) => s.for_each_table_mut(&mut f),
+            Statement::Explain { statement } => statement.for_each_table_mut(f),
             _ => {}
         }
     }
@@ -223,6 +229,7 @@ impl Statement {
             Statement::AlterSearchIndex { name, .. } => f(name),
             Statement::Suggest { index, .. } => f(index),
             Statement::ExplainScore { select, .. } => f(&mut select.from),
+            Statement::Explain { statement } => statement.for_each_local_name_mut(f),
             _ => {}
         }
     }

@@ -3208,6 +3208,50 @@ impl Node {
                 },
             )));
         }
+        // Plan inspection: the engine's plan describer answers from the local
+        // catalog (identical on every node), then cluster fan-out rows are
+        // appended so the answer covers routing too.
+        if let Statement::Explain { .. } = &stmt {
+            let mut stmt = stmt;
+            namespace::resolve_statement(&mut stmt, current_db);
+            let Statement::Explain { statement } = stmt else {
+                unreachable!()
+            };
+            let db = self
+                .local
+                .read()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
+            let mut rs = db.explain_statement(&statement)?;
+            let members = self.member_count();
+            let rf = self.cfg.replication_factor;
+            let mut push = |aspect: &str, decision: String| {
+                rs.rows
+                    .push(vec![Value::String(aspect.into()), Value::String(decision)]);
+            };
+            push("cluster.members", members.to_string());
+            push("cluster.replication_factor", rf.to_string());
+            let fan_out = match &*statement {
+                Statement::Select(sel) => {
+                    let pk = db.table_primary_key(&sel.from).unwrap_or_default();
+                    if pk_point_key(&pk, &sel.filter).is_some() {
+                        "point read routed to the key's replica set".to_string()
+                    } else if rf >= members {
+                        "every member holds all data — served without fan-out".to_string()
+                    } else {
+                        "scatter to all members, gather + LWW-merge at the coordinator"
+                            .to_string()
+                    }
+                }
+                Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
+                    "each key routes to its replica set, acked at the write consistency"
+                        .to_string()
+                }
+                _ => "executes per its statement type (local or broadcast)".to_string(),
+            };
+            push("cluster.fan_out", fan_out);
+            drop(db);
+            return Ok(SessionEffect::Output(QueryOutput::Rows(rs)));
+        }
         // Read-only catalog/stat introspection: the catalog is identical on every
         // node (DDL is broadcast), so answer from the local engine, filtered to
         // the current database, without fan-out — under a shared lock, so it
@@ -7603,6 +7647,68 @@ mod tests {
         nb.execute("INSERT INTO t (id, v) VALUES (61, 610)").unwrap();
         let rs = rows(na.execute("SELECT v FROM t WHERE id = 61").unwrap());
         assert_eq!(rs.rows, vec![vec![Value::Int(610)]]);
+    }
+
+    /// EXPLAIN on a cluster: engine plan rows plus appended cluster
+    /// fan-out rows; nothing executes.
+    #[test]
+    fn cluster_explain_statement() {
+        let (a, b) = (free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b)];
+        // RF 1 < members 2 so non-point reads scatter.
+        let na = Node::new(
+            Database::open(temp_dir("expl_a")).unwrap(),
+            cfg_auth("a", &a, &members, 1, Authenticator::None),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("expl_b")).unwrap(),
+            cfg_auth("b", &b, &members, 1, Authenticator::None),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        na.execute("INSERT INTO t (id, v) VALUES (1, 'x')").unwrap();
+
+        let explain = |sql: &str| -> Vec<(String, String)> {
+            let out = na
+                .execute_session_with(DEFAULT_DATABASE, sql, None)
+                .unwrap();
+            let rs = match out {
+                SessionEffect::Output(o) => rows(o),
+                SessionEffect::UseDatabase(_) => unreachable!(),
+            };
+            assert_eq!(rs.columns, vec!["aspect", "decision"]);
+            rs.rows
+                .into_iter()
+                .map(|r| {
+                    let s = |v: &Value| match v {
+                        Value::String(s) => s.clone(),
+                        other => format!("{other:?}"),
+                    };
+                    (s(&r[0]), s(&r[1]))
+                })
+                .collect()
+        };
+        let find = |rows: &[(String, String)], aspect: &str| -> String {
+            rows.iter()
+                .find(|(a, _)| a == aspect)
+                .map(|(_, d)| d.clone())
+                .unwrap_or_default()
+        };
+
+        // Point read: engine access row + cluster routing rows.
+        let r = explain("EXPLAIN SELECT * FROM t WHERE id = 1");
+        assert!(find(&r, "access").contains("point read"));
+        assert_eq!(find(&r, "cluster.members"), "2");
+        assert!(find(&r, "cluster.fan_out").contains("replica set"));
+        // Scatter (RF 1 < members 2, no PK equality).
+        let r = explain("EXPLAIN SELECT * FROM t WHERE v = 'x'");
+        assert!(find(&r, "cluster.fan_out").contains("scatter"));
+        // DML explains without executing.
+        let r = explain("EXPLAIN DELETE FROM t WHERE id = 1");
+        assert!(find(&r, "cluster.fan_out").contains("write consistency"));
+        let rs = rows(na.execute("SELECT id FROM t").unwrap());
+        assert_eq!(rs.rows.len(), 1, "EXPLAIN DELETE must not delete");
     }
 
     #[test]

@@ -1063,6 +1063,180 @@ impl Database {
     /// [`Database::suggest_cmd`] on the exclusive path: commit pending
     /// index writes first so a suggestion right after an insert sees it
     /// (read-your-writes, like searches on the write path).
+    /// `EXPLAIN <statement>`: describe the plan the executor would choose,
+    /// as `(aspect, decision)` rows. Mirrors the planner's actual helpers
+    /// (`pk_point_key`, `plan_index_scan`, `filter_search_query`,
+    /// `map_search_aggregate`) rather than re-deriving rules, so the
+    /// answer tracks the executor. Advisory — nothing executes.
+    pub fn explain_statement(&self, stmt: &Statement) -> Result<ResultSet> {
+        let mut rows: Vec<(String, String)> = Vec::new();
+        let mut push = |aspect: &str, decision: String| {
+            rows.push((aspect.to_string(), decision));
+        };
+        match stmt {
+            Statement::Select(sel) => {
+                push("statement", "SELECT".into());
+                push("table", sel.from.clone());
+                if self.catalog.timeseries.contains_key(&sel.from) {
+                    push(
+                        "access",
+                        "time-series read: ts-range + label pushdown narrows the storage \
+                         scan; grouped aggregates ship per-series per-bucket partials on \
+                         clusters; aged buckets may serve from a rollup"
+                            .into(),
+                    );
+                } else if sel.nearest.is_some() {
+                    let idx = self
+                        .catalog
+                        .vector_indexes
+                        .iter()
+                        .find(|(_, d)| d.table == sel.from)
+                        .map(|(n, _)| n.clone())
+                        .unwrap_or_else(|| "<missing vector index>".into());
+                    push("access", format!("vector search (HNSW) via index '{idx}'"));
+                    if sel.filter.is_some() {
+                        push("residual_filter", "applied to candidates after the search".into());
+                    }
+                } else if let Some(query) = filter_search_query(&sel.filter)? {
+                    let idx = self.search_index_for_query(&sel.from, &query)?;
+                    let aggregate_mode = !sel.group_by.is_empty()
+                        || sel.items.iter().any(|it| match it {
+                            SelectItem::Expr { expr, .. } => contains_aggregate(expr),
+                            _ => false,
+                        });
+                    if aggregate_mode {
+                        match map_search_aggregate(sel) {
+                            Some(_) => push(
+                                "access",
+                                format!(
+                                    "search aggregation: exact fast-field facet pushdown \
+                                     via '{idx}' (declines to the row gather on any \
+                                     inexactness)"
+                                ),
+                            ),
+                            None => push(
+                                "access",
+                                format!(
+                                    "search aggregation: row-gather fallback via '{idx}' \
+                                     (shape not servable by the fast-field pushdown)"
+                                ),
+                            ),
+                        }
+                    } else {
+                        let score_topk = sel.limit.is_some()
+                            && sel.order_by.len() == 1
+                            && is_score_call(&sel.order_by[0].expr)
+                            && sel.order_by[0].descending;
+                        let col_topk = sel.limit.is_some()
+                            && sel.order_by.len() == 1
+                            && matches!(sel.order_by[0].expr, Expr::Column(_));
+                        if score_topk {
+                            push(
+                                "access",
+                                format!(
+                                    "BM25 top-k pushdown via '{idx}' (k = {})",
+                                    sel.limit.unwrap_or(0)
+                                ),
+                            );
+                        } else if col_topk {
+                            push(
+                                "access",
+                                format!(
+                                    "search via '{idx}', index-ordered top-k when the sort \
+                                     column is a declared fast field (else gather + sort)"
+                                ),
+                            );
+                        } else {
+                            push(
+                                "access",
+                                format!("unranked search via '{idx}' (all matching keys)"),
+                            );
+                        }
+                        let (_, residual) = split_search_filter(&sel.filter)?;
+                        if residual.is_some() {
+                            push(
+                                "residual_filter",
+                                "ordinary predicates filter the matches after the index".into(),
+                            );
+                        }
+                    }
+                } else {
+                    let pk = self.table_primary_key(&sel.from)?;
+                    if pk_point_key(&pk, &sel.filter).is_some() {
+                        push("access", "point read (primary-key equality)".into());
+                    } else if let Some((idx, start, end)) =
+                        self.plan_index_scan(&sel.from, &sel.filter)
+                    {
+                        let bounds = match (start.is_some(), end.is_some()) {
+                            (true, true) => "bounded range",
+                            (true, false) => "lower-bounded range",
+                            (false, true) => "upper-bounded range",
+                            (false, false) => "full index",
+                        };
+                        push("access", format!("index scan via '{idx}' ({bounds})"));
+                    } else {
+                        push("access", "full table scan (streaming k-way merge)".into());
+                    }
+                    if sel.limit.is_some() && !sel.order_by.is_empty() {
+                        push(
+                            "order",
+                            "ORDER BY + LIMIT uses top-k selection, not a full sort".into(),
+                        );
+                    }
+                }
+                if !sel.joins.is_empty() {
+                    push(
+                        "join",
+                        "equi-joins hash-join, other predicates nested-loop; on a \
+                         cluster both sides gather at the coordinator"
+                            .into(),
+                    );
+                }
+            }
+            Statement::Insert(ins) => {
+                push("statement", "INSERT".into());
+                push("table", ins.table.clone());
+                push(
+                    "write",
+                    "keys route to their replica sets; acked at the write consistency; \
+                     secondary/search/vector indexes maintained per replica"
+                        .into(),
+                );
+            }
+            Statement::Update(u) => {
+                push("statement", "UPDATE".into());
+                push("table", u.table.clone());
+                let pk = self.table_primary_key(&u.table)?;
+                if pk_point_key(&pk, &u.filter).is_some() {
+                    push("access", "point read (primary-key equality), then write".into());
+                } else {
+                    push("access", "scan matching rows, then write each".into());
+                }
+            }
+            Statement::Delete(d) => {
+                push("statement", "DELETE".into());
+                push("table", d.table.clone());
+                let pk = self.table_primary_key(&d.table)?;
+                if pk_point_key(&pk, &d.filter).is_some() {
+                    push("access", "point read (primary-key equality), then tombstone".into());
+                } else {
+                    push("access", "scan matching rows, then tombstone each".into());
+                }
+            }
+            other => {
+                push("statement", format!("{other:?}").split(' ').next().unwrap_or("?").into());
+                push("plan", "executes directly (no data-access plan)".into());
+            }
+        }
+        Ok(ResultSet {
+            columns: vec!["aspect".into(), "decision".into()],
+            rows: rows
+                .into_iter()
+                .map(|(a, d)| vec![Value::String(a), Value::String(d)])
+                .collect(),
+        })
+    }
+
     /// Per-hit BM25 score breakdown (ES `_explanation`): how one row —
     /// identified by its primary-key value — scored against the search
     /// predicates in `filter`, as tantivy's explanation JSON. `Ok(None)`
@@ -1438,6 +1612,9 @@ impl Database {
                 let text = self.search_explain_query_read(&select.from, &query, &key)?;
                 Ok(QueryOutput::Rows(explain_score_rows(text)))
             }
+            Statement::Explain { ref statement } => {
+                self.explain_statement(statement).map(QueryOutput::Rows)
+            }
             Statement::ShowTables => Ok(QueryOutput::Rows(self.show_tables())),
             Statement::ShowIndexes => Ok(QueryOutput::Rows(self.show_indexes())),
             Statement::ShowStatus => Ok(QueryOutput::Rows(self.show_status())),
@@ -1512,6 +1689,9 @@ impl Database {
             Statement::ExplainScore { select, key } => {
                 let text = self.search_explain(&select.from, &select.filter, &key)?;
                 Ok(QueryOutput::Rows(explain_score_rows(text)))
+            }
+            Statement::Explain { statement } => {
+                self.explain_statement(&statement).map(QueryOutput::Rows)
             }
             Statement::AlterTable(alt) => self.alter_table(alt),
             Statement::Begin => self.begin(),
@@ -1650,7 +1830,8 @@ impl Database {
             }
             Statement::Select(_)
             | Statement::Suggest { .. }
-            | Statement::ExplainScore { .. } => {
+            | Statement::ExplainScore { .. }
+            | Statement::Explain { .. } => {
                 namespace::resolve_statement(&mut stmt, current_db);
                 self.execute_read_statement(stmt)
                     .map_err(|e| namespace::humanize_error(e, current_db))
@@ -4130,6 +4311,7 @@ pub fn statement_is_read_only(stmt: &Statement) -> bool {
         Statement::Select(_)
             | Statement::Suggest { .. }
             | Statement::ExplainScore { .. }
+            | Statement::Explain { .. }
             | Statement::ShowTables
             | Statement::ShowIndexes
             | Statement::ShowStatus

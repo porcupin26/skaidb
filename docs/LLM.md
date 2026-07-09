@@ -123,6 +123,8 @@ SELECT [DISTINCT] item [, ...] FROM t [[AS] a]
 -- Search-specific statements
 SUGGEST 'text' ON index [COLUMN col] [LIMIT n]   -- "did you mean" terms
 EXPLAIN SCORE <select> FOR <pk-literal>          -- per-row BM25 breakdown
+EXPLAIN <statement>                              -- plan inspection: access path,
+--   pushdown/fallback decisions, cluster fan-out — advisory, never executes
 
 -- Databases (namespaces; `default` always exists and cannot be dropped)
 CREATE DATABASE [IF NOT EXISTS] d
@@ -212,7 +214,9 @@ OR/NOT is rejected):
   MAX`, `time_bucket` date histograms, `COUNT(DISTINCT)` exact,
   `APPROX_COUNT_DISTINCT` sketch) — exact fast-field pushdown or exact
   row fallback, never approximated silently.
-- Diagnostics: `EXPLAIN SCORE SELECT ... WHERE MATCH(...) FOR <pk>`
+- Diagnostics: `EXPLAIN <statement>` (plan rows: access path, pushdown
+  vs. fallback, cluster fan-out — advisory, never executes);
+  `EXPLAIN SCORE SELECT ... WHERE MATCH(...) FOR <pk>`
   (BM25 breakdown JSON; works at any RF — routed to a replica of the key);
   `SUGGEST 'levensthein' ON idx` (typo suggestions).
 
