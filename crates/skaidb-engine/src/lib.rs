@@ -1792,6 +1792,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Row TTL: a row past its TTL is invisible to reads (point + scan)
+    /// and reclaimed by compaction. Uses HLC physical (wall) time, so the
+    /// test writes with backdated stamps via a direct low-level put would
+    /// be ideal — here we assert the visible behavior with a tiny TTL and
+    /// a short sleep, plus the parse/catalog round-trip.
+    #[test]
+    fn row_ttl_expiry() {
+        let dir = tempdir();
+        let mut db = Database::open(&dir).unwrap();
+        db.execute("CREATE TABLE s (PRIMARY KEY (id)) WITH (ttl = 50ms)").unwrap();
+        db.execute("INSERT INTO s (id, v) VALUES (1, 'ephemeral')").unwrap();
+        // Immediately visible.
+        assert_eq!(
+            rows(db.execute("SELECT v FROM s WHERE id = 1").unwrap()).rows,
+            vec![vec![Value::String("ephemeral".into())]]
+        );
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        // Expired: gone from point read and scan.
+        assert!(rows(db.execute("SELECT v FROM s WHERE id = 1").unwrap()).rows.is_empty());
+        assert!(rows(db.execute("SELECT v FROM s").unwrap()).rows.is_empty());
+
+        // The TTL persists in the catalog and applies after a reopen.
+        drop(db);
+        let mut db = Database::open(&dir).unwrap();
+        db.execute("INSERT INTO s (id, v) VALUES (2, 'also short')").unwrap();
+        assert_eq!(rows(db.execute("SELECT id FROM s").unwrap()).rows.len(), 1);
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert!(rows(db.execute("SELECT id FROM s").unwrap()).rows.is_empty());
+
+        // A table without TTL keeps its rows.
+        db.execute("CREATE TABLE keep (PRIMARY KEY (id))").unwrap();
+        db.execute("INSERT INTO keep (id) VALUES (1)").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert_eq!(rows(db.execute("SELECT id FROM keep").unwrap()).rows.len(), 1);
+
+        // Bad TTL is a parse/exec error.
+        assert!(db
+            .execute("CREATE TABLE bad (PRIMARY KEY (id)) WITH (ttl = 0)")
+            .is_err());
+        assert!(db
+            .execute("CREATE TABLE bad (PRIMARY KEY (id)) WITH (nope = 1)")
+            .is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// BACKUP TO + RESTORE FROM: round-trip every store (rows, search
     /// index, time-series), with the pre-restore data kept aside.
     #[test]

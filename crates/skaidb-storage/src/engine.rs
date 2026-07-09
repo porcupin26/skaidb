@@ -95,6 +95,11 @@ pub struct Engine {
     wal: Wal,
     mem: Memtable,
     clock: HlcClock,
+    /// Row time-to-live in ms (`Some` = expiring table). A row is invisible
+    /// once its stamp's physical age exceeds this; compaction drops it. A
+    /// pure read-visibility rule (the raw stamped data still replicates, so
+    /// expiry converges across replicas as each applies the same TTL).
+    ttl_ms: Option<u64>,
     opts: EngineOptions,
     /// Level-0 tables, newest first.
     l0: Vec<SsTable>,
@@ -197,6 +202,7 @@ impl Engine {
             wal,
             mem,
             clock,
+            ttl_ms: None,
             opts,
             l0,
             levels,
@@ -298,11 +304,26 @@ impl Engine {
         self.wal.sync_handle()
     }
 
-    /// Latest committed value for `key`, or `None` if absent or deleted.
+    /// Set (or clear) the row TTL. Applied to all read paths immediately;
+    /// compaction reclaims expired rows on its next pass.
+    pub fn set_ttl(&mut self, ttl_ms: Option<u64>) {
+        self.ttl_ms = ttl_ms;
+    }
+
+    /// Whether a row stamped at `hlc` has outlived the table's TTL.
+    fn is_expired(&self, hlc: Hlc) -> bool {
+        match self.ttl_ms {
+            Some(ttl) => now_wall_ms().saturating_sub(hlc.physical) > ttl,
+            None => false,
+        }
+    }
+
+    /// Latest committed value for `key`, or `None` if absent, deleted, or
+    /// TTL-expired.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         match self.get_versioned(key)? {
-            Some((_, value)) => Ok(version_to_value(value)),
-            None => Ok(None),
+            Some((hlc, value)) if !self.is_expired(hlc) => Ok(version_to_value(value)),
+            _ => Ok(None),
         }
     }
 
@@ -370,6 +391,7 @@ impl Engine {
     /// instead of materializing the table, and early-stop friendly.
     pub fn scan_iter(&self) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + '_ {
         self.merged_iter().filter_map(|item| match item {
+            Ok((_, hlc, VersionValue::Put(_))) if self.is_expired(hlc) => None,
             Ok((k, _, VersionValue::Put(bytes))) => Some(Ok((k, bytes))),
             Ok((_, _, VersionValue::Delete)) => None,
             Err(e) => Some(Err(e)),
@@ -381,6 +403,7 @@ impl Engine {
     pub fn scan_versioned(&self) -> Result<Vec<VersionedRow>> {
         self.merged_iter()
             .filter_map(|item| match item {
+                Ok((_, hlc, VersionValue::Put(_))) if self.is_expired(hlc) => None,
                 Ok((k, hlc, VersionValue::Put(bytes))) => Some(Ok((k, bytes, hlc))),
                 Ok((_, _, VersionValue::Delete)) => None,
                 Err(e) => Some(Err(e)),
@@ -695,7 +718,8 @@ impl Engine {
             sources.push(l1);
         }
         let old_paths = collect_paths(&self.l0, self.levels.first());
-        let new_l1 = merge_write(&path, &sources, deepest, codec)?;
+        let expire_before = self.ttl_ms.map(|ttl| now_wall_ms().saturating_sub(ttl));
+        let new_l1 = merge_write(&path, &sources, deepest, codec, expire_before)?;
         self.compactions += 1;
         self.compaction_bytes += new_l1.disk_len();
         self.l0.clear();
@@ -726,7 +750,7 @@ impl Engine {
                 old_paths.push(self.levels[level + 1].path().to_path_buf());
             }
 
-            let new_run = merge_write(&path, &sources, deepest, codec)?;
+            let new_run = merge_write(&path, &sources, deepest, codec, expire_before)?;
             self.compactions += 1;
             self.compaction_bytes += new_run.disk_len();
             if has_next {
@@ -854,6 +878,7 @@ fn merge_write(
     sources: &[&SsTable],
     drop_tombstones: bool,
     codec: Codec,
+    expire_before: Option<u64>,
 ) -> Result<SsTable> {
     let approx: u64 = sources.iter().map(|s| s.len()).sum();
     let iters: Vec<MergeSource<'_>> = sources
@@ -862,12 +887,23 @@ fn merge_write(
             Box::new(sst.iter().map(|r| r.map(|e| (e.key, e.hlc, e.value)))) as MergeSource<'_>
         })
         .collect();
-    let entries = KWayMerge::new(iters).filter_map(|item| match item {
+    let entries = KWayMerge::new(iters).filter_map(move |item| match item {
         Ok((_, _, VersionValue::Delete)) if drop_tombstones => None,
+        // TTL reclaim: a row whose stamp predates the cutoff is dropped
+        // outright (it is already invisible on every read path).
+        Ok((_, hlc, _)) if expire_before.is_some_and(|c| hlc.physical < c) => None,
         Ok((key, hlc, value)) => Some(Ok(SstEntry { key, hlc, value })),
         Err(e) => Some(Err(e)),
     });
     SsTable::write_stream(path, entries, approx as usize, codec)
+}
+
+/// Wall-clock milliseconds since the Unix epoch (TTL comparisons).
+fn now_wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Smallest byte string greater than every key starting with `prefix`, or

@@ -267,6 +267,9 @@ pub struct CreateTable {
     pub name: String,
     pub if_not_exists: bool,
     pub primary_key: Vec<String>,
+    /// `WITH (ttl = <duration>)` — rows expire (become invisible, then
+    /// reclaimed) after this age. `None` = no expiry.
+    pub ttl_ms: Option<i64>,
 }
 
 /// `CREATE TIMESERIES TABLE [IF NOT EXISTS] name (SERIES KEY (l1 [, ...])

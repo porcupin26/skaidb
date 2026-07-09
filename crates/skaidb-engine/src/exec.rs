@@ -217,7 +217,8 @@ impl Database {
 
         let mut tables = HashMap::new();
         for name in catalog.tables.keys() {
-            let engine = StorageEngine::open_with_options(table_dir(&dir, name), opts)?;
+            let mut engine = StorageEngine::open_with_options(table_dir(&dir, name), opts)?;
+            engine.set_ttl(catalog.tables[name].ttl_ms.map(|ms| ms as u64));
             tables.insert(name.clone(), engine);
         }
 
@@ -1460,7 +1461,7 @@ impl Database {
         skaidb_sql::resolve_now(&mut stmt, now_ms());
         match stmt {
             Statement::CreateTable(ct) => {
-                self.create_table(&ct.name, ct.primary_key, ct.if_not_exists)
+                self.create_table(&ct.name, ct.primary_key, ct.ttl_ms, ct.if_not_exists)
             }
             Statement::CreateTimeseriesTable(ct) => self.create_timeseries_table(
                 &ct.name,
@@ -1885,6 +1886,7 @@ impl Database {
         &mut self,
         name: &str,
         pk: Vec<String>,
+        ttl_ms: Option<i64>,
         if_not_exists: bool,
     ) -> Result<QueryOutput> {
         if pk.is_empty() {
@@ -1905,11 +1907,17 @@ impl Database {
             }
             return Err(EngineError::TableExists(name.to_string()));
         }
-        let engine = StorageEngine::open_with_options(table_dir(&self.dir, name), self.storage_opts)?;
+        let mut engine =
+            StorageEngine::open_with_options(table_dir(&self.dir, name), self.storage_opts)?;
+        engine.set_ttl(ttl_ms.map(|ms| ms as u64));
         self.tables.insert(name.to_string(), engine);
-        self.catalog
-            .tables
-            .insert(name.to_string(), TableDef { primary_key: pk });
+        self.catalog.tables.insert(
+            name.to_string(),
+            TableDef {
+                primary_key: pk,
+                ttl_ms,
+            },
+        );
         self.record_schema(key, hlc, false);
         self.save_catalog()?;
         Ok(QueryOutput::Ddl)

@@ -568,10 +568,38 @@ impl Parser {
             let primary_key = self.parse_ident_list()?;
             self.expect(&Token::RParen)?;
             self.expect(&Token::RParen)?;
+            // Optional `WITH (ttl = <duration>)`.
+            let mut ttl_ms = None;
+            if self.eat_ident_ci("with") {
+                self.expect(&Token::LParen)?;
+                for (opt, val) in self.parse_option_list()? {
+                    match opt.as_str() {
+                        "ttl" => {
+                            let ms: i64 = val.parse().map_err(|_| {
+                                ParseError::Other(format!(
+                                    "ttl must be a duration or integer ms, got '{val}'"
+                                ))
+                            })?;
+                            if ms <= 0 {
+                                return Err(ParseError::Other(
+                                    "ttl must be positive".into(),
+                                ));
+                            }
+                            ttl_ms = Some(ms);
+                        }
+                        other => {
+                            return Err(ParseError::Other(format!(
+                                "unknown table option '{other}' (only ttl is supported)"
+                            )))
+                        }
+                    }
+                }
+            }
             Ok(Statement::CreateTable(CreateTable {
                 name,
                 if_not_exists,
                 primary_key,
+                ttl_ms,
             }))
         } else if self.eat_keyword(Keyword::Timeseries) {
             // CREATE TIMESERIES TABLE [IF NOT EXISTS] name
@@ -823,6 +851,7 @@ impl Parser {
             let value = match self.advance() {
                 Token::Str(s) => s,
                 Token::Int(i) => i.to_string(),
+                Token::Duration(ms) => ms.to_string(),
                 Token::Float(x) => x.to_string(),
                 Token::Keyword(Keyword::True) => "true".to_string(),
                 Token::Keyword(Keyword::False) => "false".to_string(),
@@ -1476,6 +1505,7 @@ mod tests {
                 name: "users".into(),
                 if_not_exists: false,
                 primary_key: vec!["id".into()],
+                ttl_ms: None,
             })
         );
     }
@@ -1808,6 +1838,7 @@ mod tests {
                 name: "status".into(),
                 if_not_exists: false,
                 primary_key: vec!["use".into()],
+                ttl_ms: None,
             })
         );
         // A database genuinely named "database" is still selectable.
@@ -1838,6 +1869,7 @@ mod tests {
                 name: "shop.orders".into(),
                 if_not_exists: false,
                 primary_key: vec!["id".into()],
+                ttl_ms: None,
             })
         );
         // Joins and the ON-table of an index can be qualified too.

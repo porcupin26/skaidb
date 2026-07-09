@@ -19,6 +19,7 @@ current database (see *Databases* below).
 ```sql
 -- DDL
 CREATE TABLE [IF NOT EXISTS] <table> (PRIMARY KEY (<col> [, <col> ...]))
+       [WITH (ttl = <duration>)]              -- rows expire after this age
 CREATE TIMESERIES TABLE [IF NOT EXISTS] <table>
        (SERIES KEY (<label> [, <label> ...])
         [, RETENTION <duration>] [, OOO <duration>])
@@ -110,6 +111,12 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
 
 - `CREATE TABLE` declares **only the primary key** — there is no column list;
   documents are schema-less. A composite PK lists several columns.
+  `WITH (ttl = <duration>)` makes rows **expire**: a row older than the TTL
+  (measured from its write's HLC timestamp) becomes invisible to every read
+  and is physically dropped at the next compaction. TTL is a read-visibility
+  rule applied uniformly on every replica (the stamped data still
+  replicates, so expiry converges regardless of which node serves the
+  read). Useful for caches, sessions, and rolling event windows.
 - `CREATE INDEX` with one path is a single-column index; with several it is a
   **composite** index (ordered left-to-right). See indexing notes below.
 - `CREATE VECTOR INDEX` builds an HNSW index for nearest-neighbor search over the

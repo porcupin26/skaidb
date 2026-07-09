@@ -163,6 +163,10 @@ impl From<SearchIndexDefWire> for SearchIndexDef {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TableDef {
     pub primary_key: Vec<String>,
+    /// Row time-to-live in ms; `None` = no expiry. Applied to the table's
+    /// storage engine on open.
+    #[serde(default)]
+    pub ttl_ms: Option<i64>,
 }
 
 /// A time-series table definition: label columns and optional retention.

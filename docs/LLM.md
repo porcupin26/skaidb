@@ -88,7 +88,7 @@ embedding <-> [..]` (use `NEAREST`).
 
 ```sql
 -- DDL
-CREATE TABLE [IF NOT EXISTS] t (PRIMARY KEY (col [, col ...]))
+CREATE TABLE [IF NOT EXISTS] t (PRIMARY KEY (col [, col ...])) [WITH (ttl = dur)]
 DROP TABLE [IF EXISTS] t
 ALTER TABLE t RENAME TO t2
 ALTER TABLE t RENAME COLUMN a TO b          -- rewrites rows, rebuilds indexes
