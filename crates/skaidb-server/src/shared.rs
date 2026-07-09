@@ -85,6 +85,34 @@ impl Backend {
         }
     }
 
+    /// Host system statistics (CPU, RAM, disk IO, disk space) for every
+    /// member: standalone reports itself as `local`; a cluster node samples
+    /// itself and probes its peers (`None` = unreachable). Ordered by id.
+    pub fn host_stats(&self) -> Vec<(String, Option<skaidb_cluster::host::HostStats>)> {
+        match self {
+            Backend::Local(db) => {
+                let dir = db
+                    .read()
+                    .ok()
+                    .map(|d| d.dir().to_path_buf())
+                    .unwrap_or_default();
+                vec![("local".into(), Some(skaidb_cluster::host::sample(&dir)))]
+            }
+            Backend::Cluster(node) => node.cluster_host_stats(),
+        }
+    }
+
+    /// This node's own host statistics (no peer probes — `/metrics` is
+    /// scraped per node).
+    pub fn local_host_stats(&self) -> skaidb_cluster::host::HostStats {
+        let dir = match self {
+            Backend::Local(db) => db.read().ok().map(|d| d.dir().to_path_buf()),
+            Backend::Cluster(node) => node.data_dir(),
+        }
+        .unwrap_or_default();
+        skaidb_cluster::host::sample(&dir)
+    }
+
     /// Cluster statistics when running clustered, else `None`.
     pub fn cluster_stats(&self) -> Option<ClusterStats> {
         match self {
@@ -454,6 +482,24 @@ pub fn collect_runtime_metrics(ctx: &Shared) {
                 t.disk_bytes,
             );
         }
+    }
+
+    // Host system stats (this node only — Prometheus scrapes per node).
+    {
+        let h = ctx.backend.local_host_stats();
+        let m = &ctx.metrics;
+        m.set("skaidb_host_cpu_percent", h.cpu_percent.round() as u64);
+        m.set("skaidb_host_cpus", h.cpus as u64);
+        m.set("skaidb_host_mem_total_bytes", h.mem_total_bytes);
+        m.set("skaidb_host_mem_used_bytes", h.mem_used_bytes);
+        m.set("skaidb_host_rss_bytes", h.rss_bytes);
+        m.set("skaidb_host_disk_read_bytes_total", h.disk_read_bytes_total);
+        m.set(
+            "skaidb_host_disk_written_bytes_total",
+            h.disk_written_bytes_total,
+        );
+        m.set("skaidb_host_disk_total_bytes", h.disk_total_bytes);
+        m.set("skaidb_host_disk_available_bytes", h.disk_available_bytes);
     }
 
     if let Some(c) = ctx.backend.cluster_stats() {

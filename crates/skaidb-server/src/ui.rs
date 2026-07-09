@@ -133,6 +133,66 @@ pub fn schema_json(ctx: &Shared, role: &str) -> (u16, String) {
     (200, json!({"databases": out}).to_string())
 }
 
+/// Per-node host statistics (CPU, RAM, disk IO, disk space) plus a
+/// cluster-level aggregate, for the stats tab's nodes view. Serves
+/// `GET /ui/hosts` (authenticated; rest.rs resolves the role first —
+/// nothing here is table data, so any authenticated role may read it).
+pub fn hosts_json(ctx: &Shared) -> (u16, String) {
+    let nodes = ctx.backend.host_stats();
+    let mut agg_cpu = 0.0f64;
+    let mut agg_cpu_n = 0u32;
+    let (mut mem_total, mut mem_used) = (0u64, 0u64);
+    let (mut read_bps, mut write_bps) = (0.0f64, 0.0f64);
+    let (mut disk_total, mut disk_avail) = (0u64, 0u64);
+    let mut reachable = 0usize;
+    let rows: Vec<Json> = nodes
+        .iter()
+        .map(|(id, stat)| match stat {
+            Some(h) => {
+                reachable += 1;
+                agg_cpu += h.cpu_percent;
+                agg_cpu_n += 1;
+                mem_total += h.mem_total_bytes;
+                mem_used += h.mem_used_bytes;
+                read_bps += h.disk_read_bps;
+                write_bps += h.disk_write_bps;
+                disk_total += h.disk_total_bytes;
+                disk_avail += h.disk_available_bytes;
+                json!({
+                    "id": id,
+                    "reachable": true,
+                    "cpu_percent": h.cpu_percent,
+                    "cpus": h.cpus,
+                    "load1": h.load1,
+                    "mem_total_bytes": h.mem_total_bytes,
+                    "mem_used_bytes": h.mem_used_bytes,
+                    "rss_bytes": h.rss_bytes,
+                    "disk_read_bps": h.disk_read_bps,
+                    "disk_write_bps": h.disk_write_bps,
+                    "disk_total_bytes": h.disk_total_bytes,
+                    "disk_available_bytes": h.disk_available_bytes,
+                })
+            }
+            None => json!({"id": id, "reachable": false}),
+        })
+        .collect();
+    let body = json!({
+        "nodes": rows,
+        "cluster": {
+            "nodes": nodes.len(),
+            "reachable": reachable,
+            "cpu_percent_avg": if agg_cpu_n > 0 { agg_cpu / agg_cpu_n as f64 } else { 0.0 },
+            "mem_total_bytes": mem_total,
+            "mem_used_bytes": mem_used,
+            "disk_read_bps": read_bps,
+            "disk_write_bps": write_bps,
+            "disk_total_bytes": disk_total,
+            "disk_available_bytes": disk_avail,
+        },
+    });
+    (200, body.to_string())
+}
+
 /// What the login screen needs before any authenticated call can succeed.
 /// Nothing here is secret (same trust level as `/health` and `/status`).
 fn meta_json(ctx: &Shared) -> String {

@@ -655,10 +655,12 @@ function fmtRate(v) {
 }
 
 async function refreshStats() {
-  const [promText, statusResult] = await Promise.all([
+  const [promText, statusResult, hosts] = await Promise.all([
     apiText("/metrics"),
     api("POST", "/query", JSON.stringify({ sql: "SHOW STATUS" })),
+    api("GET", "/ui/hosts"),
   ]);
+  renderHosts(hosts);
   const m = parseProm(promText);
   statsHistory.push({ t: Date.now(), m });
   if (statsHistory.length > SPARK_WINDOW) statsHistory.shift();
@@ -719,6 +721,59 @@ async function refreshStats() {
   renderStatGroup("st-indexes", statusResult.rows, /^search\.(.+)\.(docs|disk_bytes|uncommitted)$/,
     ["docs", "disk_bytes", "uncommitted"]);
   $("stats-refreshed").textContent = `refreshed ${new Date().toLocaleTimeString()} · sparklines cover ${Math.round((statsHistory.length - 1) * STATS_INTERVAL_MS / 1000)}s`;
+}
+
+// The per-node system stats table, plus a cluster totals row when the
+// deployment has more than one node.
+function renderHosts(hosts) {
+  const tbody = $("st-nodes").querySelector("tbody");
+  tbody.textContent = "";
+  const cell = (text) => {
+    const td = document.createElement("td");
+    td.textContent = text;
+    return td;
+  };
+  const usedOfTotal = (used, total) =>
+    total ? `${fmtBytes(used)} / ${fmtBytes(total)} (${Math.round(used / total * 100)}%)` : "—";
+  for (const n of hosts.nodes) {
+    const tr = document.createElement("tr");
+    if (!n.reachable) {
+      tr.append(cell(n.id));
+      const td = cell("unreachable");
+      td.colSpan = 7;
+      td.className = "muted";
+      tr.append(td);
+      tbody.append(tr);
+      continue;
+    }
+    tr.append(
+      cell(n.id),
+      cell(`${n.cpu_percent.toFixed(1)}% of ${n.cpus}`),
+      cell(n.load1.toFixed(2)),
+      cell(usedOfTotal(n.mem_used_bytes, n.mem_total_bytes)),
+      cell(fmtBytes(n.rss_bytes)),
+      cell(`${fmtBytes(n.disk_read_bps)}/s`),
+      cell(`${fmtBytes(n.disk_write_bps)}/s`),
+      cell(usedOfTotal(n.disk_total_bytes - n.disk_available_bytes, n.disk_total_bytes)),
+    );
+    tbody.append(tr);
+  }
+  if (hosts.nodes.length > 1) {
+    const c = hosts.cluster;
+    const tr = document.createElement("tr");
+    tr.className = "cluster-total";
+    tr.append(
+      cell(`cluster (${c.reachable}/${c.nodes} up)`),
+      cell(`${c.cpu_percent_avg.toFixed(1)}% avg`),
+      cell(""),
+      cell(usedOfTotal(c.mem_used_bytes, c.mem_total_bytes)),
+      cell(""),
+      cell(`${fmtBytes(c.disk_read_bps)}/s`),
+      cell(`${fmtBytes(c.disk_write_bps)}/s`),
+      cell(usedOfTotal(c.disk_total_bytes - c.disk_available_bytes, c.disk_total_bytes)),
+    );
+    tbody.append(tr);
+  }
 }
 
 // Rows like `table.<name>.<field>` → one table row per <name>.

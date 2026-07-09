@@ -221,6 +221,9 @@ pub enum Request {
     /// Ask a peer for a snapshot of its own membership view and data status, for
     /// cross-node diagnostics (so `\cluster` can flag nodes that disagree).
     NodeStatus,
+    /// Ask a peer for its host system statistics (CPU, memory, disk IO,
+    /// disk space) for the UI's per-node view.
+    HostStats,
 }
 
 /// A response from a peer member.
@@ -276,6 +279,10 @@ pub enum Response {
         rows: u64,
         hlc_ms: u64,
     },
+    /// Reply to [`Request::HostStats`]: the peer's host statistics as
+    /// serde_json-encoded [`crate::host::HostStats`] (self-describing, so
+    /// fields can grow without a wire change).
+    HostStats { json: String },
     /// Reply to [`Request::TsQuery`]: this node's matching series and samples.
     TsSeries {
         series: TsSeriesData,
@@ -343,6 +350,7 @@ const REQ_SEARCH: u8 = 25;
 const REQ_SEARCHAGG: u8 = 26;
 const REQ_SEARCHSORTED: u8 = 27;
 const REQ_SEARCHEXPLAIN: u8 = 28;
+const REQ_HOSTSTATS: u8 = 29;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
@@ -360,6 +368,7 @@ const RES_SHITS: u8 = 12;
 const RES_SAGG: u8 = 13;
 const RES_SORTEDROWS: u8 = 14;
 const RES_EXPLAIN: u8 = 15;
+const RES_HOSTSTATS: u8 = 16;
 
 impl Request {
     pub fn encode(&self) -> Vec<u8> {
@@ -573,6 +582,7 @@ impl Request {
                 o.extend_from_slice(&rf.to_le_bytes());
             }
             Request::NodeStatus => o.push(REQ_NODESTATUS),
+            Request::HostStats => o.push(REQ_HOSTSTATS),
         }
     }
 
@@ -757,6 +767,7 @@ impl Request {
                 rf: c.u32()?,
             },
             REQ_NODESTATUS => Request::NodeStatus,
+            REQ_HOSTSTATS => Request::HostStats,
             _ => return Err(WireError::Malformed("unknown request op")),
         })
     }
@@ -856,6 +867,10 @@ impl Response {
                 put_str(o, msg);
             }
             Response::Pong => o.push(RES_PONG),
+            Response::HostStats { json } => {
+                o.push(RES_HOSTSTATS);
+                put_str(o, json);
+            }
             Response::NodeStatus {
                 epoch,
                 members,
@@ -982,6 +997,7 @@ impl Response {
             }
             RES_ERR => Response::Err(c.string()?),
             RES_PONG => Response::Pong,
+            RES_HOSTSTATS => Response::HostStats { json: c.string()? },
             RES_NODESTATUS => {
                 let epoch = c.u64()?;
                 let n = c.u32()? as usize;
@@ -1809,6 +1825,9 @@ mod tests {
             },
             Response::Err("x".into()),
             Response::Pong,
+            Response::HostStats {
+                json: r#"{"cpu_percent":12.5}"#.into(),
+            },
             Response::TsSeries {
                 series: vec![
                     (

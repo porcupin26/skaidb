@@ -4,6 +4,7 @@
 //! This crate is the placement/coordination logic; the network transport that
 //! ships requests between nodes lives in `skaidb-proto`/`skaidb-server`.
 
+pub mod host;
 pub mod internode;
 mod node;
 mod quorum;

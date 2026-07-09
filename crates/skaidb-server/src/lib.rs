@@ -803,6 +803,22 @@ mod tests {
         let (status, _) = ctx.config_set("ui.enabled", "true");
         assert_eq!(status, 200);
         assert!(get("/ui").starts_with("HTTP/1.1 200"));
+
+        // /ui/hosts: per-node host stats + cluster aggregate (standalone =
+        // one "local" node). Sampled from /proc, so values are live.
+        let resp = get("/ui/hosts");
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(v["nodes"].as_array().unwrap().len(), 1);
+        let n = &v["nodes"][0];
+        assert_eq!(n["id"], "local");
+        assert_eq!(n["reachable"], true);
+        assert!(n["mem_total_bytes"].as_u64().unwrap() > 0);
+        assert!(n["rss_bytes"].as_u64().unwrap() > 0);
+        assert!(n["disk_total_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(v["cluster"]["nodes"], 1);
+        assert_eq!(v["cluster"]["reachable"], 1);
     }
 
     /// An unwritable config file must not block a live-mutable key from
@@ -1182,6 +1198,10 @@ mod tests {
         // Storage gauges are populated at scrape time via the pull model.
         assert!(m.contains("# TYPE skaidb_storage_tables gauge"));
         assert!(m.contains("skaidb_uptime_seconds"));
+        // Host system stats are exported per node.
+        assert!(m.contains("skaidb_host_mem_total_bytes"));
+        assert!(m.contains("skaidb_host_cpu_percent"));
+        assert!(m.contains("skaidb_host_disk_available_bytes"));
     }
 
     #[test]

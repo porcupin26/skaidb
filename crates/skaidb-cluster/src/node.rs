@@ -658,6 +658,41 @@ impl Node {
         }
     }
 
+    /// Host system statistics for every member: this node sampled locally,
+    /// peers over internode. `None` marks an unreachable peer. Ordered by
+    /// node id.
+    pub fn cluster_host_stats(self: &Arc<Self>) -> Vec<(String, Option<crate::host::HostStats>)> {
+        let dir = self
+            .local
+            .read()
+            .ok()
+            .map(|db| db.dir().to_path_buf())
+            .unwrap_or_default();
+        let mut out = vec![(self.id.0.clone(), Some(crate::host::sample(&dir)))];
+        let peers: Vec<(NodeId, String)> = self
+            .members_snapshot()
+            .into_iter()
+            .filter(|(id, _)| *id != self.id)
+            .collect();
+        let addrs: Vec<String> = peers.iter().map(|(_, a)| a.clone()).collect();
+        let stats = scatter(&addrs, |addr| {
+            match self.pool.call_timeout(addr, &Request::HostStats, PROBE_TIMEOUT) {
+                Ok(Response::HostStats { json }) => serde_json::from_str(&json).ok(),
+                _ => None,
+            }
+        });
+        for ((id, _), stat) in peers.into_iter().zip(stats) {
+            out.push((id.0, stat));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// This node's data directory (for host-stats disk sampling).
+    pub fn data_dir(&self) -> Option<std::path::PathBuf> {
+        self.local.read().ok().map(|db| db.dir().to_path_buf())
+    }
+
     /// Storage/runtime statistics for this node's local engine (for metrics).
     pub fn db_stats(&self, per_table: bool) -> Option<DbStats> {
         self.local.read().ok().map(|db| db.stats(per_table))
@@ -2754,6 +2789,16 @@ impl Node {
     fn apply_local(&self, req: Request) -> Response {
         match req {
             Request::Ping => Response::Pong,
+            Request::HostStats => {
+                let dir = match self.local.read() {
+                    Ok(db) => db.dir().to_path_buf(),
+                    Err(_) => return Response::Err("local lock poisoned".into()),
+                };
+                match serde_json::to_string(&crate::host::sample(&dir)) {
+                    Ok(json) => Response::HostStats { json },
+                    Err(e) => Response::Err(format!("encode host stats: {e}")),
+                }
+            }
             Request::LocalScan { table } => match self.local.read() {
                 Ok(db) => match db.local_scan_versioned_with_tombstones(&table) {
                     Ok(rows) => Response::Scan { rows },

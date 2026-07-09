@@ -127,3 +127,6 @@ code { font: 12px ui-monospace, "SF Mono", Consolas, monospace; color: var(--acc
 .bad { color: var(--error); }
 .error { color: var(--error); font-size: 13px; }
 .muted { color: var(--muted); font-size: 12px; }
+
+/* stats tab: cluster totals row under the per-node rows */
+tr.cluster-total td { border-top: 2px solid var(--line); font-weight: 600; }

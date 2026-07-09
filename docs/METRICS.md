@@ -98,6 +98,23 @@ index storage engines).
 | `skaidb_cache_entries` | gauge | — | Live read-cache entries. |
 | `skaidb_bloom_negative_lookups_total` | counter | — | Point reads resolved absent by the Bloom/SSTable layer. |
 
+### Host system (per node)
+
+Sampled from `/proc` (plus `df` for the data-directory filesystem) at
+each scrape; each node reports its own host. Memory is cgroup-aware — a
+container reports its own limit and usage, not the host's. CPU% and disk
+throughput are computed over the window since the previous sample.
+
+| Metric | Type | Labels | Meaning |
+|--------|------|--------|---------|
+| `skaidb_host_cpu_percent` | gauge | — | Busy CPU as % of all cores over the last sampling window. |
+| `skaidb_host_cpus` | gauge | — | Logical CPU count. |
+| `skaidb_host_mem_total_bytes` | gauge | — | Total memory (cgroup limit when one applies). |
+| `skaidb_host_mem_used_bytes` | gauge | — | Used memory (cgroup `memory.current` when limited, else `MemTotal - MemAvailable`). |
+| `skaidb_host_rss_bytes` | gauge | — | The skaidb process's resident set size. |
+| `skaidb_host_disk_read_bytes_total` / `skaidb_host_disk_written_bytes_total` | counter | — | Whole-host disk IO since boot (physical devices; partitions/loop/dm excluded). |
+| `skaidb_host_disk_total_bytes` / `skaidb_host_disk_available_bytes` | gauge | — | The filesystem holding the data directory. |
+
 ### Per-table (opt-in)
 
 Enabled with `observability.per_table_metrics = true`. Each carries a `table`

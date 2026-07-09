@@ -36,10 +36,15 @@ http://127.0.0.1:7080/ui
   runs it in the query console; a `SUGGEST` tester; and an
   Elasticsearch-subset request tester (method + path + JSON body →
   pretty-printed response, same auth as everything else).
-- **stats** — queries/s, mean latency, rows scanned/s, bytes returned/s
-  with canvas sparklines (5 s samples, 5 min window), storage/cache/WAL
-  counters, and per-table / per-search-index breakdowns from
-  `SHOW STATUS`. Polls only while the tab is visible.
+- **stats** — a per-node system table first (CPU%, load, RAM used/total
+  — cgroup-aware in containers —, process RSS, disk read/write
+  throughput, and data-directory disk space, one row per cluster member
+  via `GET /ui/hosts`, with a cluster totals row on multi-node
+  deployments and unreachable members flagged); then queries/s, mean
+  latency, rows scanned/s, bytes returned/s with canvas sparklines (5 s
+  samples, 5 min window), storage/cache/WAL counters, and per-table /
+  per-search-index breakdowns from `SHOW STATUS`. Polls only while the
+  tab is visible.
 - **config** — the masked config (`/admin/config`), one card per section,
   with per-key set. The result states whether the key applied live or
   needs a restart; every set persists to the node's config file.
