@@ -4190,7 +4190,24 @@ impl Node {
     /// table — one WAL — and commit points are monotonic, so syncing through
     /// the last row's commit makes every row durable.
     fn apply_batch_local(&self, table: &str, rows: &[BatchRow]) -> EngineResult<()> {
-        if let Some((commit, handle)) = self.apply_batch_buffered(table, rows)? {
+        // QoS: bounded lock tenure. One write-lock acquisition for a whole
+        // 250-row FTS-indexed batch, arriving back-to-back on every replica
+        // during a bulk load, kept the engine write-locked essentially
+        // continuously — every query starved behind it (health answered,
+        // queries timed out). Apply in sub-chunks, one lock acquisition each
+        // with a breather between, so queued readers interleave. The WAL
+        // commit point is monotonic, so syncing through the last chunk's
+        // commit still covers the whole batch — one fsync, same durability
+        // at the ack as before.
+        const APPLY_CHUNK_ROWS: usize = 64;
+        let mut last: Option<(WalCommit, Arc<WalSync>)> = None;
+        for chunk in rows.chunks(APPLY_CHUNK_ROWS) {
+            if let Some(c) = self.apply_batch_buffered(table, chunk)? {
+                last = Some(c);
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        if let Some((commit, handle)) = last {
             handle.sync_through(commit)?;
         }
         Ok(())
