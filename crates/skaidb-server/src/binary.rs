@@ -84,6 +84,11 @@ fn handle_connection(stream: TcpStream, ctx: Shared) {
     // The current database is per-connection state: `USE` sets it for the life
     // of this connection; it starts at `default`.
     let mut current_db = skaidb_engine::DEFAULT_DATABASE.to_string();
+    // `SET CONSISTENCY` session override: when set, it wins over the
+    // per-request wire value until changed (SQL-only clients get the
+    // knob; drivers that pass consistency explicitly can keep doing so
+    // by not issuing SET CONSISTENCY).
+    let mut session_consistency: Option<skaidb_proto::Consistency> = None;
 
     // Request and response buffers are reused across the connection's life,
     // so steady-state a request costs no allocation in the framing layer.
@@ -107,11 +112,17 @@ fn handle_connection(stream: TcpStream, ctx: Shared) {
         };
         let response = match request {
             Ok(ClientRequest::Query { sql, consistency }) => {
-                execute_session_as(&ctx, &role, &mut current_db, &sql, Some(consistency))
+                if let Some(resp) = set_consistency_stmt(&sql, &mut session_consistency) {
+                    resp
+                } else {
+                    let c = session_consistency.unwrap_or(consistency);
+                    execute_session_as(&ctx, &role, &mut current_db, &sql, Some(c))
+                }
             }
             Ok(ClientRequest::QueryStream { sql, consistency }) => {
+                let c = session_consistency.unwrap_or(consistency);
                 let response =
-                    execute_session_as(&ctx, &role, &mut current_db, &sql, Some(consistency));
+                    execute_session_as(&ctx, &role, &mut current_db, &sql, Some(c));
                 if write_streamed(&mut writer, &mut outbuf, response, &ctx, tag).is_err() {
                     return;
                 }
@@ -130,7 +141,7 @@ fn handle_connection(stream: TcpStream, ctx: Shared) {
                         &mut current_db,
                         &ps.sql,
                         Ok(bound),
-                        Some(consistency),
+                        Some(session_consistency.unwrap_or(consistency)),
                     ),
                     Err(e) => Response::Error(e.to_string()),
                 },
@@ -309,5 +320,33 @@ fn authenticate(
             ctx.audit().log_login(&start.username, None, false);
             Err(())
         }
+    }
+}
+
+/// Intercept `SET CONSISTENCY { ONE | QUORUM | ALL }` — per-connection
+/// session state that never reaches the engine. `None` = not that
+/// statement (execute normally). A cheap prefix check gates the parse so
+/// ordinary statements pay nothing.
+fn set_consistency_stmt(
+    sql: &str,
+    session: &mut Option<skaidb_proto::Consistency>,
+) -> Option<skaidb_proto::Response> {
+    let trimmed = sql.trim_start();
+    if !trimmed
+        .get(..3)
+        .is_some_and(|w| w.eq_ignore_ascii_case("set"))
+    {
+        return None;
+    }
+    match skaidb_sql::parse(sql) {
+        Ok(skaidb_sql::ast::Statement::SetConsistency { level }) => {
+            *session = Some(match level.as_str() {
+                "ONE" => skaidb_proto::Consistency::One,
+                "ALL" => skaidb_proto::Consistency::All,
+                _ => skaidb_proto::Consistency::Quorum,
+            });
+            Some(skaidb_proto::Response::Ddl)
+        }
+        _ => None, // not SET CONSISTENCY (e.g. SET CONFIG) — execute normally
     }
 }

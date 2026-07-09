@@ -88,6 +88,19 @@ SHOW TABLES
 SHOW INDEXES
 SHOW STATUS
 SHOW DATABASES
+
+-- Admin control plane (network server only; needs ADMIN on *)
+SHOW CLUSTER                                  -- ring, members, epoch, liveness
+SHOW CONFIG [LIKE '<pattern>']                -- flattened keys, secrets masked
+SET  CONFIG <section.field> = <literal>       -- live-mutable keys apply instantly
+SHOW SLOW QUERIES [LIMIT <n>]                 -- masked slow-query sample
+REPAIR CLUSTER                                -- one anti-entropy pass
+RECLAIM                                       -- drop unowned keys/series
+ALTER CLUSTER ADD    NODE '<host:port>'
+ALTER CLUSTER REMOVE NODE '<id>'
+
+-- Session (binary-protocol connections)
+SET CONSISTENCY { ONE | QUORUM | ALL }        -- per-connection override
 ```
 
 - `CREATE TABLE` declares **only the primary key** — there is no column list;
@@ -126,6 +139,15 @@ SHOW DATABASES
   privilege, so a monitoring/tooling agent can enumerate the schema without
   `/query` data access. In cluster mode they answer from the local catalog (the
   schema is identical on every node).
+- **Admin statements** (`SHOW CLUSTER`/`SHOW CONFIG`/`SET CONFIG`/
+  `SHOW SLOW QUERIES`/`REPAIR CLUSTER`/`RECLAIM`/`ALTER CLUSTER`) are the
+  SQL spellings of the HTTP `/admin/*` control plane — identical handler,
+  RBAC (`ADMIN` on `*`), and audit; results come back as `(key, value)`
+  rows (LIKE uses `%`/`_`). They execute on the **network server** — the
+  embedded `--local` engine rejects them. `SET CONSISTENCY` is
+  per-connection session state on binary-protocol sessions (it overrides
+  the wire consistency until changed); the stateless REST gateway rejects
+  it with guidance.
 - **`SHOW STATUS`** returns storage and runtime statistics for the current
   database as `(metric, value)` rows — table/index counts, on-disk and memtable
   bytes, SSTable count, WAL bytes/fsyncs, compactions, cache hit/miss/hit-rate,

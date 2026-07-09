@@ -176,6 +176,58 @@ impl Parser {
             let name = self.expect_ident()?;
             return Ok(Statement::RebuildSearchIndex { name });
         }
+        // Statement-level SET: `SET CONFIG k = 'v'` / `SET CONSISTENCY L`.
+        if self.peek() == &Token::Keyword(Keyword::Set) {
+            self.advance();
+            if self.eat_ident_ci("config") {
+                let key = self.parse_path()?;
+                self.expect(&Token::Eq)?;
+                let value = match self.advance() {
+                    Token::Str(v) => v,
+                    Token::Int(n) => n.to_string(),
+                    Token::Float(f) => f.to_string(),
+                    Token::Keyword(Keyword::True) => "true".into(),
+                    Token::Keyword(Keyword::False) => "false".into(),
+                    other => {
+                        return Err(ParseError::Other(format!(
+                            "SET CONFIG expects a literal value, found {other:?}"
+                        )))
+                    }
+                };
+                return Ok(Statement::SetConfig { key, value });
+            }
+            if self.eat_ident_ci("consistency") {
+                let level = match self.advance() {
+                    Token::Ident(s) => s.to_ascii_uppercase(),
+                    // ALL lexes as the UNION ALL keyword.
+                    Token::Keyword(Keyword::All) => "ALL".to_string(),
+                    other => {
+                        return Err(ParseError::Other(format!(
+                            "SET CONSISTENCY takes ONE, QUORUM, or ALL — found {other:?}"
+                        )))
+                    }
+                };
+                if !matches!(level.as_str(), "ONE" | "QUORUM" | "ALL") {
+                    return Err(ParseError::Other(
+                        "SET CONSISTENCY takes ONE, QUORUM, or ALL".into(),
+                    ));
+                }
+                return Ok(Statement::SetConsistency { level });
+            }
+            return Err(self.unexpected("CONFIG or CONSISTENCY after SET".into()));
+        }
+        // `REPAIR CLUSTER` / `RECLAIM` — cluster maintenance.
+        if self.peek_ident_ci("repair") {
+            self.advance();
+            if !self.eat_ident_ci("cluster") {
+                return Err(self.unexpected("CLUSTER after REPAIR".into()));
+            }
+            return Ok(Statement::RepairCluster);
+        }
+        if self.peek_ident_ci("reclaim") {
+            self.advance();
+            return Ok(Statement::Reclaim);
+        }
         // `EXPLAIN SCORE <select> FOR <literal>` — per-row BM25 breakdown
         // (EXPLAIN/SCORE/FOR are contextual identifiers).
         if self.peek_ident_ci("explain") {
@@ -294,9 +346,43 @@ impl Parser {
                     Ok(Statement::ShowStatus)
                 } else if self.eat_ident_ci("databases") {
                     Ok(Statement::ShowDatabases)
+                } else if self.eat_ident_ci("cluster") {
+                    Ok(Statement::ShowCluster)
+                } else if self.eat_ident_ci("config") {
+                    let like = if self.eat_ident_ci("like") {
+                        match self.advance() {
+                            Token::Str(p) => Some(p),
+                            other => {
+                                return Err(ParseError::Other(format!(
+                                    "SHOW CONFIG LIKE expects a quoted pattern, found {other:?}"
+                                )))
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    Ok(Statement::ShowConfig { like })
+                } else if self.eat_ident_ci("slow") {
+                    if !self.eat_ident_ci("queries") {
+                        return Err(self.unexpected("QUERIES after SHOW SLOW".into()));
+                    }
+                    let limit = if self.eat_keyword(Keyword::Limit) {
+                        match self.advance() {
+                            Token::Int(n) if n > 0 => Some(n as u64),
+                            other => {
+                                return Err(ParseError::Other(format!(
+                                    "SHOW SLOW QUERIES LIMIT expects a positive integer,                                      found {other:?}"
+                                )))
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    Ok(Statement::ShowSlowQueries { limit })
                 } else {
                     Err(self.unexpected(
-                        "TABLES, INDEXES, GRANTS, STATUS, or DATABASES after SHOW".into(),
+                        "TABLES, INDEXES, GRANTS, STATUS, DATABASES, CLUSTER, CONFIG,                          or SLOW QUERIES after SHOW"
+                            .into(),
                     ))
                 }
             }
@@ -391,6 +477,25 @@ impl Parser {
     /// `ALTER TABLE <name> RENAME { TO <new> | COLUMN <from> TO <to> }`.
     fn parse_alter(&mut self) -> Result<Statement, ParseError> {
         self.expect_keyword(Keyword::Alter)?;
+        // `ALTER CLUSTER ADD NODE '<addr>'` / `REMOVE NODE '<id>'`.
+        if self.eat_ident_ci("cluster") {
+            let add = if self.eat_ident_ci("add") {
+                true
+            } else if self.eat_ident_ci("remove") {
+                false
+            } else {
+                return Err(self.unexpected("ADD or REMOVE after ALTER CLUSTER".into()));
+            };
+            if !self.eat_ident_ci("node") {
+                return Err(self.unexpected("NODE after ALTER CLUSTER ADD/REMOVE".into()));
+            }
+            let node = self.expect_string().map_err(|_| {
+                ParseError::Other(
+                    "ALTER CLUSTER ADD/REMOVE NODE takes a quoted 'host:port' / id".into(),
+                )
+            })?;
+            return Ok(Statement::AlterCluster { add, node });
+        }
         if self.eat_keyword(Keyword::User) {
             let name = self.expect_ident()?;
             self.expect_keyword(Keyword::Password)?;

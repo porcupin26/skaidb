@@ -384,6 +384,11 @@ mod tests {
             Response::Mutation { affected: 2 }
         );
 
+        // SET CONSISTENCY is per-connection session state (acks as DDL).
+        assert_eq!(
+            client.execute("SET CONSISTENCY ALL").unwrap(),
+            Response::Ddl
+        );
         let resp = client
             .execute("SELECT id, name FROM t ORDER BY id")
             .unwrap();
@@ -881,6 +886,62 @@ mod tests {
         assert!(!body.contains("secret_t"), "{body}");
         assert!(!body.contains("hidden_t"), "{body}");
         assert!(!body.contains("\"name\":\"other\""), "{body}");
+    }
+
+    /// The admin control plane's SQL spellings: SHOW CLUSTER / CONFIG /
+    /// SLOW QUERIES, SET CONFIG, REPAIR CLUSTER, RECLAIM — same handler,
+    /// RBAC, and results as the HTTP endpoints, spoken over /query.
+    #[test]
+    fn sql_admin_statements() {
+        let ctx = temp_ctx();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx.clone()).unwrap();
+        let post = |sql: &str| -> String {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            let head = format!(
+                "POST /query HTTP/1.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                sql.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(sql.as_bytes()).unwrap();
+            let mut resp = String::new();
+            stream.read_to_string(&mut resp).unwrap();
+            resp
+        };
+
+        // SHOW CONFIG with a LIKE filter — masked, flattened keys.
+        let resp = post("SHOW CONFIG LIKE 'ui.%'");
+        assert!(resp.contains("\"ui.enabled\""), "{resp}");
+        assert!(!resp.contains("superuser_password"), "filtered out: {resp}");
+
+        // SET CONFIG applies live and SHOW CONFIG reflects it.
+        let resp = post("SET CONFIG ui.enabled = 'false'");
+        assert!(resp.contains("applied"), "{resp}");
+        let resp = post("SHOW CONFIG LIKE 'ui.enabled'");
+        assert!(resp.contains("false"), "{resp}");
+        post("SET CONFIG ui.enabled = 'true'");
+
+        // SHOW CLUSTER answers (standalone: clustered=false).
+        let resp = post("SHOW CLUSTER");
+        assert!(resp.contains("clustered"), "{resp}");
+
+        // SHOW SLOW QUERIES answers with the right columns.
+        let resp = post("SHOW SLOW QUERIES LIMIT 5");
+        assert!(resp.contains("\"columns\":[\"seq\",\"elapsed_ms\",\"sql\"]"), "{resp}");
+
+        // RBAC: a non-admin role is denied with the standard message.
+        post("CREATE ROLE viewer2");
+        post("CREATE TABLE vt (PRIMARY KEY (id))");
+        post("GRANT SELECT ON vt TO viewer2");
+        let resp = {
+            let ctx = ctx.clone();
+            let r = crate::shared::execute_as(&ctx, "viewer2", "SHOW CONFIG");
+            format!("{r:?}")
+        };
+        assert!(resp.contains("permission denied"), "{resp}");
+
+        // SET CONSISTENCY on the stateless REST gateway explains itself.
+        let resp = post("SET CONSISTENCY QUORUM");
+        assert!(resp.contains("session"), "{resp}");
     }
 
     /// The query console's per-request session database: `{"sql", "db"}`

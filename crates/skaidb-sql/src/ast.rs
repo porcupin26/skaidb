@@ -53,6 +53,28 @@ pub enum Statement {
         select: Box<Select>,
         key: skaidb_types::Value,
     },
+    /// `SHOW CLUSTER` — ring/membership detail (needs ADMIN; served by the
+    /// server layer, not the engine).
+    ShowCluster,
+    /// `SHOW CONFIG [LIKE '<pattern>']` — flattened `(key, value)` config
+    /// rows, secrets masked (`%`/`_` wildcards; needs ADMIN).
+    ShowConfig { like: Option<String> },
+    /// `SET CONFIG <section.field> = '<value>'` — live-mutable keys apply
+    /// instantly; everything persists to the config file (needs ADMIN).
+    SetConfig { key: String, value: String },
+    /// `SHOW SLOW QUERIES [LIMIT n]` — the in-memory slow-query sample
+    /// (masked SQL; needs ADMIN).
+    ShowSlowQueries { limit: Option<u64> },
+    /// `SET CONSISTENCY { ONE | QUORUM | ALL }` — per-connection override
+    /// on binary-protocol sessions.
+    SetConsistency { level: String },
+    /// `REPAIR CLUSTER` — one anti-entropy pass, cluster-wide (ADMIN).
+    RepairCluster,
+    /// `RECLAIM` — drop data this cluster's nodes no longer own (ADMIN).
+    Reclaim,
+    /// `ALTER CLUSTER ADD NODE '<addr>'` / `ALTER CLUSTER REMOVE NODE
+    /// '<id>'` (ADMIN).
+    AlterCluster { add: bool, node: String },
     AlterTable(AlterTable),
     Insert(Insert),
     Select(Select),

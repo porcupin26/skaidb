@@ -585,6 +585,15 @@ pub fn execute_session_statement_as(
         }
     }
 
+    // The admin control plane's SQL spellings execute here (the engine
+    // never sees them): routed through the same `admin::handle` as the
+    // HTTP endpoints, so behavior, RBAC, and audit are identical.
+    if let Ok(stmt) = parsed.as_ref() {
+        if let Some(resp) = admin_statement_response(ctx, role, stmt) {
+            return resp;
+        }
+    }
+
     // Auth DDL is audit-logged (secret-free) after execution; summarize now,
     // before the parse moves into the backend.
     let auth_summary = parsed.as_ref().ok().and_then(auth_ddl_summary);
@@ -750,6 +759,134 @@ fn tx_kind(sql: &str) -> Option<TxKind> {
 /// already-parsed statement so the request's single parse is reused; callers
 /// skip the check entirely for SQL that does not parse — the engine then
 /// reports the parse error.
+/// The SQL spellings of the admin/control surface. `None` = not one of
+/// them (fall through to the ordinary backends).
+fn admin_statement_response(ctx: &Shared, role: &str, stmt: &Statement) -> Option<Response> {
+    use crate::admin::AdminCmd;
+    let cmd = match stmt {
+        Statement::ShowCluster => AdminCmd::Status,
+        Statement::RepairCluster => AdminCmd::Repair,
+        Statement::Reclaim => AdminCmd::Reclaim,
+        Statement::AlterCluster { add: true, node } => AdminCmd::AddNode(node.clone()),
+        Statement::AlterCluster { add: false, node } => AdminCmd::RemoveNode(node.clone()),
+        Statement::SetConfig { key, value } => AdminCmd::ConfigSet {
+            key: key.clone(),
+            value: value.clone(),
+        },
+        Statement::ShowSlowQueries { .. } => AdminCmd::Slow,
+        Statement::ShowConfig { .. } => AdminCmd::ConfigShow,
+        Statement::SetConsistency { .. } => {
+            return Some(Response::Error(
+                "SET CONSISTENCY is per-connection session state: it works on \
+                 binary-protocol sessions (skaidbsh, drivers); the stateless REST \
+                 gateway has no session — use the cluster's defaults or a driver"
+                    .into(),
+            ))
+        }
+        _ => return None,
+    };
+    let (status, payload) = crate::admin::handle(ctx, role, cmd);
+    if status != 200 {
+        let msg = payload["error"]
+            .as_str()
+            .unwrap_or("admin operation failed")
+            .to_string();
+        return Some(Response::Error(msg));
+    }
+    Some(match stmt {
+        Statement::ShowConfig { like } => json_kv_rows(&payload, like.as_deref()),
+        Statement::ShowSlowQueries { limit } => slow_query_rows(&payload, *limit),
+        _ => json_kv_rows(&payload, None),
+    })
+}
+
+/// Flatten a JSON payload into sorted `(key, value)` rows — nested objects
+/// join with `.`, arrays index with `.<i>` — optionally filtered by a SQL
+/// LIKE pattern (`%` any run, `_` one char) on the key.
+fn json_kv_rows(payload: &Json, like: Option<&str>) -> Response {
+    fn walk(prefix: &str, v: &Json, out: &mut Vec<(String, String)>) {
+        match v {
+            Json::Object(map) => {
+                for (k, v) in map {
+                    let key = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    walk(&key, v, out);
+                }
+            }
+            Json::Array(items) => {
+                for (i, v) in items.iter().enumerate() {
+                    walk(&format!("{prefix}.{i}"), v, out);
+                }
+            }
+            Json::String(s) => out.push((prefix.to_string(), s.clone())),
+            other => out.push((prefix.to_string(), other.to_string())),
+        }
+    }
+    let mut pairs = Vec::new();
+    walk("", payload, &mut pairs);
+    pairs.sort();
+    let rows = pairs
+        .into_iter()
+        .filter(|(k, _)| like.is_none_or(|p| like_match(p, k)))
+        .map(|(k, v)| {
+            vec![
+                skaidb_types::Value::String(k),
+                skaidb_types::Value::String(v),
+            ]
+        })
+        .collect();
+    Response::Rows {
+        columns: vec!["key".into(), "value".into()],
+        rows,
+    }
+}
+
+/// SQL LIKE over plain chars: `%` = any run, `_` = any one char.
+fn like_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    fn rec(p: &[char], t: &[char]) -> bool {
+        match p.first() {
+            None => t.is_empty(),
+            Some('%') => (0..=t.len()).any(|i| rec(&p[1..], &t[i..])),
+            Some('_') => !t.is_empty() && rec(&p[1..], &t[1..]),
+            Some(c) => t.first() == Some(c) && rec(&p[1..], &t[1..]),
+        }
+    }
+    rec(&p, &t)
+}
+
+/// `SHOW SLOW QUERIES` rows from the slow-log snapshot.
+fn slow_query_rows(payload: &Json, limit: Option<u64>) -> Response {
+    let mut rows: Vec<Vec<skaidb_types::Value>> = payload["slow_queries"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|q| {
+                    vec![
+                        skaidb_types::Value::Int(q["seq"].as_i64().unwrap_or(0)),
+                        skaidb_types::Value::Int(q["elapsed_ms"].as_i64().unwrap_or(0)),
+                        skaidb_types::Value::String(
+                            q["sql"].as_str().unwrap_or_default().to_string(),
+                        ),
+                    ]
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(n) = limit {
+        rows.truncate(n as usize);
+    }
+    Response::Rows {
+        columns: vec!["seq".into(), "elapsed_ms".into(), "sql".into()],
+        rows,
+    }
+}
+
 fn required_privilege(stmt: &Statement) -> Option<(Privilege, Object)> {
     Some(match stmt {
         Statement::Select(s) => (Privilege::Select, Object::Table(s.from.clone())),
@@ -806,6 +943,17 @@ fn required_privilege(stmt: &Statement) -> Option<(Privilege, Object)> {
         | Statement::GrantRole { .. }
         | Statement::RevokeRole { .. }
         | Statement::ShowGrants { .. } => (Privilege::Grant, Object::Global),
+        // The SQL spellings of the admin control plane; `admin::handle`
+        // re-checks, this arm makes the standard denial path fire first.
+        Statement::ShowCluster
+        | Statement::ShowConfig { .. }
+        | Statement::SetConfig { .. }
+        | Statement::ShowSlowQueries { .. }
+        | Statement::RepairCluster
+        | Statement::Reclaim
+        | Statement::AlterCluster { .. } => (Privilege::Admin, Object::Global),
+        // Session state; the binary session handles it before this layer.
+        Statement::SetConsistency { .. } => return None,
     })
 }
 

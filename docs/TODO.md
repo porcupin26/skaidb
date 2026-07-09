@@ -78,12 +78,6 @@ be spoken in SQL. Each row carries the suggested SQL extension.
 | Capability | Today | Suggested SQL extension |
 |---|---|---|
 | Query-plan inspection | nothing (only `EXPLAIN SCORE`) | `EXPLAIN <statement>` — index selection, pushdown/scatter/fallback decisions, per-node fan-out |
-| Cluster membership | `/admin/add-node`, `\node add` | `ALTER CLUSTER ADD NODE 'host:7100'` / `ALTER CLUSTER REMOVE NODE 'id'` |
-| Cluster health | `/status`, `/admin/status`, `\cluster` | `SHOW CLUSTER` (members, epoch, ring, hints, liveness) |
-| Anti-entropy / space | `/admin/repair`, `/admin/reclaim` | `REPAIR CLUSTER` / `RECLAIM` (async, returns a job row) |
-| Runtime configuration | `/admin/config*`, `\config` | `SHOW CONFIG [LIKE 'observability.%']` / `SET CONFIG key = 'value'` (ALTER SYSTEM-style) |
-| Slow-query log | `/admin/slow` | `SHOW SLOW QUERIES [LIMIT n]` |
-| Session consistency | driver/shell (`\consistency`) | `SET CONSISTENCY { ONE \| QUORUM \| ALL }` as a statement |
 | Per-group top documents | ES `top_hits` sub-agg only | window functions (`ROW_NUMBER() OVER (PARTITION BY g ORDER BY score() DESC)`), or a dedicated `TOP k BY <expr>` group clause |
 | Field-subset dis-max match | internal `match_best` (ES multi_match best_fields) | document/expose `MATCH_BEST(col, col, ..., 'text')` |
 | Vector index tuning | fixed ef/M | `ALTER VECTOR INDEX v SET (ef = 128, m = 16)` |
