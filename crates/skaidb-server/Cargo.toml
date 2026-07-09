@@ -30,5 +30,12 @@ clap.workspace = true
 serde_json.workspace = true
 snap.workspace = true
 
+# jemalloc as the global allocator (server binary only): the default glibc
+# allocator does not return freed memory to the OS under the bulk-load +
+# index-build churn, ratcheting RSS to the cgroup limit and OOM-looping small
+# nodes. Not built on MSVC (jemalloc is unsupported there).
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
+
 [dev-dependencies]
 skaidb-driver.workspace = true

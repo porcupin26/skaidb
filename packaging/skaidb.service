@@ -11,6 +11,10 @@ Group=skaidb
 # Base configuration file; per-host overrides go in /etc/default/skaidb as
 # SKAIDB_* environment variables (env > file, see `skaidb --print-config`).
 EnvironmentFile=-/etc/default/skaidb
+# jemalloc: run a background purge thread and return dirty/muzzy pages to the OS
+# within ~1s (defaults hold them ~10s), so RSS tracks the live set on
+# memory-constrained nodes instead of ratcheting to the cgroup limit.
+Environment=_RJEM_MALLOC_CONF=background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000
 ExecStart=/usr/bin/skaidb --config /etc/skaidb/skaidb.toml
 Restart=on-failure
 RestartSec=2s

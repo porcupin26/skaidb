@@ -8,6 +8,18 @@
 use clap::Parser;
 use skaidb_config::Config;
 
+// jemalloc as the global allocator: glibc's default allocator retains freed
+// memory instead of returning it to the OS, so bulk-load + index-build churn
+// ratcheted RSS to the cgroup limit and OOM-looped small nodes even after the
+// data was flushed/freed. jemalloc reclaims and fragments far better.
+// Aggressive page return to the OS (`_RJEM_MALLOC_CONF=background_thread:true,
+// dirty_decay_ms:1000,muzzy_decay_ms:1000`) is set in the systemd unit rather
+// than a `#[export_name]` symbol, which the workspace's `forbid(unsafe_code)`
+// rejects. jemalloc's defaults already return memory far better than glibc.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod cli;
 
 fn main() -> std::process::ExitCode {

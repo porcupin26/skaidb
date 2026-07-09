@@ -1074,14 +1074,14 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "skaidb-auth"
-version = "0.70.4"
+version = "0.70.6"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "skaidb-cli"
-version = "0.70.4"
+version = "0.70.6"
 dependencies = [
  "clap",
  "rustyline",
@@ -1095,7 +1095,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-cluster"
-version = "0.70.4"
+version = "0.70.6"
 dependencies = [
  "rustls",
  "rustls-pemfile",
@@ -1114,7 +1114,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-config"
-version = "0.70.4"
+version = "0.70.6"
 dependencies = [
  "clap",
  "serde",
@@ -1125,7 +1125,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-driver"
-version = "0.70.4"
+version = "0.70.6"
 dependencies = [
  "skaidb-auth",
  "skaidb-proto",
@@ -1135,7 +1135,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-engine"
-version = "0.70.4"
+version = "0.70.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -1150,7 +1150,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-fts"
-version = "0.70.4"
+version = "0.70.6"
 dependencies = [
  "levenshtein_automata",
  "serde",
@@ -1165,7 +1165,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-proto"
-version = "0.70.4"
+version = "0.70.6"
 dependencies = [
  "skaidb-types",
  "thiserror",
@@ -1173,7 +1173,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-server"
-version = "0.70.4"
+version = "0.70.6"
 dependencies = [
  "clap",
  "serde_json",
@@ -1187,11 +1187,12 @@ dependencies = [
  "skaidb-tsdb",
  "skaidb-types",
  "snap",
+ "tikv-jemallocator",
 ]
 
 [[package]]
 name = "skaidb-sql"
-version = "0.70.4"
+version = "0.70.6"
 dependencies = [
  "skaidb-types",
  "thiserror",
@@ -1199,7 +1200,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-storage"
-version = "0.70.4"
+version = "0.70.6"
 dependencies = [
  "brotli",
  "lz4_flex 0.11.6",
@@ -1209,7 +1210,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-tsdb"
-version = "0.70.4"
+version = "0.70.6"
 dependencies = [
  "regex",
  "serde",
@@ -1219,7 +1220,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-types"
-version = "0.70.4"
+version = "0.70.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -1461,6 +1462,26 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tikv-jemalloc-sys"
+version = "0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd8aa5b2ab86a2cefa406d889139c162cbb230092f7d1d7cbc1716405d852a3b"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
+name = "tikv-jemallocator"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0359b4327f954e0567e69fb191cf1436617748813819c94b8cd4a431422d053a"
+dependencies = [
+ "libc",
+ "tikv-jemalloc-sys",
 ]
 
 [[package]]
