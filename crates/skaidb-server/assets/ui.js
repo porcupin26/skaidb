@@ -704,12 +704,13 @@ function fmtRate(v) {
 }
 
 async function refreshStats() {
-  const [promText, statusResult, hosts] = await Promise.all([
+  const [promText, statusResult, hosts, status] = await Promise.all([
     apiText("/metrics"),
     api("POST", "/query", JSON.stringify({ sql: "SHOW STATUS" })),
     api("GET", "/ui/hosts"),
+    api("GET", "/status"),
   ]);
-  renderHosts(hosts);
+  renderHosts(hosts, status);
   const m = parseProm(promText);
   statsHistory.push({ t: Date.now(), m });
   if (statsHistory.length > SPARK_WINDOW) statsHistory.shift();
@@ -778,9 +779,14 @@ async function refreshStats() {
 
 // The per-node system stats table, plus a cluster totals row when the
 // deployment has more than one node.
-function renderHosts(hosts) {
+function renderHosts(hosts, status) {
   const tbody = $("st-nodes").querySelector("tbody");
   tbody.textContent = "";
+  // Per-node replication lag/backlog from /status. Peer ids (host:internode
+  // port) match the host-stats node ids exactly. The node serving this page
+  // has no lag-to-self, so it shows a dash.
+  const peers = new Map(((status && status.peers) || []).map((p) => [p.id, p]));
+  const selfId = status && status.node_id;
   const cell = (text) => {
     const td = document.createElement("td");
     td.textContent = text;
@@ -793,7 +799,7 @@ function renderHosts(hosts) {
     if (!n.reachable) {
       tr.append(cell(n.id));
       const td = cell("unreachable");
-      td.colSpan = 7;
+      td.colSpan = 8;
       td.className = "muted";
       tr.append(td);
       tbody.append(tr);
@@ -808,6 +814,7 @@ function renderHosts(hosts) {
       cell(`${fmtBytes(n.disk_read_bps)}/s`),
       cell(`${fmtBytes(n.disk_write_bps)}/s`),
       cell(usedOfTotal(n.disk_total_bytes - n.disk_available_bytes, n.disk_total_bytes)),
+      replLagCell(peers.get(n.id), n.id === selfId),
     );
     tbody.append(tr);
   }
@@ -824,9 +831,28 @@ function renderHosts(hosts) {
       cell(`${fmtBytes(c.disk_read_bps)}/s`),
       cell(`${fmtBytes(c.disk_write_bps)}/s`),
       cell(usedOfTotal(c.disk_total_bytes - c.disk_available_bytes, c.disk_total_bytes)),
+      cell(""),
     );
     tbody.append(tr);
   }
+}
+
+// Replication lag for the nodes table: the exact hinted-handoff backlog owed to
+// this node plus its estimated lag. Self (the node serving the page) has none.
+function replLagCell(peer, isSelf) {
+  const td = document.createElement("td");
+  if (isSelf || !peer) {
+    td.textContent = "—";
+    td.className = "muted";
+    return td;
+  }
+  const parts = [];
+  if (peer.lag_ms != null) parts.push(fmtLag(peer.lag_ms));
+  if (peer.hints_pending > 0) parts.push(`${peer.hints_pending} queued`);
+  td.textContent = parts.length ? parts.join(", ") : "0";
+  if (peer.hints_pending > 0 || peer.lag_ms >= 5000) td.className = "bad";
+  else if (peer.lag_ms >= 1000) td.className = "warn";
+  return td;
 }
 
 // Rows like `<prefix>.<label>[.<label>...].<field>` → one row per label
