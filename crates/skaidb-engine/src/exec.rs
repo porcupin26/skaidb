@@ -3809,6 +3809,27 @@ impl Database {
         }
     }
 
+    /// Flush every table/index memtable holding a non-trivial amount of memory
+    /// to an on-disk SSTable, reclaiming its in-memory footprint. Called by the
+    /// node under memory pressure: the per-engine flush threshold is global-
+    /// pressure-blind (memtables spread thin across many tables each stay under
+    /// it while the sum pins the node), and the normal flush is triggered by a
+    /// *write* — but a shedding node rejects writes, so nothing would ever
+    /// trigger it and the node deadlocks (sheds → no write → no flush → stays
+    /// shedding). Returns bytes reclaimed; trivially small memtables are skipped
+    /// so this doesn't litter tiny SSTables.
+    pub fn flush_memtables_under_pressure(&mut self) -> usize {
+        const FLOOR: usize = 4 * 1024 * 1024;
+        let mut reclaimed = 0;
+        for engine in self.tables.values_mut().chain(self.indexes.values_mut()) {
+            let bytes = engine.memtable_bytes();
+            if bytes >= FLOOR && engine.flush().is_ok() {
+                reclaimed += bytes;
+            }
+        }
+        reclaimed
+    }
+
     /// Aggregate storage/runtime statistics for metrics. When `per_table` is set,
     /// each table is scanned for live-key/tombstone counts (O(rows)); otherwise
     /// only cheap engine snapshots are gathered.

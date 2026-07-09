@@ -380,8 +380,13 @@ SCRAM on the binary endpoint and HTTP Basic on REST, plus RBAC; see the
   SSTable/WAL/search segments the kernel evicts before OOM), so a cache-filled
   node isn't falsely shed while it still has real headroom. Past 85% it **sheds writes** —
   rejecting new writes (client and inbound-replica) with a retryable
-  "memory pressure" error — so it can flush the memtable and commit/merge
-  search segments, shrink its footprint, and leave the OS headroom, instead
+  "memory pressure" error, and **actively flushing its table/index memtables**
+  to reclaim their in-memory footprint. The flush is driven by the memory
+  sampler, not a client write — otherwise a shedding node would deadlock
+  (it rejects the very writes that would trigger a flush) — and flushes every
+  memtable holding non-trivial memory, since pressure spread thin across many
+  tables leaves each below the per-engine flush threshold while the sum pins
+  the node. This shrinks its footprint and leaves the OS headroom instead
   of allocating until the OOM killer takes the whole container down. It
   clears the flag at 70% (hysteresis). Reads and DDL are never shed; a
   coordinator that gets a shed rejection from a replica hints it and

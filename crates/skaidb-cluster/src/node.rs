@@ -479,7 +479,23 @@ impl Node {
         let mem_weak = Arc::downgrade(&node);
         thread::spawn(move || {
             while let Some(node) = mem_weak.upgrade() {
-                node.mem.sample();
+                let shedding = node.mem.sample();
+                if shedding {
+                    // Reclaim memtable memory ourselves: a shedding node rejects
+                    // the client writes that would otherwise trigger a flush, so
+                    // without this it deadlocks (sheds → no write → no flush →
+                    // stays shedding). The per-engine flush threshold also misses
+                    // pressure spread thin across many tables.
+                    if let Ok(mut db) = node.local.write() {
+                        let reclaimed = db.flush_memtables_under_pressure();
+                        if reclaimed > 0 {
+                            skaidb_types::slog!(
+                                "skaidb: memory pressure — flushed {} MB of memtables",
+                                reclaimed / (1024 * 1024)
+                            );
+                        }
+                    }
+                }
                 drop(node); // don't hold the node alive across the sleep
                 thread::sleep(crate::memguard::SAMPLE_INTERVAL);
             }
