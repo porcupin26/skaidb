@@ -1971,6 +1971,105 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// GROUP BY ... TOP k BY <expr> [ASC|DESC]: per-group top-k rows —
+    /// each group returns its k best rows instead of one aggregated row;
+    /// ranks by score() under a search predicate.
+    #[test]
+    fn group_top_k() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE g (PRIMARY KEY (id))").unwrap();
+        db.execute(
+            "INSERT INTO g (id, cat, v, name) VALUES \
+             (1, 'a', 10, 'a10'), (2, 'a', 30, 'a30'), (3, 'a', 20, 'a20'), \
+             (4, 'b', 5, 'b5'), (5, 'b', 15, 'b15'), \
+             (6, 'c', 1, 'c1')",
+        )
+        .unwrap();
+
+        // Top 2 per group, best-first (DESC default); groups first-seen order.
+        let rs = rows(
+            db.execute("SELECT cat, name, v FROM g GROUP BY cat TOP 2 BY v ORDER BY cat, v DESC")
+                .unwrap(),
+        );
+        assert_eq!(
+            rs.rows,
+            vec![
+                vec![Value::String("a".into()), Value::String("a30".into()), Value::Int(30)],
+                vec![Value::String("a".into()), Value::String("a20".into()), Value::Int(20)],
+                vec![Value::String("b".into()), Value::String("b15".into()), Value::Int(15)],
+                vec![Value::String("b".into()), Value::String("b5".into()), Value::Int(5)],
+                vec![Value::String("c".into()), Value::String("c1".into()), Value::Int(1)],
+            ]
+        );
+        // ASC ranks smallest-first; wildcard projection works (rows out).
+        let rs = rows(
+            db.execute("SELECT cat, v FROM g GROUP BY cat TOP 1 BY v ASC ORDER BY cat")
+                .unwrap(),
+        );
+        assert_eq!(
+            rs.rows,
+            vec![
+                vec![Value::String("a".into()), Value::Int(10)],
+                vec![Value::String("b".into()), Value::Int(5)],
+                vec![Value::String("c".into()), Value::Int(1)],
+            ]
+        );
+        // HAVING filters whole groups before the top-k.
+        let rs = rows(
+            db.execute(
+                "SELECT cat, v FROM g GROUP BY cat TOP 1 BY v HAVING count(*) > 1 ORDER BY cat",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            rs.rows,
+            vec![
+                vec![Value::String("a".into()), Value::Int(30)],
+                vec![Value::String("b".into()), Value::Int(15)],
+            ]
+        );
+        // LIMIT pages the flattened output.
+        let rs = rows(
+            db.execute("SELECT cat, v FROM g GROUP BY cat TOP 2 BY v ORDER BY v DESC LIMIT 2")
+                .unwrap(),
+        );
+        assert_eq!(rs.rows.len(), 2);
+        assert_eq!(rs.rows[0][1], Value::Int(30));
+        // Aggregates cannot mix with TOP (rows out, not aggregates).
+        assert!(db
+            .execute("SELECT cat, count(*) FROM g GROUP BY cat TOP 2 BY v")
+            .is_err());
+        assert!(db
+            .execute("SELECT cat FROM g GROUP BY cat TOP 2 BY count(*)")
+            .is_err());
+        // TOP 0 and TOP without GROUP BY are parse errors.
+        assert!(db.execute("SELECT cat FROM g GROUP BY cat TOP 0 BY v").is_err());
+
+        // With a search predicate: per-group best by BM25 score.
+        db.execute("CREATE SEARCH INDEX g_fts ON g (name)").unwrap();
+        db.execute(
+            "INSERT INTO g (id, cat, name) VALUES \
+             (7, 'a', 'quick fox'), (8, 'a', 'quick quick quick fox'), (9, 'b', 'quick dog')",
+        )
+        .unwrap();
+        let rs = rows(
+            db.execute(
+                "SELECT cat, name, score() FROM g WHERE MATCH(name, 'quick') \
+                 GROUP BY cat TOP 1 BY score() ORDER BY cat",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows.len(), 2);
+        assert_eq!(rs.rows[0][0], Value::String("a".into()));
+        assert_eq!(
+            rs.rows[0][1],
+            Value::String("quick quick quick fox".into()),
+            "the more-repeated term scores best in group a"
+        );
+        assert_eq!(rs.rows[1][1], Value::String("quick dog".into()));
+        assert!(matches!(rs.rows[0][2], Value::Float(f) if f > 0.0));
+    }
+
     /// MATCH_BEST: field-centric dis-max over an explicit column subset —
     /// same match set as OR of per-field MATCHes.
     #[test]

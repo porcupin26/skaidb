@@ -4429,7 +4429,7 @@ impl Node {
         // Over-fetch per shard so the merge (and any filtering) still yields k.
         let fetch = k.map(|k| {
             if filter.is_some() {
-                k.saturating_mul(4).max(k + 16)
+                k.saturating_mul(4).max(k.saturating_add(16))
             } else {
                 k.max(1)
             }
@@ -6000,6 +6000,29 @@ mod tests {
         let rs = rows(nb.execute("SUGGEST 'vegetbles' ON articles_fts LIMIT 1").unwrap());
         assert_eq!(rs.rows.len(), 1, "{:?}", rs.rows);
         assert_eq!(rs.rows[0][1], Value::String("vegetables".into()));
+
+        // Per-group top-k over the sharded corpus: every match gathers
+        // *scored* from all shards, then each group keeps its best rows.
+        let rs = rows(
+            nc.execute(
+                "SELECT flag, id, score() FROM articles WHERE MATCH(body, 'fox') \
+                 GROUP BY flag TOP 2 BY score()",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows.len(), 4, "2 rows per flag group: {:?}", rs.rows);
+        let flags: std::collections::HashSet<bool> = rs
+            .rows
+            .iter()
+            .map(|r| match r[0] {
+                Value::Bool(b) => b,
+                ref other => panic!("expected bool flag, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(flags.len(), 2, "both groups represented");
+        for row in &rs.rows {
+            assert!(matches!(row[2], Value::Float(s) if s > 0.0), "scored: {row:?}");
+        }
     }
 
     #[test]

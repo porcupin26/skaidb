@@ -1022,6 +1022,7 @@ impl Parser {
         };
 
         let mut group_by = Vec::new();
+        let mut group_top = None;
         if self.eat_keyword(Keyword::Group) {
             self.expect_keyword(Keyword::By)?;
             loop {
@@ -1029,6 +1030,22 @@ impl Parser {
                 if !self.eat(&Token::Comma) {
                     break;
                 }
+            }
+            // TOP k BY <expr> [ASC|DESC] — per-group top-k rows.
+            if self.eat_ident_ci("top") {
+                let k = self.expect_u64()?;
+                if k == 0 {
+                    return Err(ParseError::Other("TOP 0 is not useful".into()));
+                }
+                self.expect_keyword(Keyword::By)?;
+                let by = self.parse_expr()?;
+                let ascending = if self.eat_keyword(Keyword::Asc) {
+                    true
+                } else {
+                    self.eat_keyword(Keyword::Desc);
+                    false
+                };
+                group_top = Some(GroupTopK { k, by, ascending });
             }
         }
 
@@ -1047,6 +1064,7 @@ impl Parser {
             joins,
             filter,
             group_by,
+            group_top,
             having,
             set_ops: Vec::new(),
             order_by: Vec::new(),

@@ -25,10 +25,6 @@ git history.
   fault-injecting filesystem — torn-dir injection shipped and found a
   real bug); re-run the ES A/B campaign to publish post-guard,
   post-`MATCH_CROSS`/`BOOSTED` numbers in BENCHMARKS.md.
-- [ ] **[fts] top_hits SQL surface** — shipped on the ES subset
-  (per-bucket top documents); a native SQL spelling (window functions or
-  a dedicated per-group-top-k clause) is an open language-design
-  question.
 - [ ] **[fts] Global BM25 statistics mode** — per-shard stats today (like
   ES across shards); an optional global-stats mode if result-set parity
   tests ever care.
@@ -77,12 +73,12 @@ be spoken in SQL. Each row carries the suggested SQL extension.
 
 | Capability | Today | Suggested SQL extension |
 |---|---|---|
-| Per-group top documents | ES `top_hits` sub-agg only | window functions (`ROW_NUMBER() OVER (PARTITION BY g ORDER BY score() DESC)`), or a dedicated `TOP k BY <expr>` group clause |
 | Batch scripts | one statement per call | multi-statement bodies are a protocol decision, not grammar — probably keep as-is |
 
-Window functions / per-group top-k is the remaining language feature
-with real pull (everything else from the original gap list — `EXPLAIN`,
-admin statements, `BACKUP`/`RESTORE`, TTL — has shipped).
+Everything from the original gap list with real pull has shipped
+(`EXPLAIN`, admin statements, `BACKUP`/`RESTORE`, TTL, `GROUP BY ... TOP
+k BY` per-group top-k). General window functions (`ROW_NUMBER() OVER
+(...)`) remain unimplemented; `TOP k BY` covers the common case.
 
 ## Performance
 

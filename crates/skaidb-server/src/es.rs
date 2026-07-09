@@ -77,6 +77,7 @@ fn select_from(table: &str) -> Select {
         joins: Vec::new(),
         filter: None,
         group_by: Vec::new(),
+        group_top: None,
         having: None,
         set_ops: Vec::new(),
         order_by: Vec::new(),

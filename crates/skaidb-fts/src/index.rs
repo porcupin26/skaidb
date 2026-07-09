@@ -397,7 +397,10 @@ impl SearchIndex {
             query,
         )?;
         let searcher = self.reader.searcher();
-        let top = searcher.search(&q, &TopDocs::with_limit(k.max(1)).order_by_score())?;
+        // Clamp so `k = usize::MAX` means "every match, scored, best-first"
+        // without the collector pre-allocating for the requested limit.
+        let k = k.min(searcher.num_docs() as usize).max(1);
+        let top = searcher.search(&q, &TopDocs::with_limit(k).order_by_score())?;
         let mut hits = Vec::with_capacity(top.len());
         for (score, addr) in top {
             let doc: TantivyDocument = searcher.doc(addr)?;

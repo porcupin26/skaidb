@@ -1184,6 +1184,16 @@ impl Database {
                         );
                     }
                 }
+                if let Some(t) = &sel.group_top {
+                    push(
+                        "group_top",
+                        format!(
+                            "per-group top-k rows: each group's {} best by the ranking \
+                             expression (row gather, ranked at the coordinator)",
+                            t.k
+                        ),
+                    );
+                }
                 if !sel.joins.is_empty() {
                     push(
                         "join",
@@ -1537,7 +1547,7 @@ impl Database {
         match k {
             Some(k) => {
                 let fetch = if filter.is_some() {
-                    k.saturating_mul(4).max(k + 16)
+                    k.saturating_mul(4).max(k.saturating_add(16))
                 } else {
                     k
                 };
@@ -4518,6 +4528,10 @@ fn select_uses_search(sel: &Select) -> bool {
             .order_by
             .iter()
             .any(|ok| expr_has_func(&ok.expr, &|n| n == "score"))
+        || sel
+            .group_top
+            .as_ref()
+            .is_some_and(|t| expr_has_func(&t.by, &|n| n == "score"))
 }
 
 /// The field names a search query explicitly targets (used to pick the
@@ -4905,6 +4919,22 @@ fn run_search_select(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSe
                 }
             }
         }
+        // Per-group top-k ranks rows, typically by score(): gather every
+        // match *scored* (k = all) with any requested highlights, and
+        // expose the score like the ranked path does. Plain aggregation
+        // needs neither.
+        if sel.group_top.is_some() {
+            let highlights = collect_highlights(sel)?;
+            let hits = cluster.search(&sel.from, &query, Some(usize::MAX), &residual, &highlights)?;
+            let docs: Vec<Document> = hits
+                .into_iter()
+                .map(|(_, mut doc, score)| {
+                    doc.insert("_score", Value::Float(score as f64));
+                    doc
+                })
+                .collect();
+            return select_aggregate(sel, docs, true);
+        }
         let hits = cluster.search(&sel.from, &query, None, &residual, &[])?;
         let docs: Vec<Document> = hits.into_iter().map(|(_, doc, _)| doc).collect();
         return select_aggregate(sel, docs, true);
@@ -4987,6 +5017,10 @@ enum AggOut {
 /// the fallback computes them with the ordinary grouped executor.
 fn map_search_aggregate(sel: &Select) -> Option<(skaidb_fts::AggRequest, Vec<AggOut>)> {
     if sel.having.is_some() || !sel.order_by.is_empty() || sel.offset.is_some() {
+        return None;
+    }
+    // Per-group top-k returns rows, not aggregates — never a facet pushdown.
+    if sel.group_top.is_some() {
         return None;
     }
     let group_expr = match sel.group_by.as_slice() {
@@ -6716,6 +6750,9 @@ fn select_rows(
 
 /// Aggregate / grouped projection. `finalize` applies ORDER BY / OFFSET / LIMIT.
 fn select_aggregate(sel: &Select, docs: Vec<Document>, finalize: bool) -> Result<ResultSet> {
+    if sel.group_top.is_some() {
+        return select_group_topk(sel, docs, finalize);
+    }
     if has_wildcard(sel) {
         return Err(EngineError::Unsupported(
             "`*` cannot be combined with aggregates or GROUP BY".into(),
@@ -6793,6 +6830,69 @@ fn select_aggregate(sel: &Select, docs: Vec<Document>, finalize: bool) -> Result
         apply_offset_limit(&mut rows, sel.offset, sel.limit);
     }
     Ok(ResultSet::new(columns, rows))
+}
+
+/// Per-group top-k rows (`GROUP BY ... TOP k BY <expr> [ASC|DESC]`): each
+/// group contributes its `k` best rows ranked by the expression, instead of
+/// one aggregated row. `HAVING` (aggregate-lowered per group) filters whole
+/// groups first; `ORDER BY` / `OFFSET` / `LIMIT` then apply to the flattened
+/// output. Without an outer `ORDER BY`, groups keep first-seen order with
+/// rows best-first inside each.
+fn select_group_topk(sel: &Select, docs: Vec<Document>, finalize: bool) -> Result<ResultSet> {
+    let top = sel.group_top.as_ref().expect("caller checked");
+    if contains_aggregate(&top.by) {
+        return Err(EngineError::Unsupported(
+            "TOP ... BY ranks individual rows — the ranking expression cannot contain an \
+             aggregate"
+                .into(),
+        ));
+    }
+    for item in &sel.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            if contains_aggregate(expr) {
+                return Err(EngineError::Unsupported(
+                    "with GROUP BY ... TOP the output is the groups' rows, not aggregates — \
+                     drop the aggregate or the TOP clause"
+                        .into(),
+                ));
+            }
+        }
+    }
+    // Group in first-seen order (same keying as the aggregate path).
+    let mut order: Vec<Vec<u8>> = Vec::new();
+    let mut groups: HashMap<Vec<u8>, Vec<Document>> = HashMap::new();
+    for doc in docs {
+        let mut key_vals = Vec::with_capacity(sel.group_by.len());
+        for g in &sel.group_by {
+            key_vals.push(eval(g, &doc)?);
+        }
+        let key = Value::Array(key_vals).encode_key();
+        groups.entry(key.clone()).or_insert_with(|| {
+            order.push(key.clone());
+            Vec::new()
+        });
+        groups.get_mut(&key).expect("group present").push(doc);
+    }
+    // Rank within each group: best-first (`DESC` default), NULLs last.
+    let rank = [OrderKey {
+        expr: top.by.clone(),
+        descending: !top.ascending,
+    }];
+    let mut kept: Vec<Document> = Vec::new();
+    for key in &order {
+        let mut group_docs = groups.remove(key).expect("group present");
+        if let Some(having) = &sel.having {
+            let lowered = lower_aggregates(having, &group_docs)?;
+            let rep = group_docs.first().cloned().unwrap_or_default();
+            if !eval_predicate(&lowered, &rep)? {
+                continue;
+            }
+        }
+        sort_docs(&mut group_docs, &rank, Some(top.k as usize))?;
+        group_docs.truncate(top.k as usize);
+        kept.extend(group_docs);
+    }
+    select_rows(sel, kept, false, &HashSet::new(), finalize)
 }
 
 fn has_wildcard(sel: &Select) -> bool {

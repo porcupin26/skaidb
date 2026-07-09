@@ -378,11 +378,27 @@ pub struct Select {
     pub joins: Vec<Join>,
     pub filter: Option<Expr>,
     pub group_by: Vec<Expr>,
+    /// `GROUP BY ... TOP k BY <expr> [ASC|DESC]` — per-group top-k rows:
+    /// instead of one aggregated row per group, each group contributes its
+    /// `k` best rows ranked by the expression (`DESC` — best-first — by
+    /// default). Works with `score()` under a search predicate.
+    pub group_top: Option<GroupTopK>,
     pub having: Option<Expr>,
     pub set_ops: Vec<SetOp>,
     pub order_by: Vec<OrderKey>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+}
+
+/// The `TOP k BY <expr> [ASC|DESC]` clause of a `GROUP BY`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupTopK {
+    /// Rows kept per group.
+    pub k: u64,
+    /// Ranking expression, evaluated per row (aggregates not allowed).
+    pub by: Expr,
+    /// `true` for `ASC` (smallest first); default `DESC`.
+    pub ascending: bool,
 }
 
 /// The `NEAREST (<path>, <query>, <k>)` clause of a [`Select`].

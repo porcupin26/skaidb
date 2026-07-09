@@ -56,7 +56,7 @@ FROM <table> [[AS] <alias>]
 [ <join> ... ]
 [NEAREST (<path>, <query-vector>, <k>)]
 [WHERE <expr>]
-[GROUP BY <expr> [, <expr> ...]]
+[GROUP BY <expr> [, <expr> ...] [TOP <k> BY <expr> [ASC|DESC]]]
 [HAVING <expr>]
 [ { UNION | UNION ALL } <select> ... ]
 [ORDER BY <expr> [ASC|DESC] [, <expr> [ASC|DESC] ...]]
@@ -194,6 +194,17 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
     databases there with `db.table` qualifiers rather than `USE`.
 - **`DISTINCT`** removes duplicate output rows. **`HAVING`** filters groups after
   aggregation (it may reference aggregates and the `GROUP BY` columns).
+- **`GROUP BY ... TOP <k> BY <expr> [ASC|DESC]`** — per-group top-k **rows**:
+  instead of one aggregated row per group, each group contributes its `k`
+  best rows ranked by the expression (`DESC` — best-first — is the
+  default; NULLs rank last either way). The select items are then ordinary
+  per-row expressions (`*` works; aggregates cannot mix with `TOP`), and
+  `HAVING` (which may aggregate) still filters whole groups first.
+  `ORDER BY`/`LIMIT`/`OFFSET` apply to the flattened output; without
+  `ORDER BY`, groups keep first-seen order with rows best-first inside
+  each. Under a search predicate `TOP k BY score()` ranks by BM25 — the
+  SQL spelling of ES `top_hits` (per-group best documents), and
+  `HIGHLIGHT()` works in the projection.
 - **`JOIN`** combines tables — equi-joins (`ON a = b`) run as a hash join,
   other predicates and `RIGHT` joins fall back to a nested loop.
   `INNER`/`LEFT`/`RIGHT`/`CROSS` are supported (`JOIN` alone means `INNER`;

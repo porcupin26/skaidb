@@ -112,7 +112,9 @@ DELETE FROM t [WHERE expr]
 -- Query
 SELECT [DISTINCT] item [, ...] FROM t [[AS] a]
   [JOIN ...] [NEAREST (path, [vector], k)] [WHERE expr]
-  [GROUP BY expr [, ...]] [HAVING expr]
+  [GROUP BY expr [, ...] [TOP k BY expr [ASC|DESC]]] [HAVING expr]
+--   GROUP BY ... TOP k BY e: per-group top-k ROWS (not aggregates); with
+--   MATCH + TOP k BY score() it is ES top_hits in SQL
   [{UNION | UNION ALL} SELECT ...]
   [ORDER BY expr [ASC|DESC] [, ...]] [LIMIT n] [OFFSET n]
 -- joins: [INNER|LEFT [OUTER]|RIGHT [OUTER]|CROSS] JOIN t [AS a] [ON expr]
@@ -210,6 +212,9 @@ OR/NOT is rejected):
   DESC LIMIT k` is the pushed top-k (LIMIT required, DESC only).
   `ORDER BY <fast column> LIMIT k` also pushes down.
 - `HIGHLIGHT(col [, max_chars])` — snippet with `<b>…</b>` marks.
+- Per-group top documents: `SELECT region, title, score() FROM t WHERE
+  MATCH(title, 'q') GROUP BY region TOP 3 BY score()` — each group's 3
+  best-scoring rows (ES `top_hits` equivalent).
 - Aggregations work over search (`GROUP BY region`, `COUNT/SUM/AVG/MIN/
   MAX`, `time_bucket` date histograms, `COUNT(DISTINCT)` exact,
   `APPROX_COUNT_DISTINCT` sketch) — exact fast-field pushdown or exact
