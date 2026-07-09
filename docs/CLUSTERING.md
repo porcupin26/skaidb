@@ -415,6 +415,19 @@ SCRAM on the binary endpoint and HTTP Basic on REST, plus RBAC; see the
   embedded engine; the cluster coordinator autocommits per statement.
 - **Joins gather to the coordinator.** A single-table `WHERE` is pushed to the
   shards, but a SQL `JOIN` pulls the tables to the coordinating node.
+- **A flapping peer is circuit-broken.** A zombie node (TCP up, application
+  unresponsive) used to make every replicated write burn the full internode
+  I/O timeout — worse than a cleanly-down peer. After 3 consecutive failures
+  a peer's circuit opens: calls to it fail fast (the coordinator hints
+  immediately) for a 10 s cooldown, then one call re-tests. Liveness probes
+  bypass the breaker and close it on success.
+- **Disk-spilled hints drain in bounded pages, only to live peers.** The
+  hinted-handoff overflow log replays a page (1024 records) at a time and is
+  left untouched while its peer is down. (Previously each flush cycle decoded
+  the whole log into memory and rewrote it per-record when the peer was still
+  down — a large log could balloon a restarting node to its cgroup limit.)
+  The drain also runs after a restart for logs inherited from the previous
+  process.
 - **Unfiltered scans page, merge, and honour `LIMIT`.** `SELECT … FROM t` with no
   `WHERE` gathers every shard last-writer-wins, paged so the coordinator holds a
   few pages at a time rather than whole shards. A plain `LIMIT n` (no `ORDER BY`)

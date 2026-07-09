@@ -2646,62 +2646,148 @@ impl Node {
         }
     }
 
-    /// Read and remove all disk-spilled hints for `replica`, replaying them to
-    /// `addr`. Returns how many were delivered. The file is deleted on full
-    /// success; on partial failure the undelivered tail is rewritten.
+    /// Whether any disk-spilled hint log exists (cheap readdir). The
+    /// `disk_hints` counter is process-local, so a restarted node must still
+    /// discover and drain logs it inherited from the previous process.
+    fn has_disk_hints(&self) -> bool {
+        let Some(dir) = self.hint_dir() else {
+            return false;
+        };
+        std::fs::read_dir(dir).ok().is_some_and(|entries| {
+            entries
+                .flatten()
+                .any(|e| e.path().extension().is_some_and(|x| x == "hintlog"))
+        })
+    }
+
+    /// Replay the disk-spilled hints for `replica` to `addr`, **streamed in
+    /// pages**. Returns how many records were delivered.
+    ///
+    /// The previous implementation read and decoded the whole log into memory
+    /// and, when the peer was still down, re-encoded and rewrote every record
+    /// — after every write batch. A 147 MB log ballooned a restarting node to
+    /// its cgroup limit and turned each flush cycle into a full-log rewrite.
+    /// Now: probe the peer first (down ⇒ leave the log untouched), then
+    /// rename-claim the log and decode/deliver it a bounded page at a time; if
+    /// the peer fails mid-drain, the undelivered remainder is appended back as
+    /// raw bytes (no decode, no per-record rewrite).
     fn drain_disk_hints(&self, replica: &NodeId, addr: &str) -> usize {
+        use std::io::{Read, Write};
         let Some(path) = self.hint_log_path(replica) else {
             return 0;
         };
-        let bytes = {
-            let _guard = self.hint_spill.lock().expect("hint spill lock");
-            match std::fs::read(&path) {
-                Ok(b) if !b.is_empty() => {
-                    let _ = std::fs::remove_file(&path);
-                    b
-                }
-                _ => return 0,
-            }
-        };
-        let records = decode_hint_records(&bytes);
-        let total = records.len();
-        // Group by table so each replays as one ApplyBatch (LWW-safe).
-        let mut by_table: BTreeMap<String, Vec<BatchRow>> = BTreeMap::new();
-        for (table, key, op, hlc) in &records {
-            let row: BatchRow = match op {
-                WriteOp::Put(v) => (key.clone(), v.clone(), *hlc, true),
-                WriteOp::Delete => (key.clone(), Vec::new(), *hlc, false),
-            };
-            by_table.entry(table.clone()).or_default().push(row);
+        if !path.exists() {
+            return 0;
         }
+        // Reachability gate: draining at a dead peer is pure churn.
+        if !matches!(
+            self.pool.call_timeout(addr, &Request::NodeStatus, PROBE_TIMEOUT),
+            Ok(Response::NodeStatus { .. })
+        ) {
+            return 0;
+        }
+        // Claim the log by renaming; concurrent spills append to a fresh file.
+        let draining = path.with_extension("hintlog.draining");
+        {
+            let _guard = self.hint_spill.lock().expect("hint spill lock");
+            if std::fs::rename(&path, &draining).is_err() {
+                return 0;
+            }
+        }
+        let Ok(f) = std::fs::File::open(&draining) else {
+            let _ = std::fs::remove_file(&draining);
+            return 0;
+        };
+        let mut reader = std::io::BufReader::new(f);
+        let mut buf: Vec<u8> = Vec::new();
+        let mut pos = 0usize;
+        let mut eof = false;
         let mut delivered = 0usize;
-        let mut failed: Vec<(String, Vec<u8>, WriteOp, Hlc)> = Vec::new();
+        let mut aborted = false;
         let mut max_hlc: Option<Hlc> = None;
-        for (table, rows) in by_table {
-            let batch_max = rows.iter().map(|(_, _, h, _)| *h).max();
-            if self.send_batch(addr, &table, &rows) {
-                delivered += rows.len();
-                if let Some(h) = batch_max {
-                    max_hlc = Some(max_hlc.map_or(h, |m| m.max(h)));
+        const PAGE_RECORDS: usize = 1024;
+        const READ_CHUNK: u64 = 1 << 20;
+        loop {
+            // Decode one page, refilling the carry buffer from disk as needed.
+            let mut page: Vec<(String, Vec<u8>, WriteOp, Hlc)> = Vec::new();
+            while page.len() < PAGE_RECORDS {
+                if let Some(rec) = decode_hint_record(&buf, &mut pos) {
+                    page.push(rec);
+                    continue;
                 }
-            } else {
-                for (k, v, h, is_put) in rows {
-                    let op = if is_put { WriteOp::Put(v) } else { WriteOp::Delete };
-                    failed.push((table.clone(), k, op, h));
+                if eof {
+                    break; // truncated tail (torn write) — repair backstops it
                 }
+                buf.drain(..pos);
+                pos = 0;
+                let n = (&mut reader)
+                    .take(READ_CHUNK)
+                    .read_to_end(&mut buf)
+                    .unwrap_or(0);
+                if n == 0 {
+                    eof = true;
+                }
+            }
+            if page.is_empty() {
+                break;
+            }
+            // Group the page by table so each group replays as one ApplyBatch.
+            let mut by_table: BTreeMap<String, Vec<BatchRow>> = BTreeMap::new();
+            for (table, key, op, hlc) in page {
+                let row: BatchRow = match op {
+                    WriteOp::Put(v) => (key, v, hlc, true),
+                    WriteOp::Delete => (key, Vec::new(), hlc, false),
+                };
+                by_table.entry(table).or_default().push(row);
+            }
+            for (table, rows) in by_table {
+                if aborted {
+                    // Peer failed earlier in this page: re-spill without retrying.
+                    for (k, v, h, is_put) in rows {
+                        let op = if is_put { WriteOp::Put(v) } else { WriteOp::Delete };
+                        self.spill_hint_to_disk(replica, &table, &k, &op, h);
+                    }
+                    continue;
+                }
+                let batch_max = rows.iter().map(|(_, _, h, _)| *h).max();
+                if self.send_batch(addr, &table, &rows) {
+                    delivered += rows.len();
+                    if let Some(h) = batch_max {
+                        max_hlc = Some(max_hlc.map_or(h, |m| m.max(h)));
+                    }
+                } else {
+                    aborted = true;
+                    for (k, v, h, is_put) in rows {
+                        let op = if is_put { WriteOp::Put(v) } else { WriteOp::Delete };
+                        self.spill_hint_to_disk(replica, &table, &k, &op, h);
+                    }
+                }
+            }
+            if aborted || (eof && pos >= buf.len()) {
+                break;
             }
         }
         if let Some(h) = max_hlc {
             self.note_acked(replica, h);
         }
-        self.disk_hints
-            .fetch_sub(delivered.min(total) as u64, Ordering::Relaxed);
-        // Rewrite any undelivered records so they retry next flush.
-        if !failed.is_empty() {
-            for (table, key, op, hlc) in &failed {
-                self.spill_hint_to_disk(replica, table, key, op, *hlc);
+        // Peer went away mid-drain: append the undecoded remainder back to the
+        // live log as raw bytes — no decode, no per-record rewrite.
+        if aborted {
+            let _guard = self.hint_spill.lock().expect("hint spill lock");
+            if let Ok(mut out) = std::fs::OpenOptions::new().create(true).append(true).open(&path)
+            {
+                let _ = out.write_all(&buf[pos..]);
+                let _ = std::io::copy(&mut reader, &mut out);
             }
         }
+        let _ = std::fs::remove_file(&draining);
+        // Saturating: the counter is approximate (process-local; resets on
+        // restart while logs persist).
+        let _ = self
+            .disk_hints
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(delivered as u64))
+            });
         delivered
     }
 
@@ -2814,7 +2900,11 @@ impl Node {
         }
         // Drain any disk-spilled hints for currently-reachable peers (a
         // replica that stayed full has hints only on disk, not in `pending`).
-        if self.disk_hints.load(Ordering::Relaxed) > 0 {
+        // Checked via the directory, not just the in-memory counter: the
+        // counter is process-local, so a restarted node must still drain the
+        // logs it inherited. drain_disk_hints itself probes each peer and
+        // leaves the log untouched while the peer is down.
+        if self.disk_hints.load(Ordering::Relaxed) > 0 || self.has_disk_hints() {
             for (replica, addr) in self.members_snapshot() {
                 if replica == self.id {
                     continue;
@@ -5037,10 +5127,10 @@ fn encode_hint_record(table: &str, key: &[u8], op: &WriteOp, hlc: Hlc) -> Vec<u8
     o
 }
 
-/// Decode a hint log written by [`encode_hint_record`]. A truncated trailing
-/// record (torn write / partial flush) is ignored — the delivered records
-/// before it are still returned, and repair backstops any loss.
-fn decode_hint_records(bytes: &[u8]) -> Vec<(String, Vec<u8>, WriteOp, Hlc)> {
+/// Decode one hint record from `bytes[*i..]`, advancing `i` past it. `None`
+/// on an incomplete record (`i` is left unchanged so the caller can refill
+/// its buffer and retry, or treat a truncated tail as torn and stop).
+fn decode_hint_record(bytes: &[u8], i: &mut usize) -> Option<(String, Vec<u8>, WriteOp, Hlc)> {
     fn rd_u32(b: &[u8], i: &mut usize) -> Option<usize> {
         let end = i.checked_add(4)?;
         if end > b.len() {
@@ -5050,46 +5140,66 @@ fn decode_hint_records(bytes: &[u8]) -> Vec<(String, Vec<u8>, WriteOp, Hlc)> {
         *i = end;
         Some(v)
     }
-    let mut out = Vec::new();
-    let mut i = 0;
-    // Multiple break points (any short read stops), so not a `while let`.
-    #[allow(clippy::while_let_loop)]
-    loop {
-        let Some(tl) = rd_u32(bytes, &mut i) else { break };
-        if i + tl > bytes.len() {
-            break;
+    let start = *i;
+    let mut j = *i;
+    let parsed = (|| {
+        let tl = rd_u32(bytes, &mut j)?;
+        if j + tl > bytes.len() {
+            return None;
         }
-        let table = String::from_utf8_lossy(&bytes[i..i + tl]).into_owned();
-        i += tl;
-        let Some(kl) = rd_u32(bytes, &mut i) else { break };
-        if i + kl > bytes.len() {
-            break;
+        let table = String::from_utf8_lossy(&bytes[j..j + tl]).into_owned();
+        j += tl;
+        let kl = rd_u32(bytes, &mut j)?;
+        if j + kl > bytes.len() {
+            return None;
         }
-        let key = bytes[i..i + kl].to_vec();
-        i += kl;
-        if i >= bytes.len() {
-            break;
+        let key = bytes[j..j + kl].to_vec();
+        j += kl;
+        if j >= bytes.len() {
+            return None;
         }
-        let tag = bytes[i];
-        i += 1;
+        let tag = bytes[j];
+        j += 1;
         let op = if tag == 1 {
-            let Some(vl) = rd_u32(bytes, &mut i) else { break };
-            if i + vl > bytes.len() {
-                break;
+            let vl = rd_u32(bytes, &mut j)?;
+            if j + vl > bytes.len() {
+                return None;
             }
-            let v = bytes[i..i + vl].to_vec();
-            i += vl;
+            let v = bytes[j..j + vl].to_vec();
+            j += vl;
             WriteOp::Put(v)
         } else {
             WriteOp::Delete
         };
-        if i + 12 > bytes.len() {
-            break;
+        if j + 12 > bytes.len() {
+            return None;
         }
         let mut hb = [0u8; 12];
-        hb.copy_from_slice(&bytes[i..i + 12]);
-        i += 12;
-        out.push((table, key, op, Hlc::from_bytes(hb)));
+        hb.copy_from_slice(&bytes[j..j + 12]);
+        j += 12;
+        Some((table, key, op, Hlc::from_bytes(hb)))
+    })();
+    match parsed {
+        Some(rec) => {
+            *i = j;
+            Some(rec)
+        }
+        None => {
+            *i = start;
+            None
+        }
+    }
+}
+
+/// Decode a whole hint log written by [`encode_hint_record`] (tests; the
+/// production drain streams via [`decode_hint_record`] a page at a time).
+/// A truncated trailing record (torn write) is ignored.
+#[cfg(test)]
+fn decode_hint_records(bytes: &[u8]) -> Vec<(String, Vec<u8>, WriteOp, Hlc)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(rec) = decode_hint_record(bytes, &mut i) {
+        out.push(rec);
     }
     out
 }
@@ -8473,6 +8583,71 @@ mod tests {
         // hints_pending() sees the disk hints (so a flush gets queued).
         assert!(na.hints_pending());
         assert_eq!(na.stats().hints_pending, 10); // 4 memory + 6 disk
+    }
+
+    /// The disk-hint drain must not touch the log while the peer is down
+    /// (the old drain re-read + rewrote the whole log after every write
+    /// batch), and must deliver a large log in bounded pages once the peer
+    /// is reachable.
+    #[test]
+    fn disk_hint_drain_skips_down_peer_and_streams_to_live_peer() {
+        let (a, b) = (free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b)];
+        let na = Node::new(
+            Database::open(temp_dir("drain_a")).unwrap(),
+            cfg("a", &a, &members, Consistency::One, Consistency::One),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("drain_b")).unwrap(),
+            cfg("b", &b, &members, Consistency::One, Consistency::One),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+
+        // Down peer: spill hints for an unreachable node, then drain — the
+        // probe fails and the log must be left byte-identical (no churn).
+        let cid = NodeId::new("c");
+        let dead_addr = free_addr(); // nothing listening there
+        for i in 0..8u32 {
+            na.store_hint(
+                &cid,
+                "t",
+                &i.to_le_bytes(),
+                &WriteOp::Put(vec![i as u8]),
+                Hlc::new(50 + u64::from(i), 0),
+            );
+        }
+        let c_log = na.hint_log_path(&cid).unwrap();
+        let before = std::fs::read(&c_log).unwrap();
+        assert!(!before.is_empty());
+        assert_eq!(na.drain_disk_hints(&cid, &dead_addr), 0);
+        assert_eq!(std::fs::read(&c_log).unwrap(), before, "log untouched");
+
+        // Live peer: spill far more than one drain page (1024 records) so the
+        // streamed path pages more than once, then drain — everything lands
+        // on b and the log is gone.
+        let bid = NodeId::new("b");
+        let n = 2500u32;
+        for i in 0..n {
+            let mut doc = skaidb_types::Document::new();
+            doc.insert("id", Value::Int(i64::from(i)));
+            na.store_hint(
+                &bid,
+                "t",
+                &Value::Array(vec![Value::Int(i64::from(i))]).encode_key(),
+                &WriteOp::Put(Value::Document(doc).encode()),
+                Hlc::new(100 + u64::from(i), 0),
+            );
+        }
+        let b_log = na.hint_log_path(&bid).unwrap();
+        assert!(b_log.exists());
+        // In-memory cap (4 under test) holds the first few; the rest hit disk.
+        let delivered = na.drain_disk_hints(&bid, &b);
+        assert_eq!(delivered as u32, n - 4, "all spilled records delivered");
+        assert!(!b_log.exists(), "drained log removed");
+        let rs = rows(nb.execute("SELECT count(*) FROM t").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::Int(i64::from(n - 4))]]);
     }
 
     /// Under memory pressure the node sheds *writes* (with a retryable

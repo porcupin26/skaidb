@@ -1211,15 +1211,33 @@ pub(crate) fn conn_recv_request(conn: &mut Conn) -> io::Result<Result<Request, W
 /// Max idle connections kept per peer.
 const MAX_IDLE_PER_PEER: usize = 32;
 
+/// Consecutive failures that open a peer's circuit breaker…
+const BREAKER_THRESHOLD: u32 = 3;
+/// …and how long calls to it then fail fast before one is let through again.
+#[cfg(not(test))]
+const BREAKER_COOLDOWN: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const BREAKER_COOLDOWN: Duration = Duration::from_millis(200);
+
 /// A pool of persistent, authenticated internode connections, keyed by peer
 /// address. Reuses an idle connection when available (the server keeps
 /// connections alive across requests), avoiding a TCP+auth handshake per
 /// replicated write. All connections go through the shared [`Authenticator`], so
 /// a peer that can't satisfy the configured auth mode is rejected.
+///
+/// A per-peer **circuit breaker** makes a flapping peer cheap: a zombie node
+/// (TCP up, application drowning) made every replicated write burn the full
+/// I/O timeout, degrading the whole cluster's write latency far more than a
+/// cleanly-down peer. After [`BREAKER_THRESHOLD`] consecutive failures, calls
+/// to that peer fail fast (the coordinator hints immediately) for
+/// [`BREAKER_COOLDOWN`]; then one call is let through to re-test. Probes
+/// ([`Pool::call_timeout`]) bypass the breaker — they are how recovery is
+/// detected — and any success closes it.
 #[derive(Debug)]
 pub struct Pool {
     auth: Arc<Authenticator>,
     idle: std::sync::Mutex<std::collections::HashMap<String, Vec<Conn>>>,
+    breaker: std::sync::Mutex<std::collections::HashMap<String, (u32, std::time::Instant)>>,
 }
 
 impl Pool {
@@ -1227,7 +1245,37 @@ impl Pool {
         Pool {
             auth,
             idle: std::sync::Mutex::new(std::collections::HashMap::new()),
+            breaker: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Whether `addr`'s circuit is open (fail fast). Past the cooldown the
+    /// breaker half-opens: this check lets the next call through to re-test.
+    fn breaker_open(&self, addr: &str) -> bool {
+        let breaker = self.breaker.lock().expect("breaker lock");
+        breaker.get(addr).is_some_and(|(fails, since)| {
+            *fails >= BREAKER_THRESHOLD && since.elapsed() < BREAKER_COOLDOWN
+        })
+    }
+
+    fn record_ok(&self, addr: &str) {
+        self.breaker.lock().expect("breaker lock").remove(addr);
+    }
+
+    fn record_err(&self, addr: &str) {
+        let mut breaker = self.breaker.lock().expect("breaker lock");
+        let entry = breaker
+            .entry(addr.to_string())
+            .or_insert((0, std::time::Instant::now()));
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = std::time::Instant::now();
+    }
+
+    fn breaker_err(addr: &str) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!("peer {addr} suspended after repeated failures (circuit open)"),
+        )
     }
 
     /// Send `req` to `addr`, reusing a pooled connection if possible. On any I/O
@@ -1237,8 +1285,12 @@ impl Pool {
     /// retry each stale socket fails one real request (visible as spurious
     /// quorum failures for a while after every rolling upgrade).
     pub fn call(&self, addr: &str, req: &Request) -> io::Result<Response> {
+        if self.breaker_open(addr) {
+            return Err(Self::breaker_err(addr));
+        }
         if let Some(mut conn) = self.take_idle(addr) {
             if let Ok(resp) = Self::roundtrip(&mut conn, req) {
+                self.record_ok(addr);
                 self.put(addr, conn);
                 return Ok(resp);
             }
@@ -1247,10 +1299,21 @@ impl Pool {
             // to the same dead process.
             self.idle.lock().expect("pool lock").remove(addr);
         }
-        let mut conn = self.auth.connect(addr, None)?;
-        let resp = Self::roundtrip(&mut conn, req)?;
-        self.put(addr, conn);
-        Ok(resp)
+        let result = self
+            .auth
+            .connect(addr, None)
+            .and_then(|mut conn| Self::roundtrip(&mut conn, req).map(|resp| (conn, resp)));
+        match result {
+            Ok((conn, resp)) => {
+                self.record_ok(addr);
+                self.put(addr, conn);
+                Ok(resp)
+            }
+            Err(e) => {
+                self.record_err(addr);
+                Err(e)
+            }
+        }
     }
 
     fn roundtrip(conn: &mut Conn, req: &Request) -> io::Result<Response> {
@@ -1264,22 +1327,46 @@ impl Pool {
     /// spawning a thread. Internode frames are small, so the send lands in
     /// the socket buffer without blocking on the peer.
     pub fn call_begin(&self, addr: &str, req: &Request) -> io::Result<Pending<'_>> {
-        let mut conn = self.take(addr)?;
-        conn_send(&mut conn, |o| req.encode_into(o))?;
-        Ok(Pending {
-            pool: self,
-            addr: addr.to_string(),
-            conn: Some(conn),
-        })
+        if self.breaker_open(addr) {
+            return Err(Self::breaker_err(addr));
+        }
+        let result = self
+            .take(addr)
+            .and_then(|mut conn| conn_send(&mut conn, |o| req.encode_into(o)).map(|()| conn));
+        match result {
+            Ok(conn) => Ok(Pending {
+                pool: self,
+                addr: addr.to_string(),
+                conn: Some(conn),
+            }),
+            Err(e) => {
+                self.record_err(addr);
+                Err(e)
+            }
+        }
     }
 
     /// Like [`Pool::call`], but on a fresh, time-bounded connection that is not
     /// returned to the pool — for liveness probing, where an unreachable peer
-    /// must fail fast rather than block on the OS connect timeout.
+    /// must fail fast rather than block on the OS connect timeout. Probes
+    /// bypass the circuit breaker (they are how recovery is detected); a
+    /// successful probe closes it.
     pub fn call_timeout(&self, addr: &str, req: &Request, timeout: Duration) -> io::Result<Response> {
-        let mut conn = self.auth.connect(addr, Some(timeout))?;
-        conn_send(&mut conn, |o| req.encode_into(o))?;
-        conn_recv_response(&mut conn)
+        let run = || -> io::Result<Response> {
+            let mut conn = self.auth.connect(addr, Some(timeout))?;
+            conn_send(&mut conn, |o| req.encode_into(o))?;
+            conn_recv_response(&mut conn)
+        };
+        match run() {
+            Ok(resp) => {
+                self.record_ok(addr);
+                Ok(resp)
+            }
+            Err(e) => {
+                self.record_err(addr);
+                Err(e)
+            }
+        }
     }
 
     fn take(&self, addr: &str) -> io::Result<Conn> {
@@ -1329,9 +1416,17 @@ impl Pending<'_> {
     /// the connection to the pool.
     pub fn finish(mut self) -> io::Result<Response> {
         let mut conn = self.conn.take().expect("Pending::finish called twice");
-        let resp = conn_recv_response(&mut conn)?;
-        self.pool.put(&self.addr, conn);
-        Ok(resp)
+        match conn_recv_response(&mut conn) {
+            Ok(resp) => {
+                self.pool.record_ok(&self.addr);
+                self.pool.put(&self.addr, conn);
+                Ok(resp)
+            }
+            Err(e) => {
+                self.pool.record_err(&self.addr);
+                Err(e)
+            }
+        }
     }
 }
 

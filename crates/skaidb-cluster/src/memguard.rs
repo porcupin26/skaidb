@@ -31,21 +31,22 @@ const CGROUP_UNLIMITED: u64 = 1 << 60;
 pub struct MemoryGuard {
     shedding: AtomicBool,
     used: AtomicU64,
-    limit: u64,
-    high: u64,
-    low: u64,
+    /// Bytes; 0 = no detectable limit. Refreshed on every sample so a live
+    /// cgroup resize (`pct set -memory …` on a running container) takes
+    /// effect without a restart. `u64::MAX` marks a fixed test limit.
+    limit: AtomicU64,
+    /// Fixed limit for tests (bypasses re-detection).
+    fixed: bool,
 }
 
 impl MemoryGuard {
     /// Build a guard from the detected memory limit (cgroup, else system RAM).
     pub fn new() -> Self {
-        let limit = detected_limit().unwrap_or(0);
         Self {
             shedding: AtomicBool::new(false),
             used: AtomicU64::new(0),
-            limit,
-            high: limit / 100 * HIGH_PCT,
-            low: limit / 100 * LOW_PCT,
+            limit: AtomicU64::new(detected_limit().unwrap_or(0)),
+            fixed: false,
         }
     }
 
@@ -55,9 +56,8 @@ impl MemoryGuard {
         Self {
             shedding: AtomicBool::new(false),
             used: AtomicU64::new(0),
-            limit,
-            high: limit / 100 * HIGH_PCT,
-            low: limit / 100 * LOW_PCT,
+            limit: AtomicU64::new(limit),
+            fixed: true,
         }
     }
 
@@ -68,13 +68,21 @@ impl MemoryGuard {
 
     /// Last sampled usage (bytes) and the limit (bytes; 0 = no limit).
     pub fn snapshot(&self) -> (u64, u64) {
-        (self.used.load(Ordering::Relaxed), self.limit)
+        (
+            self.used.load(Ordering::Relaxed),
+            self.limit.load(Ordering::Relaxed),
+        )
     }
 
-    /// Re-sample usage and update the flag with hysteresis. Returns the new
-    /// shedding state. With no limit the guard never sheds.
+    /// Re-sample usage (and the limit — cgroup limits can be resized live)
+    /// and update the flag with hysteresis. Returns the new shedding state.
+    /// With no limit the guard never sheds.
     pub fn sample(&self) -> bool {
-        if self.limit == 0 {
+        if !self.fixed {
+            self.limit
+                .store(detected_limit().unwrap_or(0), Ordering::Relaxed);
+        }
+        if self.limit.load(Ordering::Relaxed) == 0 {
             return false;
         }
         let used = current_usage().unwrap_or(0);
@@ -90,8 +98,10 @@ impl MemoryGuard {
     /// The hysteresis transition, factored out so tests can drive it directly.
     fn update(&self, used: u64) -> bool {
         self.used.store(used, Ordering::Relaxed);
+        let limit = self.limit.load(Ordering::Relaxed);
+        let (high, low) = (limit / 100 * HIGH_PCT, limit / 100 * LOW_PCT);
         let was = self.shedding.load(Ordering::Relaxed);
-        let now = if was { used > self.low } else { used > self.high };
+        let now = if was { used > low } else { used > high };
         if now != was {
             self.shedding.store(now, Ordering::Relaxed);
         }
