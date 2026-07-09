@@ -89,6 +89,8 @@ embedding <-> [..]` (use `NEAREST`).
 ```sql
 -- DDL
 CREATE TABLE [IF NOT EXISTS] t (PRIMARY KEY (col [, col ...])) [WITH (ttl = dur)]
+--   ttl: rows expire <dur> after their last write — immediately invisible to
+--   every read; space reclaimed lazily by compaction. Converges at any RF.
 DROP TABLE [IF EXISTS] t
 ALTER TABLE t RENAME TO t2
 ALTER TABLE t RENAME COLUMN a TO b          -- rewrites rows, rebuilds indexes
@@ -96,6 +98,8 @@ CREATE INDEX [IF NOT EXISTS] i ON t (path [, path ...])   -- composite = leftmos
 DROP INDEX [IF EXISTS] i
 CREATE VECTOR INDEX [IF NOT EXISTS] v ON t (path) DIM n [USING cosine|l2|dot]
 DROP VECTOR INDEX [IF EXISTS] v
+ALTER VECTOR INDEX v SET (ef = n)           -- live recall/latency tuning (persisted);
+--   build-time knobs (m, ef_construction, dim, metric) need a rebuild
 CREATE SEARCH INDEX [IF NOT EXISTS] s ON t (path [, ...]) [WITH (opts)]
 DROP SEARCH INDEX [IF EXISTS] s
 REBUILD SEARCH INDEX s
@@ -153,6 +157,28 @@ SHOW INDEXES       -- (index, table, kind, columns)
 SHOW STATUS        -- (metric, value): disk/memtable/wal/cache/compactions,
                    -- per-table table.<n>.*, per-index search.<n>.*
 SHOW DATABASES
+
+-- Admin statements (SQL spellings of the HTTP admin surface; need ADMIN
+-- on * and share its RBAC + audit path — a SQL-only client is fully
+-- self-sufficient)
+SHOW CLUSTER                        -- ring/peers/liveness as (key, value) rows
+SHOW CONFIG [LIKE 'pat%']           -- full config flattened to dotted keys, masked
+SET CONFIG section.key = literal    -- live-mutable keys apply instantly
+SHOW SLOW QUERIES [LIMIT n]         -- slow-query log (masked SQL)
+REPAIR CLUSTER                      -- anti-entropy pass
+RECLAIM                             -- drop keys/series this node no longer owns
+ALTER CLUSTER ADD NODE 'host:7100'  -- online resharding
+ALTER CLUSTER REMOVE NODE 'id'
+
+-- Backup / restore (paths are server-side, on the answering node)
+BACKUP TO 'path'      -- crash-consistent copy of this node's data dir
+                      -- (per-shard on a cluster); refuses to overwrite
+RESTORE FROM 'path'   -- embedded/standalone only — on a cluster stop the
+                      -- node, restore its dir offline, let repair converge
+
+-- Session consistency (binary protocol only; overrides the per-request
+-- value until changed. REST is stateless and rejects it with guidance.)
+SET CONSISTENCY ONE | QUORUM | ALL
 ```
 
 **RBAC**: privileges are `SELECT INSERT UPDATE DELETE CREATE DROP GRANT
@@ -202,7 +228,9 @@ OR/NOT is rejected):
   `FUZZY(col,'text'[,dist])` (≤2), `SEARCH('query-string')` (mini-language:
   `term "phrase" col:term +must -must_not AND OR year:[2020 TO 2024]`),
   `MATCH_CROSS(col, col, ..., 'text')` (term-centric multi-field,
-  ES cross_fields).
+  ES cross_fields), `MATCH_BEST(col, col, ..., 'text')` (field-centric
+  dis-max over an explicit column subset, ES best_fields — a row scores
+  as its best single field).
 - Pattern (NOT analyzed — lowercase them under lowercasing analyzers):
   `MATCH_PREFIX(col,'pre')`, `WILDCARD(col,'qu*ck')`, `REGEXP(col,'...')`.
 - `MORE_LIKE_THIS(col, 'like text')` — similar rows.
@@ -288,6 +316,8 @@ WHERE cat = 'news';
 ```
 
 HNSW, metrics `cosine` (default) / `l2` / `dot`; `_distance` injected;
+`ALTER VECTOR INDEX v SET (ef = n)` retunes search-time recall/latency
+live (persisted; build-time knobs need a rebuild);
 `WHERE` filters candidates (over-fetch + filter); `LIMIT/OFFSET` apply
 after. No JOIN/UNION/aggregates/ORDER BY with NEAREST. Vectors are float
 arrays of one consistent dimension. The index is in-memory, rebuilt from
@@ -353,6 +383,15 @@ log_format/log_file, per_table_metrics, prometheus_port, self_scrape,
 self_scrape_interval_secs; `[ui]` enabled.
 **Live-mutable** (no restart): all `observability.*` log/slow-query keys,
 `observability.self_scrape*`, `ui.enabled`.
+
+Every admin endpoint above also has a SQL spelling (section 3: `SHOW
+CLUSTER`, `SHOW CONFIG`/`SET CONFIG`, `SHOW SLOW QUERIES`, `REPAIR
+CLUSTER`, `RECLAIM`, `ALTER CLUSTER`) with identical RBAC and audit.
+
+**Docker**: `docker/` ships a Dockerfile + compose files (single node and
+3-node cluster); every config key is settable as a `SKAIDB_*` env var
+(env > config file > defaults), `SKAIDB_MEMORY_TARGET=auto` reads the
+container's cgroup limit. See DOCKER.md.
 
 **skaidbsh commands**: SQL plus `\status \metrics \cluster [raw] \repair
 \reclaim \node add <addr> | remove <id> \config [get k | set k v]
@@ -428,9 +467,12 @@ hard-check `X-elastic-product` need that check off.
     `/status` for topology; enable `observability.self_scrape` to dashboard
     the node from itself; Grafana points its Prometheus datasource at
     `http://node:7080`.
-14. **Backups/repair**: the table is the source of truth for every derived
-    index; `REBUILD SEARCH INDEX` and automatic rebuild-on-open cover index
-    damage. `\repair` converges replicas; `\reclaim` frees space after
+14. **Backups/repair**: `BACKUP TO '/path'` takes a crash-consistent
+    node-local backup; `RESTORE FROM` restores it (standalone — on a
+    cluster restore the node offline and let repair converge it). The
+    table is the source of truth for every derived index; `REBUILD
+    SEARCH INDEX` and automatic rebuild-on-open cover index damage.
+    `REPAIR CLUSTER` converges replicas; `RECLAIM` frees space after
     topology changes.
 15. **Upgrades**: packaged installs via apt/dnf; every node restarts into
     the new version; search indexes rebuild automatically when their
