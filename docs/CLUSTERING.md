@@ -279,7 +279,11 @@ repair converge it.
 
 Replicas converge automatically through **read-repair** (a quorum read writes the
 winning version back to stale replicas) and **hinted handoff** (a write to a
-down replica is buffered and replayed when it returns). For a full sweep — e.g.
+down replica is buffered and replayed when it returns). Hints are held in
+memory up to a per-replica cap and **spill to a per-replica on-disk log**
+beyond it — so a replica that stays down or keeps shedding for a long time
+loses no writes (bounded memory, durable across restarts) rather than
+dropping the overflow. For a full sweep — e.g.
 after a node was down a long time — run an active **repair**
 (`Node::repair`/`repair_cluster`), which reconciles every co-replica pair in both
 directions, **including the catalog**: databases, tables, and indexes are synced

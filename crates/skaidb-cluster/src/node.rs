@@ -151,6 +151,13 @@ pub struct Node {
     /// for replay when it comes back — *hinted handoff*. In-memory and bounded;
     /// anti-entropy ([`Node::repair`]) is the durable backstop if hints are lost.
     hints: Mutex<HashMap<NodeId, Vec<HintedWrite>>>,
+    /// Serializes appends to the per-replica on-disk hint logs (the overflow
+    /// past the in-memory cap), so a persistently-behind replica loses no
+    /// writes to a bounded memory buffer.
+    hint_spill: Mutex<()>,
+    /// Approx. count of hints spilled to disk and not yet delivered (for the
+    /// `hints_pending` accounting / metric).
+    disk_hints: AtomicU64,
     /// Buffered time-series batches for unreachable replicas, replayed via
     /// the gap-filling `TsMerge` on recovery (per peer: `(table, rows)`).
     ts_hints: Mutex<HashMap<NodeId, Vec<TsHint>>>,
@@ -390,9 +397,14 @@ enum BgTask {
     },
 }
 
-/// Cap on buffered hints per replica, so a long outage can't grow unboundedly
-/// (anti-entropy reconciles whatever overflows).
+/// Cap on **in-memory** buffered hints per replica; overflow spills to a
+/// per-replica on-disk hint log (durable, bounded memory) rather than being
+/// dropped, so a persistently-behind replica loses no writes.
+#[cfg(not(test))]
 const MAX_HINTS_PER_REPLICA: usize = 4096;
+/// Tiny in tests so a handful of writes exercises the disk-spill path.
+#[cfg(test)]
+const MAX_HINTS_PER_REPLICA: usize = 4;
 
 /// Max deferred tasks the background worker drains per wakeup: bounds the
 /// size of one batched send while still collapsing a burst of async-tail
@@ -448,6 +460,8 @@ impl Node {
             auth: auth.clone(),
             pool: internode::Pool::new(auth),
             hints: Mutex::new(HashMap::new()),
+            hint_spill: Mutex::new(()),
+            disk_hints: AtomicU64::new(0),
             ts_hints: Mutex::new(HashMap::new()),
             acked: Mutex::new(HashMap::new()),
             write_watermark: AtomicU64::new(0),
@@ -654,7 +668,8 @@ impl Node {
             .expect("hints lock")
             .values()
             .map(|v| v.len())
-            .sum();
+            .sum::<usize>()
+            + self.disk_hints.load(Ordering::Relaxed) as usize;
         ClusterStats {
             node_id: self.id.0.clone(),
             epoch,
@@ -2557,12 +2572,121 @@ impl Node {
 
     /// Buffer a write that couldn't reach `replica` (for hinted handoff).
     fn store_hint(&self, replica: &NodeId, table: &str, key: &[u8], op: &WriteOp, hlc: Hlc) {
-        let mut hints = self.hints.lock().expect("hints lock");
-        let bucket = hints.entry(replica.clone()).or_default();
-        if bucket.len() < MAX_HINTS_PER_REPLICA {
-            bucket.push((table.to_string(), key.to_vec(), op.clone(), hlc));
+        {
+            let mut hints = self.hints.lock().expect("hints lock");
+            let bucket = hints.entry(replica.clone()).or_default();
+            if bucket.len() < MAX_HINTS_PER_REPLICA {
+                bucket.push((table.to_string(), key.to_vec(), op.clone(), hlc));
+                self.counters.hints_stored.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        // In-memory bucket full: spill to the replica's on-disk hint log so a
+        // persistently-behind replica loses no writes (the old behavior
+        // silently dropped past the cap, leaving a full repair pass as the
+        // only recovery). Bounded memory, durable across restarts.
+        if self.spill_hint_to_disk(replica, table, key, op, hlc) {
+            self.disk_hints.fetch_add(1, Ordering::Relaxed);
             self.counters.hints_stored.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Directory holding the per-replica on-disk hint logs.
+    fn hint_dir(&self) -> Option<std::path::PathBuf> {
+        let dir = self.data_dir()?.join("hints");
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(dir)
+    }
+
+    /// A replica's hint-log path (id sanitized to a safe filename).
+    fn hint_log_path(&self, replica: &NodeId) -> Option<std::path::PathBuf> {
+        let safe: String = replica
+            .0
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        Some(self.hint_dir()?.join(format!("{safe}.hintlog")))
+    }
+
+    /// Append one hint record to the replica's on-disk log. Serialized by
+    /// `hint_spill` so concurrent writers don't interleave records.
+    fn spill_hint_to_disk(
+        &self,
+        replica: &NodeId,
+        table: &str,
+        key: &[u8],
+        op: &WriteOp,
+        hlc: Hlc,
+    ) -> bool {
+        use std::io::Write;
+        let Some(path) = self.hint_log_path(replica) else {
+            return false;
+        };
+        let rec = encode_hint_record(table, key, op, hlc);
+        let _guard = self.hint_spill.lock().expect("hint spill lock");
+        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(mut f) => f.write_all(&rec).is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// Read and remove all disk-spilled hints for `replica`, replaying them to
+    /// `addr`. Returns how many were delivered. The file is deleted on full
+    /// success; on partial failure the undelivered tail is rewritten.
+    fn drain_disk_hints(&self, replica: &NodeId, addr: &str) -> usize {
+        let Some(path) = self.hint_log_path(replica) else {
+            return 0;
+        };
+        let bytes = {
+            let _guard = self.hint_spill.lock().expect("hint spill lock");
+            match std::fs::read(&path) {
+                Ok(b) if !b.is_empty() => {
+                    let _ = std::fs::remove_file(&path);
+                    b
+                }
+                _ => return 0,
+            }
+        };
+        let records = decode_hint_records(&bytes);
+        let total = records.len();
+        // Group by table so each replays as one ApplyBatch (LWW-safe).
+        let mut by_table: BTreeMap<String, Vec<BatchRow>> = BTreeMap::new();
+        for (table, key, op, hlc) in &records {
+            let row: BatchRow = match op {
+                WriteOp::Put(v) => (key.clone(), v.clone(), *hlc, true),
+                WriteOp::Delete => (key.clone(), Vec::new(), *hlc, false),
+            };
+            by_table.entry(table.clone()).or_default().push(row);
+        }
+        let mut delivered = 0usize;
+        let mut failed: Vec<(String, Vec<u8>, WriteOp, Hlc)> = Vec::new();
+        let mut max_hlc: Option<Hlc> = None;
+        for (table, rows) in by_table {
+            let batch_max = rows.iter().map(|(_, _, h, _)| *h).max();
+            if self.send_batch(addr, &table, &rows) {
+                delivered += rows.len();
+                if let Some(h) = batch_max {
+                    max_hlc = Some(max_hlc.map_or(h, |m| m.max(h)));
+                }
+            } else {
+                for (k, v, h, is_put) in rows {
+                    let op = if is_put { WriteOp::Put(v) } else { WriteOp::Delete };
+                    failed.push((table.clone(), k, op, h));
+                }
+            }
+        }
+        if let Some(h) = max_hlc {
+            self.note_acked(replica, h);
+        }
+        self.disk_hints
+            .fetch_sub(delivered.min(total) as u64, Ordering::Relaxed);
+        // Rewrite any undelivered records so they retry next flush.
+        if !failed.is_empty() {
+            for (table, key, op, hlc) in &failed {
+                self.spill_hint_to_disk(replica, table, key, op, *hlc);
+            }
+        }
+        delivered
     }
 
     /// Buffer a time-series batch that couldn't reach `replica`. Bounded by
@@ -2589,6 +2713,7 @@ impl Node {
     fn hints_pending(&self) -> bool {
         !self.hints.lock().expect("hints lock").is_empty()
             || !self.ts_hints.lock().expect("ts hints lock").is_empty()
+            || self.disk_hints.load(Ordering::Relaxed) > 0
     }
 
     /// Replay buffered hints to replicas that are reachable again — *hinted
@@ -2669,6 +2794,16 @@ impl Node {
                     .entry(replica)
                     .or_default()
                     .extend(remaining);
+            }
+        }
+        // Drain any disk-spilled hints for currently-reachable peers (a
+        // replica that stayed full has hints only on disk, not in `pending`).
+        if self.disk_hints.load(Ordering::Relaxed) > 0 {
+            for (replica, addr) in self.members_snapshot() {
+                if replica == self.id {
+                    continue;
+                }
+                delivered += self.drain_disk_hints(&replica, &addr);
             }
         }
         self.counters
@@ -4627,7 +4762,7 @@ impl Node {
 }
 
 /// A pending replicated mutation.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum WriteOp {
     Put(Vec<u8>),
     Delete,
@@ -4688,6 +4823,83 @@ fn write_response(result: EngineResult<()>) -> Response {
 /// should back off and retry once the node has drained and recovered.
 fn shed_error() -> EngineError {
     EngineError::Cluster("memory pressure: node is shedding writes, retry".into())
+}
+
+/// Serialize one on-disk hint record: `table`, `key`, op (`1`+value / `0`),
+/// then the 12-byte HLC. Length-prefixed so records can be streamed back.
+fn encode_hint_record(table: &str, key: &[u8], op: &WriteOp, hlc: Hlc) -> Vec<u8> {
+    let mut o = Vec::with_capacity(table.len() + key.len() + 24);
+    o.extend_from_slice(&(table.len() as u32).to_le_bytes());
+    o.extend_from_slice(table.as_bytes());
+    o.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    o.extend_from_slice(key);
+    match op {
+        WriteOp::Put(v) => {
+            o.push(1);
+            o.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            o.extend_from_slice(v);
+        }
+        WriteOp::Delete => o.push(0),
+    }
+    o.extend_from_slice(&hlc.to_bytes());
+    o
+}
+
+/// Decode a hint log written by [`encode_hint_record`]. A truncated trailing
+/// record (torn write / partial flush) is ignored — the delivered records
+/// before it are still returned, and repair backstops any loss.
+fn decode_hint_records(bytes: &[u8]) -> Vec<(String, Vec<u8>, WriteOp, Hlc)> {
+    fn rd_u32(b: &[u8], i: &mut usize) -> Option<usize> {
+        let end = i.checked_add(4)?;
+        if end > b.len() {
+            return None;
+        }
+        let v = u32::from_le_bytes(b[*i..end].try_into().ok()?) as usize;
+        *i = end;
+        Some(v)
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    // Multiple break points (any short read stops), so not a `while let`.
+    #[allow(clippy::while_let_loop)]
+    loop {
+        let Some(tl) = rd_u32(bytes, &mut i) else { break };
+        if i + tl > bytes.len() {
+            break;
+        }
+        let table = String::from_utf8_lossy(&bytes[i..i + tl]).into_owned();
+        i += tl;
+        let Some(kl) = rd_u32(bytes, &mut i) else { break };
+        if i + kl > bytes.len() {
+            break;
+        }
+        let key = bytes[i..i + kl].to_vec();
+        i += kl;
+        if i >= bytes.len() {
+            break;
+        }
+        let tag = bytes[i];
+        i += 1;
+        let op = if tag == 1 {
+            let Some(vl) = rd_u32(bytes, &mut i) else { break };
+            if i + vl > bytes.len() {
+                break;
+            }
+            let v = bytes[i..i + vl].to_vec();
+            i += vl;
+            WriteOp::Put(v)
+        } else {
+            WriteOp::Delete
+        };
+        if i + 12 > bytes.len() {
+            break;
+        }
+        let mut hb = [0u8; 12];
+        hb.copy_from_slice(&bytes[i..i + 12]);
+        i += 12;
+        out.push((table, key, op, Hlc::from_bytes(hb)));
+    }
+    out
 }
 
 /// Path of the per-joiner migration checkpoint file in a node's data directory.
@@ -7916,6 +8128,53 @@ mod tests {
         // Reads meet read quorum (a + b respond).
         let rs = rows(nb.execute("SELECT id FROM t ORDER BY id").unwrap());
         assert_eq!(rs.rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+    }
+
+    /// Hint records survive an encode/decode round-trip, including a
+    /// truncated trailing record (torn write) which is skipped.
+    #[test]
+    fn hint_record_round_trip() {
+        let recs = vec![
+            ("t1".to_string(), b"k1".to_vec(), WriteOp::Put(b"val1".to_vec()), Hlc::new(10, 1)),
+            ("t2".to_string(), b"key-2".to_vec(), WriteOp::Delete, Hlc::new(20, 0)),
+        ];
+        let mut buf = Vec::new();
+        for (t, k, op, h) in &recs {
+            buf.extend_from_slice(&encode_hint_record(t, k, op, *h));
+        }
+        assert_eq!(decode_hint_records(&buf), recs);
+        // A torn trailing record is ignored; the whole records survive.
+        buf.extend_from_slice(&[9, 0, 0, 0, b'x']); // partial next record
+        assert_eq!(decode_hint_records(&buf), recs);
+    }
+
+    /// Hints past the in-memory cap spill to a per-replica on-disk log
+    /// (durable, bounded memory) instead of being dropped — so a
+    /// persistently-behind replica loses no writes.
+    #[test]
+    fn hints_spill_to_disk_beyond_cap() {
+        let (a, b) = (free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b)];
+        let na = Node::new(
+            Database::open(temp_dir("spill_a")).unwrap(),
+            cfg("a", &a, &members, Consistency::One, Consistency::One),
+        );
+        let bid = NodeId::new("b");
+        // MAX_HINTS_PER_REPLICA is 4 in tests; store 10 → 4 in memory, 6 spilled.
+        for i in 0..10u32 {
+            na.store_hint(&bid, "t", &i.to_le_bytes(), &WriteOp::Put(vec![i as u8]), Hlc::new(100 + i as u64, 0));
+        }
+        assert_eq!(na.disk_hints.load(Ordering::Relaxed), 6, "6 spilled to disk");
+        // The on-disk log decodes to exactly the 6 overflow records.
+        let path = na.hint_log_path(&bid).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let recs = decode_hint_records(&bytes);
+        assert_eq!(recs.len(), 6);
+        assert_eq!(recs[0].1, 4u32.to_le_bytes().to_vec()); // 5th write (index 4)
+        assert_eq!(recs[5].1, 9u32.to_le_bytes().to_vec());
+        // hints_pending() sees the disk hints (so a flush gets queued).
+        assert!(na.hints_pending());
+        assert_eq!(na.stats().hints_pending, 10); // 4 memory + 6 disk
     }
 
     /// Under memory pressure the node sheds *writes* (with a retryable
