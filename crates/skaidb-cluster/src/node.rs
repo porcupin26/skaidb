@@ -4422,6 +4422,182 @@ impl Node {
         Ok(out)
     }
 
+    /// Like [`Node::cluster_scan`] but stops once `limit` surviving rows have
+    /// been produced — the push-down for an unfiltered, unordered `LIMIT n`.
+    /// Without it a `SELECT … LIMIT 2` on a million-row table gathered and
+    /// merged every shard in full before the executor threw all but two rows
+    /// away (slow, and it re-materialised the whole table on the coordinator).
+    ///
+    /// Every source (local shard + each peer) is paged in key order in
+    /// lockstep and merged last-writer-wins. A key is only emitted once every
+    /// still-active source has scanned past it — the "seal" frontier, the
+    /// minimum of the active sources' latest keys — so a tombstone or a
+    /// higher-HLC version arriving from a slower replica still wins, exactly as
+    /// in a full scan, but only over the short key prefix a `LIMIT` needs.
+    /// Rows come back in key order (an unordered `LIMIT` promises no order).
+    fn cluster_scan_limited(
+        &self,
+        table: &str,
+        oc: Option<Consistency>,
+        limit: usize,
+    ) -> EngineResult<Vec<(Vec<u8>, Document)>> {
+        self.counters.reads_total.fetch_add(1, Ordering::Relaxed);
+        let needed = oc
+            .unwrap_or(self.cfg.read_consistency)
+            .required(self.member_count());
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let addrs = self.peer_addrs();
+        // Per-source paging state. Index 0 is the local shard; the rest track
+        // `addrs`. `done` = this source has delivered its whole shard; `ok` = it
+        // has never errored (only `ok` sources count toward the read quorum).
+        let mut local_cursor: Option<Vec<u8>> = None;
+        let mut local_done = false;
+        let mut peer_cursor: Vec<Option<Vec<u8>>> = vec![None; addrs.len()];
+        let mut peer_done: Vec<bool> = vec![false; addrs.len()];
+        let mut peer_ok: Vec<bool> = vec![true; addrs.len()];
+
+        let mut merged: BTreeMap<Vec<u8>, (Hlc, Option<Vec<u8>>)> = BTreeMap::new();
+        let mut out: Vec<(Vec<u8>, Document)> = Vec::new();
+        let mut max_hlc: Option<Hlc> = None;
+
+        loop {
+            // 1. Pull the next page from every still-active source and merge it.
+            if !local_done {
+                let rows = self
+                    .local
+                    .read()
+                    .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+                    .local_scan_versioned_page(table, local_cursor.as_deref(), SCAN_PAGE_ROWS)?;
+                local_done = rows.len() < SCAN_PAGE_ROWS;
+                if let Some((k, ..)) = rows.last() {
+                    local_cursor = Some(k.clone());
+                }
+                for (key, value, hlc, is_put) in rows {
+                    merge_row(&mut merged, key, is_put.then_some(value), hlc);
+                }
+            }
+            for (i, addr) in addrs.iter().enumerate() {
+                if peer_done[i] || !peer_ok[i] {
+                    continue;
+                }
+                match self.scan_peer_page(addr, table, peer_cursor[i].as_deref()) {
+                    Some((rows, exhausted)) => {
+                        peer_done[i] = exhausted;
+                        if let Some((k, ..)) = rows.last() {
+                            peer_cursor[i] = Some(k.clone());
+                        }
+                        for (key, value, hlc, is_put) in rows {
+                            merge_row(&mut merged, key, is_put.then_some(value), hlc);
+                        }
+                    }
+                    // Peer failed mid-scan: stop reading it and drop it from the
+                    // responder count (its rows still reach us via other replicas).
+                    None => {
+                        peer_ok[i] = false;
+                        peer_done[i] = true;
+                    }
+                }
+            }
+
+            // 2. Seal = the smallest latest-key among sources that still have
+            //    more to deliver. Everything <= seal is final: each active
+            //    source has returned all its keys <= its own latest key, hence
+            //    all its keys <= seal. Done sources cap nothing (fully seen); if
+            //    none remain active, every buffered key is final.
+            let mut frontiers: Vec<&Vec<u8>> = Vec::new();
+            if !local_done {
+                if let Some(c) = local_cursor.as_ref() {
+                    frontiers.push(c);
+                }
+            }
+            for i in 0..addrs.len() {
+                if !peer_done[i] && peer_ok[i] {
+                    if let Some(c) = peer_cursor[i].as_ref() {
+                        frontiers.push(c);
+                    }
+                }
+            }
+            let all_done = frontiers.is_empty();
+            let seal = frontiers.into_iter().min().cloned();
+
+            // 3. Emit finalised survivors in key order, up to `limit`.
+            let finalized: Vec<Vec<u8>> = match &seal {
+                Some(s) => merged.range(..=s.clone()).map(|(k, _)| k.clone()).collect(),
+                None => merged.keys().cloned().collect(),
+            };
+            for k in finalized {
+                let (hlc, val) = merged.remove(&k).expect("finalised key present");
+                max_hlc = Some(max_hlc.map_or(hlc, |m| m.max(hlc)));
+                if let Some(bytes) = val {
+                    if let Value::Document(doc) = Value::decode(&bytes)
+                        .map_err(|e| EngineError::Cluster(format!("corrupt row: {e}")))?
+                    {
+                        out.push((k, doc));
+                        if out.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // 4. Stop once we have enough rows or every source is drained.
+            if out.len() >= limit || all_done {
+                break;
+            }
+        }
+
+        // Read quorum over the scanned prefix: the local shard always responds;
+        // require a quorum of members to have contributed without error.
+        let responders = 1 + peer_ok.iter().filter(|ok| **ok).count();
+        if responders < needed {
+            self.counters
+                .read_quorum_failures
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(EngineError::Cluster(format!(
+                "read quorum not met: {responders}/{needed} members responded"
+            )));
+        }
+        if let Some(max) = max_hlc {
+            self.clock.observe(max);
+        }
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    /// Fetch one `ScanPage`-sized page of `table` from `addr`, in key order
+    /// after `after`. `(rows, exhausted)` where `exhausted` marks the peer's
+    /// last (short) page; `None` if the RPC failed. Used by the on-demand,
+    /// early-terminating [`Node::cluster_scan_limited`] (vs. the drain-to-a-
+    /// channel [`Node::scan_peer_paged`] a full gather uses).
+    fn scan_peer_page(
+        &self,
+        addr: &str,
+        table: &str,
+        after: Option<&[u8]>,
+    ) -> Option<(Vec<BatchRow>, bool)> {
+        self.counters.peer_requests.fetch_add(1, Ordering::Relaxed);
+        match self.pool.call(
+            addr,
+            &Request::ScanPage {
+                table: table.to_string(),
+                after: after.map(<[u8]>::to_vec),
+                limit: SCAN_PAGE_ROWS as u32,
+            },
+        ) {
+            Ok(Response::Scan { rows }) => {
+                let exhausted = rows.len() < SCAN_PAGE_ROWS;
+                Some((rows, exhausted))
+            }
+            _ => {
+                self.counters.peer_errors.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
     /// Stream one peer's shard of `table` into `tx`, one `ScanPage` at a
     /// time. Returns whether the peer supplied its complete shard (only then
     /// does it count toward the read quorum). Peers that predate `ScanPage`
@@ -5476,6 +5652,25 @@ impl Cluster for Coordinator {
         // No predicate at all: gather the whole table, LWW-merged.
         let rows = self.node.cluster_scan(table, self.oc)?;
         filter_rows(filter, rows)
+    }
+
+    fn matching_rows_ordered(
+        &self,
+        table: &str,
+        filter: &Option<Expr>,
+        order: Option<&str>,
+        fetch_limit: Option<usize>,
+    ) -> EngineResult<(Vec<(Vec<u8>, Document)>, bool)> {
+        // Push a plain `LIMIT n` into the gather so an unfiltered, unordered
+        // scan reads only the first n rows' worth across the ring instead of
+        // every shard in full. The filtered/indexed paths already gather
+        // bounded candidate sets, and an ordered scan needs a different sort
+        // key than the on-disk key order — both keep the default full gather.
+        if let (None, None, Some(lim)) = (filter, order, fetch_limit) {
+            let rows = self.node.cluster_scan_limited(table, self.oc, lim)?;
+            return Ok((rows, false));
+        }
+        Ok((self.matching_rows(table, filter)?, false))
     }
 
     fn put(&mut self, table: &str, key: &[u8], doc: &Document) -> EngineResult<()> {
@@ -7173,6 +7368,93 @@ mod tests {
                     "row {id} mismatch"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn limit_pushdown_scan_returns_merged_tombstone_skipping_prefix() {
+        use skaidb_types::Document;
+        // An unfiltered `LIMIT k` must return the k smallest-key surviving
+        // rows — LWW-merged across divergent shards and skipping tombstones,
+        // the same prefix a full `ORDER BY` scan yields — instead of gathering
+        // and merging every shard in full (cluster_scan_limited push-down).
+        let q = Consistency::Quorum;
+        let cfg2 = |id: &str, addr: &str, members: &[(NodeId, String)]| NodeConfig {
+            id: NodeId::new(id),
+            internode_addr: addr.to_string(),
+            members: members.to_vec(),
+            replication_factor: 2,
+            vnodes_per_node: 64,
+            read_consistency: q,
+            write_consistency: q,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
+            anti_entropy_interval_secs: 0,
+        };
+        let (a, b) = (free_addr(), free_addr());
+        let m = vec![member("a", &a), member("b", &b)];
+        let na = Node::new(Database::open(temp_dir("lpa")).unwrap(), cfg2("a", &a, &m));
+        let nb = Node::new(Database::open(temp_dir("lpb")).unwrap(), cfg2("b", &b, &m));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+
+        let key = |id: i64| Value::Array(vec![Value::Int(id)]).encode_key();
+        let put = |addr: &str, id: i64, v: i64, hlc: Hlc| {
+            let mut doc = Document::new();
+            doc.insert("id", Value::Int(id));
+            doc.insert("v", Value::Int(v));
+            let r = internode::call(
+                addr,
+                &Request::ApplyPut {
+                    table: "t".into(),
+                    key: key(id),
+                    value: Value::Document(doc).encode(),
+                    hlc,
+                },
+            )
+            .unwrap();
+            assert!(matches!(r, Response::Ack));
+        };
+        // a holds 20 rows; b holds newer versions of ids 0..4 (they win under
+        // LWW) plus a tombstone on id 1 (its newest write) — so id 1 must be
+        // skipped, forcing the scan to seal past it to collect enough rows.
+        for id in 0..20 {
+            put(&a, id, id, Hlc::new(100 + id as u64, 0));
+        }
+        for id in 0..5 {
+            put(&b, id, 1000 + id, Hlc::new(500 + id as u64, 0));
+        }
+        let r = internode::call(
+            &b,
+            &Request::ApplyDelete {
+                table: "t".into(),
+                key: key(1),
+                hlc: Hlc::new(600, 0),
+            },
+        )
+        .unwrap();
+        assert!(matches!(r, Response::Ack));
+
+        // Identical from either coordinator: the pushed-down LIMIT 3 equals the
+        // first three rows of the authoritative full ordered scan.
+        for node in [&na, &nb] {
+            let full = rows(node.execute("SELECT id, v FROM t ORDER BY id").unwrap());
+            assert_eq!(full.rows.len(), 19, "20 rows minus the id=1 tombstone");
+            let limited = rows(node.execute("SELECT id, v FROM t LIMIT 3").unwrap());
+            assert_eq!(limited.rows.len(), 3);
+            assert_eq!(
+                limited.rows,
+                full.rows[..3].to_vec(),
+                "LIMIT 3 must be the merged, tombstone-skipping prefix"
+            );
+            // Concretely: b's newer versions win and id 1 is gone.
+            assert_eq!(limited.rows[0], vec![Value::Int(0), Value::Int(1000)]);
+            assert_eq!(limited.rows[1], vec![Value::Int(2), Value::Int(1002)]);
+            assert_eq!(limited.rows[2], vec![Value::Int(3), Value::Int(1003)]);
+            // A limit past the end returns every survivor (all sources drained).
+            let all = rows(node.execute("SELECT id FROM t LIMIT 100").unwrap());
+            assert_eq!(all.rows.len(), 19);
         }
     }
 

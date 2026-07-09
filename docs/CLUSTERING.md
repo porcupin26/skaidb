@@ -401,5 +401,11 @@ SCRAM on the binary endpoint and HTTP Basic on REST, plus RBAC; see the
   embedded engine; the cluster coordinator autocommits per statement.
 - **Joins gather to the coordinator.** A single-table `WHERE` is pushed to the
   shards, but a SQL `JOIN` pulls the tables to the coordinating node.
+- **Unfiltered scans page, merge, and honour `LIMIT`.** `SELECT … FROM t` with no
+  `WHERE` gathers every shard last-writer-wins, paged so the coordinator holds a
+  few pages at a time rather than whole shards. A plain `LIMIT n` (no `ORDER BY`)
+  is pushed into the gather: sources are paged in lockstep and a row is emitted
+  once every still-active replica has scanned past it, so the scan stops after
+  the first `n` rows are sealed instead of materialising the whole table.
 
 See [RESHARDING.md](RESHARDING.md) for the deeper design and the current edges.
