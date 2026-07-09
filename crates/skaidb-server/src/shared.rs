@@ -956,8 +956,18 @@ fn required_privilege(stmt: &Statement) -> Option<(Privilege, Object)> {
         Statement::Insert(i) => (Privilege::Insert, Object::Table(i.table.clone())),
         Statement::Update(u) => (Privilege::Update, Object::Table(u.table.clone())),
         Statement::Delete(d) => (Privilege::Delete, Object::Table(d.table.clone())),
-        Statement::CreateTable(_) => (Privilege::Create, Object::Global),
-        Statement::CreateTimeseriesTable(_) => (Privilege::Create, Object::Global),
+        // Creating a table is table-scoped, like every other table DDL
+        // (DROP TABLE, CREATE INDEX): a `Create` grant on the target
+        // database authorizes creating tables in it, matching standard SQL.
+        // `allowed_on_table` widens the (not-yet-existing) table check to
+        // the reference's database — the current session db, or a `db.`
+        // qualifier's db — so a database-scoped user is self-service in its
+        // own database and cannot create tables elsewhere. A global `Create`
+        // grant still satisfies it.
+        Statement::CreateTable(c) => (Privilege::Create, Object::Table(c.name.clone())),
+        Statement::CreateTimeseriesTable(c) => {
+            (Privilege::Create, Object::Table(c.name.clone()))
+        }
         Statement::CreateRollup(cr) => (Privilege::Create, Object::Table(cr.table.clone())),
         Statement::CreateIndex(ci) => (Privilege::Create, Object::Table(ci.table.clone())),
         Statement::CreateVectorIndex(ci) => (Privilege::Create, Object::Table(ci.table.clone())),

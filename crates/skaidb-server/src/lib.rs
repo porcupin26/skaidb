@@ -1432,6 +1432,31 @@ mod tests {
             Response::Rows { .. } => {}
             other => panic!("unexpected: {other:?}"),
         }
+
+        // A `Create` grant on a database authorizes creating tables IN that
+        // database (standard SQL), but not in another database or globally.
+        assert_eq!(
+            execute(&ctx, "GRANT CREATE ON DATABASE walled TO scoped"),
+            Response::Ddl
+        );
+        match cross("CREATE TABLE mine (PRIMARY KEY (id))") {
+            Response::Ddl => {}
+            other => panic!("own-db CREATE TABLE should be allowed, got {other:?}"),
+        }
+        // ...but not into a different database via a qualifier.
+        match cross("CREATE TABLE default.sneaky (PRIMARY KEY (id))") {
+            Response::Error(m) => {
+                assert!(m.contains("permission denied"), "cross-db create: {m}")
+            }
+            other => panic!("cross-db CREATE TABLE must be denied, got {other:?}"),
+        }
+        // A role with no create grant anywhere still cannot create tables.
+        match execute_as(&ctx, "reader", "CREATE TABLE reader.t (PRIMARY KEY (id))") {
+            Response::Error(m) => {
+                assert!(m.contains("permission denied"), "ungranted create: {m}")
+            }
+            other => panic!("ungranted CREATE TABLE must be denied, got {other:?}"),
+        }
     }
 
     /// Auth DDL leaves secret-free audit entries in the identity log.
