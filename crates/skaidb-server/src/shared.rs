@@ -402,9 +402,19 @@ impl Context {
     /// table itself or on the whole database satisfies the check. (The role
     /// store matches objects exactly; this is where a table check widens to
     /// its database.)
+    ///
+    /// A `db.table` reference belongs to its **qualifier's** database, not
+    /// the session's `db`. Widening to the session database instead would
+    /// let a role holding a database-level grant reach a *different*
+    /// database's tables via a `db.table` reference — a privilege
+    /// escalation across the database boundary the grant was meant to fix.
     pub fn allowed_on_table(&self, role: &str, privilege: Privilege, table: &str, db: &str) -> bool {
+        let owning_db = match table.split_once('.') {
+            Some((qualifier, _)) => qualifier,
+            None => db,
+        };
         self.allowed(role, privilege, &Object::Table(table.to_string()))
-            || self.allowed(role, privilege, &Object::Database(db.to_string()))
+            || self.allowed(role, privilege, &Object::Database(owning_db.to_string()))
     }
 
     /// Resolve a username to its SCRAM credential and acting role: the

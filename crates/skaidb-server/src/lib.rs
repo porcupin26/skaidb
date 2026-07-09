@@ -1396,6 +1396,42 @@ mod tests {
             Response::Error(m) => assert!(m.contains("permission denied"), "got: {m}"),
             other => panic!("expected denial, got {other:?}"),
         }
+
+        // A database grant must NOT authorize another database's tables via a
+        // `db.table` qualifier. `scoped` holds SELECT on database `walled`
+        // only; while its session db is `walled`, a `default.t` reference is
+        // a different database and must be denied for both read and write —
+        // the check widens to the qualifier's database, not the session's.
+        use crate::shared::execute_session_as;
+        assert_eq!(execute(&ctx, "CREATE DATABASE walled"), Response::Ddl);
+        assert_eq!(execute(&ctx, "CREATE ROLE scoped"), Response::Ddl);
+        assert_eq!(
+            execute(&ctx, "GRANT SELECT ON DATABASE walled TO scoped"),
+            Response::Ddl
+        );
+        let cross = |sql: &str| {
+            let mut db = "walled".to_string();
+            execute_session_as(&ctx, "scoped", &mut db, sql, None)
+        };
+        match cross("SELECT id FROM default.t") {
+            Response::Error(m) => assert!(m.contains("permission denied"), "read escalation: {m}"),
+            other => panic!("cross-db read must be denied, got {other:?}"),
+        }
+        match cross("INSERT INTO default.t (id) VALUES (7)") {
+            Response::Error(m) => assert!(m.contains("permission denied"), "write escalation: {m}"),
+            other => panic!("cross-db write must be denied, got {other:?}"),
+        }
+        // The database grant still reaches its OWN database's tables: a bare
+        // reference in session db `walled` passes the privilege check (it
+        // fails later only because the table doesn't exist — not on RBAC).
+        match cross("SELECT id FROM own_table") {
+            Response::Error(m) => assert!(
+                !m.contains("permission denied"),
+                "own-db select must pass RBAC (table-not-found is fine): {m}"
+            ),
+            Response::Rows { .. } => {}
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     /// Auth DDL leaves secret-free audit entries in the identity log.
