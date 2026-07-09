@@ -753,6 +753,10 @@ fn tx_kind(sql: &str) -> Option<TxKind> {
 fn required_privilege(stmt: &Statement) -> Option<(Privilege, Object)> {
     Some(match stmt {
         Statement::Select(s) => (Privilege::Select, Object::Table(s.from.clone())),
+        // The score breakdown reads the row and the index — gate like SELECT.
+        Statement::ExplainScore { select, .. } => {
+            (Privilege::Select, Object::Table(select.from.clone()))
+        }
         Statement::Insert(i) => (Privilege::Insert, Object::Table(i.table.clone())),
         Statement::Update(u) => (Privilege::Update, Object::Table(u.table.clone())),
         Statement::Delete(d) => (Privilege::Delete, Object::Table(d.table.clone())),

@@ -1081,6 +1081,24 @@ impl Database {
         self.search_explain_query(table, &query, pk_value)
     }
 
+    /// [`Database::search_explain_query`] over the last-committed index
+    /// state (the shared/read-only path — pending writes are not
+    /// committed first).
+    pub fn search_explain_query_read(
+        &self,
+        table: &str,
+        query: &SearchQuery,
+        pk_value: &Value,
+    ) -> Result<Option<String>> {
+        let index_name = self.search_index_for_query(table, query)?;
+        let live = self
+            .search_indexes
+            .get(&index_name)
+            .ok_or_else(|| EngineError::IndexNotFound(index_name.clone()))?;
+        let key = Value::Array(vec![pk_value.clone()]).encode_key();
+        Ok(live.index.explain(query, &key)?)
+    }
+
     /// [`Database::search_explain`] for an already-extracted search query —
     /// the form a coordinator can route to a remote replica (the SQL
     /// filter itself does not travel; the [`SearchQuery`] does).
@@ -1357,6 +1375,15 @@ impl Database {
             } => self
                 .suggest_cmd(&index, &text, column.as_deref(), limit)
                 .map(QueryOutput::Rows),
+            Statement::ExplainScore { select, key } => {
+                let query = filter_search_query(&select.filter)?.ok_or_else(|| {
+                    EngineError::Type(
+                        "EXPLAIN SCORE needs a MATCH()/SEARCH() predicate in the WHERE".into(),
+                    )
+                })?;
+                let text = self.search_explain_query_read(&select.from, &query, &key)?;
+                Ok(QueryOutput::Rows(explain_score_rows(text)))
+            }
             Statement::ShowTables => Ok(QueryOutput::Rows(self.show_tables())),
             Statement::ShowIndexes => Ok(QueryOutput::Rows(self.show_indexes())),
             Statement::ShowStatus => Ok(QueryOutput::Rows(self.show_status())),
@@ -1423,6 +1450,10 @@ impl Database {
             } => self
                 .suggest_cmd_mut(&index, &text, column.as_deref(), limit)
                 .map(QueryOutput::Rows),
+            Statement::ExplainScore { select, key } => {
+                let text = self.search_explain(&select.from, &select.filter, &key)?;
+                Ok(QueryOutput::Rows(explain_score_rows(text)))
+            }
             Statement::AlterTable(alt) => self.alter_table(alt),
             Statement::Begin => self.begin(),
             Statement::Commit => self.commit(),
@@ -1558,7 +1589,9 @@ impl Database {
             Statement::ShowGrants { ref role } => {
                 Ok(QueryOutput::Rows(self.show_grants(role.as_deref())))
             }
-            Statement::Select(_) | Statement::Suggest { .. } => {
+            Statement::Select(_)
+            | Statement::Suggest { .. }
+            | Statement::ExplainScore { .. } => {
                 namespace::resolve_statement(&mut stmt, current_db);
                 self.execute_read_statement(stmt)
                     .map_err(|e| namespace::humanize_error(e, current_db))
@@ -4016,11 +4049,21 @@ pub trait Cluster {
 /// points ([`Database::execute_read`] / [`Database::execute_session_read`])
 /// without exclusive access. DML, DDL, and transaction control are not
 /// read-only. Lets a caller holding an `RwLock<Database>` pick the lock mode.
+/// The `EXPLAIN SCORE` result: one `explanation` row of BM25-breakdown
+/// JSON when the row matches, zero rows when it does not.
+fn explain_score_rows(text: Option<String>) -> ResultSet {
+    ResultSet {
+        columns: vec!["explanation".into()],
+        rows: text.map(|t| vec![vec![Value::String(t)]]).unwrap_or_default(),
+    }
+}
+
 pub fn statement_is_read_only(stmt: &Statement) -> bool {
     matches!(
         stmt,
         Statement::Select(_)
             | Statement::Suggest { .. }
+            | Statement::ExplainScore { .. }
             | Statement::ShowTables
             | Statement::ShowIndexes
             | Statement::ShowStatus

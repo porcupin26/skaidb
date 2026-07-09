@@ -3171,6 +3171,24 @@ impl Node {
             self.broadcast_ddl(current_db, sql)?;
             return Ok(SessionEffect::Output(QueryOutput::Ddl));
         }
+        // Per-row score explain routes to a replica of the key (any RF);
+        // the row and its index entry may live only on other nodes.
+        if let Statement::ExplainScore { .. } = &stmt {
+            let mut stmt = stmt;
+            namespace::resolve_statement(&mut stmt, current_db);
+            let Statement::ExplainScore { select, key } = stmt else {
+                unreachable!()
+            };
+            let text = self.search_explain(&select.from, &select.filter, &key)?;
+            return Ok(SessionEffect::Output(QueryOutput::Rows(
+                skaidb_engine::ResultSet {
+                    columns: vec!["explanation".into()],
+                    rows: text
+                        .map(|t| vec![vec![skaidb_types::Value::String(t)]])
+                        .unwrap_or_default(),
+                },
+            )));
+        }
         // Read-only catalog/stat introspection: the catalog is identical on every
         // node (DDL is broadcast), so answer from the local engine, filtered to
         // the current database, without fan-out — under a shared lock, so it
@@ -6141,6 +6159,16 @@ mod tests {
                     .unwrap_or_else(|| panic!("row {id} must explain"));
                 assert!(text.contains("TermQuery"), "row {id}: {text}");
             }
+            // And the SQL spelling routes the same way.
+            let rs = rows(
+                coord
+                    .execute(
+                        "EXPLAIN SCORE SELECT id FROM s WHERE MATCH(product, 'widget') FOR 42",
+                    )
+                    .unwrap(),
+            );
+            assert_eq!(rs.columns, vec!["explanation"]);
+            assert_eq!(rs.rows.len(), 1, "row 42 must explain over SQL");
         }
 
         // End-to-end over SQL from every coordinator: the sharded path and

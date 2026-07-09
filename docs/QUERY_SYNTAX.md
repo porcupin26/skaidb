@@ -38,6 +38,7 @@ ALTER   SEARCH INDEX <name> SET (<option> = <literal> [, ...])
         -- query-time options only: synonyms, refresh_ms,
         -- <col>.search_analyzer, <col>.boost (applied live, no reindex)
 SUGGEST '<text>' ON <index> [COLUMN <col>] [LIMIT <n>]
+EXPLAIN SCORE <select> FOR <pk-literal>
 ALTER  TABLE <table> RENAME TO <new_table>
 ALTER  TABLE <table> RENAME COLUMN <from> TO <to>
 
@@ -328,6 +329,13 @@ WHERE (MATCH(body, 'rust') OR MATCH(title, 'rust'))
   `<required>` matches; each `<optional>` predicate only **raises the
   score** of rows that already match. Every argument must itself be a
   search predicate (possibly AND/OR/NOT-composed).
+- **`EXPLAIN SCORE <select> FOR <pk literal>`** — a standalone statement
+  returning the BM25 breakdown (`explanation` column, tantivy's JSON —
+  per-term K1 / idf(n, N) / tf-normalization) of how the row with that
+  primary-key value scored against the SELECT's search predicates. One
+  row when the key matches, zero rows when it does not; an error without
+  a search predicate. On a cluster the explain routes to a replica of
+  the key, so it works at any replication factor.
 - **`SUGGEST '<text>' ON <index> [COLUMN <col>] [LIMIT n]`** — a
   standalone statement returning "did you mean" term suggestions
   (`input`, `suggestion`, `distance`, `doc_freq` — closest first, most

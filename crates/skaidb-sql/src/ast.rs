@@ -45,6 +45,14 @@ pub enum Statement {
         column: Option<String>,
         limit: u64,
     },
+    /// `EXPLAIN SCORE SELECT ... WHERE <search> FOR <pk literal>` — the
+    /// BM25 breakdown of how one row (by primary-key value) scored
+    /// against the SELECT's search predicates. One `explanation` row of
+    /// JSON when the row matches; zero rows when it does not.
+    ExplainScore {
+        select: Box<Select>,
+        key: skaidb_types::Value,
+    },
     AlterTable(AlterTable),
     Insert(Insert),
     Select(Select),
@@ -179,6 +187,7 @@ impl Statement {
             Statement::RebuildSearchIndex { name } => f(name),
             Statement::AlterSearchIndex { name, .. } => f(name),
             Statement::Suggest { index, .. } => f(index),
+            Statement::ExplainScore { select, .. } => f(&mut select.from),
             _ => {}
         }
     }

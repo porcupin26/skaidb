@@ -415,7 +415,8 @@ impl SearchIndex {
     /// per-hit `_explanation`), as tantivy's explanation JSON. `Ok(None)`
     /// when the key does not match the query (or is not in the index).
     pub fn explain(&self, query: &SearchQuery, key: &[u8]) -> Result<Option<String>, FtsError> {
-        use tantivy::query::{Query as _, TermQuery};
+        use tantivy::collector::Count;
+        use tantivy::query::{BooleanQuery, Occur, Query as _, TermQuery};
         let q = build_query(
             &self.index,
             &QueryFields {
@@ -426,18 +427,29 @@ impl SearchIndex {
         )?;
         let searcher = self.reader.searcher();
         // Find the doc address by key, then explain the scoring query
-        // against exactly that document.
+        // against exactly that document. `Query::explain` on a document
+        // the query does NOT match is undefined (it asserts in tantivy
+        // debug builds), so confirm the match first.
         let key_q = TermQuery::new(
             Term::from_field_bytes(self.key_field, key),
             IndexRecordOption::Basic,
         );
+        let matches_key: usize = searcher.search(
+            &BooleanQuery::new(vec![
+                (Occur::Must, q.box_clone()),
+                (Occur::Must, Box::new(key_q.clone())),
+            ]),
+            &Count,
+        )?;
+        if matches_key == 0 {
+            return Ok(None);
+        }
         let found = searcher.search(&key_q, &TopDocs::with_limit(1).order_by_score())?;
         let Some((_, addr)) = found.into_iter().next() else {
             return Ok(None);
         };
         match q.explain(&searcher, addr) {
             Ok(explanation) => Ok(Some(explanation.to_pretty_json())),
-            // A doc the query does not match cannot be explained.
             Err(_) => Ok(None),
         }
     }

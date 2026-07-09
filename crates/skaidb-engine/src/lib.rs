@@ -1845,6 +1845,42 @@ mod tests {
         assert!(err.to_string().contains("search predicates"), "{err}");
     }
 
+    /// EXPLAIN SCORE: the per-row BM25 breakdown as a statement — one
+    /// JSON row for a matching key, zero rows for a non-match, an error
+    /// without a search predicate.
+    #[test]
+    fn explain_score_statement() {
+        let mut db = search_db();
+        let rs = rows(
+            db.execute(
+                "EXPLAIN SCORE SELECT id FROM articles WHERE MATCH(body, 'quick') FOR 1",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.columns, vec!["explanation"]);
+        assert_eq!(rs.rows.len(), 1);
+        let Value::String(text) = &rs.rows[0][0] else {
+            panic!("expected a JSON string")
+        };
+        assert!(text.contains("TermQuery"), "{text}");
+        assert!(text.contains("idf"), "{text}");
+
+        // Row 3 ('slow roasted vegetables') does not match → zero rows.
+        let rs = rows(
+            db.execute(
+                "EXPLAIN SCORE SELECT id FROM articles WHERE MATCH(body, 'quick') FOR 3",
+            )
+            .unwrap(),
+        );
+        assert!(rs.rows.is_empty());
+
+        // No search predicate → a clear error.
+        let err = db
+            .execute("EXPLAIN SCORE SELECT id FROM articles WHERE flag = true FOR 1")
+            .unwrap_err();
+        assert!(err.to_string().contains("MATCH"), "{err}");
+    }
+
     #[test]
     fn search_predicate_only_returns_all_matches() {
         let mut db = search_db();

@@ -251,7 +251,8 @@ column> LIMIT k`) scatters the same way — each member resolves its
 primary-owned top k (highlights included) and the coordinator k-way
 merges; a residual SQL filter declines the scatter (filters don't
 travel). **Per-hit explain** routes to a replica of the key (ring
-order), so `"explain": true` works at any RF. Upgrade note: `_ring` was a schema
+order), so both `"explain": true` and the SQL spelling —
+`EXPLAIN SCORE SELECT ... WHERE MATCH(...) FOR <pk>` — work at any RF. Upgrade note: `_ring` was a schema
 change, so each search index rebuilds from its table once on first open
 after upgrading. One typing nuance:
 `time_bucket` pushdown keys are timestamps (a `date` column's semantics),

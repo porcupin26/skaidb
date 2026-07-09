@@ -176,6 +176,46 @@ impl Parser {
             let name = self.expect_ident()?;
             return Ok(Statement::RebuildSearchIndex { name });
         }
+        // `EXPLAIN SCORE <select> FOR <literal>` — per-row BM25 breakdown
+        // (EXPLAIN/SCORE/FOR are contextual identifiers).
+        if self.peek_ident_ci("explain") {
+            self.advance();
+            if !self.eat_ident_ci("score") {
+                return Err(ParseError::Other(
+                    "EXPLAIN supports only EXPLAIN SCORE <select> FOR <pk>".into(),
+                ));
+            }
+            let select = self.parse_select()?;
+            self.expect_keyword(Keyword::For).map_err(|_| {
+                ParseError::Other("EXPLAIN SCORE needs `FOR <primary-key literal>`".into())
+            })?;
+            let key = match self.parse_expr()? {
+                Expr::Literal(v) => v,
+                Expr::Unary {
+                    op: UnaryOp::Neg,
+                    expr,
+                } => match *expr {
+                    Expr::Literal(skaidb_types::Value::Int(n)) => skaidb_types::Value::Int(-n),
+                    Expr::Literal(skaidb_types::Value::Float(f)) => {
+                        skaidb_types::Value::Float(-f)
+                    }
+                    _ => {
+                        return Err(ParseError::Other(
+                            "EXPLAIN SCORE FOR takes a literal primary-key value".into(),
+                        ))
+                    }
+                },
+                _ => {
+                    return Err(ParseError::Other(
+                        "EXPLAIN SCORE FOR takes a literal primary-key value".into(),
+                    ))
+                }
+            };
+            return Ok(Statement::ExplainScore {
+                select: Box::new(select),
+                key,
+            });
+        }
         // `SUGGEST '<text>' ON <index> [COLUMN <col>] [LIMIT n]` — term
         // suggestions from a search index (SUGGEST is contextual).
         if self.peek_ident_ci("suggest") {
