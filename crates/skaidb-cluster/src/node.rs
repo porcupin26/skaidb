@@ -3171,6 +3171,25 @@ impl Node {
             self.broadcast_ddl(current_db, sql)?;
             return Ok(SessionEffect::Output(QueryOutput::Ddl));
         }
+        // BACKUP copies THIS node's shard (each node backs up its own
+        // data); RESTORE into a live ring is an operator action, not a
+        // statement — swapping one node's data underneath quorum reads
+        // would silently diverge replicas.
+        if let Statement::Backup { path } = &stmt {
+            return self
+                .local
+                .write()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+                .backup_to(path)
+                .map(|rs| SessionEffect::Output(QueryOutput::Rows(rs)));
+        }
+        if let Statement::Restore { .. } = &stmt {
+            return Err(EngineError::Unsupported(
+                "RESTORE is not available on a cluster — stop the node and restore its \
+                 data directory offline, then let repair converge it"
+                    .into(),
+            ));
+        }
         // Per-row score explain routes to a replica of the key (any RF);
         // the row and its index entry may live only on other nodes.
         if let Statement::ExplainScore { .. } = &stmt {

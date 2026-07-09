@@ -81,6 +81,13 @@ pub enum Statement {
     /// `ALTER CLUSTER ADD NODE '<addr>'` / `ALTER CLUSTER REMOVE NODE
     /// '<id>'` (ADMIN).
     AlterCluster { add: bool, node: String },
+    /// `BACKUP TO '<path>'` — a crash-consistent copy of this node's data
+    /// directory (tables + WALs + catalog + search/time-series stores)
+    /// taken under the exclusive lock (ADMIN).
+    Backup { path: String },
+    /// `RESTORE FROM '<path>'` — replace this instance's data with a
+    /// backup and reopen. Embedded / single-node only (ADMIN).
+    Restore { path: String },
     AlterTable(AlterTable),
     Insert(Insert),
     Select(Select),

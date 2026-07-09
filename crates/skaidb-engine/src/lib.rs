@@ -1792,6 +1792,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// BACKUP TO + RESTORE FROM: round-trip every store (rows, search
+    /// index, time-series), with the pre-restore data kept aside.
+    #[test]
+    fn backup_and_restore_roundtrip() {
+        let dir = tempdir();
+        let backup = {
+            let mut b = dir.clone();
+            b.set_extension("bak");
+            let _ = std::fs::remove_dir_all(&b);
+            b
+        };
+        let mut db = Database::open(&dir).unwrap();
+        db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        db.execute("INSERT INTO t (id, v) VALUES (1, 'keep me')").unwrap();
+        db.execute("CREATE SEARCH INDEX t_fts ON t (v)").unwrap();
+        db.execute("CREATE TIMESERIES TABLE m (SERIES KEY (h))").unwrap();
+        db.execute("INSERT INTO m (h, ts, value) VALUES ('a', 1000, 1.5)").unwrap();
+
+        let rs = rows(
+            db.execute(&format!("BACKUP TO '{}'", backup.display())).unwrap(),
+        );
+        assert_eq!(rs.columns[0], "path");
+        assert!(matches!(rs.rows[0][1], Value::Int(n) if n > 0), "files copied");
+        // Refuses to overwrite.
+        assert!(db.execute(&format!("BACKUP TO '{}'", backup.display())).is_err());
+
+        // Diverge, then restore — the backup state comes back everywhere.
+        db.execute("INSERT INTO t (id, v) VALUES (2, 'post-backup')").unwrap();
+        db.execute("DELETE FROM t WHERE id = 1").unwrap();
+        let rs = rows(
+            db.execute(&format!("RESTORE FROM '{}'", backup.display())).unwrap(),
+        );
+        assert_eq!(rs.columns, vec!["restored_from", "previous_data"]);
+        let rs = rows(db.execute("SELECT id, v FROM t ORDER BY id").unwrap());
+        assert_eq!(
+            rs.rows,
+            vec![vec![Value::Int(1), Value::String("keep me".into())]]
+        );
+        // Search works on the restored index; TS samples survived.
+        let rs = rows(db.execute("SELECT id FROM t WHERE MATCH(v, 'keep')").unwrap());
+        assert_eq!(rs.rows.len(), 1);
+        let rs = rows(db.execute("SELECT value FROM m WHERE h = 'a'").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::Float(1.5)]]);
+        // A garbage path is rejected cleanly.
+        assert!(db.execute("RESTORE FROM '/nonexistent/nope'").is_err());
+        let _ = std::fs::remove_dir_all(&backup);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// ALTER VECTOR INDEX SET (ef = n): live recall/latency tuning;
     /// build-time parameters decline with a rebuild pointer.
     #[test]

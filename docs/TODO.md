@@ -80,7 +80,6 @@ be spoken in SQL. Each row carries the suggested SQL extension.
 | Query-plan inspection | nothing (only `EXPLAIN SCORE`) | `EXPLAIN <statement>` — index selection, pushdown/scatter/fallback decisions, per-node fan-out |
 | Per-group top documents | ES `top_hits` sub-agg only | window functions (`ROW_NUMBER() OVER (PARTITION BY g ORDER BY score() DESC)`), or a dedicated `TOP k BY <expr>` group clause |
 | Row TTL on regular tables | only TS `RETENTION` | `CREATE TABLE t (PRIMARY KEY (id)) WITH (ttl = 30d)` |
-| Backup / snapshot | nothing anywhere | `BACKUP [DATABASE d] TO '<path>'` / `RESTORE FROM '<path>'` |
 | Batch scripts | one statement per call | multi-statement bodies are a protocol decision, not grammar — probably keep as-is |
 
 Ordered by expected value: `EXPLAIN`, `SHOW CONFIG`/`SET CONFIG`, and

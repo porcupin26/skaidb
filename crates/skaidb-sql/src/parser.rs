@@ -216,6 +216,25 @@ impl Parser {
             }
             return Err(self.unexpected("CONFIG or CONSISTENCY after SET".into()));
         }
+        // `BACKUP TO '<path>'` / `RESTORE FROM '<path>'`.
+        if self.peek_ident_ci("backup") {
+            self.advance();
+            self.expect_keyword(Keyword::To)
+                .map_err(|_| ParseError::Other("BACKUP TO '<path>'".into()))?;
+            let path = self
+                .expect_string()
+                .map_err(|_| ParseError::Other("BACKUP TO takes a quoted path".into()))?;
+            return Ok(Statement::Backup { path });
+        }
+        if self.peek_ident_ci("restore") {
+            self.advance();
+            self.expect_keyword(Keyword::From)
+                .map_err(|_| ParseError::Other("RESTORE FROM '<path>'".into()))?;
+            let path = self
+                .expect_string()
+                .map_err(|_| ParseError::Other("RESTORE FROM takes a quoted path".into()))?;
+            return Ok(Statement::Restore { path });
+        }
         // `REPAIR CLUSTER` / `RECLAIM` — cluster maintenance.
         if self.peek_ident_ci("repair") {
             self.advance();

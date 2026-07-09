@@ -1498,6 +1498,8 @@ impl Database {
             Statement::AlterVectorIndex { name, options } => {
                 self.alter_vector_index(&name, &options)
             }
+            Statement::Backup { path } => self.backup_to(&path).map(QueryOutput::Rows),
+            Statement::Restore { path } => self.restore_from(&path).map(QueryOutput::Rows),
             Statement::Suggest {
                 text,
                 index,
@@ -5982,6 +5984,130 @@ pub(crate) fn now_ms() -> i64 {
 
 /// The indexed values of `doc` at `paths` (a missing field indexes as `NULL`).
 /// Build an empty HNSW for a vector index definition.
+/// Recursively copy a directory tree (regular files + dirs only),
+/// returning `(files, bytes)`.
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<(u64, u64)> {
+    std::fs::create_dir_all(dst)?;
+    let (mut files, mut bytes) = (0u64, 0u64);
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            let (f, b) = copy_dir_all(&entry.path(), &to)?;
+            files += f;
+            bytes += b;
+        } else if ty.is_file() {
+            bytes += std::fs::copy(entry.path(), &to)?;
+            files += 1;
+        }
+    }
+    Ok((files, bytes))
+}
+
+impl Database {
+    /// `BACKUP TO '<path>'`: a crash-consistent copy of the whole data
+    /// directory. Runs under the exclusive lock (`&mut self`), so no write
+    /// can interleave; WALs travel with the files, so opening the copy
+    /// replays exactly like a crash recovery. Vector indexes are derived
+    /// (in-memory, rebuilt on open) and need nothing extra. The target
+    /// must not already exist.
+    pub fn backup_to(&mut self, path: &str) -> Result<ResultSet> {
+        let dst = Path::new(path);
+        if dst.exists() {
+            return Err(EngineError::Unsupported(format!(
+                "backup target '{path}' already exists — refusing to overwrite"
+            )));
+        }
+        // Make the copy as compact and current as possible: commit pending
+        // search-index writes so their segments are on disk.
+        let names: Vec<String> = self.search_indexes.keys().cloned().collect();
+        for name in names {
+            if let Some(live) = self.search_indexes.get_mut(&name) {
+                live.commit_if_dirty()?;
+            }
+        }
+        let started = std::time::Instant::now();
+        let (files, bytes) = copy_dir_all(&self.dir, dst)
+            .map_err(|e| EngineError::Unsupported(format!("backup to '{path}': {e}")))?;
+        Ok(ResultSet {
+            columns: vec![
+                "path".into(),
+                "files".into(),
+                "bytes".into(),
+                "elapsed_ms".into(),
+            ],
+            rows: vec![vec![
+                Value::String(path.to_string()),
+                Value::Int(files as i64),
+                Value::Int(bytes as i64),
+                Value::Int(started.elapsed().as_millis() as i64),
+            ]],
+        })
+    }
+
+    /// `RESTORE FROM '<path>'`: replace this instance's data with a backup
+    /// and reopen in place. The old data directory is moved aside to
+    /// `<dir>.pre-restore-<n>` (never deleted). Single-instance semantics —
+    /// the cluster layer rejects RESTORE (restoring one node's data into a
+    /// live ring is an operator-level action).
+    pub fn restore_from(&mut self, path: &str) -> Result<ResultSet> {
+        let src = Path::new(path);
+        if !src.join("catalog.json").is_file() {
+            return Err(EngineError::Unsupported(format!(
+                "'{path}' does not look like a skaidb backup (no catalog.json)"
+            )));
+        }
+        let dir = self.dir.clone();
+        let opts = self.storage_opts;
+        // Move the live directory aside (transaction-ish: the backup copy
+        // happens into the ORIGINAL path, so on any error the aside copy
+        // still holds the previous state).
+        let mut aside = dir.with_extension("pre-restore");
+        let mut n = 1;
+        while aside.exists() {
+            aside = dir.with_extension(format!("pre-restore-{n}"));
+            n += 1;
+        }
+        // Drop every open handle before touching the files: swap in a
+        // placeholder opened on an empty temp dir? Not needed — renaming
+        // the directory out from under memory-mapped/open files is safe on
+        // POSIX (handles follow the inode), and we reopen from scratch
+        // below before serving anything.
+        std::fs::rename(&dir, &aside)
+            .map_err(|e| EngineError::Unsupported(format!("restore: move aside: {e}")))?;
+        if let Err(e) = copy_dir_all(src, &dir) {
+            // Roll back: put the original data back.
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::rename(&aside, &dir);
+            return Err(EngineError::Unsupported(format!(
+                "restore from '{path}': {e} (previous data restored)"
+            )));
+        }
+        match Database::open_with_options(&dir, opts) {
+            Ok(fresh) => {
+                *self = fresh;
+                Ok(ResultSet {
+                    columns: vec!["restored_from".into(), "previous_data".into()],
+                    rows: vec![vec![
+                        Value::String(path.to_string()),
+                        Value::String(aside.display().to_string()),
+                    ]],
+                })
+            }
+            Err(e) => {
+                // Roll back to the pre-restore data.
+                let _ = std::fs::remove_dir_all(&dir);
+                let _ = std::fs::rename(&aside, &dir);
+                *self = Database::open_with_options(&dir, opts)?;
+                Err(EngineError::Unsupported(format!(
+                    "restored data failed to open ({e}); previous data reinstated"
+                )))
+            }
+        }
+    }
+}
+
 fn new_hnsw(def: &VectorIndexDef) -> Hnsw {
     let mut h = Hnsw::new(Metric::parse(&def.metric).unwrap_or(Metric::Cosine), def.dim);
     if let Some(ef) = def.ef_search {

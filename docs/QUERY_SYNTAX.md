@@ -102,6 +102,10 @@ ALTER CLUSTER REMOVE NODE '<id>'
 
 -- Session (binary-protocol connections)
 SET CONSISTENCY { ONE | QUORUM | ALL }        -- per-connection override
+
+-- Backup & restore (ADMIN)
+BACKUP TO '<path>'        -- crash-consistent copy of this node's data dir
+RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
 ```
 
 - `CREATE TABLE` declares **only the primary key** — there is no column list;
@@ -149,6 +153,15 @@ SET CONSISTENCY { ONE | QUORUM | ALL }        -- per-connection override
   per-connection session state on binary-protocol sessions (it overrides
   the wire consistency until changed); the stateless REST gateway rejects
   it with guidance.
+- **`BACKUP TO '<path>'`** copies the whole data directory (tables, WALs,
+  catalog, search and time-series stores) under the exclusive lock —
+  crash-consistent by construction (opening the copy replays WALs like a
+  crash recovery); vector indexes are derived and rebuild on open. The
+  target must not exist. On a cluster each node backs up **its own
+  shard**. **`RESTORE FROM '<path>'`** swaps the backup in and reopens,
+  moving the previous data aside to `<dir>.pre-restore-<n>` (never
+  deleted); it refuses to run on a cluster — stop the node and restore
+  offline, then let repair converge it.
 - **`SHOW STATUS`** returns storage and runtime statistics for the current
   database as `(metric, value)` rows — table/index counts, on-disk and memtable
   bytes, SSTable count, WAL bytes/fsyncs, compactions, cache hit/miss/hit-rate,

@@ -953,6 +953,9 @@ fn required_privilege(stmt: &Statement) -> Option<(Privilege, Object)> {
         | Statement::RepairCluster
         | Statement::Reclaim
         | Statement::AlterCluster { .. } => (Privilege::Admin, Object::Global),
+        Statement::Backup { .. } | Statement::Restore { .. } => {
+            (Privilege::Admin, Object::Global)
+        }
         // Session state; the binary session handles it before this layer.
         Statement::SetConsistency { .. } => return None,
     })
