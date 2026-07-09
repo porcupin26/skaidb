@@ -157,6 +157,9 @@ Confirm the resolved settings on any node with `skaidb --print-config`.
   - **Strong consistency** when read CL + write CL > RF (e.g. `QUORUM`+`QUORUM`
     with RF 3 → R2 + W2 > 3). With weaker levels, the remaining replicas are
     updated in the background and converge via anti-entropy.
+  - Per session: `SET CONSISTENCY ONE|QUORUM|ALL` on a binary-protocol
+    connection (or `\consistency` in `skaidbsh`) overrides the defaults for
+    that session's statements. REST is stateless and rejects it.
 
 ## Verify the cluster
 
@@ -247,11 +250,24 @@ during the move so concurrent writes stay correct); `remove-node` drains the
 leaving node's keys to their new owners before dropping it from the ring. The
 same operations are also available as raw HTTP (`POST /admin/status`,
 `/admin/add-node` with `{"addr":"…"}`, `/admin/remove-node` with `{"id":"…"}`,
-`/admin/repair`, `/admin/reclaim`) and as `skaidb_cluster::Node` library methods.
+`/admin/repair`, `/admin/reclaim`), as plain SQL from any client —
+`SHOW CLUSTER`, `ALTER CLUSTER ADD NODE 'host:7100'` / `REMOVE NODE 'id'`,
+`REPAIR CLUSTER`, `RECLAIM`, plus `SHOW CONFIG [LIKE]` / `SET CONFIG` and
+`SHOW SLOW QUERIES` (identical RBAC and audit as the HTTP endpoints) —
+and as `skaidb_cluster::Node` library methods.
 
 A long migration keeps the `skaidbsh` request open until it finishes; tune the
 push rate per node with the migration throttle (see
 [RESHARDING.md](RESHARDING.md)). Run one membership change at a time.
+
+### Backups on a cluster
+
+`BACKUP TO '/path'` backs up **the answering node's shard** (a
+crash-consistent copy of its data directory — each node backs up its
+own). `RESTORE FROM` is refused on a live cluster: swapping one node's
+data underneath quorum reads would silently diverge replicas. To restore
+a node: stop it, restore its data directory offline, start it, and let
+repair converge it.
 
 ## Anti-entropy: repair & space reclamation
 

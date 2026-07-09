@@ -137,11 +137,16 @@ surface are in **[docs/CLUSTERING.md](docs/CLUSTERING.md)** (mechanics in
 
 ## SQL surface (phase 1)
 
-`CREATE/DROP TABLE` (declares only the primary key — no column list),
-`CREATE/DROP INDEX`, `ALTER TABLE … RENAME`, `INSERT`, `SELECT` (projection incl.
-nested paths, `WHERE`, `ORDER BY`, `LIMIT/OFFSET`, aggregates, `GROUP BY`,
-`DISTINCT`, `HAVING`, `INNER/LEFT/RIGHT/CROSS JOIN`, `UNION [ALL]`), `UPDATE`,
-`DELETE`, and embedded `BEGIN/COMMIT/ROLLBACK` transactions.
+`CREATE/DROP TABLE` (declares only the primary key — no column list; optional
+row TTL via `WITH (ttl = 30d)`), `CREATE/DROP INDEX`, `ALTER TABLE … RENAME`,
+`INSERT`, `SELECT` (projection incl. nested paths, `WHERE`, `ORDER BY`,
+`LIMIT/OFFSET`, aggregates, `GROUP BY` — incl. per-group top-k rows via
+`TOP k BY expr` —, `DISTINCT`, `HAVING`, `INNER/LEFT/RIGHT/CROSS JOIN`,
+`UNION [ALL]`), `UPDATE`, `DELETE`, embedded `BEGIN/COMMIT/ROLLBACK`
+transactions, `EXPLAIN` plan inspection, `BACKUP TO` / `RESTORE FROM`, and
+SQL spellings of the whole admin surface (`SHOW CLUSTER/CONFIG/SLOW QUERIES`,
+`SET CONFIG`, `SET CONSISTENCY`, `REPAIR CLUSTER`, `RECLAIM`,
+`ALTER CLUSTER ADD/REMOVE NODE`).
 
 Types: `null, bool, int64, float64, decimal, string, bytes, uuid, timestamp`
 (unixtime ms), `array`, `document`, plus JSON-like values.
@@ -153,7 +158,7 @@ surface, APIs, cluster semantics, and pitfalls in one place.
 
 ## Status & deferred work
 
-Implemented end-to-end and tested (202 tests):
+Implemented end-to-end and tested (430+ tests):
 
 - soft-schema document model, SQL subset, 3-valued logic
 - **SQL surface**: projection over nested paths, `WHERE`, `GROUP BY`/`HAVING`,

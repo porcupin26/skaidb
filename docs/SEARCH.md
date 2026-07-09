@@ -157,6 +157,10 @@ analyzer):
   `first_name`/`last_name`) still matches and ranks sensibly. Per-field
   `MATCH` composed with OR is field-centric instead (each field scores the
   whole query).
+- `MATCH_BEST(col, col, …, 'text')` — field-centric dis-max over an
+  explicit column subset (ES `multi_match` `best_fields`): a row matches
+  if any listed column matches and scores as its best single field. The
+  same match set as OR-ing per-field `MATCH`es, spelled in one predicate.
 
 Term-level pattern predicates (**not analyzed** — they run against the
 indexed terms, so with a lowercasing analyzer write patterns lowercase):
@@ -197,7 +201,17 @@ when the column didn't match). Stemming is respected — a query for
 
 ## Aggregations
 
-Search queries combine with GROUP BY and aggregates like any other SQL:
+Search queries combine with GROUP BY and aggregates like any other SQL,
+and `GROUP BY g TOP k BY score()` returns each group's k best-scoring
+**rows** instead of aggregates — the SQL spelling of ES `top_hits`
+(per-group top documents), with `HIGHLIGHT()` available in the
+projection:
+
+```sql
+SELECT region, title, score() FROM products
+WHERE MATCH(title, 'widget') GROUP BY region TOP 3 BY score();
+```
+
 
 ```sql
 SELECT region, COUNT(*), SUM(units), AVG(price) FROM sales

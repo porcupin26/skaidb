@@ -76,6 +76,7 @@ binaries**:
 | macOS | Apple Silicon (M-series) | `skaidb-X.Y.Z-aarch64-apple-darwin.dmg` | `.tar.gz` |
 | macOS | Intel | `skaidb-X.Y.Z-x86_64-apple-darwin.dmg` | `.tar.gz` |
 | Windows | x86-64 | `skaidb-X.Y.Z-x86_64-pc-windows-msvc.zip` | standalone `.exe` |
+| Docker / compose | any | build from `docker/` ([DOCKER.md](DOCKER.md)) — every config key as a `SKAIDB_*` env var | — |
 
 Not sure of your CPU? `uname -m` on Linux/macOS (`x86_64` → amd64/x86_64,
 `aarch64`/`arm64` → ARM64). On Apple Silicon Macs `uname -m` prints `arm64`.

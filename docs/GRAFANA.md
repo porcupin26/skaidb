@@ -68,10 +68,14 @@ need the fallback below.
 ### Monitoring skaidb itself
 
 The node's own operational metrics are a Prometheus scrape at
-`GET /metrics` (unauthenticated, gauge names under `skaidb_*`). Scrape it
-with your regular Prometheus and dashboard it like any other target — or
-`remote_write` that Prometheus back into skaidb and dashboard skaidb from
-skaidb. There is also a built-in web UI with live stats at
+`GET /metrics` (unauthenticated, gauge names under `skaidb_*`) — including
+per-node **host system stats** (`skaidb_host_*`: CPU%, cgroup-aware memory,
+process RSS, disk IO counters, data-dir disk space; see
+[METRICS.md](METRICS.md)), so basic host dashboards need no separate
+node_exporter. Scrape it with your regular Prometheus and dashboard it
+like any other target — or `remote_write` that Prometheus back into skaidb
+and dashboard skaidb from skaidb. There is also a built-in web UI with
+live stats (incl. a per-node CPU/RAM/disk table) at
 `http://<node>:7080/ui` ([UI.md](UI.md)).
 
 ## 2. Fallback: SQL over REST (Infinity / JSON API datasource)
