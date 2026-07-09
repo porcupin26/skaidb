@@ -1902,7 +1902,12 @@ impl Node {
                     })
                     .collect();
                 for chunk in pending.chunks(batch) {
-                    if !self.send_batch(&addr, &table, chunk) {
+                    // One retry before erroring: transient slowness on the
+                    // joiner shouldn't fail the join — and if it does, the
+                    // checkpoint below makes a re-triggered join resume here.
+                    if !self.send_batch(&addr, &table, chunk)
+                        && !self.send_batch(&addr, &table, chunk)
+                    {
                         return Err(EngineError::Cluster(format!(
                             "rebalance to {joiner}: batch not acked"
                         )));
@@ -1983,10 +1988,30 @@ impl Node {
                 for (replica, dest_rows) in per_dest {
                     let addr = &addr_of[&replica];
                     for chunk in dest_rows.chunks(batch) {
-                        if !self.send_batch(addr, &table, chunk) {
-                            return Err(EngineError::Cluster(format!(
-                                "drain: write to {replica} not acked"
-                            )));
+                        // Retry once, then degrade the chunk to hints and keep
+                        // draining: a receiver too slow to ack inside the I/O
+                        // timeout (say, FTS-indexing a large chunk) used to
+                        // abort the whole decommission here. Hinted handoff +
+                        // anti-entropy repair backstop missed writes on every
+                        // other path — the drain is no different, and the
+                        // remaining replicas still hold every drained key.
+                        if self.send_batch(addr, &table, chunk)
+                            || self.send_batch(addr, &table, chunk)
+                        {
+                            continue;
+                        }
+                        skaidb_types::slog!(
+                            "skaidb: drain: {} rows for {} not acked — hinted for replay/repair",
+                            chunk.len(),
+                            replica.0
+                        );
+                        for (k, v, hlc, is_put) in chunk {
+                            let op = if *is_put {
+                                WriteOp::Put(v.clone())
+                            } else {
+                                WriteOp::Delete
+                            };
+                            self.store_hint(&replica, &table, k, &op, *hlc);
                         }
                     }
                 }
