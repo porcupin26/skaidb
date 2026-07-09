@@ -543,6 +543,24 @@ fn status_json(ctx: &Shared) -> Json {
                 "self_in_ring": c.self_in_ring,
                 "configured_not_in_ring": configured_not_in_ring,
                 "ring_not_configured": ring_not_configured,
+                // Per-peer replication status so the UI can show how far behind
+                // each node is: `hints_pending` is the exact backlog of writes
+                // buffered for that peer, `lag_ms` the gap between the last write
+                // this node coordinated and the latest one the peer has confirmed
+                // applied (null until a write is confirmed to it).
+                "peers": c
+                    .peers
+                    .iter()
+                    .map(|p| {
+                        json!({
+                            "id": p.id,
+                            "in_ring": p.in_ring,
+                            "in_config": p.in_config,
+                            "hints_pending": p.hints_pending,
+                            "lag_ms": p.lag_ms,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
                 "read_consistency": c.read_consistency,
                 "write_consistency": c.write_consistency,
                 "ready": ctx.backend.is_ready(),

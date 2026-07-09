@@ -360,6 +360,8 @@ the table on open. Distributed: scatter, merge by distance.
 
 ```
 /admin/status        cluster detail (ring, peers, liveness)
+                     (GET /status also carries peers[] w/ hints_pending + lag_ms;
+                      UI members panel shows per-node backlog + lag)
 /admin/repair        anti-entropy pass          {"ok":true,"repaired":n}
 /admin/reclaim       drop unowned keys/series   {"ok":true,"reclaimed":n}
 /admin/add-node      {"addr":"host:7100"}

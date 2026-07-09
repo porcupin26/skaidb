@@ -104,6 +104,10 @@ function renderMembers(status) {
   // server surfaces explicitly.
   const halfJoined = new Set(status.configured_not_in_ring || []);
   const unconfigured = new Set(status.ring_not_configured || []);
+  // Per-peer replication backlog/lag, keyed by host (peer ids and client
+  // endpoints share a host but differ in port). One node per host here.
+  const byHost = new Map();
+  for (const p of status.peers || []) byHost.set(hostOf(p.id), p);
   for (const endpoint of (status.endpoints || []).slice().sort()) {
     const tr = document.createElement("tr");
     const idc = document.createElement("td");
@@ -112,7 +116,7 @@ function renderMembers(status) {
     cc.append(mark(!unconfigured.has(endpoint)));
     const rc = document.createElement("td");
     rc.append(mark(!halfJoined.has(endpoint)));
-    tr.append(idc, cc, rc);
+    tr.append(idc, cc, rc, backlogCell(byHost.get(hostOf(endpoint))), lagCell(byHost.get(hostOf(endpoint))));
     tbody.append(tr);
   }
   for (const id of [...halfJoined].sort()) {
@@ -120,9 +124,54 @@ function renderMembers(status) {
     const idc = document.createElement("td");
     idc.textContent = `${id} (configured, not in ring)`;
     idc.className = "bad";
-    tr.append(idc, document.createElement("td"), document.createElement("td"));
+    tr.append(idc, td(), td(), backlogCell(byHost.get(hostOf(id))), lagCell(byHost.get(hostOf(id))));
     tbody.append(tr);
   }
+}
+
+function hostOf(idOrEndpoint) {
+  return String(idOrEndpoint || "").split(":")[0];
+}
+
+function td() {
+  return document.createElement("td");
+}
+
+// Hinted-handoff backlog for a peer: how many writes are buffered awaiting
+// handoff. 0 (or self, no peer entry) is caught up; any backlog is flagged.
+function backlogCell(peer) {
+  const c = td();
+  if (!peer) {
+    c.textContent = "—";
+    c.className = "muted";
+  } else if (peer.hints_pending > 0) {
+    c.textContent = peer.hints_pending;
+    c.className = "bad";
+  } else {
+    c.textContent = "0";
+  }
+  return c;
+}
+
+// Replication lag for a peer in ms: the gap between the last write this node
+// coordinated and the latest one the peer confirmed. null until first confirm.
+function lagCell(peer) {
+  const c = td();
+  if (!peer || peer.lag_ms == null) {
+    c.textContent = "—";
+    c.className = "muted";
+  } else {
+    c.textContent = fmtLag(peer.lag_ms);
+    if (peer.lag_ms >= 5000) c.className = "bad";
+    else if (peer.lag_ms >= 1000) c.className = "warn";
+  }
+  return c;
+}
+
+function fmtLag(ms) {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${Math.round(ms / 60000)}m`;
 }
 
 // ---- tabs ----

@@ -1,11 +1,11 @@
 :root {
   --bg: #f6f7f9; --panel: #ffffff; --ink: #1c2430; --muted: #6b7686;
-  --line: #e3e7ee; --accent: #2563eb; --error: #b91c1c; --ok: #15803d;
+  --line: #e3e7ee; --accent: #2563eb; --error: #b91c1c; --ok: #15803d; --warn: #b45309;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #12161d; --panel: #1a212b; --ink: #e6eaf0; --muted: #8b96a5;
-    --line: #2a3341; --accent: #60a5fa; --error: #f87171; --ok: #4ade80;
+    --line: #2a3341; --accent: #60a5fa; --error: #f87171; --ok: #4ade80; --warn: #fbbf24;
   }
 }
 * { box-sizing: border-box; }
@@ -125,6 +125,7 @@ code { font: 12px ui-monospace, "SF Mono", Consolas, monospace; color: var(--acc
 .valspark > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ok { color: var(--ok); }
 .bad { color: var(--error); }
+.warn { color: var(--warn); }
 .error { color: var(--error); font-size: 13px; }
 .muted { color: var(--muted); font-size: 12px; }
 

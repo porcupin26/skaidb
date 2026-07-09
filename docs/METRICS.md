@@ -171,6 +171,12 @@ no confirmed write yet (freshly added, or down since startup) is **absent** from
 `replication_lag_ms` — rely on `hints_pending_peer` and the `reachable` flag in
 `\cluster` for those. Both are emitted per current peer (ring ∪ configured seeds).
 
+The same per-peer backlog and lag are surfaced without a scraper: `GET /status`
+carries a `peers` array (`id`, `in_ring`, `in_config`, `hints_pending`, `lag_ms`),
+and the UI **members** panel renders a **backlog** column (buffered writes owed to
+that node — nonzero is flagged) and a **lag** column (that node's replication lag),
+so you can see at a glance how far behind each node is.
+
 ## Logs
 
 Audit/query/login logs are written to stderr in human-readable text by default.
