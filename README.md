@@ -49,6 +49,8 @@ shell and cluster/config admin client.
 
 **Full, OS-by-OS instructions (packages, tarballs, source, binary-only,
 verification, upgrade/uninstall) are in [docs/INSTALL.md](docs/INSTALL.md).**
+Docker images build from `docker/` (single-node and 3-node compose files,
+every parameter as an env var) — see [docs/DOCKER.md](docs/DOCKER.md).
 The short version:
 
 ```sh

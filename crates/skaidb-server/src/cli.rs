@@ -100,6 +100,13 @@ pub struct Cli {
     pub at_rest_keyfile: Option<String>,
 
     // ---- [storage] ----
+    /// Storage memory budget: "auto" (half the cgroup/host limit) or a
+    /// size like "1GB"; splits across memtable, read cache, search writer
+    /// heaps, and time-series heads. Empty disables budgeting.
+    #[arg(long, env = "SKAIDB_MEMORY_TARGET")]
+    pub memory_target: Option<String>,
+    #[arg(long, env = "SKAIDB_READ_CACHE_ENTRIES")]
+    pub read_cache_entries: Option<u64>,
     #[arg(long, env = "SKAIDB_MEMTABLE_SIZE_MB")]
     pub memtable_size_mb: Option<u64>,
     #[arg(long, env = "SKAIDB_COMPACTION_STRATEGY")]
@@ -110,6 +117,14 @@ pub struct Cli {
     // ---- [observability] ----
     #[arg(long, env = "SKAIDB_PROMETHEUS_PORT")]
     pub prometheus_port: Option<u16>,
+    /// Ingest this node's own /metrics into the `metrics` TS table.
+    #[arg(long, env = "SKAIDB_SELF_SCRAPE")]
+    pub self_scrape: Option<bool>,
+    #[arg(long, env = "SKAIDB_SELF_SCRAPE_INTERVAL_SECS")]
+    pub self_scrape_interval_secs: Option<u64>,
+    /// Serve the embedded web UI at /ui (live-toggleable later).
+    #[arg(long, env = "SKAIDB_UI_ENABLED")]
+    pub ui_enabled: Option<bool>,
     #[arg(long, env = "SKAIDB_SLOW_QUERY_MS")]
     pub slow_query_ms: Option<u64>,
     #[arg(long, env = "SKAIDB_QUERY_LOG_ENABLED")]
@@ -192,11 +207,16 @@ impl Cli {
             at_rest_kek_source => config.encryption.at_rest_kek_source,
             at_rest_keyfile => config.encryption.at_rest_keyfile,
 
+            memory_target => config.storage.memory_target,
+            read_cache_entries => config.storage.read_cache_entries,
             memtable_size_mb => config.storage.memtable_size_mb,
             compaction_strategy => config.storage.compaction_strategy,
             use_io_uring => config.storage.use_io_uring,
 
             prometheus_port => config.observability.prometheus_port,
+            self_scrape => config.observability.self_scrape,
+            self_scrape_interval_secs => config.observability.self_scrape_interval_secs,
+            ui_enabled => config.ui.enabled,
             slow_query_ms => config.observability.slow_query_ms,
             query_log_enabled => config.observability.query_log_enabled,
             query_log_masked => config.observability.query_log_masked,

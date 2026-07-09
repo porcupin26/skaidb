@@ -1,0 +1,56 @@
+# Single-node skaidb. Every configuration option is an SKAIDB_* env var
+# (the commented ones show the surface; defaults apply when unset).
+services:
+  skaidb:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: skaidb:latest
+    ports:
+      - "7000:7000"   # binary protocol (drivers, skaidbsh)
+      - "7080:7080"   # REST /query, web UI /ui, ES subset, PromQL
+    volumes:
+      - skaidb-data:/var/lib/skaidb
+      # - ./skaidb.toml:/etc/skaidb/skaidb.toml:ro   # optional config file
+    environment:
+      # ---- server ----
+      SKAIDB_BIND_ADDR: 0.0.0.0
+      SKAIDB_QUIC_PORT: "7000"
+      SKAIDB_REST_PORT: "7080"
+      SKAIDB_DATA_DIR: /var/lib/skaidb
+      # SKAIDB_CONFIG: /etc/skaidb/skaidb.toml
+      # SKAIDB_NODE_ROLE: member
+
+      # ---- auth (enable both to require login) ----
+      # SKAIDB_SCRAM_ENABLED: "true"
+      # SKAIDB_SUPERUSER: admin
+      # SKAIDB_SUPERUSER_PASSWORD: change-me
+
+      # ---- storage ----
+      SKAIDB_MEMORY_TARGET: auto        # or e.g. "1GB"; container-limit aware
+      # SKAIDB_MEMTABLE_SIZE_MB: "256"
+      # SKAIDB_READ_CACHE_ENTRIES: "16384"
+      # SKAIDB_COMPACTION_STRATEGY: lazy_leveled
+      # SKAIDB_USE_IO_URING: "true"
+
+      # ---- observability ----
+      # SKAIDB_PROMETHEUS_PORT: "9090"
+      # SKAIDB_SLOW_QUERY_MS: "200"
+      # SKAIDB_QUERY_LOG_ENABLED: "false"
+      # SKAIDB_LOG_FORMAT: text          # or json
+      # SKAIDB_SELF_SCRAPE: "false"
+      # SKAIDB_SELF_SCRAPE_INTERVAL_SECS: "15"
+      # SKAIDB_PER_TABLE_METRICS: "false"
+
+      # ---- web UI ----
+      # SKAIDB_UI_ENABLED: "true"
+
+      # ---- encryption ----
+      # SKAIDB_TLS_CERT_FILE: /etc/skaidb/tls.crt
+      # SKAIDB_TLS_KEY_FILE: /etc/skaidb/tls.key
+      # SKAIDB_AT_REST_ENABLED: "false"
+      # SKAIDB_AT_REST_KEK_SOURCE: keyfile
+      # SKAIDB_AT_REST_KEYFILE: /etc/skaidb/kek
+
+volumes:
+  skaidb-data:

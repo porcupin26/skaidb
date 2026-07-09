@@ -1,0 +1,51 @@
+# Three-node skaidb cluster (RF=3, quorum reads/writes). Each node binds
+# to its service name so the ring identity matches the seed list.
+#
+#   docker compose -f docker/docker-compose.cluster.yml up -d
+#   docker compose -f docker/docker-compose.cluster.yml exec skaidb1 \
+#     skaidbsh --host skaidb1 -e "SHOW CLUSTER"
+x-node: &node
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  image: skaidb:latest
+  environment: &node-env
+    SKAIDB_SEEDS: skaidb1:7100,skaidb2:7100,skaidb3:7100
+    SKAIDB_INTERNODE_PORT: "7100"
+    SKAIDB_REPLICATION_FACTOR: "3"
+    SKAIDB_DEFAULT_READ_CONSISTENCY: QUORUM
+    SKAIDB_DEFAULT_WRITE_CONSISTENCY: QUORUM
+    SKAIDB_MEMORY_TARGET: auto
+    # SKAIDB_SCRAM_ENABLED: "true"
+    # SKAIDB_SUPERUSER: admin
+    # SKAIDB_SUPERUSER_PASSWORD: change-me
+    # SKAIDB_INTERNODE_AUTH: token
+    # SKAIDB_INTERNODE_TOKEN: shared-secret
+
+services:
+  skaidb1:
+    <<: *node
+    environment:
+      <<: *node-env
+      SKAIDB_BIND_ADDR: skaidb1
+    ports: ["7001:7000", "7081:7080"]
+    volumes: [skaidb1-data:/var/lib/skaidb]
+  skaidb2:
+    <<: *node
+    environment:
+      <<: *node-env
+      SKAIDB_BIND_ADDR: skaidb2
+    ports: ["7002:7000", "7082:7080"]
+    volumes: [skaidb2-data:/var/lib/skaidb]
+  skaidb3:
+    <<: *node
+    environment:
+      <<: *node-env
+      SKAIDB_BIND_ADDR: skaidb3
+    ports: ["7003:7000", "7083:7080"]
+    volumes: [skaidb3-data:/var/lib/skaidb]
+
+volumes:
+  skaidb1-data:
+  skaidb2-data:
+  skaidb3-data:
