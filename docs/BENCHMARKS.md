@@ -361,6 +361,12 @@ independently from the generator.
 - **Reshard**: live remove-node → 2 members (RF ≥ members local path,
   exact) → re-add at a new epoch → sharded path back, exact.
 
+Surface completion re-check (same fleet, 30 k docs): **sorted top-k**
+exact from every coordinator (per-shard fast-field top-k, k-way merged),
+**AVG** now partials-class (~71 ms p50 vs its former fallback-class
+latency) via the SUM+COUNT rewrite, and **per-hit explain** answering on
+every hit through the key-routed forward — all three coordinators.
+
 ## Performance engineering notes
 
 *Absorbed from the standalone performance audit (originally 2026-07-03,
