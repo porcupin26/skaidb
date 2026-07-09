@@ -27,7 +27,10 @@ concurrency:
 jobs:
   gate:
     name: clippy + test
-    runs-on: ubuntu-latest
+    # Self-hosted runner on p224 (16 cores, warm cargo cache): the
+    # GitHub-hosted queue kept cancelling this job. macOS/Windows/arm builds
+    # stay GitHub-hosted (see the build matrix).
+    runs-on: [self-hosted, skaidb-linux]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -40,7 +43,7 @@ jobs:
   version:
     name: compute version + tag
     needs: gate
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, skaidb-linux]
     outputs:
       version: ${{ steps.compute.outputs.version }}
       tag: ${{ steps.compute.outputs.tag }}
