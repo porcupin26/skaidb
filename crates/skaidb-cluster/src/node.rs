@@ -2188,7 +2188,15 @@ impl Node {
             let addr = self.peer_addr(&leaving).ok_or_else(|| {
                 EngineError::Cluster(format!("leaving node {leaving} not in topology"))
             })?;
-            match self.pool.call(&addr, &Request::Drain { members: wire.clone() }) {
+            // Draining a whole keyspace takes minutes on a large/slow node —
+            // one synchronous RPC under the ordinary I/O timeout read as
+            // "unreachable" long before the drain finished. Rare admin op:
+            // give it a deadline sized to the work.
+            const DRAIN_TIMEOUT: Duration = Duration::from_secs(3600);
+            match self
+                .pool
+                .call_timeout(&addr, &Request::Drain { members: wire.clone() }, DRAIN_TIMEOUT)
+            {
                 Ok(Response::Ack) => {}
                 Ok(Response::Err(e)) => {
                     return Err(EngineError::Cluster(format!("drain failed: {e}")))
