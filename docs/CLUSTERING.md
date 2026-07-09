@@ -415,6 +415,13 @@ SCRAM on the binary endpoint and HTTP Basic on REST, plus RBAC; see the
   embedded engine; the cluster coordinator autocommits per statement.
 - **Joins gather to the coordinator.** A single-table `WHERE` is pushed to the
   shards, but a SQL `JOIN` pulls the tables to the coordinating node.
+- **Broad filters resolve in one merged scan.** A pushed-down `WHERE` (or an
+  index scan) gathers candidate keys per member and re-reads them for the
+  authoritative LWW version. Few candidates re-read as quorum point reads;
+  past ~256 the coordinator switches to a single paged, LWW-merged pass over
+  the table intersected with the candidate set — same read-quorum guarantee,
+  one scan instead of one RPC fan-out per key (a `count(*)` over a 100k-row
+  match previously issued 100k sequential quorum reads).
 - **A flapping peer is circuit-broken.** A zombie node (TCP up, application
   unresponsive) used to make every replicated write burn the full internode
   I/O timeout — worse than a cleanly-down peer. After 3 consecutive failures

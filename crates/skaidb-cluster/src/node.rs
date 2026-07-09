@@ -4802,12 +4802,36 @@ impl Node {
             }
         }
 
-        // Re-read each candidate key at quorum for its authoritative version.
-        let mut out = Vec::new();
-        for key in keys.into_keys() {
-            out.extend(self.point_get(table, &key, oc)?);
+        self.resolve_candidates(table, keys, oc)
+    }
+
+    /// Resolve a gathered candidate-key set to authoritative rows.
+    ///
+    /// Few candidates: one quorum point read each — cheap and exact. Many
+    /// candidates: **one** paged, LWW-merged pass over the table intersected
+    /// with the set. A broad predicate (`WHERE channel = 'X'` matching 100k
+    /// rows, or the count(*) behind it) previously issued one sequential
+    /// quorum RPC fan-out *per key* — minutes of round-trips for what a
+    /// single merged scan answers with the same read-quorum guarantee.
+    fn resolve_candidates(
+        &self,
+        table: &str,
+        keys: BTreeMap<Vec<u8>, ()>,
+        oc: Option<Consistency>,
+    ) -> EngineResult<Vec<(Vec<u8>, Document)>> {
+        const POINT_READ_MAX: usize = 256;
+        if keys.len() <= POINT_READ_MAX {
+            let mut out = Vec::new();
+            for key in keys.into_keys() {
+                out.extend(self.point_get(table, &key, oc)?);
+            }
+            return Ok(out);
         }
-        Ok(out)
+        let rows = self.cluster_scan(table, oc)?;
+        Ok(rows
+            .into_iter()
+            .filter(|(k, _)| keys.contains_key(k))
+            .collect())
     }
 
     /// Distributed **filter pushdown** for a non-indexed `WHERE`: scatter the
@@ -4852,11 +4876,7 @@ impl Node {
             }
         }
 
-        let mut out = Vec::new();
-        for key in keys.into_keys() {
-            out.extend(self.point_get(table, &key, oc)?);
-        }
-        Ok(out)
+        self.resolve_candidates(table, keys, oc)
     }
 
     /// Distributed approximate nearest-neighbor search: scatter the query to
@@ -8648,6 +8668,46 @@ mod tests {
         assert!(!b_log.exists(), "drained log removed");
         let rs = rows(nb.execute("SELECT count(*) FROM t").unwrap());
         assert_eq!(rs.rows, vec![vec![Value::Int(i64::from(n - 4))]]);
+    }
+
+    /// A broad non-indexed filter (many matching rows) resolves through one
+    /// merged scan instead of a quorum point read per candidate key — and
+    /// stays exact: count and rows match, non-matching rows are excluded.
+    #[test]
+    fn broad_filter_resolves_via_merged_scan_exactly() {
+        let q = Consistency::Quorum;
+        let (a, b) = (free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b)];
+        let na = Node::new(
+            Database::open(temp_dir("bfa")).unwrap(),
+            cfg("a", &a, &members, q, q),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("bfb")).unwrap(),
+            cfg("b", &b, &members, q, q),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        // 300 matching rows (> the 256 point-read cutoff) + 40 non-matching.
+        for i in 0..340 {
+            let grp = if i < 300 { "hot" } else { "cold" };
+            na.execute(&format!("INSERT INTO t (id, grp) VALUES ({i}, '{grp}')"))
+                .unwrap();
+        }
+        for node in [&na, &nb] {
+            let rs = rows(
+                node.execute("SELECT count(*) FROM t WHERE grp = 'hot'")
+                    .unwrap(),
+            );
+            assert_eq!(rs.rows, vec![vec![Value::Int(300)]]);
+            let rs = rows(
+                node.execute("SELECT id FROM t WHERE grp = 'cold' ORDER BY id LIMIT 5")
+                    .unwrap(),
+            );
+            assert_eq!(rs.rows.len(), 5);
+            assert_eq!(rs.rows[0], vec![Value::Int(300)]);
+        }
     }
 
     /// Under memory pressure the node sheds *writes* (with a retryable
