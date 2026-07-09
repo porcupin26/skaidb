@@ -410,6 +410,7 @@ impl Database {
             path: path.to_string(),
             metric: metric.to_ascii_lowercase(),
             dim,
+            ef_search: None,
         };
         let mut hnsw = new_hnsw(&def);
         for (key, doc) in &rows {
@@ -1120,6 +1121,58 @@ impl Database {
         Ok(live.index.explain(query, &key)?)
     }
 
+    /// `ALTER VECTOR INDEX ... SET (...)`: live search-time tuning. Only
+    /// `ef` (recall/latency) qualifies; the graph-shaping parameters
+    /// (`m`, `ef_construction`) error with a pointer to DROP + CREATE.
+    fn alter_vector_index(
+        &mut self,
+        name: &str,
+        options: &[(String, String)],
+    ) -> Result<QueryOutput> {
+        let mut new_ef = None;
+        for (key, value) in options {
+            match key.as_str() {
+                "ef" => {
+                    let ef: usize = value.parse().map_err(|_| {
+                        EngineError::Type(format!("ef must be a positive integer, got '{value}'"))
+                    })?;
+                    if ef == 0 || ef > 65_536 {
+                        return Err(EngineError::Type("ef must be between 1 and 65536".into()));
+                    }
+                    new_ef = Some(ef);
+                }
+                "m" | "ef_construction" => {
+                    return Err(EngineError::Unsupported(format!(
+                        "'{key}' shapes the graph at build time — DROP and re-CREATE the \
+                         vector index to change it"
+                    )));
+                }
+                other => {
+                    return Err(EngineError::Unsupported(format!(
+                        "unknown vector index option '{other}' (try ef)"
+                    )));
+                }
+            }
+        }
+        let hlc = self.ddl_stamp();
+        let key = format!("v:{name}");
+        if !self.schema_advances(&key, hlc) {
+            return Ok(QueryOutput::Ddl);
+        }
+        let Some(def) = self.catalog.vector_indexes.get_mut(name) else {
+            return Err(EngineError::IndexNotFound(name.to_string()));
+        };
+        if let Some(ef) = new_ef {
+            def.ef_search = Some(ef);
+            if let Some(h) = self.vector_indexes.get_mut(name) {
+                h.set_ef_search(ef);
+            }
+        }
+        self.record_schema(key, hlc, false);
+        self.save_catalog()?;
+        Ok(QueryOutput::Ddl)
+    }
+
     fn suggest_cmd_mut(
         &mut self,
         index: &str,
@@ -1441,6 +1494,9 @@ impl Database {
             Statement::RebuildSearchIndex { name } => self.rebuild_search_index_cmd(&name),
             Statement::AlterSearchIndex { name, options } => {
                 self.alter_search_index(&name, &options)
+            }
+            Statement::AlterVectorIndex { name, options } => {
+                self.alter_vector_index(&name, &options)
             }
             Statement::Suggest {
                 text,
@@ -5927,7 +5983,11 @@ pub(crate) fn now_ms() -> i64 {
 /// The indexed values of `doc` at `paths` (a missing field indexes as `NULL`).
 /// Build an empty HNSW for a vector index definition.
 fn new_hnsw(def: &VectorIndexDef) -> Hnsw {
-    Hnsw::new(Metric::parse(&def.metric).unwrap_or(Metric::Cosine), def.dim)
+    let mut h = Hnsw::new(Metric::parse(&def.metric).unwrap_or(Metric::Cosine), def.dim);
+    if let Some(ef) = def.ef_search {
+        h.set_ef_search(ef);
+    }
+    h
 }
 
 /// Extract the float vector at `path` (an array of `int`/`float`), or `None`.

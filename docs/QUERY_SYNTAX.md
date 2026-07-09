@@ -29,6 +29,7 @@ CREATE INDEX [IF NOT EXISTS] <name> ON <table> (<path> [, <path> ...])
 DROP   INDEX [IF EXISTS] <name>
 CREATE VECTOR INDEX [IF NOT EXISTS] <name> ON <table> (<path>) DIM <n> [USING <metric>]
 DROP   VECTOR INDEX [IF EXISTS] <name>
+ALTER  VECTOR INDEX <name> SET (ef = <n>)   -- live recall/latency tuning
 CREATE SEARCH INDEX [IF NOT EXISTS] <name> ON <table> (<path> [, <path> ...])
        [WITH (<option> = <literal> [, <option> = <literal> ...])]
        -- options are global (analyzer, refresh_ms) or per-column (<path>.<option>)
@@ -337,6 +338,10 @@ WHERE (MATCH(body, 'rust') OR MATCH(title, 'rust'))
     multi-field match (ES `multi_match` `cross_fields`): the listed
     fields behave like one big field — each term scores by its best
     field, terms OR together. At least two columns.
+  - `MATCH_BEST(<col>, <col> [, ...], '<text>')` — field-centric twin
+    (ES `best_fields` over an explicit subset): each listed field scores
+    the whole query and the best field wins (dis-max). `MATCH` with all
+    text fields already dis-maxes; `MATCH_BEST` picks the subset.
 - **Pattern predicates** (not analyzed — they run against the indexed
   terms, so with a lowercasing analyzer write patterns lowercase):
   - `MATCH_PREFIX(<col>, '<prefix>')` — term prefix.

@@ -37,6 +37,12 @@ pub enum Statement {
         /// Raw options, validated by the engine like the CREATE options.
         options: Vec<(String, String)>,
     },
+    /// `ALTER VECTOR INDEX <name> SET (<option> = <literal>, ...)` —
+    /// search-time tuning (`ef`); index-time parameters need a rebuild.
+    AlterVectorIndex {
+        name: String,
+        options: Vec<(String, String)>,
+    },
     /// `SUGGEST '<text>' ON <index> [COLUMN <col>] [LIMIT n]` — term
     /// suggestions ("did you mean") from the index's term dictionary.
     Suggest {

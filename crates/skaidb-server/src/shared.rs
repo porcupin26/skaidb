@@ -911,6 +911,7 @@ fn required_privilege(stmt: &Statement) -> Option<(Privilege, Object)> {
         // ALTER changes index options the same way.
         Statement::RebuildSearchIndex { .. } => (Privilege::Create, Object::Global),
         Statement::AlterSearchIndex { .. } => (Privilege::Create, Object::Global),
+        Statement::AlterVectorIndex { .. } => (Privilege::Create, Object::Global),
         // Suggestions read the index's term dictionary — a read, gated
         // like SELECT (the dictionary derives from table rows).
         Statement::Suggest { .. } => (Privilege::Select, Object::Global),

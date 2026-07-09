@@ -502,6 +502,15 @@ impl Parser {
             let password = self.expect_string()?;
             return Ok(Statement::AlterUser { name, password });
         }
+        // `ALTER VECTOR INDEX <name> SET (<option> = <literal>, ...)`.
+        if self.eat_keyword(Keyword::Vector) {
+            self.expect_keyword(Keyword::Index)?;
+            let name = self.expect_ident()?;
+            self.expect_keyword(Keyword::Set)?;
+            self.expect(&Token::LParen)?;
+            let options = self.parse_option_list()?;
+            return Ok(Statement::AlterVectorIndex { name, options });
+        }
         // `ALTER SEARCH INDEX <name> SET (<option> = <literal>, ...)` —
         // SEARCH stays contextual.
         if self.eat_ident_ci("search") {

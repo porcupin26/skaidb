@@ -114,6 +114,10 @@ in-memory; see limitations).
   scanning the table at startup (slow for very large sets). The performant fix is
   to persist per-segment graphs that ride the LSM (snapshot + mmap), with
   quantized vectors in RAM and exact vectors re-read from the table.
-- **Simple neighbor selection** and a fixed `ef` — recall/latency aren't tuned to
+- `ALTER VECTOR INDEX <name> SET (ef = <n>)` retunes the search-time
+  candidate-list size live (higher = better recall, slower queries;
+  persisted, applies immediately). `m`/`ef_construction` shape the graph
+  and need DROP + CREATE.
+- **Simple neighbor selection** — recall/latency beyond `ef` aren't tuned to
   production ANN libraries; large/high-dimensional workloads want a specialist.
 - Vectors must be arrays of `int`/`float` of a single, consistent dimension.

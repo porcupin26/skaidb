@@ -4784,6 +4784,7 @@ fn is_ddl(stmt: &Statement) -> bool {
             | Statement::DropSearchIndex { .. }
             | Statement::RebuildSearchIndex { .. }
             | Statement::AlterSearchIndex { .. }
+            | Statement::AlterVectorIndex { .. }
             | Statement::AlterTable(_)
             | Statement::CreateDatabase { .. }
             | Statement::DropDatabase { .. }

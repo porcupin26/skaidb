@@ -1792,6 +1792,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// ALTER VECTOR INDEX SET (ef = n): live recall/latency tuning;
+    /// build-time parameters decline with a rebuild pointer.
+    #[test]
+    fn alter_vector_index_ef() {
+        let dir = tempdir();
+        let mut db = Database::open(&dir).unwrap();
+        db.execute("CREATE TABLE docs (PRIMARY KEY (id))").unwrap();
+        db.execute("CREATE VECTOR INDEX docs_emb ON docs (emb) DIM 3").unwrap();
+        db.execute("INSERT INTO docs (id, emb) VALUES (1, [1.0, 0.0, 0.0]), (2, [0.0, 1.0, 0.0])")
+            .unwrap();
+        db.execute("ALTER VECTOR INDEX docs_emb SET (ef = 200)").unwrap();
+        // Still searches correctly after the retune.
+        let rs = rows(
+            db.execute("SELECT id FROM docs NEAREST (emb, [1.0, 0.0, 0.0], 1)").unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(1)]]);
+        // Persisted: survives a reopen.
+        drop(db);
+        let mut db = Database::open(&dir).unwrap();
+        let rs = rows(
+            db.execute("SELECT id FROM docs NEAREST (emb, [0.0, 1.0, 0.0], 1)").unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(2)]]);
+        // Build-time knobs and unknown options error clearly.
+        assert!(db
+            .execute("ALTER VECTOR INDEX docs_emb SET (m = 32)")
+            .unwrap_err()
+            .to_string()
+            .contains("build time"));
+        assert!(db
+            .execute("ALTER VECTOR INDEX docs_emb SET (nope = 1)")
+            .is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// MATCH_BEST: field-centric dis-max over an explicit column subset —
+    /// same match set as OR of per-field MATCHes.
+    #[test]
+    fn search_match_best_subset() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE d2 (PRIMARY KEY (id))").unwrap();
+        db.execute(
+            "INSERT INTO d2 (id, title, body, footer) VALUES \
+             (1, 'rust guide', 'systems text', 'misc'), \
+             (2, 'cooking', 'rust removal from pans', 'misc'), \
+             (3, 'gardening', 'plants', 'rust fungus notes')",
+        )
+        .unwrap();
+        db.execute("CREATE SEARCH INDEX d2_fts ON d2 (title, body, footer)")
+            .unwrap();
+        // Only title+body participate: doc 3 (footer-only match) is out.
+        let rs = rows(
+            db.execute("SELECT id FROM d2 WHERE MATCH_BEST(title, body, 'rust')").unwrap(),
+        );
+        assert_eq!(sorted_ids(rs), vec![1, 2]);
+    }
+
     /// MATCH_CROSS: the fields act as one big field — a query whose terms
     /// are spread across columns still matches (term-centric, ES
     /// multi_match cross_fields), where per-field MATCH cannot.

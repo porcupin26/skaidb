@@ -56,6 +56,11 @@ pub struct VectorIndexDef {
     pub metric: String,
     /// Vector dimension (all indexed vectors must match).
     pub dim: usize,
+    /// Search-time candidate-list size (HNSW `ef`); `None` = the built-in
+    /// default. Live-tunable via `ALTER VECTOR INDEX ... SET (ef = n)` —
+    /// higher = better recall, slower queries.
+    #[serde(default)]
+    pub ef_search: Option<usize>,
 }
 
 /// A full-text search index declaration (`CREATE SEARCH INDEX ... ON t(paths)

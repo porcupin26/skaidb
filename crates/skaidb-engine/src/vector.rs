@@ -82,6 +82,14 @@ impl Hnsw {
         Hnsw::with_params(metric, dim, 16, 200, 64)
     }
 
+    /// Retune the search-time candidate-list size (`ef`) live — a pure
+    /// query-time knob: higher = better recall, slower queries. Build-time
+    /// parameters (`m`, `ef_construction`) shape the graph and need a
+    /// rebuild.
+    pub fn set_ef_search(&mut self, ef: usize) {
+        self.ef_search = ef.max(1);
+    }
+
     pub fn with_params(
         metric: Metric,
         dim: usize,
