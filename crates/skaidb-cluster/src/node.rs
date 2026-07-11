@@ -407,6 +407,15 @@ const BULK_ADMISSION_WAIT: Duration = Duration::from_secs(2);
 /// loses nothing.
 const SCAN_LOCK_WAIT: Duration = Duration::from_millis(1500);
 
+/// Result of pre-filtering a replica-apply chunk against local versions
+/// (see [`Node::filter_newer_rows`]); the all-fresh common case avoids
+/// cloning row payloads.
+enum RowFilter {
+    AllFresh,
+    AllStale,
+    Some(Vec<BatchRow>),
+}
+
 /// RAII permit from [`BulkGate::acquire`].
 struct BulkPermit<'a>(&'a BulkGate);
 
@@ -4354,7 +4363,21 @@ impl Node {
         const APPLY_CHUNK_ROWS: usize = 64;
         let mut last: Option<(WalCommit, Arc<WalSync>)> = None;
         for chunk in rows.chunks(APPLY_CHUNK_ROWS) {
-            if let Some(c) = self.apply_batch_buffered(table, chunk)? {
+            // Idempotent redelivery: drop rows already held at an equal-or-
+            // newer stamp BEFORE paying the write + search-index cost. A
+            // catch-up sender whose ack times out re-spills and redelivers
+            // pages the replica in fact applied — observed as a rejoining
+            // node re-indexing the same rows at 4 cores for hours while the
+            // sender's hint log never shrank, plus duplicate LSM versions
+            // bloating its tables. A bloom-gated point read per row is cheap
+            // next to indexing; blind LWW appends are not idempotent-cheap.
+            let fresh = self.filter_newer_rows(table, chunk)?;
+            let applied = match &fresh {
+                RowFilter::AllFresh => self.apply_batch_buffered(table, chunk)?,
+                RowFilter::Some(rows) => self.apply_batch_buffered(table, rows)?,
+                RowFilter::AllStale => None,
+            };
+            if let Some(c) = applied {
                 last = Some(c);
             }
             thread::sleep(Duration::from_millis(1));
@@ -4363,6 +4386,28 @@ impl Node {
             handle.sync_through(commit)?;
         }
         Ok(())
+    }
+
+    /// Partition a replica-apply chunk into rows strictly newer than what we
+    /// hold (apply) vs redelivered/stale rows (skip). Absent keys and unknown
+    /// tables count as fresh — the apply path owns those errors.
+    fn filter_newer_rows(&self, table: &str, chunk: &[BatchRow]) -> EngineResult<RowFilter> {
+        let db = self
+            .local
+            .read()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
+        let is_fresh = |(key, _, hlc, _): &BatchRow| match db.local_get_versioned(table, key) {
+            Ok(Some((_, cur, _))) => cur < *hlc,
+            _ => true,
+        };
+        let stale = chunk.iter().filter(|r| !is_fresh(r)).count();
+        Ok(if stale == 0 {
+            RowFilter::AllFresh
+        } else if stale == chunk.len() {
+            RowFilter::AllStale
+        } else {
+            RowFilter::Some(chunk.iter().filter(|r| is_fresh(r)).cloned().collect())
+        })
     }
 
     /// Catalog lookups for stateless gateways (the catalog is identical
