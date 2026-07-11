@@ -965,8 +965,13 @@ impl Node {
     }
 
     /// Storage/runtime statistics for this node's local engine (for metrics).
+    /// Bounded lock wait: stats are periodic and best-effort, and every
+    /// scrape/probe thread that parks unboundedly behind a long write-lock
+    /// tenure (index rebuild, bulk apply) is a leak — the production pile of
+    /// stats threads stacked up at ~90/min behind one rebuild. `None` under
+    /// contention; callers already treat that as "stats unavailable".
     pub fn db_stats(&self, per_table: bool) -> Option<DbStats> {
-        self.local.read().ok().map(|db| db.stats(per_table))
+        self.local_read_bounded().map(|db| db.stats(per_table))
     }
 
     /// The current membership as node ids (for diagnostics).
@@ -2875,6 +2880,27 @@ impl Node {
         }
     }
 
+    /// Write-lock twin of [`Node::local_read_bounded`], for inbound handlers
+    /// that need the exclusive lock (search read-your-writes commit, applied
+    /// DDL). Same rationale: an abandoned connection thread parked on the
+    /// lock is a leak; the callers' failure paths (search scatter fallback,
+    /// DDL schema-sync backstop) already tolerate a busy reply.
+    fn local_write_bounded(&self) -> Option<std::sync::RwLockWriteGuard<'_, Database>> {
+        let deadline = Instant::now() + SCAN_LOCK_WAIT;
+        loop {
+            match self.local.try_write() {
+                Ok(guard) => return Some(guard),
+                Err(std::sync::TryLockError::Poisoned(_)) => return None,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    thread::sleep(Duration::from_millis(25));
+                }
+            }
+        }
+    }
+
     /// Buffer a write that couldn't reach `replica` (for hinted handoff).
     fn store_hint(&self, replica: &NodeId, table: &str, key: &[u8], op: &WriteOp, hlc: Hlc) {
         {
@@ -3397,9 +3423,9 @@ impl Node {
         match req {
             Request::Ping => Response::Pong,
             Request::HostStats => {
-                let dir = match self.local.read() {
-                    Ok(db) => db.dir().to_path_buf(),
-                    Err(_) => return Response::Err("local lock poisoned".into()),
+                let dir = match self.local_read_bounded() {
+                    Some(db) => db.dir().to_path_buf(),
+                    None => return Response::Err("busy: engine write-locked, retry".into()),
                 };
                 match serde_json::to_string(&crate::host::sample(&dir)) {
                     Ok(json) => Response::HostStats { json },
@@ -3422,20 +3448,20 @@ impl Node {
                 }
                 None => Response::Err("busy: engine write-locked, retry".into()),
             },
-            Request::TsAppend { table, rows } => match self.local.read() {
-                Ok(db) => match db.ts_append(&table, &rows) {
+            Request::TsAppend { table, rows } => match self.local_read_bounded() {
+                Some(db) => match db.ts_append(&table, &rows) {
                     Ok(_) => Response::Ack,
                     Err(e) => Response::Err(e.to_string()),
                 },
-                Err(_) => Response::Err("local lock poisoned".into()),
+                None => Response::Err("busy: engine write-locked, retry".into()),
             },
             Request::TsQuery {
                 table,
                 matchers,
                 t0,
                 t1,
-            } => match self.local.read() {
-                Ok(db) => {
+            } => match self.local_read_bounded() {
+                Some(db) => {
                     let matchers: Vec<skaidb_tsdb::Matcher> = matchers
                         .into_iter()
                         .map(|(negated, k, v)| {
@@ -3461,21 +3487,21 @@ impl Node {
                         Err(e) => Response::Err(e.to_string()),
                     }
                 }
-                Err(_) => Response::Err("local lock poisoned".into()),
+                None => Response::Err("busy: engine write-locked, retry".into()),
             },
-            Request::TsMerge { table, rows } => match self.local.read() {
-                Ok(db) => match db.ts_merge(&table, &rows) {
+            Request::TsMerge { table, rows } => match self.local_read_bounded() {
+                Some(db) => match db.ts_merge(&table, &rows) {
                     Ok(_) => Response::Ack,
                     Err(e) => Response::Err(e.to_string()),
                 },
-                Err(_) => Response::Err("local lock poisoned".into()),
+                None => Response::Err("busy: engine write-locked, retry".into()),
             },
-            Request::TsSummary { table } => match self.local.read() {
-                Ok(db) => match db.ts_summaries(&table) {
+            Request::TsSummary { table } => match self.local_read_bounded() {
+                Some(db) => match db.ts_summaries(&table) {
                     Ok(series) => Response::TsSummaries { series },
                     Err(e) => Response::Err(e.to_string()),
                 },
-                Err(_) => Response::Err("local lock poisoned".into()),
+                None => Response::Err("busy: engine write-locked, retry".into()),
             },
             Request::TsPartials {
                 table,
@@ -3483,8 +3509,8 @@ impl Node {
                 t0,
                 t1,
                 bucket,
-            } => match self.local.read() {
-                Ok(db) => {
+            } => match self.local_read_bounded() {
+                Some(db) => {
                     let matchers: Vec<skaidb_tsdb::Matcher> = matchers
                         .into_iter()
                         .map(|(negated, k, v)| {
@@ -3507,43 +3533,43 @@ impl Node {
                         Err(e) => Response::Err(e.to_string()),
                     }
                 }
-                Err(_) => Response::Err("local lock poisoned".into()),
+                None => Response::Err("busy: engine write-locked, retry".into()),
             },
-            Request::LocalGet { table, key } => match self.local.read() {
-                Ok(db) => match db.local_get_versioned(&table, &key) {
+            Request::LocalGet { table, key } => match self.local_read_bounded() {
+                Some(db) => match db.local_get_versioned(&table, &key) {
                     Ok(entry) => Response::Get { entry },
                     Err(e) => Response::Err(e.to_string()),
                 },
-                Err(_) => Response::Err("local lock poisoned".into()),
+                None => Response::Err("busy: engine write-locked, retry".into()),
             },
-            Request::FilteredScan { table, filter } => match self.local.read() {
-                Ok(db) => match db.local_scan_filtered_keys(&table, &Some(filter)) {
+            Request::FilteredScan { table, filter } => match self.local_read_bounded() {
+                Some(db) => match db.local_scan_filtered_keys(&table, &Some(filter)) {
                     Ok(keys) => Response::Keys { keys },
                     Err(e) => Response::Err(e.to_string()),
                 },
-                Err(_) => Response::Err("local lock poisoned".into()),
+                None => Response::Err("busy: engine write-locked, retry".into()),
             },
-            Request::IndexScan { index, start, end } => match self.local.read() {
-                Ok(db) => match db.index_scan_keys(&index, start.as_deref(), end.as_deref()) {
+            Request::IndexScan { index, start, end } => match self.local_read_bounded() {
+                Some(db) => match db.index_scan_keys(&index, start.as_deref(), end.as_deref()) {
                     Ok(keys) => Response::Keys { keys },
                     Err(e) => Response::Err(e.to_string()),
                 },
-                Err(_) => Response::Err("local lock poisoned".into()),
+                None => Response::Err("busy: engine write-locked, retry".into()),
             },
-            Request::VectorSearch { index, query, k } => match self.local.read() {
-                Ok(db) => match db.vector_search_local(&index, &query, k as usize) {
+            Request::VectorSearch { index, query, k } => match self.local_read_bounded() {
+                Some(db) => match db.vector_search_local(&index, &query, k as usize) {
                     Ok(hits) => Response::VectorHits { hits },
                     Err(e) => Response::Err(e.to_string()),
                 },
-                Err(_) => Response::Err("local lock poisoned".into()),
+                None => Response::Err("busy: engine write-locked, retry".into()),
             },
             // Serve under the write lock so pending index writes commit
             // first: replicated writes reach replicas synchronously at the
             // write consistency, so committing here makes every acked write
             // searchable cluster-wide (read-your-writes, not just NRT). A
             // clean index is a no-op.
-            Request::Search { table, query, k } => match self.local.write() {
-                Ok(mut db) => match serde_json::from_str::<skaidb_fts::SearchQuery>(&query) {
+            Request::Search { table, query, k } => match self.local_write_bounded() {
+                Some(mut db) => match serde_json::from_str::<skaidb_fts::SearchQuery>(&query) {
                     Ok(parsed) => {
                         let k = (k > 0).then_some(k as usize);
                         match db.search_local_commit_if_dirty(&table, &parsed, k) {
@@ -3553,7 +3579,7 @@ impl Node {
                     }
                     Err(e) => Response::Err(format!("bad search query: {e}")),
                 },
-                Err(_) => Response::Err("local lock poisoned".into()),
+                None => Response::Err("busy: engine write-locked, retry".into()),
             },
             Request::SearchSorted {
                 table,
@@ -3596,14 +3622,14 @@ impl Node {
                     skaidb_types::Value::decode(&pk),
                 );
                 match parsed {
-                    (Ok(query), Ok(pk_value)) => match self.local.write() {
-                        Ok(mut db) => {
+                    (Ok(query), Ok(pk_value)) => match self.local_write_bounded() {
+                        Some(mut db) => {
                             match db.search_explain_query(&table, &query, &pk_value) {
                                 Ok(text) => Response::Explanation { text },
                                 Err(e) => Response::Err(e.to_string()),
                             }
                         }
-                        Err(_) => Response::Err("local lock poisoned".into()),
+                        None => Response::Err("busy: engine write-locked, retry".into()),
                     },
                     _ => Response::Err("bad search-explain request".into()),
                 }
@@ -3741,12 +3767,12 @@ impl Node {
     /// Run a write closure under the exclusive lock, mapping the result to an
     /// `Ack`/`Err` response.
     fn with_write(&self, f: impl FnOnce(&mut Database) -> EngineResult<()>) -> Response {
-        match self.local.write() {
-            Ok(mut db) => match f(&mut db) {
+        match self.local_write_bounded() {
+            Some(mut db) => match f(&mut db) {
                 Ok(()) => Response::Ack,
                 Err(e) => Response::Err(e.to_string()),
             },
-            Err(_) => Response::Err("local lock poisoned".into()),
+            None => Response::Err("busy: engine write-locked, retry".into()),
         }
     }
 

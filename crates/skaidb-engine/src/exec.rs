@@ -322,6 +322,16 @@ impl Database {
             );
         }
         let search_rebuild_ms = rebuild_start.elapsed().as_millis() as u64;
+        // The replay/rebuild above ran silently for years of accumulated
+        // startup mystery ("why is this node at 400% CPU with no log
+        // lines?"). One line per open keeps it attributable.
+        if search_rebuild_ms > 2_000 {
+            skaidb_types::slog!(
+                "skaidb: startup search-index catch-up took {}s ({} indexes)",
+                search_rebuild_ms / 1000,
+                search_indexes.len()
+            );
+        }
 
         let role_store = build_role_store(&catalog);
         Ok(Database {
@@ -593,6 +603,28 @@ impl Database {
     /// Wipe and re-backfill a search index from its table's current rows
     /// (also picks up a changed definition, e.g. after a column rename).
     fn rebuild_search_index(&mut self, name: &str) -> Result<()> {
+        // Loud on purpose: this streams the whole table under the engine
+        // write lock, so it starves every reader for its duration — a
+        // rebuild that loops silently (repeated NeedsRebuild) looked like an
+        // unexplained multi-hour 4-core burn in production. Start/finish
+        // lines make that failure mode visible in the journal.
+        let rebuild_started = std::time::Instant::now();
+        skaidb_types::slog!("skaidb: search index '{name}' rebuild starting (write-lock held for the duration)");
+        let result = self.rebuild_search_index_inner(name);
+        match &result {
+            Ok(()) => skaidb_types::slog!(
+                "skaidb: search index '{name}' rebuilt in {}s",
+                rebuild_started.elapsed().as_secs()
+            ),
+            Err(e) => skaidb_types::slog!(
+                "skaidb: search index '{name}' rebuild FAILED after {}s: {e}",
+                rebuild_started.elapsed().as_secs()
+            ),
+        }
+        result
+    }
+
+    fn rebuild_search_index_inner(&mut self, name: &str) -> Result<()> {
         let def = self
             .catalog
             .search_indexes
