@@ -580,6 +580,17 @@ impl Node {
             counters: Counters::default(),
             cfg,
         });
+        // Seed the disk-hint counter from the directory: it is process-local,
+        // and `hints_pending()` — the gate that queues a hint flush at all —
+        // trusts it. A restarted node with zero new failures otherwise never
+        // notices the hint logs it inherited (observed: a 1.8 GB log for a
+        // recovered peer sat untouched forever because the gate never fired;
+        // the directory check inside `flush_hints` was unreachable). The
+        // sentinel self-corrects on the first drain.
+        if node.has_disk_hints() {
+            node.disk_hints.store(1, Ordering::Relaxed);
+            skaidb_types::slog!("skaidb: inherited on-disk hint logs found — queueing drain");
+        }
         // Memory-pressure sampler: holds a `Weak`, so it exits when the node is
         // dropped. Updates the shedding flag every `SAMPLE_INTERVAL`.
         let mem_weak = Arc::downgrade(&node);
@@ -9018,6 +9029,22 @@ mod tests {
         // hints_pending() sees the disk hints (so a flush gets queued).
         assert!(na.hints_pending());
         assert_eq!(na.stats().hints_pending, 10); // 4 memory + 6 disk
+
+        // Restart-inheritance: a NEW process over the same data dir must
+        // still see the spilled log — the counter is process-local, and a
+        // restarted node whose writes all succeed otherwise never queues a
+        // flush (a 1.8 GB inherited log sat undrained in production because
+        // this gate never fired).
+        let dir = na.data_dir().unwrap();
+        drop(na);
+        let nb = Node::new(
+            Database::open(dir).unwrap(),
+            cfg("a", &a, &members, Consistency::One, Consistency::One),
+        );
+        assert!(
+            nb.hints_pending(),
+            "restarted node must notice inherited disk hint logs"
+        );
     }
 
     /// The disk-hint drain must not touch the log while the peer is down
