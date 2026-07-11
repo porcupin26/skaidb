@@ -18,6 +18,13 @@ Environment=_RJEM_MALLOC_CONF=background_thread:true,dirty_decay_ms:1000,muzzy_d
 ExecStart=/usr/bin/skaidb --config /etc/skaidb/skaidb.toml
 Restart=on-failure
 RestartSec=2s
+# Kernel-side memory backstop: past 85% of available memory the kernel
+# throttles + reclaims this service instead of letting it sprint silently to
+# a hard OOM kill (which costs a full restart + search-index rebuild). The
+# in-process guard releases/sheds from 75%/85% of the cgroup limit; this is
+# the layer below it in case the process misjudges. Percentage resolves
+# against the container/machine memory as systemd sees it.
+MemoryHigh=85%
 # LSM compaction + many client connections want a high fd ceiling.
 LimitNOFILE=1048576
 

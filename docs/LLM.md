@@ -357,6 +357,13 @@ the table on open. Distributed: scatter, merge by distance.
 - **Transactions do not work on clusters** (each statement autocommits).
 - Every acked write is durable (WAL) and searchable cluster-wide within the
   refresh interval.
+- **Memory pressure** (limits from cgroup/system RAM, non-reclaimable
+  usage): above 75% a node actively releases (flushes memtables, commits
+  search writers); above 85% it also sheds writes with a retryable
+  "memory pressure" error (clears at 70%). Shedding logs loudly (anon/file
+  + jemalloc allocated/resident/retained; a distress line every 60 s while
+  stuck). Anti-entropy passes log duration when they reconcile rows or run
+  ≥60 s. The systemd unit sets `MemoryHigh=85%` as a kernel-side backstop.
 
 ---
 

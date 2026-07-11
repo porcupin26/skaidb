@@ -15,16 +15,66 @@
 //! (no cgroup, no `/proc`) the guard is inert.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// Start shedding above this percent of the memory limit…
 const HIGH_PCT: u64 = 85;
 /// …and stop once back below this percent (hysteresis).
 const LOW_PCT: u64 = 70;
+/// Above this percent, actively *release* memory (flush memtables, commit
+/// search writers, return allocator pages to the OS) before shedding ever
+/// starts. Shedding only stops new writes; nothing about it frees what is
+/// already held — a node that merely sheds rides its limit until the fault
+/// storm or the OOM killer gets it (observed twice in production: anon crept
+/// to the cgroup ceiling, file cache went to ~0, and the node thrashed itself
+/// unreachable at 500 MB/s of major faults).
+const RELEASE_PCT: u64 = 75;
 /// How often the sampler re-reads memory usage.
 pub const SAMPLE_INTERVAL: Duration = Duration::from_millis(1000);
 /// A cgroup "max" at or above this is "unlimited" — ignore it.
 const CGROUP_UNLIMITED: u64 = 1 << 60;
+
+/// Memory pressure, coarsely. Ordered: each level implies the ones below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Pressure {
+    /// Comfortable headroom.
+    Normal,
+    /// Above [`RELEASE_PCT`]: actively free reclaimable memory now.
+    Release,
+    /// Above [`HIGH_PCT`] (with hysteresis): also reject new writes.
+    Shed,
+}
+
+/// Process-wide allocator introspection hook ("allocated X MB, resident Y MB,
+/// retained Z MB" from jemalloc). Lives here rather than on a `Node` because
+/// the allocator is program-global and the hook is registered once by the
+/// binary that chose it; library consumers without one simply never set it.
+/// Diagnostic, not cosmetic: distinguishing live heap from allocator-retained
+/// pages is exactly what the production OOM post-mortems lacked.
+static ALLOC_STATS_HOOK: OnceLock<Box<dyn Fn() -> Option<String> + Send + Sync>> = OnceLock::new();
+
+/// Register the allocator stats hook (first caller wins).
+pub fn set_alloc_stats_hook(hook: Box<dyn Fn() -> Option<String> + Send + Sync>) {
+    let _ = ALLOC_STATS_HOOK.set(hook);
+}
+
+/// A one-line allocator summary for pressure logs; `None` without a hook.
+pub fn alloc_stats() -> Option<String> {
+    ALLOC_STATS_HOOK.get().and_then(|h| h())
+}
+
+/// The cgroup's anon vs file byte split, for pressure diagnostics ("is this
+/// real heap or just cache?"). `None` outside cgroup v2.
+pub fn anon_file_breakdown() -> Option<(u64, u64)> {
+    let s = std::fs::read_to_string("/sys/fs/cgroup/memory.stat").ok()?;
+    let read = |key: &str| {
+        s.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    };
+    Some((read("anon ")?, read("file ").unwrap_or(0)))
+}
 
 /// Tracks memory usage against the node's limit and exposes a shedding flag.
 #[derive(Debug)]
@@ -89,6 +139,15 @@ impl MemoryGuard {
         self.update(used)
     }
 
+    /// Re-sample and classify. [`Pressure::Shed`] follows the hysteresis flag;
+    /// [`Pressure::Release`] is a plain threshold (no hysteresis — releasing
+    /// reclaimable memory twice is harmless, rejecting writes twice is not).
+    pub fn sample_pressure(&self) -> Pressure {
+        let shedding = self.sample();
+        let (used, limit) = self.snapshot();
+        classify(used, limit, shedding)
+    }
+
     /// Force the shedding flag directly (tests only).
     #[cfg(test)]
     pub fn force(&self, on: bool) {
@@ -112,6 +171,17 @@ impl MemoryGuard {
 impl Default for MemoryGuard {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Pure pressure classification (the shedding flag carries the hysteresis).
+fn classify(used: u64, limit: u64, shedding: bool) -> Pressure {
+    if shedding {
+        Pressure::Shed
+    } else if limit > 0 && used > limit / 100 * RELEASE_PCT {
+        Pressure::Release
+    } else {
+        Pressure::Normal
     }
 }
 
@@ -204,5 +274,18 @@ mod tests {
         let g = MemoryGuard::with_limit(0);
         assert!(!g.sample());
         assert!(!g.shedding());
+    }
+
+    #[test]
+    fn pressure_tiers() {
+        // Limit 1000 → release above 750; shed follows the flag.
+        assert_eq!(classify(700, 1000, false), Pressure::Normal);
+        assert_eq!(classify(760, 1000, false), Pressure::Release);
+        assert_eq!(classify(900, 1000, true), Pressure::Shed);
+        // Hysteresis: still shedding at 800 stays Shed, not Release.
+        assert_eq!(classify(800, 1000, true), Pressure::Shed);
+        // No limit: never anything but Normal.
+        assert_eq!(classify(900, 0, false), Pressure::Normal);
+        assert!(Pressure::Shed > Pressure::Release && Pressure::Release > Pressure::Normal);
     }
 }

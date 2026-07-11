@@ -374,25 +374,38 @@ SCRAM on the binary endpoint and HTTP Basic on REST, plus RBAC; see the
   one for handoff, rather than blocking on it. (A *refused* connection
   already failed fast on connect; this covers the connected-but-silent
   case.)
-- **Memory-pressure load shedding.** A node watches its memory against its
-  limit (cgroup when set, else system RAM), measuring **non-reclaimable**
-  usage — the cgroup charge minus reclaimable file-backed page cache (mmap'd
-  SSTable/WAL/search segments the kernel evicts before OOM), so a cache-filled
-  node isn't falsely shed while it still has real headroom. Past 85% it **sheds writes** —
-  rejecting new writes (client and inbound-replica) with a retryable
-  "memory pressure" error, and **actively flushing its table/index memtables**
-  to reclaim their in-memory footprint. The flush is driven by the memory
-  sampler, not a client write — otherwise a shedding node would deadlock
-  (it rejects the very writes that would trigger a flush) — and flushes every
-  memtable holding non-trivial memory, since pressure spread thin across many
-  tables leaves each below the per-engine flush threshold while the sum pins
-  the node. This shrinks its footprint and leaves the OS headroom instead
-  of allocating until the OOM killer takes the whole container down. It
-  clears the flag at 70% (hysteresis). Reads and DDL are never shed; a
-  coordinator that gets a shed rejection from a replica hints it and
-  proceeds at quorum. Watch `skaidb_memory_shedding_writes` /
-  `skaidb_memory_used_bytes` (METRICS.md); a node stuck shedding is
-  undersized for its workload.
+- **Memory-pressure release and load shedding.** A node watches its memory
+  against its limit (cgroup when set, else system RAM), measuring
+  **non-reclaimable** usage — the cgroup charge minus reclaimable file-backed
+  page cache (mmap'd SSTable/WAL/search segments the kernel evicts before
+  OOM), so a cache-filled node isn't falsely shed while it still has real
+  headroom. Two tiers:
+  - Past **75%** it **actively releases**: flushes table/index memtables
+    (≥4 MB) and commits every dirty search-index writer (Tantivy holds
+    indexed-but-uncommitted documents in heap buffers; a node that stops
+    taking writes otherwise never commits them and rides its limit until the
+    fault storm or the OOM killer gets it — observed in production). Release
+    actions are paced (at most every 10 s).
+  - Past **85%** it also **sheds writes** — rejecting new writes (client and
+    inbound-replica) with a retryable "memory pressure" error — and the
+    release pass turns aggressive (flushes memtables down to 64 KB). The
+    release is driven by the memory sampler, not a client write — otherwise a
+    shedding node would deadlock (it rejects the very writes that would
+    trigger a flush) — and covers every memtable, since pressure spread thin
+    across many tables leaves each below the per-engine flush threshold while
+    the sum pins the node. The flag clears at 70% (hysteresis).
+
+  Shedding is loud: entering it logs the anon/file split plus jemalloc's
+  allocated/resident/retained numbers, a distress line repeats every 60 s
+  while it persists ("releases are not freeing enough; OOM risk"), and
+  recovery logs the episode's duration. Anti-entropy passes log their
+  duration (and allocator stats) whenever they reconcile rows or take ≥60 s.
+  The packaged unit also sets `MemoryHigh=85%` so the kernel throttles and
+  reclaims the service before a hard OOM kill (which costs a restart + full
+  search-index rebuild). Reads and DDL are never shed; a coordinator that
+  gets a shed rejection from a replica hints it and proceeds at quorum. Watch
+  `skaidb_memory_shedding_writes` / `skaidb_memory_used_bytes` (METRICS.md);
+  a node stuck shedding is undersized for its workload.
 - **Bulk index builds stream the table.** Building or rebuilding a search
   index (`CREATE SEARCH INDEX`, startup catch-up, or an automatic rebuild)
   reads the source table one row at a time rather than gathering the whole

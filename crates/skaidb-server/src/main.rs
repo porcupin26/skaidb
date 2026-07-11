@@ -22,7 +22,30 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod cli;
 
+/// Give memory-pressure logs jemalloc's allocated/resident/retained split, so
+/// "the node is at its limit" is attributable to live heap vs pages the
+/// allocator hasn't returned yet. Only the binary knows which allocator is in
+/// use, so the hook is registered here.
+#[cfg(not(target_env = "msvc"))]
+fn register_alloc_stats() {
+    skaidb_cluster::memguard::set_alloc_stats_hook(Box::new(|| {
+        use tikv_jemalloc_ctl::{epoch, stats};
+        epoch::advance().ok()?; // refresh the stats snapshot
+        let mb = |v: usize| v / (1024 * 1024);
+        Some(format!(
+            "jemalloc: allocated {} MB, resident {} MB, retained {} MB",
+            mb(stats::allocated::read().ok()?),
+            mb(stats::resident::read().ok()?),
+            mb(stats::retained::read().ok()?),
+        ))
+    }));
+}
+
+#[cfg(target_env = "msvc")]
+fn register_alloc_stats() {}
+
 fn main() -> std::process::ExitCode {
+    register_alloc_stats();
     let args = cli::Cli::parse();
     match run(args) {
         Ok(()) => std::process::ExitCode::SUCCESS,

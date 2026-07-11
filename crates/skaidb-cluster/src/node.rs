@@ -537,23 +537,90 @@ impl Node {
         // dropped. Updates the shedding flag every `SAMPLE_INTERVAL`.
         let mem_weak = Arc::downgrade(&node);
         thread::spawn(move || {
+            use crate::memguard::Pressure;
+            // Release actions are paced (not every 1s tick — a flush + purge
+            // storm is its own denial of service) and shedding is loudly
+            // logged: both production wedges crept to the ceiling in silence.
+            const RELEASE_EVERY: Duration = Duration::from_secs(10);
+            const DISTRESS_EVERY: Duration = Duration::from_secs(60);
+            let mut last_release: Option<Instant> = None;
+            let mut shed_since: Option<Instant> = None;
+            let mut last_distress: Option<Instant> = None;
             while let Some(node) = mem_weak.upgrade() {
-                let shedding = node.mem.sample();
-                if shedding {
-                    // Reclaim memtable memory ourselves: a shedding node rejects
-                    // the client writes that would otherwise trigger a flush, so
+                let pressure = node.mem.sample_pressure();
+                if pressure >= Pressure::Release
+                    && last_release.is_none_or(|t| t.elapsed() >= RELEASE_EVERY)
+                {
+                    last_release = Some(Instant::now());
+                    // Free what we can ourselves: a shedding node rejects the
+                    // client writes that would otherwise trigger a flush, so
                     // without this it deadlocks (sheds → no write → no flush →
-                    // stays shedding). The per-engine flush threshold also misses
-                    // pressure spread thin across many tables.
-                    if let Ok(mut db) = node.local.write() {
-                        let reclaimed = db.flush_memtables_under_pressure();
-                        if reclaimed > 0 {
+                    // stays shedding), and the per-engine flush threshold
+                    // misses pressure spread thin across many tables. Then
+                    // hand freed pages back to the OS — under a cgroup limit,
+                    // allocator-retained pages are what strangle the file
+                    // cache and start the major-fault storm.
+                    let reclaimed = match node.local.write() {
+                        Ok(mut db) => {
+                            db.release_memory_under_pressure(pressure == Pressure::Shed)
+                        }
+                        Err(_) => 0,
+                    };
+                    if reclaimed > 0 {
+                        skaidb_types::slog!(
+                            "skaidb: memory pressure — flushed {} MB of memtables, committed search writers",
+                            reclaimed / (1024 * 1024)
+                        );
+                    }
+                }
+                let (used, limit) = node.mem.snapshot();
+                let breakdown = || {
+                    let mut s = crate::memguard::anon_file_breakdown()
+                        .map_or(String::new(), |(a, f)| {
+                            format!(
+                                " (anon {} MB, file {} MB)",
+                                a / (1024 * 1024),
+                                f / (1024 * 1024)
+                            )
+                        });
+                    if let Some(alloc) = crate::memguard::alloc_stats() {
+                        s.push_str(&format!(" [{alloc}]"));
+                    }
+                    s
+                };
+                match (pressure == Pressure::Shed, shed_since) {
+                    (true, None) => {
+                        shed_since = Some(Instant::now());
+                        last_distress = Some(Instant::now());
+                        skaidb_types::slog!(
+                            "skaidb: memory pressure — SHEDDING writes at {}/{} MB{}",
+                            used / (1024 * 1024),
+                            limit / (1024 * 1024),
+                            breakdown()
+                        );
+                    }
+                    (true, Some(since)) => {
+                        if last_distress.is_none_or(|t| t.elapsed() >= DISTRESS_EVERY) {
+                            last_distress = Some(Instant::now());
                             skaidb_types::slog!(
-                                "skaidb: memory pressure — flushed {} MB of memtables",
-                                reclaimed / (1024 * 1024)
+                                "skaidb: memory pressure — still shedding after {}s at {}/{} MB{} — releases are not freeing enough; OOM risk",
+                                since.elapsed().as_secs(),
+                                used / (1024 * 1024),
+                                limit / (1024 * 1024),
+                                breakdown()
                             );
                         }
                     }
+                    (false, Some(since)) => {
+                        shed_since = None;
+                        skaidb_types::slog!(
+                            "skaidb: memory pressure — recovered after {}s, now {}/{} MB",
+                            since.elapsed().as_secs(),
+                            used / (1024 * 1024),
+                            limit / (1024 * 1024)
+                        );
+                    }
+                    (false, None) => {}
                 }
                 drop(node); // don't hold the node alive across the sleep
                 thread::sleep(crate::memguard::SAMPLE_INTERVAL);
@@ -3115,10 +3182,33 @@ impl Node {
             if self.member_count() <= 1 {
                 continue; // standalone: nothing to reconcile
             }
-            match self.repair() {
-                Ok(n) if n > 0 => skaidb_types::slog!("skaidb: anti-entropy reconciled {n} rows"),
-                Ok(_) => {}                  // already converged: stay quiet
-                Err(e) => skaidb_types::slog!("skaidb: anti-entropy pass failed: {e}"),
+            let started = Instant::now();
+            let result = self.repair();
+            let secs = started.elapsed().as_secs();
+            // A pass streams every table page by page — a large transient
+            // allocation churn, and the prime suspect for footprint ratchet
+            // between passes. Log the allocator's live/resident/retained split
+            // after any pass big enough to matter so growth is attributable.
+            let alloc = || {
+                crate::memguard::alloc_stats().map_or(String::new(), |s| format!(" [{s}]"))
+            };
+            match result {
+                Ok(n) if n > 0 => {
+                    skaidb_types::slog!(
+                        "skaidb: anti-entropy reconciled {n} rows in {secs}s{}",
+                        alloc()
+                    );
+                }
+                // Converged: stay quiet unless the no-op pass itself is slow
+                // enough to matter (it competes with foreground queries).
+                Ok(_) if secs >= 60 => {
+                    skaidb_types::slog!(
+                        "skaidb: anti-entropy pass converged (took {secs}s){}",
+                        alloc()
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => skaidb_types::slog!("skaidb: anti-entropy pass failed after {secs}s: {e}"),
             }
         }
     }

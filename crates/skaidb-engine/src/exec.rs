@@ -3819,13 +3819,27 @@ impl Database {
     /// shedding). Returns bytes reclaimed; trivially small memtables are skipped
     /// so this doesn't litter tiny SSTables.
     pub fn flush_memtables_under_pressure(&mut self) -> usize {
-        const FLOOR: usize = 4 * 1024 * 1024;
+        self.release_memory_under_pressure(false)
+    }
+
+    /// The full memory-release pass for a node under pressure: flush memtables
+    /// past a floor (64 KB when `aggressive` — a node about to shed keeps
+    /// nothing it can drop; 4 MB otherwise, so routine release doesn't litter
+    /// tiny SSTables) and commit every dirty search-index writer (Tantivy
+    /// holds indexed-but-uncommitted docs in heap buffers; a commit moves them
+    /// to disk segments). Returns memtable bytes reclaimed (search-writer
+    /// buffers aren't cheaply measurable, so they're released but uncounted).
+    pub fn release_memory_under_pressure(&mut self, aggressive: bool) -> usize {
+        let floor: usize = if aggressive { 64 * 1024 } else { 4 * 1024 * 1024 };
         let mut reclaimed = 0;
         for engine in self.tables.values_mut().chain(self.indexes.values_mut()) {
             let bytes = engine.memtable_bytes();
-            if bytes >= FLOOR && engine.flush().is_ok() {
+            if bytes >= floor && engine.flush().is_ok() {
                 reclaimed += bytes;
             }
+        }
+        for live in self.search_indexes.values_mut() {
+            let _ = live.commit_if_dirty();
         }
         reclaimed
     }

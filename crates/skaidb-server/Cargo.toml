@@ -36,6 +36,10 @@ snap.workspace = true
 # nodes. Not built on MSVC (jemalloc is unsupported there).
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
+# Safe jemalloc introspection: memory-pressure logs report the allocator's
+# allocated/resident/retained split so live heap is distinguishable from
+# allocator-retained pages (what the OOM post-mortems lacked).
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 
 [dev-dependencies]
 skaidb-driver.workspace = true
