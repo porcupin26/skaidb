@@ -359,15 +359,43 @@ impl BulkGate {
         }
     }
 
-    fn acquire(&self) -> BulkPermit<'_> {
+    /// Try to admit an applier, waiting at most `wait`. `None` = the gate is
+    /// saturated: respond "busy" fast so the sender degrades to a hint.
+    ///
+    /// The wait MUST be bounded and short. The first unbounded version parked
+    /// each excess connection thread on the condvar forever; under a
+    /// catch-up flood (a rejoining node facing hint drains + repair pushes
+    /// from every peer) senders timed out and retried on fresh connections
+    /// while their abandoned server threads stayed queued — observed in
+    /// production as 2 800+ threads (~23 GB of stack VIRT) on a node that made
+    /// no progress. Bounding the wait lets an abandoned thread notice the
+    /// dead socket (its response write fails) and exit; hinted handoff and
+    /// anti-entropy already guarantee no write is lost to a `Busy` reply.
+    fn acquire(&self, wait: Duration) -> Option<BulkPermit<'_>> {
+        let deadline = Instant::now() + wait;
         let mut n = self.active.lock().expect("bulk gate lock");
         while *n >= self.max {
-            n = self.cv.wait(n).expect("bulk gate wait");
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            let (guard, timeout) = self.cv.wait_timeout(n, left).expect("bulk gate wait");
+            n = guard;
+            if timeout.timed_out() && *n >= self.max {
+                return None;
+            }
         }
         *n += 1;
-        BulkPermit(self)
+        Some(BulkPermit(self))
     }
 }
+
+/// How long an inbound bulk applier may wait for gate admission before the
+/// node answers "busy". Short by design: the queue exists to smooth bursts,
+/// not to buffer a flood — senders' 10s I/O timeout means anything parked
+/// longer is likely already abandoned, and durability comes from the hint
+/// path, not from queueing.
+const BULK_ADMISSION_WAIT: Duration = Duration::from_secs(2);
 
 /// RAII permit from [`BulkGate::acquire`].
 struct BulkPermit<'a>(&'a BulkGate);
@@ -3585,9 +3613,14 @@ impl Node {
             }
             Request::ApplyBatch { table, rows } => {
                 // QoS: bounded concurrency for bulk appliers — queries keep
-                // cores even under a drain/rebalance/repair flood.
-                let _permit = self.bulk_gate.acquire();
-                write_response(self.apply_batch_local(&table, &rows))
+                // cores even under a drain/rebalance/repair flood. A bounded
+                // admission wait, then "busy": the sender's failure path
+                // (hint + retry via handoff/anti-entropy) is durable, and an
+                // unbounded queue melts a rejoining node (see BulkGate).
+                match self.bulk_gate.acquire(BULK_ADMISSION_WAIT) {
+                    Some(_permit) => write_response(self.apply_batch_local(&table, &rows)),
+                    None => Response::Err("busy: bulk appliers saturated, retry".into()),
+                }
             }
             Request::ApplyDdl { db, sql, hlc } => {
                 self.with_write(|d| d.execute_session_with_hlc(&db, &sql, hlc).map(|_| ()))
@@ -6203,6 +6236,22 @@ mod tests {
             auto_join: false,
             anti_entropy_interval_secs: 0,
         }
+    }
+
+    #[test]
+    fn bulk_gate_bounded_wait_rejects_when_saturated() {
+        let gate = BulkGate {
+            max: 1,
+            active: std::sync::Mutex::new(0),
+            cv: std::sync::Condvar::new(),
+        };
+        let held = gate.acquire(Duration::from_millis(10)).expect("first permit");
+        // Saturated: a bounded wait must give up rather than park forever.
+        let t = Instant::now();
+        assert!(gate.acquire(Duration::from_millis(50)).is_none());
+        assert!(t.elapsed() >= Duration::from_millis(50));
+        drop(held);
+        assert!(gate.acquire(Duration::from_millis(10)).is_some());
     }
 
     #[test]

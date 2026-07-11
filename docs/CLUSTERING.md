@@ -433,10 +433,15 @@ SCRAM on the binary endpoint and HTTP Basic on REST, plus RBAC; see the
   (clamped 1–4) apply batches concurrently, so a migration flood can't
   monopolize the CPU and starve foreground queries (measured during a
   decommission: cpu PSI ~80% with io ~0 — pure CPU saturation from
-  FTS-indexing inbound rows). Senders that queue past their I/O timeout
-  degrade to hints, which repair backstops. The drain also pauses
-  `migration_pause_ms` (floor 10 ms) between chunks. `node_stats` now
-  carries `cpu_pressure_pct` (PSI) so saturation is visible per node.
+  FTS-indexing inbound rows). The admission wait is **bounded (2 s)**: a
+  saturated node answers "busy" fast instead of parking excess connection
+  threads on the gate — an unbounded queue let a rejoining node facing every
+  peer's catch-up flood accumulate 2 800+ abandoned threads (senders time
+  out at 10 s and retry on fresh connections) while making no progress.
+  Rejected/timed-out senders degrade to hints, which repair backstops. The
+  drain also pauses `migration_pause_ms` (floor 10 ms) between chunks.
+  `node_stats` carries `cpu_pressure_pct` (PSI) so saturation is visible
+  per node.
 - **Broad filters resolve in one merged scan.** A pushed-down `WHERE` (or an
   index scan) gathers candidate keys per member and re-reads them for the
   authoritative LWW version. Few candidates re-read as quorum point reads;
