@@ -397,6 +397,16 @@ impl BulkGate {
 /// path, not from queueing.
 const BULK_ADMISSION_WAIT: Duration = Duration::from_secs(2);
 
+/// How long an inbound repair scan may wait for the engine read lock before
+/// answering "busy". During a rejoin catch-up the admitted bulk appliers keep
+/// the engine write lock near-continuously; reader threads parked on the
+/// lock outlive their callers (senders time out at 10s and hang up) and were
+/// observed piling into the thousands — each a zombie serving a dead socket
+/// whenever the lock finally frees. Repair treats a busy peer as unreachable
+/// for that (table, peer) pass and retries next interval, so failing fast
+/// loses nothing.
+const SCAN_LOCK_WAIT: Duration = Duration::from_millis(1500);
+
 /// RAII permit from [`BulkGate::acquire`].
 struct BulkPermit<'a>(&'a BulkGate);
 
@@ -2837,6 +2847,25 @@ impl Node {
         Ok(local)
     }
 
+    /// The engine read lock with a bounded wait ([`SCAN_LOCK_WAIT`]); `None`
+    /// when it stayed write-locked (or poisoned) — callers answer "busy"
+    /// instead of parking the connection thread indefinitely.
+    fn local_read_bounded(&self) -> Option<std::sync::RwLockReadGuard<'_, Database>> {
+        let deadline = Instant::now() + SCAN_LOCK_WAIT;
+        loop {
+            match self.local.try_read() {
+                Ok(guard) => return Some(guard),
+                Err(std::sync::TryLockError::Poisoned(_)) => return None,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    thread::sleep(Duration::from_millis(25));
+                }
+            }
+        }
+    }
+
     /// Buffer a write that couldn't reach `replica` (for hinted handoff).
     fn store_hint(&self, replica: &NodeId, table: &str, key: &[u8], op: &WriteOp, hlc: Hlc) {
         {
@@ -3368,21 +3397,21 @@ impl Node {
                     Err(e) => Response::Err(format!("encode host stats: {e}")),
                 }
             }
-            Request::LocalScan { table } => match self.local.read() {
-                Ok(db) => match db.local_scan_versioned_with_tombstones(&table) {
+            Request::LocalScan { table } => match self.local_read_bounded() {
+                Some(db) => match db.local_scan_versioned_with_tombstones(&table) {
                     Ok(rows) => Response::Scan { rows },
                     Err(e) => Response::Err(e.to_string()),
                 },
-                Err(_) => Response::Err("local lock poisoned".into()),
+                None => Response::Err("busy: engine write-locked, retry".into()),
             },
-            Request::ScanPage { table, after, limit } => match self.local.read() {
-                Ok(db) => {
+            Request::ScanPage { table, after, limit } => match self.local_read_bounded() {
+                Some(db) => {
                     match db.local_scan_versioned_page(&table, after.as_deref(), limit as usize) {
                         Ok(rows) => Response::Scan { rows },
                         Err(e) => Response::Err(e.to_string()),
                     }
                 }
-                Err(_) => Response::Err("local lock poisoned".into()),
+                None => Response::Err("busy: engine write-locked, retry".into()),
             },
             Request::TsAppend { table, rows } => match self.local.read() {
                 Ok(db) => match db.ts_append(&table, &rows) {

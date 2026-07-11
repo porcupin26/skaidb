@@ -1262,6 +1262,31 @@ impl Pool {
         self.breaker.lock().expect("breaker lock").remove(addr);
     }
 
+    /// Whether a successfully-transported reply is the peer telling us to
+    /// back off ("busy" admission rejections, memory-pressure shedding).
+    /// These count toward the breaker like transport errors: a saturated
+    /// peer that answers every retry instantly otherwise gets hammered at
+    /// full rate forever — observed as a rejoining node burning cores
+    /// decoding a flood of requests it kept rejecting. Probes bypass and
+    /// close the breaker, so a recovered peer is picked back up within the
+    /// cooldown. Rolling-upgrade "unknown request op" replies do NOT match:
+    /// they must keep flowing so callers can fall back to older RPCs.
+    fn is_backpressure(resp: &Response) -> bool {
+        match resp {
+            Response::Err(e) => e.starts_with("busy") || e.contains("shedding writes"),
+            _ => false,
+        }
+    }
+
+    /// Book-keep the breaker for a reply that made it across the wire.
+    fn record_reply(&self, addr: &str, resp: &Response) {
+        if Self::is_backpressure(resp) {
+            self.record_err(addr);
+        } else {
+            self.record_ok(addr);
+        }
+    }
+
     fn record_err(&self, addr: &str) {
         let mut breaker = self.breaker.lock().expect("breaker lock");
         let entry = breaker
@@ -1290,7 +1315,7 @@ impl Pool {
         }
         if let Some(mut conn) = self.take_idle(addr) {
             if let Ok(resp) = Self::roundtrip(&mut conn, req) {
-                self.record_ok(addr);
+                self.record_reply(addr, &resp);
                 self.put(addr, conn);
                 return Ok(resp);
             }
@@ -1305,7 +1330,7 @@ impl Pool {
             .and_then(|mut conn| Self::roundtrip(&mut conn, req).map(|resp| (conn, resp)));
         match result {
             Ok((conn, resp)) => {
-                self.record_ok(addr);
+                self.record_reply(addr, &resp);
                 self.put(addr, conn);
                 Ok(resp)
             }
@@ -1418,7 +1443,7 @@ impl Pending<'_> {
         let mut conn = self.conn.take().expect("Pending::finish called twice");
         match conn_recv_response(&mut conn) {
             Ok(resp) => {
-                self.pool.record_ok(&self.addr);
+                self.pool.record_reply(&self.addr, &resp);
                 self.pool.put(&self.addr, conn);
                 Ok(resp)
             }

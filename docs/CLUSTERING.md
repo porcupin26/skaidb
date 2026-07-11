@@ -438,10 +438,17 @@ SCRAM on the binary endpoint and HTTP Basic on REST, plus RBAC; see the
   threads on the gate — an unbounded queue let a rejoining node facing every
   peer's catch-up flood accumulate 2 800+ abandoned threads (senders time
   out at 10 s and retry on fresh connections) while making no progress.
-  Rejected/timed-out senders degrade to hints, which repair backstops. The
-  drain also pauses `migration_pause_ms` (floor 10 ms) between chunks.
-  `node_stats` carries `cpu_pressure_pct` (PSI) so saturation is visible
-  per node.
+  Rejected/timed-out senders degrade to hints, which repair backstops.
+  "Busy"/shedding replies count toward the sender's **circuit breaker** like
+  transport errors (probes still bypass and close it), so a saturated peer
+  gets a cooldown instead of a full-rate retry hammer — without this the
+  rejecting node burned cores decoding a flood it kept refusing. Inbound
+  repair scans (`ScanPage`/`LocalScan`) take the engine read lock with a
+  bounded wait (1.5 s) and answer "busy" rather than parking behind a
+  catch-up write flood; repair treats the peer as unreachable for that pass
+  and retries next interval. The drain also pauses `migration_pause_ms`
+  (floor 10 ms) between chunks. `node_stats` carries `cpu_pressure_pct`
+  (PSI) so saturation is visible per node.
 - **Broad filters resolve in one merged scan.** A pushed-down `WHERE` (or an
   index scan) gathers candidate keys per member and re-reads them for the
   authoritative LWW version. Few candidates re-read as quorum point reads;
