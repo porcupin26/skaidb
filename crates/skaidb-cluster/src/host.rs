@@ -60,6 +60,11 @@ pub struct HostStats {
     /// (why a node restarted, when the cause was memory).
     #[serde(default)]
     pub oom_kills: u64,
+    /// Whether an anti-entropy repair pass is currently running on this
+    /// node. Peers defer their own pass while one runs anywhere — two
+    /// concurrent passes (paced or not) were enough to dent write quorum.
+    #[serde(default)]
+    pub repairing: bool,
     /// Set by a coordinator when this snapshot was served from cache because
     /// the node missed a probe: seconds since it last answered. 0 = fresh.
     #[serde(default)]

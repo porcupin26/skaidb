@@ -173,6 +173,10 @@ pub struct Node {
     host_cache: Mutex<HashMap<NodeId, (crate::host::HostStats, Instant, bool)>>,
     /// QoS: bounds concurrent inbound bulk appliers (see [`BulkGate`]).
     bulk_gate: BulkGate,
+    /// True while an anti-entropy pass runs here (any trigger: the hourly
+    /// loop or an admin REPAIR). Served to peers in HostStats so they defer
+    /// their own pass — concurrent passes dent write quorum.
+    repairing: AtomicBool,
     /// Physical-time (ms) high-water mark of data writes this node has
     /// *coordinated*. Replication lag for a peer is `watermark − acked[peer]`
     /// (both track data writes). Unlike the HLC frontier (`clock.peek()`), this advances
@@ -577,6 +581,7 @@ impl Node {
             acked: Mutex::new(HashMap::new()),
             host_cache: Mutex::new(HashMap::new()),
             bulk_gate: BulkGate::new(),
+            repairing: AtomicBool::new(false),
             write_watermark: AtomicU64::new(0),
             membership_lock: Mutex::new(()),
             bg,
@@ -2637,6 +2642,13 @@ impl Node {
     /// key ranges instead of streaming the whole shard (future work). Returns the
     /// number of rows repaired (pulled + pushed).
     pub fn repair(&self) -> EngineResult<usize> {
+        self.repairing.store(true, Ordering::Relaxed);
+        let result = self.repair_inner();
+        self.repairing.store(false, Ordering::Relaxed);
+        result
+    }
+
+    fn repair_inner(&self) -> EngineResult<usize> {
         let mut repaired = 0usize;
         // Converge the catalog first (databases/tables/indexes), both directions,
         // so a node that missed a DDL broadcast learns it — and so the data pass
@@ -3303,6 +3315,26 @@ impl Node {
             if self.member_count() <= 1 {
                 continue; // standalone: nothing to reconcile
             }
+            // Defer while any peer is mid-pass: two concurrent passes (even
+            // paced ones) dent write quorum — the hourly stagger only offsets
+            // start times, and minutes-long passes still overlapped. Bounded
+            // deferral (10 x 90s) so mutual deference can't live-lock.
+            for _ in 0..10 {
+                let peer_repairing = self.peers_with_ids().into_iter().any(|(_, addr)| {
+                    matches!(
+                        self.pool.call_timeout(&addr, &Request::HostStats, PROBE_TIMEOUT),
+                        Ok(Response::HostStats { json })
+                            if serde_json::from_str::<crate::host::HostStats>(&json)
+                                .map(|h| h.repairing)
+                                .unwrap_or(false)
+                    )
+                });
+                if !peer_repairing {
+                    break;
+                }
+                skaidb_types::slog!("skaidb: anti-entropy deferred — a peer is mid-pass");
+                thread::sleep(Duration::from_secs(90));
+            }
             // Start line: a pass that hangs (or crawls) is otherwise
             // invisible until it ends — the multi-hour silent burns of
             // 2026-07-11 were only attributable after this class of logging.
@@ -3460,7 +3492,9 @@ impl Node {
                     Some(db) => db.dir().to_path_buf(),
                     None => return Response::Err("busy: engine write-locked, retry".into()),
                 };
-                match serde_json::to_string(&crate::host::sample(&dir)) {
+                let mut stats = crate::host::sample(&dir);
+                stats.repairing = self.repairing.load(Ordering::Relaxed);
+                match serde_json::to_string(&stats) {
                     Ok(json) => Response::HostStats { json },
                     Err(e) => Response::Err(format!("encode host stats: {e}")),
                 }
