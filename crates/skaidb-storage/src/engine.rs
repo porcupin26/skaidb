@@ -87,7 +87,15 @@ impl Default for EngineOptions {
             l0_compaction_trigger: DEFAULT_L0_COMPACTION_TRIGGER,
             level1_capacity: DEFAULT_LEVEL1_CAPACITY,
             compression: Codec::Lz4,
-            bottom_compression: Codec::Brotli,
+            // Lz4, not Brotli: compaction compresses the whole deepest
+            // level under the engine write lock, and brotli's ~10 MB/s made
+            // every L1 rewrite a tens-of-seconds write stall (profiled live
+            // 2026-07-12: the hot thread in BrotliCreateBackwardReferences
+            // while quorum dented). Lz4 rewrites the same level in ~2s for
+            // ~2x the disk. Revisit when compaction moves off the write
+            // lock (#75) — existing brotli blocks stay readable either way
+            // (per-block codec byte).
+            bottom_compression: Codec::Lz4,
             read_cache_capacity: DEFAULT_READ_CACHE_CAPACITY,
             search_writer_heap_bytes: DEFAULT_SEARCH_WRITER_HEAP,
             ts_head_max_bytes: 0,
