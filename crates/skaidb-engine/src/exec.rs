@@ -3115,6 +3115,17 @@ impl Database {
     }
 
     /// The `(name, paths)` of every index defined on `table`.
+    /// Whether any index consumer (secondary/vector/search) needs the
+    /// decoded document on this table's write path. Replicated applies of
+    /// 10 KB JSON documents burned a core in serde_json (`parse_escape`,
+    /// profiled live on .4, 2026-07-12) decoding rows for tables with no
+    /// indexes at all — the decode exists only to feed index maintenance.
+    fn needs_doc_on_write(&self, table: &str) -> bool {
+        self.catalog.indexes.values().any(|i| i.table == table)
+            || self.catalog.vector_indexes.values().any(|v| v.table == table)
+            || self.catalog.search_indexes.values().any(|s| s.table == table)
+    }
+
     fn indexes_on(&self, table: &str) -> Vec<(String, Vec<String>)> {
         self.catalog
             .indexes
@@ -4039,23 +4050,32 @@ impl Database {
 
     /// Apply a replicated row write at an explicit stamp, maintaining indexes.
     pub fn apply_put(&mut self, table: &str, key: &[u8], bytes: Vec<u8>, hlc: Hlc) -> Result<()> {
-        let doc = match Value::decode(&bytes)
-            .map_err(|e| EngineError::Constraint(format!("corrupt replicated row: {e}")))?
-        {
-            Value::Document(d) => d,
-            _ => {
-                return Err(EngineError::Constraint(
-                    "replicated row is not a document".into(),
-                ))
+        // Decode lazily: only index maintenance reads the document, and
+        // parsing large JSON rows dominated replicated-apply CPU on tables
+        // with no indexes (see `needs_doc_on_write`).
+        let doc = if self.needs_doc_on_write(table) {
+            match Value::decode(&bytes)
+                .map_err(|e| EngineError::Constraint(format!("corrupt replicated row: {e}")))?
+            {
+                Value::Document(d) => Some(d),
+                _ => {
+                    return Err(EngineError::Constraint(
+                        "replicated row is not a document".into(),
+                    ))
+                }
             }
+        } else {
+            None
         };
         self.table_engine_mut(table)?
             .put_with_hlc(key, bytes, hlc)?;
-        for (name, path) in self.indexes_on(table) {
-            self.index_put(&name, &path, &doc, key)?;
+        if let Some(doc) = doc {
+            for (name, path) in self.indexes_on(table) {
+                self.index_put(&name, &path, &doc, key)?;
+            }
+            self.maintain_vectors_put(table, &doc, key);
+            self.maintain_search_put(table, &doc, key, hlc)?;
         }
-        self.maintain_vectors_put(table, &doc, key);
-        self.maintain_search_put(table, &doc, key, hlc)?;
         Ok(())
     }
 
@@ -4114,26 +4134,32 @@ impl Database {
         bytes: Vec<u8>,
         hlc: Hlc,
     ) -> Result<(WalCommit, Arc<WalSync>)> {
-        let doc = match Value::decode(&bytes)
-            .map_err(|e| EngineError::Constraint(format!("corrupt replicated row: {e}")))?
-        {
-            Value::Document(d) => d,
-            _ => {
-                return Err(EngineError::Constraint(
-                    "replicated row is not a document".into(),
-                ))
+        let doc = if self.needs_doc_on_write(table) {
+            match Value::decode(&bytes)
+                .map_err(|e| EngineError::Constraint(format!("corrupt replicated row: {e}")))?
+            {
+                Value::Document(d) => Some(d),
+                _ => {
+                    return Err(EngineError::Constraint(
+                        "replicated row is not a document".into(),
+                    ))
+                }
             }
+        } else {
+            None
         };
         let (commit, handle) = {
             let engine = self.table_engine_mut(table)?;
             let commit = engine.append_put_buffered(key, bytes, hlc)?;
             (commit, engine.wal_sync_handle())
         };
-        for (name, path) in self.indexes_on(table) {
-            self.index_put(&name, &path, &doc, key)?;
+        if let Some(doc) = doc {
+            for (name, path) in self.indexes_on(table) {
+                self.index_put(&name, &path, &doc, key)?;
+            }
+            self.maintain_vectors_put(table, &doc, key);
+            self.search_put_unrefreshed(table, &doc, key, hlc)?;
         }
-        self.maintain_vectors_put(table, &doc, key);
-        self.search_put_unrefreshed(table, &doc, key, hlc)?;
         Ok((commit, handle))
     }
 
