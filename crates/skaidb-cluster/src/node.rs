@@ -2948,7 +2948,11 @@ impl Node {
     /// forced replay from a stale watermark. Bounded lock wait: a wedged
     /// engine must not stall exit past systemd's kill window.
     pub fn prepare_shutdown(&self) {
-        for _ in 0..40 {
+        // Wait up to 60s (systemd allows 90 before SIGKILL): giving up early
+        // and exiting over an in-flight flush is what tore .3's manifest on
+        // 2026-07-12 — the storage-level ordering now makes even that safe,
+        // but patience is still cheaper than a WAL replay.
+        for _ in 0..240 {
             match self.local.try_write() {
                 Ok(mut db) => {
                     let _ = db.release_memory_under_pressure(true);

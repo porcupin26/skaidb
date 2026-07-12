@@ -553,9 +553,16 @@ impl Engine {
         let sst = SsTable::write_stream(&path, entries, self.mem.version_count(), codec)?;
         self.l0.insert(0, sst);
 
+        // Persist the manifest BEFORE truncating the WAL: a kill between the
+        // two must leave the WAL intact so the flushed rows replay at open
+        // (LWW dedupes the overlap). The old order (truncate, then persist)
+        // had a window where the new SSTable existed unreferenced and the
+        // WAL was already gone — a process exit there lost the memtable and
+        // left a stale manifest (observed 2026-07-12: graceful shutdown gave
+        // up its bounded lock wait and exited over an in-flight flush).
+        self.persist_manifest()?;
         self.mem = Memtable::new();
         self.wal.truncate()?;
-        self.persist_manifest()?;
         self.maybe_compact()?;
         Ok(())
     }
@@ -742,16 +749,16 @@ impl Engine {
         } else {
             self.levels[0] = new_l1;
         }
-        remove_files(&old_paths);
 
-        // Cascade: push a level down when it exceeds its capacity.
-        // Retired inputs are deleted only AFTER the manifest is durably
-        // repointed: removing them first left a kill window where the
-        // on-disk MANIFEST named already-deleted files and the engine
-        // refused to open — two production incidents (2026-07-09 and
-        // 2026-07-12, both mid-bulk-load restarts) required moving the
-        // shard aside and re-replicating it.
-        let mut retired: Vec<PathBuf> = Vec::new();
+        // Retired inputs (from the L0 merge above AND the cascade below) are
+        // deleted only AFTER the manifest durably points at their
+        // replacements. The L0 merge deleting first was the third (and
+        // forensically confirmed) manifest tear: MANIFEST mtime 16:16, the
+        // merged 0076.sst written 16:26 with its five inputs removed, and
+        // the manifest never rewritten before the process exited — the node
+        // crash-looped on ENOENT at open (2026-07-09, 2026-07-12 x2, all
+        // during bulk-load L0 churn).
+        let mut retired: Vec<PathBuf> = old_paths;
         let mut level = 0;
         loop {
             let capacity = self.opts.level1_capacity * 10u64.pow(level as u32);
