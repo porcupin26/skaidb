@@ -1079,15 +1079,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "signal-hook"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
+
+[[package]]
 name = "skaidb-auth"
-version = "0.70.22"
+version = "0.70.23"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "skaidb-cli"
-version = "0.70.22"
+version = "0.70.23"
 dependencies = [
  "clap",
  "rustyline",
@@ -1101,7 +1121,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-cluster"
-version = "0.70.22"
+version = "0.70.23"
 dependencies = [
  "rustls",
  "rustls-pemfile",
@@ -1120,7 +1140,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-config"
-version = "0.70.22"
+version = "0.70.23"
 dependencies = [
  "clap",
  "serde",
@@ -1131,7 +1151,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-driver"
-version = "0.70.22"
+version = "0.70.23"
 dependencies = [
  "skaidb-auth",
  "skaidb-proto",
@@ -1141,7 +1161,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-engine"
-version = "0.70.22"
+version = "0.70.23"
 dependencies = [
  "serde",
  "serde_json",
@@ -1156,7 +1176,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-fts"
-version = "0.70.22"
+version = "0.70.23"
 dependencies = [
  "levenshtein_automata",
  "serde",
@@ -1171,7 +1191,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-proto"
-version = "0.70.22"
+version = "0.70.23"
 dependencies = [
  "skaidb-types",
  "thiserror",
@@ -1179,10 +1199,11 @@ dependencies = [
 
 [[package]]
 name = "skaidb-server"
-version = "0.70.22"
+version = "0.70.23"
 dependencies = [
  "clap",
  "serde_json",
+ "signal-hook",
  "skaidb-auth",
  "skaidb-cluster",
  "skaidb-config",
@@ -1199,7 +1220,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-sql"
-version = "0.70.22"
+version = "0.70.23"
 dependencies = [
  "skaidb-types",
  "thiserror",
@@ -1207,7 +1228,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-storage"
-version = "0.70.22"
+version = "0.70.23"
 dependencies = [
  "brotli",
  "lz4_flex 0.11.6",
@@ -1217,7 +1238,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-tsdb"
-version = "0.70.22"
+version = "0.70.23"
 dependencies = [
  "regex",
  "serde",
@@ -1227,7 +1248,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-types"
-version = "0.70.22"
+version = "0.70.23"
 dependencies = [
  "serde",
  "serde_json",

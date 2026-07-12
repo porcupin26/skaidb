@@ -34,6 +34,20 @@ pub enum Backend {
 }
 
 impl Backend {
+    /// Graceful-shutdown hook: flush memtables + commit search writers (see
+    /// `Node::prepare_shutdown`); the local backend does the same directly.
+    pub fn prepare_shutdown(&self) {
+        match self {
+            Backend::Local(db) => {
+                if let Ok(mut db) = db.write() {
+                    let _ = db.release_memory_under_pressure(true);
+                }
+            }
+            Backend::Cluster(node) => node.prepare_shutdown(),
+        }
+    }
+
+
     /// Execute `sql` in a session whose current database is `current_db`,
     /// resolving names against it and replicating database/table DDL across the
     /// cluster. `USE` returns [`SessionEffect::UseDatabase`] for the caller to

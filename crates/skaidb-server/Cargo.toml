@@ -29,6 +29,9 @@ skaidb-sql.workspace = true
 clap.workspace = true
 serde_json.workspace = true
 snap.workspace = true
+# Safe SIGTERM/SIGINT handling for graceful shutdown (flush + FTS commit
+# before exit — an unclean kill costs a full search-index rebuild).
+signal-hook = "0.3"
 
 # jemalloc as the global allocator (server binary only): the default glibc
 # allocator does not return freed memory to the OS under the bulk-load +

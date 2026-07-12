@@ -357,6 +357,11 @@ the table on open. Distributed: scatter, merge by distance.
 - **Transactions do not work on clusters** (each statement autocommits).
 - Every acked write is durable (WAL) and searchable cluster-wide within the
   refresh interval.
+- **Graceful shutdown**: SIGTERM flushes memtables + commits search
+  writers (fast restart, no index rebuild). **Full-copy counts**: at
+  RF >= members, unfiltered `COUNT(*)` answers from local key stats (no
+  gather). Compaction deletes retired SSTables only after the manifest
+  commit (crash-safe).
 - **Memory pressure** (limits from cgroup/system RAM, non-reclaimable
   usage): above 75% a node actively releases (flushes memtables, commits
   search writers); above 85% it also sheds writes with a retryable

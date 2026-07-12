@@ -2971,7 +2971,7 @@ impl Database {
     /// Live-row count of `table` straight from storage key statistics — no row
     /// decode. Unavailable while a transaction is open (its overlay could
     /// change the count).
-    fn local_count_rows(&self, table: &str) -> Result<Option<usize>> {
+    pub fn local_count_rows(&self, table: &str) -> Result<Option<usize>> {
         if self.txn.is_some() {
             return Ok(None);
         }

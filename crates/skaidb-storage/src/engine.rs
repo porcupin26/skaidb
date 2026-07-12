@@ -738,6 +738,13 @@ impl Engine {
         remove_files(&old_paths);
 
         // Cascade: push a level down when it exceeds its capacity.
+        // Retired inputs are deleted only AFTER the manifest is durably
+        // repointed: removing them first left a kill window where the
+        // on-disk MANIFEST named already-deleted files and the engine
+        // refused to open — two production incidents (2026-07-09 and
+        // 2026-07-12, both mid-bulk-load restarts) required moving the
+        // shard aside and re-replicating it.
+        let mut retired: Vec<PathBuf> = Vec::new();
         let mut level = 0;
         loop {
             let capacity = self.opts.level1_capacity * 10u64.pow(level as u32);
@@ -767,11 +774,12 @@ impl Engine {
                 self.levels.push(new_run);
                 self.levels.remove(level);
             }
-            remove_files(&old_paths);
+            retired.extend(old_paths);
             level += 1;
         }
 
         self.persist_manifest()?;
+        remove_files(&retired);
         Ok(())
     }
 
@@ -970,7 +978,14 @@ fn load_manifest(dir: &Path) -> Result<(Vec<SsTable>, Vec<SsTable>, u64)> {
         {
             max_seq = max_seq.max(seq + 1);
         }
-        let sst = SsTable::open(&path)?;
+        let sst = SsTable::open(&path).map_err(|e| {
+            skaidb_types::slog!(
+                "skaidb: manifest {} references {} which failed to open: {e}",
+                manifest.display(),
+                path.display()
+            );
+            e
+        })?;
         if level == 0 {
             l0.push(sst);
         } else {

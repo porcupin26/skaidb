@@ -327,6 +327,30 @@ pub fn run(
     }
 
     // Node-stats publishing (`observability.node_stats`, live-mutable):
+    // Graceful shutdown: SIGTERM/SIGINT flush memtables and commit search
+    // writers before exit, so the next start replays (almost) nothing — an
+    // unclean kill costs a full search-index rebuild from a stale watermark
+    // (the known ~15-minute restart penalty). systemd's `restart`/`stop`
+    // send SIGTERM, so every routine deploy goes through this path.
+    {
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            use signal_hook::consts::{SIGINT, SIGTERM};
+            use signal_hook::iterator::Signals;
+            let Ok(mut signals) = Signals::new([SIGTERM, SIGINT]) else {
+                return;
+            };
+            if signals.forever().next().is_some() {
+                skaidb_types::slog!(
+                    "skaidb: shutdown signal — flushing memtables, committing search writers"
+                );
+                ctx.backend.prepare_shutdown();
+                skaidb_types::slog!("skaidb: clean shutdown");
+                std::process::exit(0);
+            }
+        });
+    }
+
     // INSERT this node's host stats into the replicated `node_stats` table
     // every `node_stats_interval_secs` (default 1s), timestamped — the
     // dashboard reads the table (data + age) instead of probing peers, so a

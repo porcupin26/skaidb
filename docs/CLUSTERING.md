@@ -406,6 +406,23 @@ SCRAM on the binary endpoint and HTTP Basic on REST, plus RBAC; see the
   gets a shed rejection from a replica hints it and proceeds at quorum. Watch
   `skaidb_memory_shedding_writes` / `skaidb_memory_used_bytes` (METRICS.md);
   a node stuck shedding is undersized for its workload.
+- **Graceful shutdown.** SIGTERM/SIGINT (what systemd's `stop`/`restart`
+  send) flush memtables and commit search-index writers before exit, so the
+  next start replays almost nothing — an unclean kill costs a full
+  search-index rebuild from the last committed watermark. The flush waits at
+  most ~10 s for the engine lock, so a wedged node still exits inside
+  systemd's kill window.
+- **Full-copy counts are local.** When `replication_factor >= members`
+  (every node holds every row), unfiltered `COUNT(*)` is answered from the
+  local engine's key statistics — no cluster gather. The gather materialized
+  the whole merged table on the coordinator (a plain count OOM-killed a
+  production node); the local answer is O(keys) with no value decode, at the
+  same freshness trade the search paths already make.
+- **Compaction commits before it deletes.** Retired SSTables are removed
+  only after the manifest durably points at their replacement — the old
+  order left a kill window where the manifest named deleted files and the
+  engine refused to open (two production incidents). A manifest entry that
+  fails to open is logged with the exact file and manifest path.
 - **Bulk index builds stream the table.** Building or rebuilding a search
   index (`CREATE SEARCH INDEX`, startup catch-up, or an automatic rebuild)
   reads the source table one row at a time rather than gathering the whole

@@ -2942,6 +2942,27 @@ impl Node {
         }
     }
 
+    /// Graceful-shutdown hook: flush memtables and commit search writers so
+    /// the next start replays (almost) nothing — an unclean kill used to cost
+    /// a full search-index rebuild (~15 min) because uncommitted writer state
+    /// forced replay from a stale watermark. Bounded lock wait: a wedged
+    /// engine must not stall exit past systemd's kill window.
+    pub fn prepare_shutdown(&self) {
+        for _ in 0..40 {
+            match self.local.try_write() {
+                Ok(mut db) => {
+                    let _ = db.release_memory_under_pressure(true);
+                    return;
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => return,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    thread::sleep(Duration::from_millis(250));
+                }
+            }
+        }
+        skaidb_types::slog!("skaidb: shutdown flush skipped — engine lock busy for 10s");
+    }
+
     /// Buffer a write that couldn't reach `replica` (for hinted handoff).
     fn store_hint(&self, replica: &NodeId, table: &str, key: &[u8], op: &WriteOp, hlc: Hlc) {
         {
@@ -6233,6 +6254,21 @@ impl Cluster for Coordinator {
             .write()
             .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
             .search_aggregate(table, query, agg, None)
+    }
+
+    fn count_rows(&self, table: &str) -> EngineResult<Option<usize>> {
+        // Full-copy cluster (RF >= members): every node holds every row, so
+        // the local engine's key stats answer without a cluster gather — the
+        // gather materialized the whole merged table on the coordinator, and
+        // a plain count(*) OOM-killed a production node (2026-07-11). Same
+        // freshness trade the search-index paths already make at RF >=
+        // members: the count may lag an in-flight write by a beat.
+        if self.node.cfg.replication_factor >= self.node.member_count() {
+            if let Some(db) = self.node.local_read_bounded() {
+                return db.local_count_rows(table);
+            }
+        }
+        Ok(None)
     }
 
     fn matching_rows(
