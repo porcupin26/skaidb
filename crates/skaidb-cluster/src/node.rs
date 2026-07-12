@@ -307,6 +307,13 @@ type TsHint = (String, Vec<(skaidb_tsdb::Labels, i64, f64)>);
 /// independent of table size.
 #[cfg(not(test))]
 const REPAIR_PAGE_ROWS: usize = 2_000;
+
+/// Pause between repair page fills / (table, peer) pairs: repair is a
+/// background op and must never saturate a node. ~5% duty impact on pass
+/// wall-time per page, whole cores handed back to foreground queries.
+const REPAIR_PAGE_PAUSE: Duration = Duration::from_millis(25);
+/// Pause between (table, peer) reconciliations in a pass.
+const REPAIR_PAIR_PAUSE: Duration = Duration::from_millis(250);
 #[cfg(test)]
 const REPAIR_PAGE_ROWS: usize = 8;
 
@@ -2661,6 +2668,13 @@ impl Node {
                     Err(RepairPeerError::Unreachable) => continue,
                     Err(RepairPeerError::Engine(e)) => return Err(e),
                 }
+                // QoS: repair is a background op. Back-to-back (table, peer)
+                // reconciliations kept 1-2 cores busy for the whole pass
+                // (~100-120s measured) and degraded write quorum on the
+                // passing node — foreground traffic saw timeouts every hour,
+                // per node. Breathe between pairs; a slower pass is free,
+                // a degraded quorum is not.
+                thread::sleep(REPAIR_PAIR_PAUSE);
             }
         }
         repaired += self.ts_repair()?;
@@ -2693,6 +2707,10 @@ impl Node {
                     .local_scan_versioned_page(table, local.after(), REPAIR_PAGE_ROWS)
                     .map_err(RepairPeerError::Engine)?;
                 local.fill(rows);
+                // QoS: local fills decompress whole pages (the CPU-heavy
+                // part of a pass, measured as the multi-core brotli burn) —
+                // yield between pages so queries interleave.
+                thread::sleep(REPAIR_PAGE_PAUSE);
             }
             if remote.needs_fill() {
                 let resp = self.pool.call(
@@ -3285,6 +3303,10 @@ impl Node {
             if self.member_count() <= 1 {
                 continue; // standalone: nothing to reconcile
             }
+            // Start line: a pass that hangs (or crawls) is otherwise
+            // invisible until it ends — the multi-hour silent burns of
+            // 2026-07-11 were only attributable after this class of logging.
+            skaidb_types::slog!("skaidb: anti-entropy pass starting");
             let started = Instant::now();
             let result = self.repair();
             let secs = started.elapsed().as_secs();
