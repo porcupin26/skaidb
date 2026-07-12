@@ -35,6 +35,15 @@ curl -u user:pass -X POST http://node:7080/query \
 # Response: {"columns":[...],"rows":[[...],...]} | {"affected":n} | {"ok":true}
 # | {"error":"..."} (HTTP 400)
 
+# Bulk JSON document upsert (overwrites on primary key). Optional
+# "consistency": "one" | "quorum" | "all" overrides the write default for
+# this request — bulk loaders use "one" so the ack never waits on the
+# slowest replica (replication still reaches every replica via the async
+# tail; hints + anti-entropy backstop).
+curl -u user:pass -X POST http://node:7080/insert \
+     -d '{"db":"mydb","table":"t","rows":[{"id":"a","x":1}],"consistency":"one"}'
+# Response: {"inserted":n} | {"error":"..."}
+
 # Shell (nearest-node selection, failover, discovers peers via /status):
 skaidbsh --host node --port 7000 --rest-port 7080 [--user u --password p]
 ```

@@ -429,6 +429,21 @@ fn handle_insert(ctx: &Shared, role: &str, body: &[u8]) -> (u16, Json) {
         Some(_) => return (200, json!({"inserted": 0})),
         None => return (400, json!({"error": "missing \"rows\" array"})),
     };
+    // Optional per-request write consistency ("one" | "quorum" | "all").
+    // Bulk loaders use ONE so the ack never waits on the slowest replica's
+    // flush/compaction window; replication still reaches every replica via
+    // the async tail, with hints + anti-entropy as the backstop.
+    let consistency = match obj.get("consistency").and_then(|v| v.as_str()) {
+        None => None,
+        Some(c) => match c.to_ascii_lowercase().as_str() {
+            "one" => Some(skaidb_proto::Consistency::One),
+            "quorum" => Some(skaidb_proto::Consistency::Quorum),
+            "all" => Some(skaidb_proto::Consistency::All),
+            other => {
+                return (400, json!({"error": format!("bad consistency {other:?}")}))
+            }
+        },
+    };
 
     // Group rows by their (sorted) column set so a homogeneous batch becomes
     // one multi-row INSERT; heterogeneous docs fall into separate groups.
@@ -465,7 +480,7 @@ fn handle_insert(ctx: &Shared, role: &str, body: &[u8]) -> (u16, Json) {
             &mut current_db,
             "INSERT (JSON)",
             Ok(stmt),
-            None,
+            consistency,
         );
         match resp {
             Response::Mutation { .. } | Response::Ddl => inserted += n,
