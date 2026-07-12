@@ -34,7 +34,14 @@ pub type VersionedRow = (Vec<u8>, Vec<u8>, Hlc);
 pub type VersionedTombstoneRow = (Vec<u8>, Hlc, Option<Vec<u8>>);
 
 /// Default memtable size that triggers a flush (SPEC §9.1: 256 MiB).
-pub const DEFAULT_FLUSH_THRESHOLD_BYTES: usize = 256 * 1024 * 1024;
+// 32 MB, not 256: the flush brotli-compresses the whole memtable while the
+// caller holds the engine write lock, so threshold size IS stall length.
+// 256 MB of large JSON rows stalled writes for multiple seconds per flush —
+// enough to dent write quorum and time out interactive reads during bulk
+// loads (measured 2026-07-12). Smaller memtables flush sub-second; leveled
+// compaction absorbs the extra file count. The real fix (flush outside the
+// lock via immutable-memtable handoff) is tracked in #75.
+pub const DEFAULT_FLUSH_THRESHOLD_BYTES: usize = 32 * 1024 * 1024;
 /// Number of level-0 tables that triggers compaction.
 const DEFAULT_L0_COMPACTION_TRIGGER: usize = 4;
 /// Entry capacity of level 1; each deeper level holds 10× more.
