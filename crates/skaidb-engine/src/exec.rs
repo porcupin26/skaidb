@@ -3138,11 +3138,31 @@ impl Database {
     /// Ordered/limited variant of [`Database::local_matching_rows`]; see
     /// [`Cluster::matching_rows_ordered`]. In a transaction, reads go through
     /// the buffered overlay (unindexed, never presorted).
+    /// Streamed count of rows matching `filter` — decode, test, discard;
+    /// memory stays one row regardless of match count. Scan-meter ticked.
+    pub fn local_count_matching(&self, table: &str, filter: &Option<Expr>) -> Result<usize> {
+        let engine = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+        let mut n = 0usize;
+        for item in engine.scan_iter() {
+            crate::scan_meter::tick(1)?;
+            let (_key, bytes) = item?;
+            if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
+                if matches_filter(filter, &doc)? {
+                    n += 1;
+                }
+            }
+        }
+        Ok(n)
+    }
+
     pub fn local_matching_rows_ordered(
         &self,
         table: &str,
         filter: &Option<Expr>,
-        order: Option<(&str, bool)>,
+        order: Option<(&str, bool, bool)>,
         fetch_limit: Option<usize>,
     ) -> Result<OrderedRows> {
         if self.txn.is_some() {
@@ -3224,7 +3244,7 @@ impl Database {
         &self,
         table: &str,
         filter: &Option<Expr>,
-        order: Option<(&str, bool)>,
+        order: Option<(&str, bool, bool)>,
         fetch_limit: Option<usize>,
     ) -> Result<OrderedRows> {
         // Fast path: the whole filter is a primary-key equality — one point
@@ -3249,8 +3269,9 @@ impl Database {
             };
             return Ok((rows, true));
         }
+        let order2 = order.map(|(c, d, _)| (c, d));
         let Some((index_name, start, end, sorted, reverse)) =
-            self.plan_index(table, filter, order, fetch_limit)
+            self.plan_index(table, filter, order2, fetch_limit)
         else {
             // No usable index: stream the table scan (decode one row at a
             // time) and, when no ordering is required, stop as soon as the
@@ -3302,6 +3323,14 @@ impl Database {
         } else {
             Box::new(entries.into_iter())
         };
+        // Multi-key ORDER BY: the walk satisfies only the leading key, so
+        // reaching the limit isn't enough — every row TIED with the boundary
+        // on the leading column must also be gathered, then the executor
+        // re-sorts the bounded set by the full clause. Without this, rows
+        // equal on the leading key could be dropped by walk order rather
+        // than by the secondary keys.
+        let exact_order = order.is_none_or(|(_, _, exact)| exact);
+        let mut tie_boundary: Option<Option<Value>> = None;
         for (_entry_key, row_key) in iter {
             crate::scan_meter::tick(1)?;
             let Some(bytes) = table_engine.get(&row_key)? else {
@@ -3311,18 +3340,33 @@ impl Database {
                 Value::decode(&bytes).map_err(|e| EngineError::Constraint(format!("corrupt row: {e}")))?
             {
                 if matches_filter(filter, &doc)? {
+                    if let (Some(boundary), Some((col, _, _))) = (&tie_boundary, order) {
+                        // Limit already met: keep only leading-key ties.
+                        if doc.get_path(col) != boundary.as_ref() {
+                            break;
+                        }
+                        out.push((row_key, doc));
+                        continue;
+                    }
                     out.push((row_key, doc));
                     // Stop early when the rows already arrive in `order`, or
                     // when the query never asked for one.
                     if (sorted || order.is_none())
                         && fetch_limit.is_some_and(|lim| out.len() >= lim)
                     {
+                        if sorted && !exact_order {
+                            if let Some((col, _, _)) = order {
+                                let (_, last) = out.last().expect("just pushed");
+                                tie_boundary = Some(last.get_path(col).cloned());
+                                continue;
+                            }
+                        }
                         break;
                     }
                 }
             }
         }
-        Ok((out, sorted))
+        Ok((out, sorted && exact_order))
     }
 
     /// Choose an index access path for `(filter, order)`: a column with
@@ -4585,10 +4629,16 @@ pub trait Cluster {
         &self,
         table: &str,
         filter: &Option<Expr>,
-        _order: Option<(&str, bool)>,
+        _order: Option<(&str, bool, bool)>,
         _fetch_limit: Option<usize>,
     ) -> Result<OrderedRows> {
         Ok((self.matching_rows(table, filter)?, false))
+    }
+    /// Count rows matching `filter` without materializing them — the fallback
+    /// for filtered `COUNT(*)` when no covering index applies. `None` = no
+    /// streaming count available; the caller gathers (scan-meter bounded).
+    fn count_matching(&self, _table: &str, _filter: &Option<Expr>) -> Result<Option<usize>> {
+        Ok(None)
     }
     /// Fast count of `table`'s live rows, when the implementation can serve it
     /// without materializing or decoding rows (`None` = unavailable; the
@@ -5666,7 +5716,15 @@ fn run_simple_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> {
             let counted = if sel.filter.is_none() {
                 cluster.count_rows(&sel.from)?
             } else {
-                cluster.count_filtered(&sel.from, &sel.filter)?
+                match cluster.count_filtered(&sel.from, &sel.filter)? {
+                    // No covering index (e.g. a `!=` in the filter): stream a
+                    // counting scan instead of materializing every matching
+                    // document just to take its length — a UI pagination
+                    // count over 150k rows allocated gigabytes on the
+                    // coordinator and pushed nodes into shedding.
+                    None => cluster.count_matching(&sel.from, &sel.filter)?,
+                    n => n,
+                }
             };
             if let Some(n) = counted {
                 let col = alias.clone().unwrap_or_else(|| expr_name(expr));
@@ -5698,7 +5756,9 @@ fn run_simple_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> {
     let (keyed, presorted) = cluster.matching_rows_ordered(
         &sel.from,
         &sel.filter,
-        order_col.as_ref().map(|(c, desc)| (c.as_str(), *desc)),
+        order_col
+            .as_ref()
+            .map(|(c, desc, exact)| (c.as_str(), *desc, *exact)),
         fetch_limit,
     )?;
     let docs: Vec<Document> = keyed.into_iter().map(|(_k, doc)| doc).collect();
@@ -6032,12 +6092,15 @@ fn sort_result_rows(rs: &mut ResultSet, order_by: &[OrderKey]) -> Result<()> {
 }
 
 /// The column an index could order by: a lone ascending `ORDER BY <column>`.
-fn index_order_column(order_by: &[OrderKey]) -> Option<(String, bool)> {
-    match order_by {
-        [key] => match &key.expr {
-            Expr::Column(col) => Some((col.clone(), key.descending)),
-            _ => None,
-        },
+/// The leading `ORDER BY` key when it is a plain column, plus whether the
+/// index walk alone satisfies the whole clause (`exact` — a single key) or
+/// only its primary component (multi-key: the walk bounds the gather, the
+/// executor re-sorts by the full clause; see `gather_rows_planned`'s
+/// tie-group handling).
+fn index_order_column(order_by: &[OrderKey]) -> Option<(String, bool, bool)> {
+    let first = order_by.first()?;
+    match &first.expr {
+        Expr::Column(col) => Some((col.clone(), first.descending, order_by.len() == 1)),
         _ => None,
     }
 }
@@ -6195,7 +6258,7 @@ impl Cluster for LocalCluster<'_> {
         &self,
         table: &str,
         filter: &Option<Expr>,
-        order: Option<(&str, bool)>,
+        order: Option<(&str, bool, bool)>,
         fetch_limit: Option<usize>,
     ) -> Result<OrderedRows> {
         self.db.local_matching_rows_ordered(table, filter, order, fetch_limit)
@@ -6207,6 +6270,10 @@ impl Cluster for LocalCluster<'_> {
 
     fn count_filtered(&self, table: &str, filter: &Option<Expr>) -> Result<Option<usize>> {
         self.db.local_count_filtered(table, filter)
+    }
+
+    fn count_matching(&self, table: &str, filter: &Option<Expr>) -> Result<Option<usize>> {
+        self.db.local_count_matching(table, filter).map(Some)
     }
 
     fn vector_search(
@@ -6350,7 +6417,7 @@ impl Cluster for LocalRead<'_> {
         &self,
         table: &str,
         filter: &Option<Expr>,
-        order: Option<(&str, bool)>,
+        order: Option<(&str, bool, bool)>,
         fetch_limit: Option<usize>,
     ) -> Result<OrderedRows> {
         self.db.local_matching_rows_ordered(table, filter, order, fetch_limit)
@@ -6362,6 +6429,10 @@ impl Cluster for LocalRead<'_> {
 
     fn count_filtered(&self, table: &str, filter: &Option<Expr>) -> Result<Option<usize>> {
         self.db.local_count_filtered(table, filter)
+    }
+
+    fn count_matching(&self, table: &str, filter: &Option<Expr>) -> Result<Option<usize>> {
+        self.db.local_count_matching(table, filter).map(Some)
     }
 
     fn vector_search(

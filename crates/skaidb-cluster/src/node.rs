@@ -5101,7 +5101,21 @@ impl Node {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        self.cluster_scan_collect(table, oc, Some(limit), None, &None)
+        self.cluster_scan_collect(table, oc, Some(limit), None, &None, None)
+    }
+
+    /// Streamed, LWW-merged **count** of rows matching `filter`: the sliding
+    /// merge of [`Node::cluster_scan_collect`] with a counter in place of the
+    /// output vector. Same read-quorum guarantee, O(page window) memory.
+    fn cluster_scan_collect_counted(
+        &self,
+        table: &str,
+        oc: Option<Consistency>,
+        filter: &Option<Expr>,
+        n: &mut usize,
+    ) -> EngineResult<()> {
+        self.cluster_scan_collect(table, oc, None, None, filter, Some(n))?;
+        Ok(())
     }
 
     /// Paged, LWW-merged scan collecting at most `limit` rows (all when
@@ -5117,6 +5131,7 @@ impl Node {
         limit: Option<usize>,
         keep: Option<&BTreeMap<Vec<u8>, ()>>,
         filter: &Option<Expr>,
+        mut counter: Option<&mut usize>,
     ) -> EngineResult<Vec<(Vec<u8>, Document)>> {
         self.counters.reads_total.fetch_add(1, Ordering::Relaxed);
         let needed = oc
@@ -5216,6 +5231,10 @@ impl Node {
                         .map_err(|e| EngineError::Cluster(format!("corrupt row: {e}")))?
                     {
                         if !skaidb_engine::matches_filter(filter, &doc)? {
+                            continue;
+                        }
+                        if let Some(c) = counter.as_deref_mut() {
+                            *c += 1; // count-only: the doc is dropped here
                             continue;
                         }
                         out.push((k, doc));
@@ -5419,7 +5438,7 @@ impl Node {
         // materialized every row on the coordinator (4.6 GB allocated,
         // OOM-killed two production nodes, 2026-07-13); the sliding merge
         // holds one page window per source and keeps only matching rows.
-        self.cluster_scan_collect(table, oc, None, Some(&keys), &None)
+        self.cluster_scan_collect(table, oc, None, Some(&keys), &None, None)
     }
 
     /// Distributed **filter pushdown** for a non-indexed `WHERE`: scatter the
@@ -6391,6 +6410,18 @@ impl Cluster for Coordinator {
         Ok(None)
     }
 
+    fn count_matching(&self, table: &str, filter: &Option<Expr>) -> EngineResult<Option<usize>> {
+        // Streamed count at the read quorum: the sliding LWW merge walks the
+        // table page-window by page-window, evaluates the filter, and keeps
+        // only a counter — the materializing fallback held every matching
+        // document on the coordinator (gigabytes for a UI pagination count)
+        // and shoved nodes into shedding (2026-07-13).
+        let mut n = 0usize;
+        self.node
+            .cluster_scan_collect_counted(table, self.oc, filter, &mut n)?;
+        Ok(Some(n))
+    }
+
     fn matching_rows(
         &self,
         table: &str,
@@ -6426,7 +6457,7 @@ impl Cluster for Coordinator {
         &self,
         table: &str,
         filter: &Option<Expr>,
-        order: Option<(&str, bool)>,
+        order: Option<(&str, bool, bool)>,
         fetch_limit: Option<usize>,
     ) -> EngineResult<(Vec<(Vec<u8>, Document)>, bool)> {
         // Push a plain `LIMIT n` into the gather so an unfiltered, unordered
@@ -6460,9 +6491,14 @@ impl Cluster for Coordinator {
                     return Ok((rows, false));
                 }
             }
-            let rows =
-                self.node
-                    .cluster_scan_collect(table, self.oc, Some(lim), None, filter)?;
+            let rows = self.node.cluster_scan_collect(
+                table,
+                self.oc,
+                Some(lim),
+                None,
+                filter,
+                None,
+            )?;
             return Ok((rows, false));
         }
         // Ordered gather at caller-chosen consistency ONE on a full-copy

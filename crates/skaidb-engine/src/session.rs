@@ -375,6 +375,79 @@ mod tests {
         );
     }
 
+    /// Multi-key ORDER BY with an indexed leading column must gather only
+    /// limit + tie-group rows and return exactly the brute-force answer —
+    /// the two-key UI sort previously defeated the index path and gathered
+    /// every matching row.
+    #[test]
+    fn multi_key_order_by_uses_index_walk_with_ties() {
+        let mut s = Session::open(tmp()).unwrap();
+        s.execute("CREATE TABLE emails (PRIMARY KEY (id));").unwrap();
+        s.execute("CREATE INDEX i_ad ON emails (account, date);").unwrap();
+        for i in 0..400 {
+            // Dates repeat every 8 rows: plenty of leading-key ties, and the
+            // tiebreaker column deliberately disagrees with insert order.
+            let date = format!("2026-01-{:02}", (i / 8) % 28 + 1);
+            let scraped = format!("s{:04}", (i * 37) % 400);
+            s.execute(&format!(
+                "INSERT INTO emails (id, account, date, scraped_at) VALUES ('k{i:04}', 'a@x', '{date}', '{scraped}');"
+            ))
+            .unwrap();
+        }
+        // Brute force: fetch all, sort in the test.
+        let mut all: Vec<(String, String, String)> = rows(
+            s.execute("SELECT id, date, scraped_at FROM emails WHERE account = 'a@x';").unwrap(),
+        )
+        .into_iter()
+        .map(|r| match (&r[0], &r[1], &r[2]) {
+            (
+                skaidb_types::Value::String(a),
+                skaidb_types::Value::String(b),
+                skaidb_types::Value::String(c),
+            ) => (b.clone(), c.clone(), a.clone()),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+        all.sort_by(|x, y| y.0.cmp(&x.0).then(y.1.cmp(&x.1))); // date DESC, scraped DESC
+        let want: Vec<String> = all.iter().take(7).map(|(_, _, id)| id.clone()).collect();
+        let got: Vec<String> = rows(
+            s.execute(
+                "SELECT id FROM emails WHERE account = 'a@x' ORDER BY date DESC, scraped_at DESC LIMIT 7;",
+            )
+            .unwrap(),
+        )
+        .into_iter()
+        .map(|r| match &r[0] {
+            skaidb_types::Value::String(a) => a.clone(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+        assert_eq!(got, want, "multi-key order diverged from brute force");
+    }
+
+    /// Filtered COUNT(*) that no covering index serves (a `!=` in the
+    /// filter) must still answer — via the streaming count, and exactly.
+    #[test]
+    fn non_covering_filtered_count_streams() {
+        let mut s = Session::open(tmp()).unwrap();
+        s.execute("CREATE TABLE emails (PRIMARY KEY (id));").unwrap();
+        s.execute("CREATE INDEX i_a ON emails (account, tomb);").unwrap();
+        for i in 0..500 {
+            let arch = i % 5 == 0;
+            s.execute(&format!(
+                "INSERT INTO emails (id, account, tomb, archived) VALUES ('k{i}', 'a@x', false, {arch});"
+            ))
+            .unwrap();
+        }
+        let got = rows(
+            s.execute(
+                "SELECT COUNT(*) FROM emails WHERE account = 'a@x' AND tomb = false AND archived != true;",
+            )
+            .unwrap(),
+        );
+        assert_eq!(got[0][0], skaidb_types::Value::Int(400));
+    }
+
     #[test]
     fn default_is_current_on_open() {
         let s = Session::open(tmp()).unwrap();
