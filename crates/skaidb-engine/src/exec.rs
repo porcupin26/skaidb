@@ -1662,11 +1662,31 @@ impl Database {
         self.execute_read_statement(parse(sql)?)
     }
 
+    /// The `(scan_row_budget, statement_timeout_secs)` pair for callers that
+    /// arm the scan meter outside this database (the cluster coordinator).
+    pub fn scan_meter_opts(&self) -> (usize, u64) {
+        (
+            self.storage_opts.scan_row_budget,
+            self.storage_opts.statement_timeout_secs,
+        )
+    }
+
+    /// Arm the per-statement scan meter from this database's options. Held
+    /// for the statement's whole execution; nested calls no-op (outermost
+    /// meter wins).
+    fn arm_scan_meter(&self) -> Option<crate::scan_meter::Armed> {
+        let secs = self.storage_opts.statement_timeout_secs;
+        let deadline = (secs != 0)
+            .then(|| std::time::Instant::now() + std::time::Duration::from_secs(secs));
+        crate::scan_meter::arm(self.storage_opts.scan_row_budget, deadline)
+    }
+
     /// Execute an already-parsed read-only statement; see
     /// [`Database::execute_read`]. A `SELECT` inside an open transaction still
     /// works here: it reads through the buffered overlay, which needs only
     /// shared access.
     pub fn execute_read_statement(&self, stmt: Statement) -> Result<QueryOutput> {
+        let _meter = self.arm_scan_meter();
         let mut stmt = stmt;
         skaidb_sql::resolve_now(&mut stmt, now_ms());
         match stmt {
@@ -1718,6 +1738,7 @@ impl Database {
     /// [`Session`](crate::Session) dispatch a statement it has classified
     /// without re-parsing it.
     pub fn execute_statement(&mut self, stmt: Statement) -> Result<QueryOutput> {
+        let _meter = self.arm_scan_meter();
         let mut stmt = stmt;
         skaidb_sql::resolve_now(&mut stmt, now_ms());
         match stmt {
@@ -3137,6 +3158,7 @@ impl Database {
                 .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
             let mut out = Vec::new();
             for item in engine.scan_iter() {
+                crate::scan_meter::tick(1)?;
                 let (key, bytes) = item?;
                 let doc = match Value::decode(&bytes) {
                     Ok(Value::Document(doc)) => doc,
@@ -3177,6 +3199,7 @@ impl Database {
             Box::new(entries.into_iter())
         };
         for (_entry_key, row_key) in iter {
+            crate::scan_meter::tick(1)?;
             let Some(bytes) = table_engine.get(&row_key)? else {
                 continue; // index entry for a since-deleted row
             };
@@ -4155,7 +4178,12 @@ impl Database {
             .get(table)
             .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
         let mut out = Vec::new();
-        for (key, _hlc, value) in engine.scan_versioned_with_tombstones()? {
+        // Stream one row at a time: the materializing scan built a whole-table
+        // Vec (~1.8 GB on the largest production table) per filtered RPC and
+        // OOM'd 4 GB nodes when several stacked (2026-07-13).
+        for item in engine.scan_versioned_with_tombstones_iter() {
+            crate::scan_meter::tick(1)?;
+            let (key, _hlc, value) = item?;
             let Some(bytes) = value else { continue }; // tombstone: not a candidate
             if let Value::Document(doc) = Value::decode(&bytes)
                 .map_err(|e| EngineError::Constraint(format!("corrupt row: {e}")))?

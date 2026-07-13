@@ -84,6 +84,11 @@ Key facts an agent must know:
   Three-valued logic: `NULL` comparisons are unknown.
 - **Scalar functions**: `now()` (statement start, timestamp),
   `time_bucket(step, ts)` (floor to bucket: `time_bucket(5m, ts)`).
+- **Scan budget**: one statement may examine at most `storage.scan_row_budget`
+  rows (default 250k; 0 disables) and run at most
+  `storage.statement_timeout_secs` (default 120s; 0 disables) — past either it
+  errors with `resource limit: ...`. `LIMIT` bounds output, not scan work: a
+  filter matching nothing under `ORDER BY .. LIMIT` walks the whole range.
 - **Aggregates**: `COUNT(*)`, `COUNT(expr)`, `COUNT(DISTINCT expr)` (exact),
   filtered `COUNT(*)` is answered index-only when a secondary index fully
   covers a conjunctive equality/range filter (no row reads — safe on tables

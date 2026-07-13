@@ -61,6 +61,17 @@ pub struct EngineOptions {
     /// `0` disables it. Recent data is already served from the memtable, so this
     /// only helps reads of keys that have been flushed to SSTables.
     pub read_cache_capacity: usize,
+    /// Per-statement scan budget: the maximum rows a single statement may
+    /// examine (decode + filter) across all its gathers before it errors.
+    /// Guards the node against filters that match (almost) nothing walking
+    /// entire large tables per query — LIMIT bounds output, not scan work.
+    /// `0` disables. Consumed by the engine layer via the scan meter.
+    pub scan_row_budget: usize,
+    /// Wall-clock ceiling per statement in seconds; past it the statement
+    /// errors at its next scan-meter check. Kills zombie queries whose
+    /// client has long since timed out and disconnected (the server used
+    /// to keep executing them to completion). `0` disables.
+    pub statement_timeout_secs: u64,
     /// Tantivy writer heap per full-text search index (bytes). Consumed by
     /// the engine layer, not storage — carried here so the one options bag
     /// the server assembles reaches `Database::open`. Sized from
@@ -79,6 +90,12 @@ pub const DEFAULT_READ_CACHE_CAPACITY: usize = 16_384;
 /// Default full-text writer heap per index (peak RSS during a bulk build is
 /// ≈ 1.5× the heap — measured in the phase-0 spike).
 pub const DEFAULT_SEARCH_WRITER_HEAP: usize = 64 * 1024 * 1024;
+/// Default per-statement scan budget (rows examined). Generous enough for a
+/// full sweep of the largest production table, small enough that a
+/// runaway filter cannot examine the table many times over per statement.
+pub const DEFAULT_SCAN_ROW_BUDGET: usize = 250_000;
+/// Default per-statement wall-clock ceiling (seconds).
+pub const DEFAULT_STATEMENT_TIMEOUT_SECS: u64 = 120;
 
 impl Default for EngineOptions {
     fn default() -> Self {
@@ -97,6 +114,8 @@ impl Default for EngineOptions {
             // (per-block codec byte).
             bottom_compression: Codec::Lz4,
             read_cache_capacity: DEFAULT_READ_CACHE_CAPACITY,
+            scan_row_budget: DEFAULT_SCAN_ROW_BUDGET,
+            statement_timeout_secs: DEFAULT_STATEMENT_TIMEOUT_SECS,
             search_writer_heap_bytes: DEFAULT_SEARCH_WRITER_HEAP,
             ts_head_max_bytes: 0,
         }

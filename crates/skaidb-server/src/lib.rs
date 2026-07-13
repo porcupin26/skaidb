@@ -160,6 +160,8 @@ pub fn run(
         read_cache_capacity,
         search_writer_heap_bytes,
         ts_head_max_bytes,
+        scan_row_budget: config.storage.scan_row_budget as usize,
+        statement_timeout_secs: config.storage.statement_timeout_secs,
         ..Default::default()
     };
     let db = Database::open_with_options(&config.server.data_dir, storage_opts)?;

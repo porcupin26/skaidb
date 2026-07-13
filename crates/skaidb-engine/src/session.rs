@@ -30,6 +30,18 @@ impl Session {
         })
     }
 
+    /// [`Session::open`] with explicit engine options (tests tune the scan
+    /// meter; embedded callers tune storage knobs).
+    pub fn open_with_options(
+        dir: impl AsRef<Path>,
+        opts: skaidb_storage::EngineOptions,
+    ) -> Result<Session> {
+        Ok(Session {
+            db: Database::open_with_options(dir, opts)?,
+            current: DEFAULT_DATABASE.to_string(),
+        })
+    }
+
     /// The database statements currently resolve against.
     pub fn current_database(&self) -> &str {
         &self.current
@@ -233,6 +245,47 @@ mod tests {
         }
         let dt = t0.elapsed();
         assert!(dt.as_millis() < 500, "50 indexed point lookups took {dt:?} — not using the index");
+    }
+
+    /// A filter matching nothing under ORDER BY .. LIMIT walks the whole
+    /// index range; the scan budget must turn that into an error instead of
+    /// unbounded work (the categorizer-poll shape that OOM-looped
+    /// production, 2026-07-13). Queries that fill their limit early stay
+    /// well under budget and are unaffected.
+    #[test]
+    fn scan_budget_bounds_never_matching_walks() {
+        let mut opts = skaidb_storage::EngineOptions {
+            scan_row_budget: 500,
+            ..Default::default()
+        };
+        opts.statement_timeout_secs = 0;
+        let mut s = Session::open_with_options(tmp(), opts).unwrap();
+        s.execute("CREATE TABLE emails (PRIMARY KEY (id));").unwrap();
+        s.execute("CREATE INDEX i_ad ON emails (account, date);").unwrap();
+        for i in 0..2000 {
+            s.execute(&format!(
+                "INSERT INTO emails (id, account, date, flag) VALUES ('k{i:05}', 'a@x', 'd{i:05}', false);"
+            ))
+            .unwrap();
+        }
+        // Fills LIMIT immediately: unaffected by the budget.
+        let ok = s.execute(
+            "SELECT id FROM emails WHERE account = 'a@x' ORDER BY date DESC LIMIT 3;",
+        );
+        assert_eq!(rows(ok.unwrap()).len(), 3);
+        // Residual filter never matches: the walk must die at the budget.
+        let err = s
+            .execute(
+                "SELECT id FROM emails WHERE account = 'a@x' AND flag = true ORDER BY date DESC LIMIT 3;",
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("scan budget"),
+            "expected scan-budget error, got: {err}"
+        );
+        // A later statement gets a fresh meter.
+        let ok = s.execute("SELECT id FROM emails WHERE id = 'k00007';").unwrap();
+        assert_eq!(rows(ok).len(), 1);
     }
 
     #[test]

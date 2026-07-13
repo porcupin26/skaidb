@@ -184,6 +184,16 @@ pub struct StorageConfig {
     /// memtable (0 disables it). Larger values trade RAM for hit rate on
     /// datasets bigger than the memtable.
     pub read_cache_entries: u64,
+    /// Per-statement scan budget: the maximum rows one statement may examine
+    /// (decode + filter) across all its gathers before it errors. `LIMIT`
+    /// bounds output, not scan work — a filter that matches (almost)
+    /// nothing under `ORDER BY .. LIMIT` otherwise walks whole tables per
+    /// query. `0` disables.
+    pub scan_row_budget: u64,
+    /// Wall-clock ceiling per statement in seconds; past it the statement
+    /// errors at its next scan-meter check (kills queries whose client has
+    /// long since disconnected). `0` disables.
+    pub statement_timeout_secs: u64,
     pub compaction_strategy: String,
     pub use_io_uring: bool,
 }
@@ -443,6 +453,8 @@ impl Default for StorageConfig {
         StorageConfig {
             memory_target: String::new(),
             memtable_size_mb: 256,
+            scan_row_budget: 250_000,
+            statement_timeout_secs: 120,
             read_cache_entries: 16_384,
             compaction_strategy: "lazy_leveled".to_string(),
             use_io_uring: true,

@@ -8,6 +8,7 @@ mod error;
 mod eval;
 mod exec;
 pub mod namespace;
+pub mod scan_meter;
 mod result;
 mod session;
 mod ts_query;

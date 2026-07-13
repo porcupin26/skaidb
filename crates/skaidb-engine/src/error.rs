@@ -42,6 +42,9 @@ pub enum EngineError {
     #[error("unsupported: {0}")]
     Unsupported(String),
 
+    #[error("resource limit: {0}")]
+    ResourceLimit(String),
+
     #[error("cluster error: {0}")]
     Cluster(String),
 
