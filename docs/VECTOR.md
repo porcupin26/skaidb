@@ -77,11 +77,16 @@ is present, since filtering happens after the re-read).
 ## How it works
 
 - **HNSW** (Hierarchical Navigable Small World): a layered proximity graph. A
-  search greedily descends from a sparse top layer to the dense base layer,
-  following edges toward the query, giving high recall at a fraction of a
-  brute-force scan. Metrics: cosine (vectors normalized on insert), squared L2,
-  negative dot product. Verified at **>90% recall vs. brute force** on random
-  data across all three metrics.
+  search descends with a small beam from a sparse top layer to the dense base
+  layer, following edges toward the query, giving high recall at a fraction of
+  a brute-force scan. Neighbor edges are chosen with the diversity heuristic
+  (Malkov & Yashunin Algorithm 4), which preserves long-range links on
+  clustered data — closest-only selection lets dense near-duplicate islands
+  wire exclusively to each other and leaves whole regions unreachable.
+  Metrics: cosine (vectors normalized on insert), squared L2, negative dot
+  product. Verified at **>90% recall vs. brute force** on random data across
+  all three metrics, plus dedicated self-recall tests on tightly clustered
+  near-duplicate data.
 - **Filtered search** evaluates the predicate against candidates surfaced by the
   graph; the graph is still traversed through filtered-out nodes for
   connectivity (the basic filtered-HNSW approach).
@@ -118,6 +123,6 @@ in-memory; see limitations).
   candidate-list size live (higher = better recall, slower queries;
   persisted, applies immediately). `m`/`ef_construction` shape the graph
   and need DROP + CREATE.
-- **Simple neighbor selection** — recall/latency beyond `ef` aren't tuned to
-  production ANN libraries; large/high-dimensional workloads want a specialist.
+- **Recall/latency beyond `ef`** aren't tuned to production ANN libraries;
+  large/high-dimensional workloads want a specialist.
 - Vectors must be arrays of `int`/`float` of a single, consistent dimension.

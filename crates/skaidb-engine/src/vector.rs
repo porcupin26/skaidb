@@ -151,7 +151,13 @@ impl Hnsw {
         let mut cur = entry;
         let entry_level = self.nodes[entry as usize].neighbors.len() - 1;
         for l in (level + 1..=entry_level).rev() {
-            cur = self.greedy_closest(id, cur, l);
+            // Same small-beam descent as search(): pure greedy can land the
+            // connect phase in the wrong region on clustered data.
+            let v = self.nodes[id as usize].vector.clone();
+            let cand = self.search_layer(&v, cur, 8, l);
+            if let Some(&(_, nearest)) = cand.first() {
+                cur = nearest;
+            }
         }
 
         // Connect at each layer from the new node's top down to 0.
@@ -159,7 +165,7 @@ impl Hnsw {
         for l in (0..=top).rev() {
             let cand = self.search_layer(&self.nodes[id as usize].vector.clone(), cur, self.ef_construction, l);
             let max = if l == 0 { self.m0 } else { self.m };
-            let chosen: Vec<u32> = cand.iter().take(max).map(|&(_, n)| n).collect();
+            let chosen = self.select_diverse(&cand, max);
             if let Some(&(_, nearest)) = cand.first() {
                 cur = nearest;
             }
@@ -203,7 +209,13 @@ impl Hnsw {
         let mut cur = entry;
         let entry_level = self.nodes[entry as usize].neighbors.len() - 1;
         for l in (1..=entry_level).rev() {
-            cur = self.greedy_closest_vec(&q, cur, l);
+            // A small beam (not pure greedy) at the upper layers: greedy
+            // descent gets trapped in local minima on clustered data and
+            // hands layer 0 an entry point in the wrong region.
+            let cand = self.search_layer(&q, cur, 8, l);
+            if let Some(&(_, nearest)) = cand.first() {
+                cur = nearest;
+            }
         }
         let ef = self.ef_search.max(k);
         let cand = self.search_layer(&q, cur, ef, 0);
@@ -258,33 +270,6 @@ impl Hnsw {
         (-u.ln() * self.ml).floor() as usize
     }
 
-    /// Greedy descent at `layer` from `start` toward node `target`'s vector.
-    fn greedy_closest(&self, target: u32, start: u32, layer: usize) -> u32 {
-        let v = self.nodes[target as usize].vector.clone();
-        self.greedy_closest_vec(&v, start, layer)
-    }
-
-    fn greedy_closest_vec(&self, query: &[f32], start: u32, layer: usize) -> u32 {
-        let mut cur = start;
-        let mut cur_d = self.distance(query, &self.nodes[cur as usize].vector);
-        loop {
-            let mut moved = false;
-            for &nb in &self.nodes[cur as usize].neighbors[layer] {
-                let d = self.distance(query, &self.nodes[nb as usize].vector);
-                if d < cur_d {
-                    cur_d = d;
-                    cur = nb;
-                    moved = true;
-                }
-            }
-            if !moved {
-                return cur;
-            }
-        }
-    }
-
-    /// The classic layer search: returns up to `ef` candidates nearest to
-    /// `query` at `layer`, sorted nearest-first.
     fn search_layer(&self, query: &[f32], entry: u32, ef: usize, layer: usize) -> Vec<(Dist, u32)> {
         let mut visited: HashMap<u32, ()> = HashMap::new();
         // `candidates` is a min-heap (closest first) via Reverse; `result` is a
@@ -337,14 +322,117 @@ impl Hnsw {
             .collect();
         scored.sort_by(|a, b| a.0.cmp(&b.0));
         scored.dedup_by_key(|(_, nb)| *nb);
-        scored.truncate(max);
-        self.nodes[id as usize].neighbors[layer] = scored.into_iter().map(|(_, nb)| nb).collect();
+        self.nodes[id as usize].neighbors[layer] = self.select_diverse(&scored, max);
+    }
+
+    /// Neighbor selection with the diversity heuristic (Malkov & Yashunin,
+    /// Algorithm 4): from `cand` (sorted nearest-first relative to the base
+    /// node), keep a candidate only if it is closer to the base than to every
+    /// neighbor already kept. Closest-only selection collapses on clustered
+    /// data — dense islands wire exclusively to each other, long-range links
+    /// vanish, and whole regions become unreachable. Discarded candidates
+    /// backfill remaining slots so degree stays at `max` when possible.
+    fn select_diverse(&self, cand: &[(Dist, u32)], max: usize) -> Vec<u32> {
+        let mut kept: Vec<(Dist, u32)> = Vec::with_capacity(max);
+        let mut spilled: Vec<u32> = Vec::new();
+        for &(d, c) in cand {
+            if kept.len() >= max {
+                break;
+            }
+            let cv = &self.nodes[c as usize].vector;
+            let diverse = kept
+                .iter()
+                .all(|&(_, k)| Dist(self.distance(cv, &self.nodes[k as usize].vector)) >= d);
+            if diverse {
+                kept.push((d, c));
+            } else {
+                spilled.push(c);
+            }
+        }
+        let mut out: Vec<u32> = kept.into_iter().map(|(_, c)| c).collect();
+        for c in spilled {
+            if out.len() >= max {
+                break;
+            }
+            out.push(c);
+        }
+        out
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Clustered data — the production failure shape: dense near-duplicate
+    /// islands (e.g. newsletter embeddings). Closest-only neighbor selection
+    /// severed inter-cluster links and made whole regions unreachable (top
+    /// hits ~0.38 away from an exact-match query). With diversity selection,
+    /// every stored vector must find itself or an effectively-identical
+    /// near-duplicate; misses to a *different region* are the bug and get
+    /// zero tolerance.
+    #[test]
+    fn self_recall_survives_clustered_data() {
+        let dim = 32;
+        let mut h = Hnsw::new(Metric::Cosine, dim);
+        let centers = vecs(60, dim, 7);
+        let jitter = vecs(60 * 80, dim, 99);
+        let mut all: Vec<Vec<f32>> = Vec::new();
+        for (ci, c) in centers.iter().enumerate() {
+            for j in 0..80 {
+                let mut v = c.clone();
+                for (d, x) in v.iter_mut().enumerate() {
+                    *x += jitter[ci * 80 + j][d] * 0.01; // tight cluster
+                }
+                all.push(v);
+            }
+        }
+        for (i, v) in all.iter().enumerate() {
+            h.insert(format!("k{i}").into_bytes(), v.clone());
+        }
+        let mut catastrophic = 0;
+        let mut near_dupe_misses = 0;
+        let mut probes = 0;
+        for i in (0..all.len()).step_by(97) {
+            probes += 1;
+            let hits = h.search(&all[i], 3, |_| true);
+            let me = format!("k{i}").into_bytes();
+            if hits.iter().any(|(k, _)| *k == me) {
+                continue;
+            }
+            match hits.first() {
+                Some(&(_, d)) if d < 1e-3 => near_dupe_misses += 1,
+                other => {
+                    println!("catastrophic miss idx={i}: {other:?}");
+                    catastrophic += 1;
+                }
+            }
+        }
+        assert_eq!(
+            catastrophic, 0,
+            "{catastrophic} exact-match queries landed in the wrong region"
+        );
+        assert!(
+            near_dupe_misses * 20 <= probes,
+            "{near_dupe_misses}/{probes} near-dupe self-misses (>5%)"
+        );
+    }
+
+    /// Non-degenerate data: exact self-recall must be perfect.
+    #[test]
+    fn self_recall_perfect_on_uniform_data() {
+        let dim = 32;
+        let mut h = Hnsw::new(Metric::Cosine, dim);
+        let all = vecs(3000, dim, 42);
+        for (i, v) in all.iter().enumerate() {
+            h.insert(format!("k{i}").into_bytes(), v.clone());
+        }
+        for i in (0..all.len()).step_by(37) {
+            let hits = h.search(&all[i], 1, |_| true);
+            let me = format!("k{i}").into_bytes();
+            assert_eq!(hits[0].0, me, "k{i} did not find itself");
+        }
+    }
 
     fn vecs(n: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
         let mut r = seed | 1;
