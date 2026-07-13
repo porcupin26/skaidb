@@ -34,6 +34,10 @@ curl -u user:pass -X POST http://node:7080/query \
      -d '{"sql":"SELECT * FROM t","db":"mydb"}'
 # Response: {"columns":[...],"rows":[[...],...]} | {"affected":n} | {"ok":true}
 # | {"error":"..."} (HTTP 400)
+# Optional "consistency": "one" | "quorum" | "all" overrides the defaults
+# for this request. Reads at "one" answer from the coordinator's local
+# replica — bounded and fast (an indexed ORDER BY ... LIMIT n reads n rows),
+# may lag an in-flight write by a beat.
 
 # Bulk JSON document upsert (overwrites on primary key). Optional
 # "consistency": "one" | "quorum" | "all" overrides the write default for
@@ -81,6 +85,9 @@ Key facts an agent must know:
 - **Scalar functions**: `now()` (statement start, timestamp),
   `time_bucket(step, ts)` (floor to bucket: `time_bucket(5m, ts)`).
 - **Aggregates**: `COUNT(*)`, `COUNT(expr)`, `COUNT(DISTINCT expr)` (exact),
+  filtered `COUNT(*)` is answered index-only when a secondary index fully
+  covers a conjunctive equality/range filter (no row reads — safe on tables
+  of any size),
   `APPROX_COUNT_DISTINCT(expr)` (opt-in HLL on the search pushdown, exact
   everywhere else), `SUM`, `AVG`, `MIN`, `MAX`; time-series only: `RATE`,
   `INCREASE`, `DELTA`, `FIRST`, `LAST`.

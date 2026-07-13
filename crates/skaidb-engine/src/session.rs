@@ -80,6 +80,127 @@ mod tests {
         }
     }
 
+    /// Filtered `COUNT(*)` served index-only from a covering secondary index
+    /// must agree with the gather path across inserts, updates and deletes —
+    /// the count_documents shape that wedged two production coordinators.
+    #[test]
+    fn covering_index_count_matches_gather() {
+        let mut s = Session::open(tmp()).unwrap();
+        s.execute("CREATE TABLE emails (PRIMARY KEY (id));").unwrap();
+        s.execute("CREATE INDEX i_acct ON emails (account, tomb, is_read);")
+            .unwrap();
+        for i in 0..300 {
+            let acct = if i % 3 == 0 { "a@x" } else { "b@x" };
+            let tomb = i % 7 == 0;
+            let read = i % 2 == 0;
+            s.execute(&format!(
+                "INSERT INTO emails (id, account, tomb, is_read, n) VALUES ('k{i}', '{acct}', {tomb}, {read}, {i});"
+            ))
+            .unwrap();
+        }
+        // Mutate: flip some is_read (index entries must move), delete some rows.
+        for i in (0..300).step_by(11) {
+            s.execute(&format!("UPDATE emails SET is_read = true WHERE id = 'k{i}';"))
+                .unwrap();
+        }
+        for i in (0..300).step_by(13) {
+            s.execute(&format!("DELETE FROM emails WHERE id = 'k{i}';")).unwrap();
+        }
+        let count = |s: &mut Session, sql: &str| -> i64 {
+            match &rows(s.execute(sql).unwrap())[0][0] {
+                skaidb_types::Value::Int(n) => *n,
+                other => panic!("expected int, got {other:?}"),
+            }
+        };
+        // Covered shapes (index-only) vs the same predicate counted the slow
+        // way (SELECT id + client-side len) — must agree exactly.
+        for pred in [
+            "account = 'b@x' AND tomb = false",
+            "account = 'b@x' AND tomb = false AND is_read = false",
+            "account = 'a@x'",
+        ] {
+            let fast = count(&mut s, &format!("SELECT COUNT(*) FROM emails WHERE {pred};"));
+            let slow = rows(
+                s.execute(&format!("SELECT id FROM emails WHERE {pred};")).unwrap(),
+            )
+            .len() as i64;
+            assert_eq!(fast, slow, "covered count diverged for: {pred}");
+        }
+        // Non-covered shapes must still answer correctly via the gather path:
+        // residual un-indexed column, and a numeric literal (coercion-unsafe
+        // for index probes by design).
+        let fast = count(
+            &mut s,
+            "SELECT COUNT(*) FROM emails WHERE account = 'b@x' AND n = 43;",
+        );
+        assert_eq!(fast, 1);
+        let fast = count(&mut s, "SELECT COUNT(*) FROM emails WHERE n < 10;");
+        let slow = rows(s.execute("SELECT id FROM emails WHERE n < 10;").unwrap()).len() as i64;
+        assert_eq!(fast, slow);
+    }
+
+    /// `ORDER BY <indexed col> [DESC] LIMIT n` must return exactly the
+    /// brute-force answer via the index plan — including the DESC tail-walk —
+    /// across updates and deletes (the newest/oldest-per-account shape).
+    #[test]
+    fn ordered_index_scan_asc_and_desc() {
+        let mut s = Session::open(tmp()).unwrap();
+        s.execute("CREATE TABLE emails (PRIMARY KEY (id));").unwrap();
+        s.execute("CREATE INDEX i_acct_date ON emails (account, date);").unwrap();
+        for i in 0..200 {
+            let acct = if i % 3 == 0 { "a@x" } else { "b@x" };
+            // Deliberately not insertion-ordered dates.
+            let date = format!("2026-01-{:02}T{:02}:00:00+00:00", (i * 7) % 28 + 1, i % 24);
+            s.execute(&format!(
+                "INSERT INTO emails (id, account, date) VALUES ('k{i}', '{acct}', '{date}');"
+            ))
+            .unwrap();
+        }
+        for i in (0..200).step_by(17) {
+            s.execute(&format!("DELETE FROM emails WHERE id = 'k{i}';")).unwrap();
+        }
+        // Brute force over a projection without ORDER BY.
+        let mut dates: Vec<String> = rows(
+            s.execute("SELECT date FROM emails WHERE account = 'b@x';").unwrap(),
+        )
+        .into_iter()
+        .map(|r| match &r[0] {
+            skaidb_types::Value::String(d) => d.clone(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+        dates.sort();
+        for (dir, want) in [("ASC", dates.first().unwrap()), ("DESC", dates.last().unwrap())] {
+            let got = rows(
+                s.execute(&format!(
+                    "SELECT date FROM emails WHERE account = 'b@x' ORDER BY date {dir} LIMIT 1;"
+                ))
+                .unwrap(),
+            );
+            assert_eq!(got.len(), 1, "{dir}");
+            assert_eq!(
+                got[0][0],
+                skaidb_types::Value::String(want.clone()),
+                "{dir} head diverged from brute force"
+            );
+        }
+        // Top-5 DESC must equal the brute-force tail reversed.
+        let got: Vec<String> = rows(
+            s.execute(
+                "SELECT date FROM emails WHERE account = 'b@x' ORDER BY date DESC LIMIT 5;",
+            )
+            .unwrap(),
+        )
+        .into_iter()
+        .map(|r| match &r[0] {
+            skaidb_types::Value::String(d) => d.clone(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+        let want: Vec<String> = dates.iter().rev().take(5).cloned().collect();
+        assert_eq!(got, want);
+    }
+
     #[test]
     fn default_is_current_on_open() {
         let s = Session::open(tmp()).unwrap();

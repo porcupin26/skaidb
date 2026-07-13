@@ -6275,6 +6275,25 @@ impl Cluster for Coordinator {
         Ok(None)
     }
 
+    fn count_filtered(
+        &self,
+        table: &str,
+        filter: &Option<Expr>,
+    ) -> EngineResult<Option<usize>> {
+        // Same full-copy rationale as `count_rows`: every node holds every
+        // row, so a covering secondary index on the local replica answers a
+        // filtered count without a cluster gather (which materializes every
+        // matching row on the coordinator — a count_documents-shaped query
+        // on a 183k-row table wedged two production coordinators,
+        // 2026-07-13). Same freshness trade as `count_rows`.
+        if self.node.cfg.replication_factor >= self.node.member_count() {
+            if let Some(db) = self.node.local_read_bounded() {
+                return db.local_count_filtered(table, filter);
+            }
+        }
+        Ok(None)
+    }
+
     fn matching_rows(
         &self,
         table: &str,
@@ -6310,7 +6329,7 @@ impl Cluster for Coordinator {
         &self,
         table: &str,
         filter: &Option<Expr>,
-        order: Option<&str>,
+        order: Option<(&str, bool)>,
         fetch_limit: Option<usize>,
     ) -> EngineResult<(Vec<(Vec<u8>, Document)>, bool)> {
         // Push a plain `LIMIT n` into the gather so an unfiltered, unordered
@@ -6321,6 +6340,21 @@ impl Cluster for Coordinator {
         if let (None, None, Some(lim)) = (filter, order, fetch_limit) {
             let rows = self.node.cluster_scan_limited(table, self.oc, lim)?;
             return Ok((rows, false));
+        }
+        // Ordered gather at caller-chosen consistency ONE on a full-copy
+        // cluster: serve from the local replica's index plan (sorted scan +
+        // early stop at the fetch limit) instead of materializing every
+        // matching row from every peer on the coordinator — an
+        // `ORDER BY <col> DESC LIMIT 1` over a 183k-row table must read one
+        // row, not the table. Local-only is exactly what ONE means; the
+        // default (quorum) keeps the divergence-merging gather.
+        if order.is_some()
+            && self.oc == Some(Consistency::One)
+            && self.node.cfg.replication_factor >= self.node.member_count()
+        {
+            if let Some(db) = self.node.local_read_bounded() {
+                return db.local_matching_rows_ordered(table, filter, order, fetch_limit);
+            }
         }
         Ok((self.matching_rows(table, filter)?, false))
     }

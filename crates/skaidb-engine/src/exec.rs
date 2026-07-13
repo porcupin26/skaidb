@@ -48,7 +48,7 @@ type KeyedRows = Vec<(Vec<u8>, Document)>;
 type OrderedRows = (KeyedRows, bool);
 /// A chosen index access path: `(index_name, start_key, end_key, sorted)` where
 /// `sorted` is whether the scan order already satisfies the query's `ORDER BY`.
-type IndexPlan = (String, Option<Vec<u8>>, Option<Vec<u8>>, bool);
+type IndexPlan = (String, Option<Vec<u8>>, Option<Vec<u8>>, bool, bool);
 
 /// An embedded skaidb database: catalog plus one storage engine per table and
 /// per secondary index.
@@ -2992,11 +2992,11 @@ impl Database {
     /// Ordered/limited variant of [`Database::local_matching_rows`]; see
     /// [`Cluster::matching_rows_ordered`]. In a transaction, reads go through
     /// the buffered overlay (unindexed, never presorted).
-    fn local_matching_rows_ordered(
+    pub fn local_matching_rows_ordered(
         &self,
         table: &str,
         filter: &Option<Expr>,
-        order: Option<&str>,
+        order: Option<(&str, bool)>,
         fetch_limit: Option<usize>,
     ) -> Result<OrderedRows> {
         if self.txn.is_some() {
@@ -3019,6 +3019,45 @@ impl Database {
         Ok(Some(engine.key_stats()?.live_keys))
     }
 
+    /// Index-only count of `table`'s rows matching `filter`: `Some(n)` when a
+    /// secondary index fully covers a purely conjunctive filter (see
+    /// `plan_covering`), so the answer is the entry count of one index byte
+    /// range with no row reads or decodes. `None` = no covering index (or a
+    /// transaction is open, whose overlay could change the count) — the
+    /// caller falls back to a full gather.
+    pub fn local_count_filtered(
+        &self,
+        table: &str,
+        filter: &Option<Expr>,
+    ) -> Result<Option<usize>> {
+        if self.txn.is_some() {
+            return Ok(None);
+        }
+        if !self.catalog.tables.contains_key(table) {
+            return Err(EngineError::TableNotFound(table.to_string()));
+        }
+        let Some(expr) = filter else {
+            return Ok(None);
+        };
+        if !filter_is_conjunctive(expr) {
+            return Ok(None);
+        }
+        let constraints = column_constraints(filter);
+        if constraints.is_empty() {
+            return Ok(None);
+        }
+        for (name, idx) in self.catalog.indexes.iter().filter(|(_, i)| i.table == table) {
+            let Some((start, end)) = plan_covering(&idx.paths, &constraints) else {
+                continue;
+            };
+            let Some(engine) = self.indexes.get(name) else {
+                continue;
+            };
+            return Ok(Some(engine.count_range(start.as_deref(), end.as_deref())?));
+        }
+        Ok(None)
+    }
+
     /// Collect `(key, doc)` for the rows of `table` matching `filter`, using a
     /// secondary index when the filter permits (equality or range on an indexed
     /// path). Unordered convenience wrapper over [`Database::gather_rows_planned`].
@@ -3039,7 +3078,7 @@ impl Database {
         &self,
         table: &str,
         filter: &Option<Expr>,
-        order: Option<&str>,
+        order: Option<(&str, bool)>,
         fetch_limit: Option<usize>,
     ) -> Result<OrderedRows> {
         // Fast path: the whole filter is a primary-key equality — one point
@@ -3064,7 +3103,8 @@ impl Database {
             };
             return Ok((rows, true));
         }
-        let Some((index_name, start, end, sorted)) = self.plan_index(table, filter, order) else {
+        let Some((index_name, start, end, sorted, reverse)) = self.plan_index(table, filter, order)
+        else {
             // No usable index: stream the table scan (decode one row at a
             // time) and, when no ordering is required, stop as soon as the
             // fetch limit is satisfied — a plain `LIMIT n` touches n matching
@@ -3105,7 +3145,16 @@ impl Database {
             .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
 
         let mut out = Vec::new();
-        for (_entry_key, row_key) in index_engine.scan_range(start.as_deref(), end.as_deref())? {
+        let entries = index_engine.scan_range(start.as_deref(), end.as_deref())?;
+        // A DESC request on the index's scan column: entry keys ascend, so
+        // the tail of the range is the DESC head — walk the entries reversed
+        // (entry keys are cheap; rows are read only until the fetch limit).
+        let iter: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)>> = if reverse {
+            Box::new(entries.into_iter().rev())
+        } else {
+            Box::new(entries.into_iter())
+        };
+        for (_entry_key, row_key) in iter {
             let Some(bytes) = table_engine.get(&row_key)? else {
                 continue; // index entry for a since-deleted row
             };
@@ -3135,13 +3184,15 @@ impl Database {
         &self,
         table: &str,
         filter: &Option<Expr>,
-        order: Option<&str>,
+        order: Option<(&str, bool)>,
     ) -> Option<IndexPlan> {
         let constraints = column_constraints(filter);
         let mut fallback: Option<IndexPlan> = None;
         for (name, idx) in self.catalog.indexes.iter().filter(|(_, i)| i.table == table) {
-            if let Some((start, end, sorted)) = plan_for_index(&idx.paths, &constraints, order) {
-                let plan = (name.clone(), start, end, sorted);
+            if let Some((start, end, sorted, reverse)) =
+                plan_for_index(&idx.paths, &constraints, order)
+            {
+                let plan = (name.clone(), start, end, sorted, reverse);
                 if sorted {
                     return Some(plan); // prefer a plan that also satisfies ORDER BY
                 }
@@ -3249,7 +3300,7 @@ impl Database {
     /// scans the same range.
     pub fn plan_index_scan(&self, table: &str, filter: &Option<Expr>) -> Option<IndexScanRange> {
         self.plan_index(table, filter, None)
-            .map(|(name, start, end, _sorted)| (name, start, end))
+            .map(|(name, start, end, _sorted, _reverse)| (name, start, end))
     }
 
     /// Row keys whose entries fall in `[start, end)` of the named index — the
@@ -4338,7 +4389,7 @@ pub trait Cluster {
         &self,
         table: &str,
         filter: &Option<Expr>,
-        _order: Option<&str>,
+        _order: Option<(&str, bool)>,
         _fetch_limit: Option<usize>,
     ) -> Result<OrderedRows> {
         Ok((self.matching_rows(table, filter)?, false))
@@ -4348,6 +4399,12 @@ pub trait Cluster {
     /// caller falls back to a full gather). Only consulted for unfiltered
     /// `COUNT(*)`.
     fn count_rows(&self, _table: &str) -> Result<Option<usize>> {
+        Ok(None)
+    }
+    /// Fast count of `table`'s rows matching `filter`, when a fully covering
+    /// secondary index answers without materializing or decoding rows
+    /// (`None` = unavailable; the caller falls back to a full gather).
+    fn count_filtered(&self, _table: &str, _filter: &Option<Expr>) -> Result<Option<usize>> {
         Ok(None)
     }
     /// Approximate nearest-neighbor search over the vector index on
@@ -5397,7 +5454,7 @@ fn run_simple_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> {
     let grouped = is_grouped(sel);
     // Unfiltered `SELECT COUNT(*)`: serve straight from storage key statistics
     // without decoding a single row.
-    if grouped && sel.filter.is_none() && sel.group_by.is_empty() && sel.having.is_none() {
+    if grouped && sel.group_by.is_empty() && sel.having.is_none() {
         if let [SelectItem::Expr {
             expr:
                 expr @ Expr::Aggregate {
@@ -5407,7 +5464,15 @@ fn run_simple_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> {
             alias,
         }] = sel.items.as_slice()
         {
-            if let Some(n) = cluster.count_rows(&sel.from)? {
+            // Filtered counts are answered from a covering secondary index
+            // when one exists — a `count_documents`-shaped query on a large
+            // table must not gather the table.
+            let counted = if sel.filter.is_none() {
+                cluster.count_rows(&sel.from)?
+            } else {
+                cluster.count_filtered(&sel.from, &sel.filter)?
+            };
+            if let Some(n) = counted {
                 let col = alias.clone().unwrap_or_else(|| expr_name(expr));
                 let mut rows = vec![vec![Value::Int(n as i64)]];
                 apply_offset_limit(&mut rows, sel.offset, sel.limit);
@@ -5434,8 +5499,12 @@ fn run_simple_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> {
         _ => None,
     };
 
-    let (keyed, presorted) =
-        cluster.matching_rows_ordered(&sel.from, &sel.filter, order_col.as_deref(), fetch_limit)?;
+    let (keyed, presorted) = cluster.matching_rows_ordered(
+        &sel.from,
+        &sel.filter,
+        order_col.as_ref().map(|(c, desc)| (c.as_str(), *desc)),
+        fetch_limit,
+    )?;
     let docs: Vec<Document> = keyed.into_iter().map(|(_k, doc)| doc).collect();
 
     if grouped {
@@ -5767,10 +5836,10 @@ fn sort_result_rows(rs: &mut ResultSet, order_by: &[OrderKey]) -> Result<()> {
 }
 
 /// The column an index could order by: a lone ascending `ORDER BY <column>`.
-fn index_order_column(order_by: &[OrderKey]) -> Option<String> {
+fn index_order_column(order_by: &[OrderKey]) -> Option<(String, bool)> {
     match order_by {
-        [key] if !key.descending => match &key.expr {
-            Expr::Column(col) => Some(col.clone()),
+        [key] => match &key.expr {
+            Expr::Column(col) => Some((col.clone(), key.descending)),
             _ => None,
         },
         _ => None,
@@ -5930,7 +5999,7 @@ impl Cluster for LocalCluster<'_> {
         &self,
         table: &str,
         filter: &Option<Expr>,
-        order: Option<&str>,
+        order: Option<(&str, bool)>,
         fetch_limit: Option<usize>,
     ) -> Result<OrderedRows> {
         self.db.local_matching_rows_ordered(table, filter, order, fetch_limit)
@@ -5938,6 +6007,10 @@ impl Cluster for LocalCluster<'_> {
 
     fn count_rows(&self, table: &str) -> Result<Option<usize>> {
         self.db.local_count_rows(table)
+    }
+
+    fn count_filtered(&self, table: &str, filter: &Option<Expr>) -> Result<Option<usize>> {
+        self.db.local_count_filtered(table, filter)
     }
 
     fn vector_search(
@@ -6081,7 +6154,7 @@ impl Cluster for LocalRead<'_> {
         &self,
         table: &str,
         filter: &Option<Expr>,
-        order: Option<&str>,
+        order: Option<(&str, bool)>,
         fetch_limit: Option<usize>,
     ) -> Result<OrderedRows> {
         self.db.local_matching_rows_ordered(table, filter, order, fetch_limit)
@@ -6089,6 +6162,10 @@ impl Cluster for LocalRead<'_> {
 
     fn count_rows(&self, table: &str) -> Result<Option<usize>> {
         self.db.local_count_rows(table)
+    }
+
+    fn count_filtered(&self, table: &str, filter: &Option<Expr>) -> Result<Option<usize>> {
+        self.db.local_count_filtered(table, filter)
     }
 
     fn vector_search(
@@ -6632,16 +6709,111 @@ fn column_constraints(filter: &Option<Expr>) -> Vec<(String, ColConstraint)> {
     by_col
 }
 
+/// Whether `expr` is a pure conjunction of `column <op> literal` comparisons —
+/// exactly the shape `collect_comparisons` captures in full, so the collected
+/// constraints *are* the filter with nothing residual. Index-only `COUNT(*)`
+/// requires this: any residual predicate would need row re-reads to apply.
+fn filter_is_conjunctive(expr: &Expr) -> bool {
+    match expr {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => filter_is_conjunctive(left) && filter_is_conjunctive(right),
+        Expr::Binary {
+            op: BinaryOp::Eq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq,
+            left,
+            right,
+        } => {
+            matches!(
+                (left.as_ref(), right.as_ref()),
+                (Expr::Column(_), Expr::Literal(v)) | (Expr::Literal(v), Expr::Column(_))
+                    if count_safe_literal(v)
+            )
+        }
+        _ => false,
+    }
+}
+
+/// Whether a literal can probe an index with byte-exact fidelity. Filter
+/// evaluation coerces numerics cross-type (`Int(1)` matches a stored
+/// `Float(1.0)`), but index keys encode each type distinctly — a numeric
+/// probe could silently undercount rows stored under the sibling type. Bool,
+/// String, Bytes and Uuid compare only within their own type in eval, so
+/// index bytes and eval agree. Null literals never match anything.
+fn count_safe_literal(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::Bool(_) | Value::String(_) | Value::Bytes(_) | Value::Uuid(_)
+    )
+}
+
+/// Like `plan_for_index`, but only when the index *fully covers* the
+/// constraint set: a leftmost run of equality-pinned columns, optionally one
+/// trailing range column, and no constrained column left over. Every row
+/// contributes exactly one entry per index (`index_values` never fans out),
+/// so under full coverage the entries in the returned byte range correspond
+/// 1:1 with the rows matching the filter.
+type CoveringBounds = (Option<Vec<u8>>, Option<Vec<u8>>);
+fn plan_covering(
+    paths: &[String],
+    constraints: &[(String, ColConstraint)],
+) -> Option<CoveringBounds> {
+    let get = |col: &str| constraints.iter().find(|(c, _)| c == col).map(|(_, c)| c);
+
+    let mut eq_prefix: Vec<Value> = Vec::new();
+    let mut consumed = 0usize;
+    while eq_prefix.len() < paths.len() {
+        match get(&paths[eq_prefix.len()]) {
+            Some(c) if c.eq.is_some() && c.lo.is_none() && c.hi.is_none() => {
+                eq_prefix.push(c.eq.clone().expect("checked eq above"));
+                consumed += 1;
+            }
+            _ => break,
+        }
+    }
+    let i = eq_prefix.len();
+    let trailing = if i < paths.len() {
+        get(&paths[i]).filter(|c| c.eq.is_none() && (c.lo.is_some() || c.hi.is_some()))
+    } else {
+        None
+    };
+    if trailing.is_some() {
+        consumed += 1;
+    }
+    if consumed == 0 || consumed != constraints.len() {
+        return None; // residual constraints — an entry count would be a superset
+    }
+
+    Some(match trailing {
+        Some(c) => {
+            let start = match &c.lo {
+                Some(v) => Some(index_prefix_n(&push(&eq_prefix, v))),
+                None => Some(index_prefix_n(&eq_prefix)),
+            };
+            let end = match &c.hi {
+                Some(v) => index_upper_bound_n(&push(&eq_prefix, v)),
+                None => index_upper_bound_n(&eq_prefix),
+            };
+            (start, end)
+        }
+        None => (
+            Some(index_prefix_n(&eq_prefix)),
+            index_upper_bound_n(&eq_prefix),
+        ),
+    })
+}
+
 /// Build a scan plan for one (possibly composite) index given the filter's
 /// per-column constraints and the requested `ORDER BY` column. Consumes a
 /// leftmost run of equality-pinned columns, then an optional trailing range on
 /// the next column. Returns `(start, end, sorted)` where `sorted` is whether the
 /// scan order already satisfies `order`.
-type ScanBounds = (Option<Vec<u8>>, Option<Vec<u8>>, bool);
+type ScanBounds = (Option<Vec<u8>>, Option<Vec<u8>>, bool, bool);
 fn plan_for_index(
     paths: &[String],
     constraints: &[(String, ColConstraint)],
-    order: Option<&str>,
+    order: Option<(&str, bool)>,
 ) -> Option<ScanBounds> {
     let get = |col: &str| constraints.iter().find(|(c, _)| c == col).map(|(_, c)| c);
 
@@ -6664,9 +6836,14 @@ fn plan_for_index(
     // The scan yields rows ordered by paths[i], paths[i+1], … (columns 0..i are
     // pinned to a constant). A single `ORDER BY oc` is satisfied if `oc` is one
     // of those pinned columns or is paths[i].
-    let sorted = order.is_some_and(|oc| {
+    // Equality-pinned columns are constant across the range, so any direction
+    // is trivially satisfied; the scan column itself arrives ascending and a
+    // DESC request on it needs the gather to walk the range from the tail.
+    let sorted = order.is_some_and(|(oc, _)| {
         paths[..i].iter().any(|p| p == oc) || paths.get(i).map(String::as_str) == Some(oc)
     });
+    let reverse =
+        order.is_some_and(|(oc, desc)| desc && paths.get(i).map(String::as_str) == Some(oc));
 
     let usable = !eq_prefix.is_empty() || trailing.is_some() || sorted;
     if !usable {
@@ -6693,7 +6870,7 @@ fn plan_for_index(
             index_upper_bound_n(&eq_prefix),
         ),
     };
-    Some((start, end, sorted))
+    Some((start, end, sorted, reverse))
 }
 
 fn push(prefix: &[Value], v: &Value) -> Vec<Value> {

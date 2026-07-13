@@ -272,14 +272,38 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) -> io::Result<()> {
         ctx.superuser_role.clone()
     };
 
-    let (sql, db) = extract_sql(&String::from_utf8_lossy(&req.body));
+    let body_str = String::from_utf8_lossy(&req.body);
+    let (sql, db) = extract_sql(&body_str);
+    // Optional per-request consistency, mirroring POST /insert: reads at
+    // "one" answer from the local replica (bounded, may lag a beat); writes
+    // at "one" ack before the slowest replica. Default: the config levels.
+    let consistency = match serde_json::from_str::<serde_json::Value>(&body_str)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.get("consistency"))
+        .and_then(|v| v.as_str())
+    {
+        None => None,
+        Some(c) => match c.to_ascii_lowercase().as_str() {
+            "one" => Some(skaidb_proto::Consistency::One),
+            "quorum" => Some(skaidb_proto::Consistency::Quorum),
+            "all" => Some(skaidb_proto::Consistency::All),
+            other => {
+                return write_response(
+                    &mut stream,
+                    400,
+                    &json!({"error": format!("bad consistency {other:?}")}),
+                );
+            }
+        },
+    };
     let response = match db {
         // A caller-supplied session database (the gateway itself is
         // stateless): `{"sql": "...", "db": "..."}`. Wrong names fail
         // exactly like `USE <db>` would.
         Some(db) => {
             let mut current_db = db;
-            crate::shared::execute_session_as(&ctx, &role, &mut current_db, &sql, None)
+            crate::shared::execute_session_as(&ctx, &role, &mut current_db, &sql, consistency)
         }
         None => execute_as(&ctx, &role, &sql),
     };

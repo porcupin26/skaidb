@@ -527,6 +527,28 @@ impl Engine {
             .collect()
     }
 
+    /// Count live keys in the half-open byte range `[start, end)` without
+    /// materializing entries — index-only `COUNT(*)` pushdown wants the
+    /// cardinality of an index range, not its contents. Same sources and
+    /// merge as [`Engine::scan_range`], so cost is proportional to the range.
+    pub fn count_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<usize> {
+        let mut sources: Vec<MergeSource<'_>> = Vec::with_capacity(1 + self.sstable_count());
+        sources.push(Box::new(self.mem.range_latest(start, end).into_iter().map(Ok)));
+        for sst in self.sstables_newest_first() {
+            let entries = sst.range(start, end)?;
+            sources.push(Box::new(
+                entries.into_iter().map(|e| Ok((e.key, e.hlc, e.value))),
+            ));
+        }
+        let mut n = 0usize;
+        for item in KWayMerge::new(sources) {
+            if let (_, _, VersionValue::Put(_)) = item? {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
     /// Stream the latest version per key (newest stamp wins) across the
     /// memtable and all SSTables, in key order.
     fn merged_iter(&self) -> KWayMerge<'_> {
