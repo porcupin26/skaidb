@@ -29,10 +29,6 @@ skaidb-sql.workspace = true
 clap.workspace = true
 serde_json.workspace = true
 snap.workspace = true
-# Safe SIGTERM/SIGINT handling for graceful shutdown (flush + FTS commit
-# before exit — an unclean kill costs a full search-index rebuild).
-signal-hook = "0.3"
-
 # jemalloc as the global allocator (server binary only): the default glibc
 # allocator does not return freed memory to the OS under the bulk-load +
 # index-build churn, ratcheting RSS to the cgroup limit and OOM-looping small
@@ -43,6 +39,12 @@ tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 # allocated/resident/retained split so live heap is distinguishable from
 # allocator-retained pages (what the OOM post-mortems lacked).
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+
+# Safe SIGTERM/SIGINT handling for graceful shutdown (flush + FTS commit
+# before exit — an unclean kill costs a full search-index rebuild). Unix-only:
+# the iterator API doesn't exist on Windows.
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
 
 [dev-dependencies]
 skaidb-driver.workspace = true

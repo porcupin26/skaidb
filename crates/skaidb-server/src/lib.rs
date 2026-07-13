@@ -332,6 +332,9 @@ pub fn run(
     // unclean kill costs a full search-index rebuild from a stale watermark
     // (the known ~15-minute restart penalty). systemd's `restart`/`stop`
     // send SIGTERM, so every routine deploy goes through this path.
+    // Unix-only: signal_hook's iterator API doesn't exist on Windows, where
+    // stops are hard kills anyway.
+    #[cfg(unix)]
     {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
