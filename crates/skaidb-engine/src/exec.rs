@@ -242,7 +242,10 @@ impl Database {
         for (name, def) in &catalog.vector_indexes {
             let mut hnsw = new_hnsw(def);
             if let Some(engine) = tables.get(&def.table) {
-                for (key, bytes) in engine.scan()? {
+                // Stream: engine.scan() gathered the whole table's raw bytes
+                // into one Vec before decoding (gigabytes for large tables).
+                for row in engine.scan_versioned_iter() {
+                    let (key, bytes, _hlc) = row?;
                     if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
                         if let Some(v) = doc_vector(&doc, &def.path, def.dim) {
                             hnsw.insert(key, v);
@@ -410,32 +413,57 @@ impl Database {
         if Metric::parse(metric).is_none() {
             return Err(EngineError::Constraint(format!("unknown vector metric '{metric}'")));
         }
-        let rows = self.scan_docs(table)?;
-        let dim = match dim {
-            Some(d) => d,
-            None => rows
-                .iter()
-                .find_map(|(_, doc)| doc_vector_raw(doc, path).map(|v| v.len()))
-                .ok_or_else(|| {
-                    EngineError::Constraint(format!(
-                        "cannot infer vector dimension: no row of '{table}' has a numeric array at '{path}'"
-                    ))
-                })?,
-        };
-
-        let def = VectorIndexDef {
+        // Stream the table: materializing every row as a Document tree
+        // multiplied memory ~8x (a 3 KB float array becomes ~24 KB of Value
+        // nodes) — building over 182k embedding rows OOM-killed a 4 GB node
+        // (2026-07-13). Each row is decoded, its f32 vector extracted, and
+        // the Document dropped before the next row is read.
+        let engine = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+        let mut dim_seen: Option<usize> = dim;
+        let mut hnsw = None;
+        let mut pending_def: Option<VectorIndexDef> = None;
+        for row in engine.scan_versioned_iter() {
+            let (row_key, bytes, _hlc) = row?;
+            let Ok(Value::Document(doc)) = Value::decode(&bytes) else {
+                continue;
+            };
+            let Some(raw) = doc_vector_raw(&doc, path) else {
+                continue;
+            };
+            let d = *dim_seen.get_or_insert(raw.len());
+            if hnsw.is_none() {
+                let def = VectorIndexDef {
+                    table: table.to_string(),
+                    path: path.to_string(),
+                    metric: metric.to_ascii_lowercase(),
+                    dim: d,
+                    ef_search: None,
+                };
+                hnsw = Some(new_hnsw(&def));
+                pending_def = Some(def);
+            }
+            if raw.len() == d {
+                if let (Some(h), Some(v)) = (hnsw.as_mut(), doc_vector(&doc, path, d)) {
+                    h.insert(row_key, v);
+                }
+            }
+        }
+        let dim = dim_seen.ok_or_else(|| {
+            EngineError::Constraint(format!(
+                "cannot infer vector dimension: no row of '{table}' has a numeric array at '{path}'"
+            ))
+        })?;
+        let def = pending_def.unwrap_or_else(|| VectorIndexDef {
             table: table.to_string(),
             path: path.to_string(),
             metric: metric.to_ascii_lowercase(),
             dim,
             ef_search: None,
-        };
-        let mut hnsw = new_hnsw(&def);
-        for (key, doc) in &rows {
-            if let Some(v) = doc_vector(doc, path, dim) {
-                hnsw.insert(key.clone(), v);
-            }
-        }
+        });
+        let hnsw = hnsw.unwrap_or_else(|| new_hnsw(&def));
         self.vector_indexes.insert(name.to_string(), hnsw);
         self.catalog.vector_indexes.insert(name.to_string(), def);
         self.record_schema(key, hlc, false);
@@ -2825,9 +2853,18 @@ impl Database {
             .ok_or_else(|| EngineError::IndexNotFound(name.to_string()))?
             .clone();
         let mut hnsw = new_hnsw(&def);
-        for (row_key, doc) in self.scan_docs(&def.table)? {
-            if let Some(v) = doc_vector(&doc, &def.path, def.dim) {
-                hnsw.insert(row_key, v);
+        let engine = self
+            .tables
+            .get(&def.table)
+            .ok_or_else(|| EngineError::TableNotFound(def.table.clone()))?;
+        // Stream (see create_vector_index): whole-table Document
+        // materialization OOM'd 4 GB nodes.
+        for row in engine.scan_versioned_iter() {
+            let (row_key, bytes, _hlc) = row?;
+            if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
+                if let Some(v) = doc_vector(&doc, &def.path, def.dim) {
+                    hnsw.insert(row_key, v);
+                }
             }
         }
         self.vector_indexes.insert(name.to_string(), hnsw);
