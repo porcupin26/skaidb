@@ -2648,10 +2648,22 @@ impl Database {
             return Err(EngineError::IndexExists(name.to_string()));
         }
         // Create the index store and backfill it from the existing rows.
+        // Stream one row at a time (see rebuild_vector_index): whole-table
+        // Document materialization via scan_docs OOM-killed a 4 GB node
+        // backfilling a 183k-row index (2026-07-13).
         let mut index_engine = StorageEngine::open_with_options(index_dir(&self.dir, name), self.storage_opts)?;
-        for (row_key, doc) in self.scan_docs(table)? {
-            let values = index_values(&doc, paths);
-            index_engine.put(&index_entry_key(&values, &row_key), row_key.clone())?;
+        {
+            let engine = self
+                .tables
+                .get(table)
+                .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+            for row in engine.scan_versioned_iter() {
+                let (row_key, bytes, _hlc) = row?;
+                if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
+                    let values = index_values(&doc, paths);
+                    index_engine.put(&index_entry_key(&values, &row_key), row_key.clone())?;
+                }
+            }
         }
         self.indexes.insert(name.to_string(), index_engine);
         self.catalog.indexes.insert(
@@ -2836,9 +2848,19 @@ impl Database {
             std::fs::remove_dir_all(&dir)?;
         }
         let mut engine = StorageEngine::open_with_options(dir, self.storage_opts)?;
-        for (row_key, doc) in self.scan_docs(&idx_table)? {
-            let values = index_values(&doc, &idx_paths);
-            engine.put(&index_entry_key(&values, &row_key), row_key.clone())?;
+        {
+            // Stream (see create_index): scan_docs materializes the table.
+            let table_engine = self
+                .tables
+                .get(&idx_table)
+                .ok_or_else(|| EngineError::TableNotFound(idx_table.clone()))?;
+            for row in table_engine.scan_versioned_iter() {
+                let (row_key, bytes, _hlc) = row?;
+                if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
+                    let values = index_values(&doc, &idx_paths);
+                    engine.put(&index_entry_key(&values, &row_key), row_key.clone())?;
+                }
+            }
         }
         self.indexes.insert(name.to_string(), engine);
         Ok(())
