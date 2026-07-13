@@ -343,7 +343,8 @@ SELECT id, _distance FROM docs NEAREST (embedding, [/* query */], 5)
 WHERE cat = 'news';
 ```
 
-HNSW, metrics `cosine` (default) / `l2` / `dot`; `_distance` injected;
+HNSW (snapshot-persisted; reload + watermark replay on open), metrics
+`cosine` (default) / `l2` / `dot`; `_distance` injected;
 `ALTER VECTOR INDEX v SET (ef = n)` retunes search-time recall/latency
 live (persisted; build-time knobs need a rebuild);
 `WHERE` filters candidates (over-fetch + filter); `LIMIT/OFFSET` apply

@@ -69,6 +69,9 @@ pub struct Database {
     indexes: HashMap<String, StorageEngine>,
     /// In-memory HNSW vector indexes by name (rebuilt from the table on open).
     vector_indexes: HashMap<String, Hnsw>,
+    /// Max row HLC each vector index has applied — persisted in its snapshot
+    /// so a reload replays only rows stamped after it (FTS-style catch-up).
+    vector_watermarks: HashMap<String, Hlc>,
     /// Live full-text search indexes by name (reopened from disk on open,
     /// caught up from the table by watermark replay).
     search_indexes: HashMap<String, LiveSearchIndex>,
@@ -236,23 +239,59 @@ impl Database {
             timeseries.insert(name.clone(), open_tsdb(&dir, name, def, opts.ts_head_max_bytes)?);
         }
 
-        // Vector indexes live in memory; rebuild each from its table's rows.
+        // Vector indexes live in memory. Load each from its on-disk snapshot
+        // and replay only rows stamped after the snapshot's watermark
+        // (FTS-style catch-up): a reload takes seconds where the from-scratch
+        // graph build takes tens of minutes and has dominated every restart.
+        // Missing, corrupt, or definition-mismatched snapshots fall back to
+        // the full streamed rebuild, and a fresh snapshot is written below.
         let rebuild_start = std::time::Instant::now();
         let mut vector_indexes = HashMap::new();
+        let mut vector_watermarks: HashMap<String, Hlc> = HashMap::new();
         for (name, def) in &catalog.vector_indexes {
-            let mut hnsw = new_hnsw(def);
+            let snap = vector_snapshot_path(&dir, name);
+            let (mut hnsw, watermark, fresh) = match load_vector_snapshot(&snap, def) {
+                Some((h, w)) => (h, w, false),
+                None => (new_hnsw(def), Hlc::MIN, true),
+            };
+            // Rows arrive in KEY order, not HLC order: compare every row
+            // against the snapshot's fixed watermark and track the max seen
+            // separately — advancing the bar mid-loop let one late-stamped
+            // early-keyed tombstone shadow every later-keyed newer row.
+            let mut max_seen = watermark;
             if let Some(engine) = tables.get(&def.table) {
-                // Stream: engine.scan() gathered the whole table's raw bytes
-                // into one Vec before decoding (gigabytes for large tables).
-                for row in engine.scan_versioned_iter() {
-                    let (key, bytes, _hlc) = row?;
-                    if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
-                        if let Some(v) = doc_vector(&doc, &def.path, def.dim) {
-                            hnsw.insert(key, v);
+                // Tombstones included: a row deleted after the snapshot must
+                // leave the graph. HLCs come from the row header, so rows at
+                // or before the watermark skip without a decode.
+                for row in engine.scan_versioned_with_tombstones_iter() {
+                    let (key, hlc, value) = row?;
+                    if hlc <= watermark && !fresh {
+                        continue;
+                    }
+                    if hlc > max_seen {
+                        max_seen = hlc;
+                    }
+                    match value {
+                        Some(bytes) => {
+                            if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
+                                match doc_vector(&doc, &def.path, def.dim) {
+                                    Some(v) => hnsw.insert(key, v),
+                                    None => hnsw.remove(&key),
+                                }
+                            }
                         }
+                        None => hnsw.remove(&key),
                     }
                 }
             }
+            if hnsw.is_dirty() || fresh {
+                if let Err(e) = save_vector_snapshot(&snap, &hnsw, max_seen) {
+                    skaidb_types::slog!("skaidb: vector snapshot save failed for {name}: {e}");
+                } else {
+                    hnsw.mark_clean();
+                }
+            }
+            vector_watermarks.insert(name.clone(), max_seen);
             vector_indexes.insert(name.clone(), hnsw);
         }
         let vector_rebuild_ms = rebuild_start.elapsed().as_millis() as u64;
@@ -346,6 +385,7 @@ impl Database {
             role_store,
             indexes,
             vector_indexes,
+            vector_watermarks,
             search_indexes,
             txn: None,
             clock,
@@ -425,8 +465,12 @@ impl Database {
         let mut dim_seen: Option<usize> = dim;
         let mut hnsw = None;
         let mut pending_def: Option<VectorIndexDef> = None;
+        let mut watermark = Hlc::MIN;
         for row in engine.scan_versioned_iter() {
-            let (row_key, bytes, _hlc) = row?;
+            let (row_key, bytes, hlc) = row?;
+            if hlc > watermark {
+                watermark = hlc;
+            }
             let Ok(Value::Document(doc)) = Value::decode(&bytes) else {
                 continue;
             };
@@ -463,7 +507,14 @@ impl Database {
             dim,
             ef_search: None,
         });
-        let hnsw = hnsw.unwrap_or_else(|| new_hnsw(&def));
+        let mut hnsw = hnsw.unwrap_or_else(|| new_hnsw(&def));
+        if let Err(e) = save_vector_snapshot(&vector_snapshot_path(&self.dir, name), &hnsw, watermark)
+        {
+            skaidb_types::slog!("skaidb: vector snapshot save failed for {name}: {e}");
+        } else {
+            hnsw.mark_clean();
+        }
+        self.vector_watermarks.insert(name.to_string(), watermark);
         self.vector_indexes.insert(name.to_string(), hnsw);
         self.catalog.vector_indexes.insert(name.to_string(), def);
         self.record_schema(key, hlc, false);
@@ -482,6 +533,8 @@ impl Database {
             return Err(EngineError::IndexNotFound(name.to_string()));
         }
         self.vector_indexes.remove(name);
+        self.vector_watermarks.remove(name);
+        let _ = std::fs::remove_file(vector_snapshot_path(&self.dir, name));
         self.record_schema(key, hlc, true);
         self.save_catalog()?;
         Ok(QueryOutput::Ddl)
@@ -789,34 +842,44 @@ impl Database {
     }
 
     /// Update the vector index `name` for `doc` at `key` (insert/replace), or
-    /// remove the entry when the doc has no vector at `path`.
-    fn vector_index_put(&mut self, name: &str, path: &str, doc: &Document, key: &[u8]) {
+    /// remove the entry when the doc has no vector at `path`. `hlc` advances
+    /// the index's replay watermark.
+    fn vector_index_put(&mut self, name: &str, path: &str, doc: &Document, key: &[u8], hlc: Hlc) {
         let dim = self.vector_indexes.get(name).map(|h| h.dim());
         if let (Some(dim), Some(hnsw)) = (dim, self.vector_indexes.get_mut(name)) {
             match doc_vector(doc, path, dim) {
                 Some(v) => hnsw.insert(key.to_vec(), v),
                 None => hnsw.remove(key),
             }
+            self.advance_vector_watermark(name, hlc);
         }
     }
 
-    fn vector_index_del(&mut self, name: &str, key: &[u8]) {
+    fn vector_index_del(&mut self, name: &str, key: &[u8], hlc: Hlc) {
         if let Some(hnsw) = self.vector_indexes.get_mut(name) {
             hnsw.remove(key);
+            self.advance_vector_watermark(name, hlc);
+        }
+    }
+
+    fn advance_vector_watermark(&mut self, name: &str, hlc: Hlc) {
+        let w = self.vector_watermarks.entry(name.to_string()).or_insert(Hlc::MIN);
+        if hlc > *w {
+            *w = hlc;
         }
     }
 
     /// Maintain every vector index on `table` for a written row.
-    fn maintain_vectors_put(&mut self, table: &str, doc: &Document, key: &[u8]) {
+    fn maintain_vectors_put(&mut self, table: &str, doc: &Document, key: &[u8], hlc: Hlc) {
         for (name, path) in self.vector_indexes_on(table) {
-            self.vector_index_put(&name, &path, doc, key);
+            self.vector_index_put(&name, &path, doc, key, hlc);
         }
     }
 
     /// Maintain every vector index on `table` for a deleted row.
-    fn maintain_vectors_del(&mut self, table: &str, key: &[u8]) {
+    fn maintain_vectors_del(&mut self, table: &str, key: &[u8], hlc: Hlc) {
         for (name, _) in self.vector_indexes_on(table) {
-            self.vector_index_del(&name, key);
+            self.vector_index_del(&name, key, hlc);
         }
     }
 
@@ -1660,6 +1723,35 @@ impl Database {
     /// route it through [`Database::execute`] instead.
     pub fn execute_read(&self, sql: &str) -> Result<QueryOutput> {
         self.execute_read_statement(parse(sql)?)
+    }
+
+    /// Persist every vector index whose graph changed since its last
+    /// snapshot. Called on graceful shutdown (and after builds), so the next
+    /// start reloads in seconds instead of rebuilding for tens of minutes.
+    pub fn save_vector_indexes(&mut self) {
+        let names: Vec<String> = self
+            .vector_indexes
+            .iter()
+            .filter(|(_, h)| h.is_dirty())
+            .map(|(n, _)| n.clone())
+            .collect();
+        for name in names {
+            let watermark = self
+                .vector_watermarks
+                .get(&name)
+                .copied()
+                .unwrap_or(Hlc::MIN);
+            let path = vector_snapshot_path(&self.dir, &name);
+            let Some(hnsw) = self.vector_indexes.get_mut(&name) else {
+                continue;
+            };
+            match save_vector_snapshot(&path, hnsw, watermark) {
+                Ok(()) => hnsw.mark_clean(),
+                Err(e) => {
+                    skaidb_types::slog!("skaidb: vector snapshot save failed for {name}: {e}")
+                }
+            }
+        }
     }
 
     /// The `(scan_row_budget, statement_timeout_secs)` pair for callers that
@@ -2902,14 +2994,25 @@ impl Database {
             .ok_or_else(|| EngineError::TableNotFound(def.table.clone()))?;
         // Stream (see create_vector_index): whole-table Document
         // materialization OOM'd 4 GB nodes.
+        let mut watermark = Hlc::MIN;
         for row in engine.scan_versioned_iter() {
-            let (row_key, bytes, _hlc) = row?;
+            let (row_key, bytes, hlc) = row?;
+            if hlc > watermark {
+                watermark = hlc;
+            }
             if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
                 if let Some(v) = doc_vector(&doc, &def.path, def.dim) {
                     hnsw.insert(row_key, v);
                 }
             }
         }
+        if let Err(e) = save_vector_snapshot(&vector_snapshot_path(&self.dir, name), &hnsw, watermark)
+        {
+            skaidb_types::slog!("skaidb: vector snapshot save failed for {name}: {e}");
+        } else {
+            hnsw.mark_clean();
+        }
+        self.vector_watermarks.insert(name.to_string(), watermark);
         self.vector_indexes.insert(name.to_string(), hnsw);
         Ok(())
     }
@@ -4254,7 +4357,7 @@ impl Database {
             for (name, path) in self.indexes_on(table) {
                 self.index_put(&name, &path, &doc, key)?;
             }
-            self.maintain_vectors_put(table, &doc, key);
+            self.maintain_vectors_put(table, &doc, key, hlc);
             self.maintain_search_put(table, &doc, key, hlc)?;
         }
         Ok(())
@@ -4286,7 +4389,7 @@ impl Database {
                 }
             }
         }
-        self.maintain_vectors_del(table, key);
+        self.maintain_vectors_del(table, key, hlc);
         self.maintain_search_del(table, key, hlc)?;
         Ok(())
     }
@@ -4338,7 +4441,7 @@ impl Database {
             for (name, path) in self.indexes_on(table) {
                 self.index_put(&name, &path, &doc, key)?;
             }
-            self.maintain_vectors_put(table, &doc, key);
+            self.maintain_vectors_put(table, &doc, key, hlc);
             self.search_put_unrefreshed(table, &doc, key, hlc)?;
         }
         Ok((commit, handle))
@@ -4380,7 +4483,7 @@ impl Database {
                 }
             }
         }
-        self.maintain_vectors_del(table, key);
+        self.maintain_vectors_del(table, key, hlc);
         self.search_del_unrefreshed(table, key, hlc)?;
         Ok((commit, handle))
     }
@@ -6069,7 +6172,7 @@ impl<'a> LocalCluster<'a> {
                 self.pending.insert(format!("i:{name}"), sync);
             }
         }
-        self.db.maintain_vectors_put(table, doc, key);
+        self.db.maintain_vectors_put(table, doc, key, hlc);
         self.db.search_put_unrefreshed(table, doc, key, hlc)?;
         Ok(true)
     }
@@ -6190,7 +6293,7 @@ impl Cluster for LocalCluster<'_> {
                 self.pending.insert(format!("i:{name}"), sync);
             }
         }
-        self.db.maintain_vectors_del(table, key);
+        self.db.maintain_vectors_del(table, key, hlc);
         self.db.maintain_search_del(table, key, hlc)?;
         Ok(())
     }
@@ -6683,6 +6786,58 @@ impl Database {
             }
         }
     }
+}
+
+/// `<data dir>/vector/<index>.hnsw` — the persisted HNSW snapshot.
+fn vector_snapshot_path(dir: &Path, name: &str) -> std::path::PathBuf {
+    dir.join("vector").join(format!("{name}.hnsw"))
+}
+
+/// Load a snapshot if it exists and matches the live definition's
+/// construction parameters (metric, dim, m, ef_construction — the graph's
+/// shape). `ef_search` is a query-time knob and takes the definition's
+/// current value. Any failure returns `None`: the caller rebuilds.
+fn load_vector_snapshot(
+    path: &Path,
+    def: &VectorIndexDef,
+) -> Option<(Hnsw, Hlc)> {
+    let f = std::fs::File::open(path).ok()?;
+    let mut r = std::io::BufReader::with_capacity(1 << 20, f);
+    let mut wm = [0u8; 12];
+    std::io::Read::read_exact(&mut r, &mut wm).ok()?;
+    let watermark = Hlc::from_bytes(wm);
+    let mut h = Hnsw::read_from(&mut r).ok()?;
+    let fresh = new_hnsw(def);
+    if h.params() != fresh.params() {
+        skaidb_types::slog!(
+            "skaidb: vector snapshot {} ignored — construction params changed",
+            path.display()
+        );
+        return None;
+    }
+    if let Some(ef) = def.ef_search {
+        h.set_ef_search(ef);
+    }
+    Some((h, watermark))
+}
+
+/// Persist `hnsw` + its replay watermark: temp file, fsync, rename — a crash
+/// mid-save leaves the previous snapshot intact.
+fn save_vector_snapshot(path: &Path, hnsw: &Hnsw, watermark: Hlc) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("hnsw.tmp");
+    {
+        let f = std::fs::File::create(&tmp)?;
+        let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+        std::io::Write::write_all(&mut w, &watermark.to_bytes())?;
+        hnsw.write_to(&mut w)?;
+        let f = std::io::Write::flush(&mut w).map(|()| w.into_inner());
+        f?.map_err(|e| e.into_error())?.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 fn new_hnsw(def: &VectorIndexDef) -> Hnsw {

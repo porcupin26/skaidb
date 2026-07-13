@@ -5,9 +5,10 @@ search over them with an in-memory **HNSW** index, including **filtered** search
 ("nearest neighbors *where* …"). This is the index family behind semantic
 search / RAG / recommendations.
 
-> Status: **distributed** (sharded scatter-gather) but still in-memory and
-> rebuilt from the table on open. Both index creation and the kNN query have
-> SQL syntax (`NEAREST`, below). See limitations at the end.
+> Status: **distributed** (sharded scatter-gather), in-memory, persisted as a
+> snapshot and reloaded on open (full rebuild only when no usable snapshot
+> exists). Both index creation and the kNN query have SQL syntax (`NEAREST`,
+> below). See limitations at the end.
 
 ## Storing vectors
 
@@ -59,8 +60,7 @@ let hits = node.vector_search("docs_emb", &query_vec, 10, &filter)?;
 ```
 
 The embedded `create_vector_index(name, table, path, metric, dim)` also exists
-(pass `dim = None` to infer from existing rows — single-node only). On reopen the
-in-memory graph is rebuilt from the table's rows.
+(pass `dim = None` to infer from existing rows — single-node only).
 
 ## Distributed search
 
@@ -115,10 +115,15 @@ in-memory; see limitations).
 
 ## Limitations
 
-- **In-memory, rebuilt on open** — the HNSW lives in RAM and is reconstructed by
-  scanning the table at startup (slow for very large sets). The performant fix is
-  to persist per-segment graphs that ride the LSM (snapshot + mmap), with
-  quantized vectors in RAM and exact vectors re-read from the table.
+- **In-memory** — the whole graph (vectors included) lives in RAM
+  (~1 GB resident for 182k×768). The RAM-lean evolution is quantized vectors
+  in RAM with exact vectors re-read from the table.
+- **Snapshots** — each HNSW persists to `<data>/vector/<name>.hnsw` (written
+  on build and graceful shutdown). A restart loads the snapshot and replays
+  only rows stamped after its watermark — seconds, where the from-scratch
+  build of a 182k×768 graph took 10–40 minutes per restart. A
+  construction-parameter change or corrupt file falls back to a full
+  rebuild.
 - `ALTER VECTOR INDEX <name> SET (ef = <n>)` retunes the search-time
   candidate-list size live (higher = better recall, slower queries;
   persisted, applies immediately). `m`/`ef_construction` shape the graph

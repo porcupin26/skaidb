@@ -75,6 +75,8 @@ pub struct Hnsw {
     by_key: HashMap<Vec<u8>, u32>,
     entry: Option<u32>,
     rng: u64,
+    /// Mutated since the last snapshot save (never persisted itself).
+    dirty: bool,
 }
 
 impl Hnsw {
@@ -109,6 +111,7 @@ impl Hnsw {
             by_key: HashMap::new(),
             entry: None,
             rng: 0x2545_f491_4f6c_dd1d,
+            dirty: false,
         }
     }
 
@@ -131,6 +134,7 @@ impl Hnsw {
         if self.by_key.contains_key(&key) {
             self.remove(&key);
         }
+        self.dirty = true;
         let vector = self.prepared(vector);
         let level = self.random_level();
         let id = self.nodes.len() as u32;
@@ -186,6 +190,7 @@ impl Hnsw {
         if let Some(&id) = self.by_key.get(key) {
             self.nodes[id as usize].deleted = true;
             self.by_key.remove(key);
+            self.dirty = true;
         }
     }
 
@@ -360,9 +365,196 @@ impl Hnsw {
     }
 }
 
+impl Hnsw {
+    /// Whether the graph changed since the last [`Hnsw::mark_clean`].
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Clear the dirty flag (call after a successful snapshot save).
+    pub fn mark_clean(&mut self) {
+        self.dirty = false;
+    }
+
+    /// Snapshot the whole graph to a byte stream: format `SKHNSW01`, all
+    /// parameters, every node (key, tombstone, adjacency, raw f32 vector) —
+    /// enough to resume exactly where construction left off, `rng` included
+    /// (levels of future inserts stay deterministic across a reload, so
+    /// replicas that build vs. load converge on identical graphs).
+    pub fn write_to(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        w.write_all(b"SKHNSW01")?;
+        w.write_all(&[match self.metric {
+            Metric::Cosine => 0u8,
+            Metric::L2 => 1,
+            Metric::Dot => 2,
+        }])?;
+        for v in [
+            self.dim as u64,
+            self.m as u64,
+            self.m0 as u64,
+            self.ef_construction as u64,
+            self.ef_search as u64,
+        ] {
+            w.write_all(&v.to_le_bytes())?;
+        }
+        w.write_all(&self.ml.to_le_bytes())?;
+        w.write_all(&self.rng.to_le_bytes())?;
+        w.write_all(&self.entry.map_or(u32::MAX, |e| e).to_le_bytes())?;
+        w.write_all(&(self.nodes.len() as u32).to_le_bytes())?;
+        for n in &self.nodes {
+            w.write_all(&(n.key.len() as u32).to_le_bytes())?;
+            w.write_all(&n.key)?;
+            w.write_all(&[u8::from(n.deleted)])?;
+            w.write_all(&(n.neighbors.len() as u32).to_le_bytes())?;
+            for level in &n.neighbors {
+                w.write_all(&(level.len() as u32).to_le_bytes())?;
+                for &nb in level {
+                    w.write_all(&nb.to_le_bytes())?;
+                }
+            }
+            // Vector length is `dim` by construction; write raw f32 LE.
+            for &x in &n.vector {
+                w.write_all(&x.to_le_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Rebuild a graph from a [`Hnsw::write_to`] stream. `by_key` is derived;
+    /// any structural mismatch (bad magic, truncation) is an error — the
+    /// caller falls back to a full rebuild from the table.
+    pub fn read_from(r: &mut impl std::io::Read) -> std::io::Result<Hnsw> {
+        use std::io::{Error, ErrorKind, Read};
+        fn u32_of(r: &mut impl Read) -> std::io::Result<u32> {
+            let mut b = [0u8; 4];
+            r.read_exact(&mut b)?;
+            Ok(u32::from_le_bytes(b))
+        }
+        fn u64_of(r: &mut impl Read) -> std::io::Result<u64> {
+            let mut b = [0u8; 8];
+            r.read_exact(&mut b)?;
+            Ok(u64::from_le_bytes(b))
+        }
+        let mut magic = [0u8; 8];
+        r.read_exact(&mut magic)?;
+        if &magic != b"SKHNSW01" {
+            return Err(Error::new(ErrorKind::InvalidData, "bad HNSW snapshot magic"));
+        }
+        let mut mb = [0u8; 1];
+        r.read_exact(&mut mb)?;
+        let metric = match mb[0] {
+            0 => Metric::Cosine,
+            1 => Metric::L2,
+            2 => Metric::Dot,
+            other => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("bad metric tag {other}"),
+                ))
+            }
+        };
+        let dim = u64_of(r)? as usize;
+        let m = u64_of(r)? as usize;
+        let m0 = u64_of(r)? as usize;
+        let ef_construction = u64_of(r)? as usize;
+        let ef_search = u64_of(r)? as usize;
+        let mut fb = [0u8; 8];
+        r.read_exact(&mut fb)?;
+        let ml = f64::from_le_bytes(fb);
+        let rng = u64_of(r)?;
+        let entry_raw = u32_of(r)?;
+        let count = u32_of(r)? as usize;
+        let mut nodes = Vec::with_capacity(count);
+        let mut by_key = HashMap::with_capacity(count);
+        for id in 0..count {
+            let key_len = u32_of(r)? as usize;
+            let mut key = vec![0u8; key_len];
+            r.read_exact(&mut key)?;
+            let mut del = [0u8; 1];
+            r.read_exact(&mut del)?;
+            let levels = u32_of(r)? as usize;
+            let mut neighbors = Vec::with_capacity(levels);
+            for _ in 0..levels {
+                let n = u32_of(r)? as usize;
+                let mut level = Vec::with_capacity(n);
+                for _ in 0..n {
+                    level.push(u32_of(r)?);
+                }
+                neighbors.push(level);
+            }
+            let mut raw = vec![0u8; dim * 4];
+            r.read_exact(&mut raw)?;
+            let vector: Vec<f32> = raw
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            if del[0] == 0 {
+                by_key.insert(key.clone(), id as u32);
+            }
+            nodes.push(Node {
+                vector,
+                key,
+                neighbors,
+                deleted: del[0] != 0,
+            });
+        }
+        Ok(Hnsw {
+            metric,
+            dim,
+            m,
+            m0,
+            ef_construction,
+            ef_search,
+            ml,
+            nodes,
+            by_key,
+            entry: (entry_raw != u32::MAX).then_some(entry_raw),
+            rng,
+            dirty: false,
+        })
+    }
+
+    /// Construction parameters `(metric, dim, m, ef_construction)` — a loaded
+    /// snapshot must match the live index definition or be discarded.
+    pub fn params(&self) -> (Metric, usize, usize, usize) {
+        (self.metric, self.dim, self.m, self.ef_construction)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Snapshot round-trip: a reloaded graph answers identically and future
+    /// inserts (rng included) keep it deterministic vs. never-saved twins.
+    #[test]
+    fn snapshot_roundtrip_preserves_graph_and_determinism() {
+        let dim = 24;
+        let mut a = Hnsw::new(Metric::Cosine, dim);
+        let data = vecs(1500, dim, 11);
+        for (i, v) in data.iter().enumerate().take(1000) {
+            a.insert(format!("k{i}").into_bytes(), v.clone());
+        }
+        a.remove(b"k17".as_slice());
+        let mut buf = Vec::new();
+        a.write_to(&mut buf).unwrap();
+        let mut b = Hnsw::read_from(&mut buf.as_slice()).unwrap();
+        assert!(!b.is_dirty());
+        assert_eq!(a.len(), b.len());
+        // Continue building BOTH from the same state; they must stay twins.
+        for (i, v) in data.iter().enumerate().skip(1000) {
+            a.insert(format!("k{i}").into_bytes(), v.clone());
+            b.insert(format!("k{i}").into_bytes(), v.clone());
+        }
+        assert!(b.is_dirty());
+        for i in (0..1500).step_by(113) {
+            let qa = a.search(&data[i], 5, |_| true);
+            let qb = b.search(&data[i], 5, |_| true);
+            assert_eq!(qa, qb, "diverged at probe {i}");
+        }
+        // The removed key stays gone.
+        assert!(b.search(&data[17], 3, |_| true).iter().all(|(k, _)| k != b"k17"));
+    }
 
     /// Clustered data — the production failure shape: dense near-duplicate
     /// islands (e.g. newsletter embeddings). Closest-only neighbor selection

@@ -165,7 +165,8 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
 - **`BACKUP TO '<path>'`** copies the whole data directory (tables, WALs,
   catalog, search and time-series stores) under the exclusive lock —
   crash-consistent by construction (opening the copy replays WALs like a
-  crash recovery); vector indexes are derived and rebuild on open. The
+  crash recovery); vector indexes load their persisted snapshot on open and
+  replay only rows newer than its watermark (full rebuild if absent). The
   target must not exist. On a cluster each node backs up **its own
   shard**. **`RESTORE FROM '<path>'`** swaps the backup in and reopens,
   moving the previous data aside to `<dir>.pre-restore-<n>` (never

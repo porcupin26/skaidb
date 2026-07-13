@@ -40,6 +40,7 @@ impl Backend {
         match self {
             Backend::Local(db) => {
                 if let Ok(mut db) = db.write() {
+                    db.save_vector_indexes();
                     let _ = db.release_memory_under_pressure(true);
                 }
             }

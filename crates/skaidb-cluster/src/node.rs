@@ -603,6 +603,31 @@ impl Node {
             node.disk_hints.store(1, Ordering::Relaxed);
             skaidb_types::slog!("skaidb: inherited on-disk hint logs found — queueing drain");
         }
+        // Hint-drain retry ticker. Hinted handoff is event-driven — each write
+        // queues one coalesced flush — so a drain that aborted (peer busy,
+        // restart mid-pass) had nothing to retry it: a 2.5 GB inherited
+        // hintlog sat untouched for 14 hours while its peer was long healthy
+        // (2026-07-13). A slow ticker retries while any backlog exists and
+        // logs delivered work, so a stuck drain is visible instead of silent.
+        let drain_weak = Arc::downgrade(&node);
+        thread::spawn(move || {
+            const RETRY_EVERY: Duration = Duration::from_secs(60);
+            loop {
+                thread::sleep(RETRY_EVERY);
+                let Some(node) = drain_weak.upgrade() else { break };
+                if !node.hints_pending() {
+                    continue;
+                }
+                let t0 = Instant::now();
+                let delivered = node.flush_hints();
+                if delivered > 0 {
+                    skaidb_types::slog!(
+                        "skaidb: hint-drain retry delivered {delivered} writes in {} ms",
+                        t0.elapsed().as_millis()
+                    );
+                }
+            }
+        });
         // Memory-pressure sampler: holds a `Weak`, so it exits when the node is
         // dropped. Updates the shedding flag every `SAMPLE_INTERVAL`.
         let mem_weak = Arc::downgrade(&node);
@@ -2955,6 +2980,10 @@ impl Node {
         for _ in 0..240 {
             match self.local.try_write() {
                 Ok(mut db) => {
+                    // Snapshot dirty vector indexes first: the next start
+                    // reloads them in seconds instead of rebuilding for tens
+                    // of minutes (the dominant restart cost before this).
+                    db.save_vector_indexes();
                     let _ = db.release_memory_under_pressure(true);
                     return;
                 }
@@ -3060,11 +3089,21 @@ impl Node {
         if !path.exists() {
             return 0;
         }
-        // Reachability gate: draining at a dead peer is pure churn.
+        // Reachability gate: draining at a dead peer is pure churn. A large
+        // backlog deferred this way is worth a line per retry tick — the
+        // silent variant of this bail is how a multi-GB log went unnoticed.
         if !matches!(
             self.pool.call_timeout(addr, &Request::NodeStatus, PROBE_TIMEOUT),
             Ok(Response::NodeStatus { .. })
         ) {
+            if let Ok(md) = std::fs::metadata(&path) {
+                if md.len() > 64 * 1024 * 1024 {
+                    skaidb_types::slog!(
+                        "skaidb: hint drain deferred — {} MB pending for {replica}, peer unreachable",
+                        md.len() >> 20
+                    );
+                }
+            }
             return 0;
         }
         // Claim the log by renaming; concurrent spills append to a fresh file.

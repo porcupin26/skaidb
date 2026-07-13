@@ -305,6 +305,76 @@ mod tests {
         assert_eq!(rows(ok).len(), 1);
     }
 
+    /// A reopened database must serve NEAREST from the persisted HNSW
+    /// snapshot plus a watermark replay of rows written after it — including
+    /// deletes — without a full rebuild.
+    #[test]
+    fn vector_snapshot_survives_reopen_with_replay() {
+        let dir = tmp();
+        let vec_lit = |seed: usize| -> String {
+            // xorshift-mixed so distinct seeds give genuinely distinct
+            // directions (a linear pattern collides under cosine).
+            let mut x = (seed as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            let v: Vec<String> = (0..8)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    format!("{:.6}", ((x >> 11) as f64 / (1u64 << 53) as f64) - 0.5)
+                })
+                .collect();
+            format!("[{}]", v.join(", "))
+        };
+        {
+            let mut s = Session::open(&dir).unwrap();
+            s.execute("CREATE TABLE docs (PRIMARY KEY (id));").unwrap();
+            for i in 0..50 {
+                s.execute(&format!(
+                    "INSERT INTO docs (id, emb) VALUES ('k{i}', {});",
+                    vec_lit(i)
+                ))
+                .unwrap();
+            }
+            // DDL builds the graph and writes the snapshot.
+            s.execute("CREATE VECTOR INDEX v_docs ON docs (emb) DIM 8 USING cosine;")
+                .unwrap();
+            // Post-snapshot writes: must reach the graph via watermark replay.
+            for i in 50..70 {
+                s.execute(&format!(
+                    "INSERT INTO docs (id, emb) VALUES ('k{i}', {});",
+                    vec_lit(i)
+                ))
+                .unwrap();
+            }
+            s.execute("DELETE FROM docs WHERE id = 'k3';").unwrap();
+            // No explicit save: the reopen must replay these from the table.
+        }
+        let mut s = Session::open(&dir).unwrap();
+        let n = rows(s.execute("SELECT COUNT(*) FROM docs;").unwrap());
+        assert_eq!(n[0][0], skaidb_types::Value::Int(69), "table itself lost rows");
+        // A post-snapshot row is findable.
+        let got = rows(
+            s.execute(&format!(
+                "SELECT id FROM docs NEAREST (emb, {}, 1);",
+                vec_lit(65)
+            ))
+            .unwrap(),
+        );
+        assert_eq!(got[0][0], skaidb_types::Value::String("k65".into()));
+        // The post-snapshot delete stays deleted.
+        let got = rows(
+            s.execute(&format!(
+                "SELECT id FROM docs NEAREST (emb, {}, 50);",
+                vec_lit(3)
+            ))
+            .unwrap(),
+        );
+        assert!(
+            got.iter().all(|r| r[0] != skaidb_types::Value::String("k3".into())),
+            "deleted row resurfaced from the snapshot"
+        );
+    }
+
     #[test]
     fn default_is_current_on_open() {
         let s = Session::open(tmp()).unwrap();
