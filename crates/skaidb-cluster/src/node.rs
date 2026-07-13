@@ -321,6 +321,16 @@ const REPAIR_PAIR_PAUSE: Duration = Duration::from_millis(250);
 #[cfg(test)]
 const REPAIR_PAGE_ROWS: usize = 8;
 
+/// What one `cluster_scan_collect` pass produces from the matching rows.
+enum CollectSink<'a> {
+    /// Collect the rows themselves, optionally stopping at a limit.
+    Rows(Option<usize>),
+    /// Count matches; nothing is retained.
+    Count(&'a mut usize),
+    /// Distinct values of one column across matches; rows are discarded.
+    Distinct(&'a str, &'a mut BTreeMap<Vec<u8>, Value>),
+}
+
 /// Candidate-key count up to which a gathered index range is resolved by
 /// per-key quorum point reads; past it, one paged LWW merge over the table
 /// answers with the same guarantee at far fewer round-trips.
@@ -5101,7 +5111,7 @@ impl Node {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        self.cluster_scan_collect(table, oc, Some(limit), None, &None, None)
+        self.cluster_scan_collect(table, oc, None, &None, CollectSink::Rows(Some(limit)))
     }
 
     /// Streamed, LWW-merged **count** of rows matching `filter`: the sliding
@@ -5114,7 +5124,7 @@ impl Node {
         filter: &Option<Expr>,
         n: &mut usize,
     ) -> EngineResult<()> {
-        self.cluster_scan_collect(table, oc, None, None, filter, Some(n))?;
+        self.cluster_scan_collect(table, oc, None, filter, CollectSink::Count(n))?;
         Ok(())
     }
 
@@ -5128,11 +5138,14 @@ impl Node {
         &self,
         table: &str,
         oc: Option<Consistency>,
-        limit: Option<usize>,
         keep: Option<&BTreeMap<Vec<u8>, ()>>,
         filter: &Option<Expr>,
-        mut counter: Option<&mut usize>,
+        mut sink: CollectSink<'_>,
     ) -> EngineResult<Vec<(Vec<u8>, Document)>> {
+        let limit = match sink {
+            CollectSink::Rows(l) => l,
+            _ => None,
+        };
         self.counters.reads_total.fetch_add(1, Ordering::Relaxed);
         let needed = oc
             .unwrap_or(self.cfg.read_consistency)
@@ -5233,9 +5246,20 @@ impl Node {
                         if !skaidb_engine::matches_filter(filter, &doc)? {
                             continue;
                         }
-                        if let Some(c) = counter.as_deref_mut() {
-                            *c += 1; // count-only: the doc is dropped here
-                            continue;
+                        match &mut sink {
+                            CollectSink::Count(c) => {
+                                **c += 1; // nothing retained
+                                continue;
+                            }
+                            CollectSink::Distinct(col, set) => {
+                                if let Some(v) = doc.get_path(col) {
+                                    if !v.is_null() {
+                                        set.entry(v.encode_key()).or_insert_with(|| v.clone());
+                                    }
+                                }
+                                continue; // nothing retained
+                            }
+                            CollectSink::Rows(_) => {}
                         }
                         out.push((k, doc));
                         if filled(&out) {
@@ -5438,7 +5462,7 @@ impl Node {
         // materialized every row on the coordinator (4.6 GB allocated,
         // OOM-killed two production nodes, 2026-07-13); the sliding merge
         // holds one page window per source and keeps only matching rows.
-        self.cluster_scan_collect(table, oc, None, Some(&keys), &None, None)
+        self.cluster_scan_collect(table, oc, Some(&keys), &None, CollectSink::Rows(None))
     }
 
     /// Distributed **filter pushdown** for a non-indexed `WHERE`: scatter the
@@ -6410,6 +6434,21 @@ impl Cluster for Coordinator {
         Ok(None)
     }
 
+    fn distinct_values(
+        &self,
+        table: &str,
+        col: &str,
+        filter: &Option<Expr>,
+    ) -> EngineResult<Option<Vec<Value>>> {
+        // Streamed distinct at the read quorum via the sliding LWW merge —
+        // one value extracted per matching row, docs discarded. Memory is
+        // the page window plus the distinct set.
+        let mut set: BTreeMap<Vec<u8>, Value> = BTreeMap::new();
+        self.node
+            .cluster_scan_collect(table, self.oc, None, filter, CollectSink::Distinct(col, &mut set))?;
+        Ok(Some(set.into_values().collect()))
+    }
+
     fn count_matching(&self, table: &str, filter: &Option<Expr>) -> EngineResult<Option<usize>> {
         // Streamed count at the read quorum: the sliding LWW merge walks the
         // table page-window by page-window, evaluates the filter, and keeps
@@ -6494,10 +6533,9 @@ impl Cluster for Coordinator {
             let rows = self.node.cluster_scan_collect(
                 table,
                 self.oc,
-                Some(lim),
                 None,
                 filter,
-                None,
+                CollectSink::Rows(Some(lim)),
             )?;
             return Ok((rows, false));
         }

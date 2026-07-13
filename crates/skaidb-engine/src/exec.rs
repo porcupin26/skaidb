@@ -3158,6 +3158,37 @@ impl Database {
         Ok(n)
     }
 
+    /// Streamed distinct values of `col` over rows matching `filter` —
+    /// decode, test, extract one value, discard the row. Values dedupe by
+    /// their order-preserving key encoding; NULL/absent is skipped (it is
+    /// not a value in use). Scan-meter ticked.
+    pub fn local_distinct_values(
+        &self,
+        table: &str,
+        col: &str,
+        filter: &Option<Expr>,
+    ) -> Result<Vec<Value>> {
+        let engine = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+        let mut set: std::collections::BTreeMap<Vec<u8>, Value> = std::collections::BTreeMap::new();
+        for item in engine.scan_iter() {
+            crate::scan_meter::tick(1)?;
+            let (_key, bytes) = item?;
+            if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
+                if matches_filter(filter, &doc)? {
+                    if let Some(v) = doc.get_path(col) {
+                        if !v.is_null() {
+                            set.entry(v.encode_key()).or_insert_with(|| v.clone());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(set.into_values().collect())
+    }
+
     pub fn local_matching_rows_ordered(
         &self,
         table: &str,
@@ -4680,6 +4711,18 @@ pub trait Cluster {
     fn count_matching(&self, _table: &str, _filter: &Option<Expr>) -> Result<Option<usize>> {
         Ok(None)
     }
+    /// Distinct values of one column across rows matching `filter`, without
+    /// materializing rows — `SELECT DISTINCT col` used to gather every
+    /// matching document on the coordinator to deduplicate at the end.
+    /// `None` = unavailable; the caller falls back to the gather.
+    fn distinct_values(
+        &self,
+        _table: &str,
+        _col: &str,
+        _filter: &Option<Expr>,
+    ) -> Result<Option<Vec<Value>>> {
+        Ok(None)
+    }
     /// Fast count of `table`'s live rows, when the implementation can serve it
     /// without materializing or decoding rows (`None` = unavailable; the
     /// caller falls back to a full gather). Only consulted for unfiltered
@@ -5774,6 +5817,24 @@ fn run_simple_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> {
             }
         }
     }
+    // `SELECT DISTINCT <one column>`: stream the distinct set instead of
+    // gathering every matching row to deduplicate at the end — a tags
+    // endpoint's distinct over 183k rows materialized the whole table on
+    // the coordinator and OOM-killed nodes (2026-07-13).
+    if sel.distinct && !grouped && sel.order_by.is_empty() && sel.joins.is_empty() {
+        if let [SelectItem::Expr {
+            expr: Expr::Column(col),
+            alias,
+        }] = sel.items.as_slice()
+        {
+            if let Some(values) = cluster.distinct_values(&sel.from, col, &sel.filter)? {
+                let name = alias.clone().unwrap_or_else(|| col.clone());
+                let mut rows: Vec<Vec<Value>> = values.into_iter().map(|v| vec![v]).collect();
+                apply_offset_limit(&mut rows, sel.offset, sel.limit);
+                return Ok(ResultSet::new(vec![name], rows));
+            }
+        }
+    }
     // An index can satisfy a single ascending `ORDER BY <column>` directly.
     let order_col = if grouped {
         None
@@ -6316,6 +6377,15 @@ impl Cluster for LocalCluster<'_> {
         self.db.local_count_matching(table, filter).map(Some)
     }
 
+    fn distinct_values(
+        &self,
+        table: &str,
+        col: &str,
+        filter: &Option<Expr>,
+    ) -> Result<Option<Vec<Value>>> {
+        self.db.local_distinct_values(table, col, filter).map(Some)
+    }
+
     fn vector_search(
         &self,
         table: &str,
@@ -6473,6 +6543,15 @@ impl Cluster for LocalRead<'_> {
 
     fn count_matching(&self, table: &str, filter: &Option<Expr>) -> Result<Option<usize>> {
         self.db.local_count_matching(table, filter).map(Some)
+    }
+
+    fn distinct_values(
+        &self,
+        table: &str,
+        col: &str,
+        filter: &Option<Expr>,
+    ) -> Result<Option<Vec<Value>>> {
+        self.db.local_distinct_values(table, col, filter).map(Some)
     }
 
     fn vector_search(

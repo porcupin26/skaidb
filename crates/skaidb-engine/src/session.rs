@@ -487,6 +487,32 @@ mod tests {
         assert_eq!(got[0][0], skaidb_types::Value::Int(400), "bare != must exclude NULLs");
     }
 
+    /// SELECT DISTINCT <col> streams the value set (arrays dedupe as whole
+    /// values, like the gather it replaces) and respects the filter.
+    #[test]
+    fn distinct_single_column_streams() {
+        let mut s = Session::open(tmp()).unwrap();
+        s.execute("CREATE TABLE emails (PRIMARY KEY (id));").unwrap();
+        for i in 0..300 {
+            let labels = match i % 4 {
+                0 => "['work']",
+                1 => "['home','work']",
+                2 => "['spam']",
+                _ => "['home','work']",
+            };
+            let tomb = i % 10 == 0;
+            s.execute(&format!(
+                "INSERT INTO emails (id, labels, tomb) VALUES ('k{i}', {labels}, {tomb});"
+            ))
+            .unwrap();
+        }
+        let got = rows(
+            s.execute("SELECT DISTINCT labels FROM emails WHERE tomb = false;").unwrap(),
+        );
+        // three distinct arrays survive the filter
+        assert_eq!(got.len(), 3, "{got:?}");
+    }
+
     #[test]
     fn default_is_current_on_open() {
         let s = Session::open(tmp()).unwrap();
