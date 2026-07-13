@@ -84,6 +84,9 @@ Key facts an agent must know:
   Three-valued logic: `NULL` comparisons are unknown.
 - **Scalar functions**: `now()` (statement start, timestamp),
   `time_bucket(step, ts)` (floor to bucket: `time_bucket(5m, ts)`).
+- **ORDER BY**: a multi-key `ORDER BY` whose leading key is indexed walks the
+  index bounded by LIMIT plus the leading-key tie group, then re-sorts by the
+  full clause — exact, without gathering every matching row.
 - **Scan budget**: one statement may examine at most `storage.scan_row_budget`
   rows (default 250k; 0 disables) and run at most
   `storage.statement_timeout_secs` (default 120s; 0 disables) — past either it
@@ -92,7 +95,10 @@ Key facts an agent must know:
 - **Aggregates**: `COUNT(*)`, `COUNT(expr)`, `COUNT(DISTINCT expr)` (exact),
   filtered `COUNT(*)` is answered index-only when a secondary index fully
   covers a conjunctive equality/range filter (no row reads — safe on tables
-  of any size),
+  of any size); one NULL-safe negated equality (`col != v OR col IS NULL`,
+  the Mongo-`$ne` shape) beside a covering conjunction counts by complement
+  (two index-range cardinalities); other filtered counts stream with
+  bounded memory,
   `APPROX_COUNT_DISTINCT(expr)` (opt-in HLL on the search pushdown, exact
   everywhere else), `SUM`, `AVG`, `MIN`, `MAX`; time-series only: `RATE`,
   `INCREASE`, `DELTA`, `FIRST`, `LAST`.
