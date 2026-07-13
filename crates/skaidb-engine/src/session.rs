@@ -273,6 +273,23 @@ mod tests {
             "SELECT id FROM emails WHERE account = 'a@x' ORDER BY date DESC LIMIT 3;",
         );
         assert_eq!(rows(ok.unwrap()).len(), 3);
+        // A sibling index pinning one more equality but spanning the whole
+        // range must NOT beat the sorted plan when a limit bounds the walk —
+        // this exact mis-pick turned a LIMIT-5 poll into 150k row reads.
+        s.execute("CREATE INDEX i_af ON emails (account, flag);").unwrap();
+        let t0 = std::time::Instant::now();
+        let got = rows(
+            s.execute(
+                "SELECT id FROM emails WHERE account = 'a@x' AND flag = false ORDER BY date DESC LIMIT 3;",
+            )
+            .unwrap(),
+        );
+        assert_eq!(got.len(), 3);
+        assert!(
+            t0.elapsed().as_millis() < 200,
+            "sorted plan not chosen under ORDER BY + LIMIT: {:?}",
+            t0.elapsed()
+        );
         // Residual filter never matches: the walk must die at the budget.
         let err = s
             .execute(

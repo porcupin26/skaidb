@@ -3146,7 +3146,8 @@ impl Database {
             };
             return Ok((rows, true));
         }
-        let Some((index_name, start, end, sorted, reverse)) = self.plan_index(table, filter, order)
+        let Some((index_name, start, end, sorted, reverse)) =
+            self.plan_index(table, filter, order, fetch_limit)
         else {
             // No usable index: stream the table scan (decode one row at a
             // time) and, when no ordering is required, stop as soon as the
@@ -3230,6 +3231,7 @@ impl Database {
         table: &str,
         filter: &Option<Expr>,
         order: Option<(&str, bool)>,
+        fetch_limit: Option<usize>,
     ) -> Option<IndexPlan> {
         let constraints = column_constraints(filter);
         // Rank candidates by how much of the filter the index consumes: the
@@ -3254,6 +3256,15 @@ impl Database {
             }));
             (eq, range)
         };
+        // Which quality leads depends on what bounds the work. With an ORDER
+        // BY *and* a fetch limit, a sorted plan stops after `limit` matches —
+        // the categorizer shape (account eq + ORDER BY date DESC LIMIT n)
+        // must take the sorted (account, date) walk, not a sibling index
+        // that pins one more equality yet spans half the table (that pick
+        // ran 150k row reads for LIMIT 5). Without a limit the whole result
+        // gets built either way, so the tightest range wins — the dedup
+        // shape (two equalities, no order) must take its covering index.
+        let sorted_first = order.is_some() && fetch_limit.is_some();
         let mut best: Option<(IndexPlan, (usize, usize), bool)> = None;
         for (name, idx) in self.catalog.indexes.iter().filter(|(_, i)| i.table == table) {
             if let Some((start, end, sorted, reverse)) =
@@ -3263,10 +3274,12 @@ impl Database {
                 let plan = (name.clone(), start, end, sorted, reverse);
                 let better = match &best {
                     None => true,
-                    // Selectivity first — a tight range beats a sorted full
-                    // scan; sorted breaks ties.
                     Some((_, bs, bsorted)) => {
-                        score > *bs || (score == *bs && sorted && !bsorted)
+                        if sorted_first && sorted != *bsorted {
+                            sorted
+                        } else {
+                            score > *bs || (score == *bs && sorted && !bsorted)
+                        }
                     }
                 };
                 if better {
@@ -3374,7 +3387,7 @@ impl Database {
     /// The byte bounds are catalog-deterministic, so every node's local index
     /// scans the same range.
     pub fn plan_index_scan(&self, table: &str, filter: &Option<Expr>) -> Option<IndexScanRange> {
-        self.plan_index(table, filter, None)
+        self.plan_index(table, filter, None, None)
             .map(|(name, start, end, _sorted, _reverse)| (name, start, end))
     }
 
