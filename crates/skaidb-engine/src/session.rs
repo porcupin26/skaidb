@@ -446,9 +446,9 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(got[0][0], skaidb_types::Value::Int(400));
-        // With (account, tomb, archived) indexed, the same count must be
-        // answered by the covering complement — COUNT(rest) − COUNT(rest AND
-        // archived = true) — and stay exact.
+        // With (account, tomb, archived) indexed, the bare `!=` still streams
+        // (SQL semantics exclude nulls; the complement can't) — exactness is
+        // what matters here.
         s.execute("CREATE INDEX i_arch ON emails (account, tomb, archived);").unwrap();
         let got = rows(
             s.execute(
@@ -457,11 +457,34 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(got[0][0], skaidb_types::Value::Int(400));
-        // Negated-eq as the WHOLE filter: total-rows complement.
+        // Bare negated-eq as the WHOLE filter: streamed, null-excluding.
         let got = rows(
             s.execute("SELECT COUNT(*) FROM emails WHERE archived != true;").unwrap(),
         );
         assert_eq!(got[0][0], skaidb_types::Value::Int(400));
+        // The NULL-safe form Mongo-semantics adapters emit — rows lacking the
+        // column count as "not equal". Insert some column-less rows: the
+        // complement must include them; the bare != must not.
+        for i in 500..520 {
+            s.execute(&format!(
+                "INSERT INTO emails (id, account, tomb) VALUES ('k{i}', 'a@x', false);"
+            ))
+            .unwrap();
+        }
+        let got = rows(
+            s.execute(
+                "SELECT COUNT(*) FROM emails WHERE account = 'a@x' AND tomb = false AND (archived != true OR archived IS NULL);",
+            )
+            .unwrap(),
+        );
+        assert_eq!(got[0][0], skaidb_types::Value::Int(420));
+        let got = rows(
+            s.execute(
+                "SELECT COUNT(*) FROM emails WHERE account = 'a@x' AND tomb = false AND archived != true;",
+            )
+            .unwrap(),
+        );
+        assert_eq!(got[0][0], skaidb_types::Value::Int(400), "bare != must exclude NULLs");
     }
 
     #[test]

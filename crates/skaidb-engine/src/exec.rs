@@ -7068,10 +7068,43 @@ fn column_constraints(filter: &Option<Expr>) -> Vec<(String, ColConstraint)> {
     by_col
 }
 
-/// Split a conjunction holding exactly one `col != lit` term (count-safe
-/// literal) into `(rest_of_conjunction, col, lit)`. `rest` is `None` when the
-/// negated equality is the whole filter. Any other shape returns `None`.
+/// Split a conjunction holding exactly one NULL-safe negated equality —
+/// `(col != lit OR col IS NULL)`, the shape Mongo-semantics adapters emit for
+/// `$ne` — into `(rest_of_conjunction, col, lit)`. Only this form admits the
+/// complement identity COUNT(rest) − COUNT(rest AND col = lit): it counts
+/// everything except `col = lit`, absent/null included. A BARE `col != lit`
+/// must NOT take this path — SQL `!=` excludes nulls, the complement keeps
+/// them (a test caught exactly that off-by-nulls).
 fn split_one_negated_eq(expr: &Expr) -> Option<(Option<Expr>, String, Value)> {
+    /// `col != lit` with a count-safe literal → `(col, lit)`.
+    fn as_neq(expr: &Expr) -> Option<(String, Value)> {
+        let Expr::Binary {
+            op: BinaryOp::NotEq,
+            left,
+            right,
+        } = expr
+        else {
+            return None;
+        };
+        match (left.as_ref(), right.as_ref()) {
+            (Expr::Column(c), Expr::Literal(v)) | (Expr::Literal(v), Expr::Column(c))
+                if count_safe_literal(v) =>
+            {
+                Some((c.clone(), v.clone()))
+            }
+            _ => None,
+        }
+    }
+    /// `col IS NULL` → the column name.
+    fn as_is_null(expr: &Expr) -> Option<&str> {
+        match expr {
+            Expr::IsNull { expr, negated: false } => match expr.as_ref() {
+                Expr::Column(c) => Some(c),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
     fn collect(expr: &Expr, keep: &mut Vec<Expr>, neg: &mut Vec<(String, Value)>) -> bool {
         match expr {
             Expr::Binary {
@@ -7080,18 +7113,26 @@ fn split_one_negated_eq(expr: &Expr) -> Option<(Option<Expr>, String, Value)> {
                 right,
             } => collect(left, keep, neg) && collect(right, keep, neg),
             Expr::Binary {
-                op: BinaryOp::NotEq,
+                op: BinaryOp::Or,
                 left,
                 right,
-            } => match (left.as_ref(), right.as_ref()) {
-                (Expr::Column(c), Expr::Literal(v)) | (Expr::Literal(v), Expr::Column(c))
-                    if count_safe_literal(v) =>
-                {
-                    neg.push((c.clone(), v.clone()));
-                    true
+            } => {
+                // NULL-safe pair: (col != lit OR col IS NULL), either order.
+                let pair = match (as_neq(left), as_is_null(right)) {
+                    (Some((c, v)), Some(n)) if c == n => Some((c, v)),
+                    _ => match (as_is_null(left), as_neq(right)) {
+                        (Some(n), Some((c, v))) if c == n => Some((c, v)),
+                        _ => None,
+                    },
+                };
+                match pair {
+                    Some(cv) => {
+                        neg.push(cv);
+                        true
+                    }
+                    None => false,
                 }
-                _ => false,
-            },
+            }
             other => {
                 keep.push(other.clone());
                 true
