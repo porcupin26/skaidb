@@ -3209,19 +3209,49 @@ impl Database {
         order: Option<(&str, bool)>,
     ) -> Option<IndexPlan> {
         let constraints = column_constraints(filter);
-        let mut fallback: Option<IndexPlan> = None;
+        // Rank candidates by how much of the filter the index consumes: the
+        // number of equality-pinned prefix columns, then a trailing range.
+        // Taking the *first* usable index (HashMap order — varies per
+        // process!) let a two-equality dedup probe land on a sibling index
+        // that only consumed one column: the 150k-entry candidate range
+        // overflowed the point-read budget and fell back to a whole-table
+        // coordinator gather, OOM-killing 4 GB nodes (2026-07-13).
+        let selectivity = |paths: &[String]| -> (usize, usize) {
+            let get =
+                |col: &str| constraints.iter().find(|(c, _)| c == col).map(|(_, c)| c);
+            let mut eq = 0usize;
+            while eq < paths.len() {
+                match get(&paths[eq]) {
+                    Some(c) if c.eq.is_some() => eq += 1,
+                    _ => break,
+                }
+            }
+            let range = usize::from(paths.get(eq).and_then(|p| get(p)).is_some_and(|c| {
+                c.lo.is_some() || c.hi.is_some()
+            }));
+            (eq, range)
+        };
+        let mut best: Option<(IndexPlan, (usize, usize), bool)> = None;
         for (name, idx) in self.catalog.indexes.iter().filter(|(_, i)| i.table == table) {
             if let Some((start, end, sorted, reverse)) =
                 plan_for_index(&idx.paths, &constraints, order)
             {
+                let score = selectivity(&idx.paths);
                 let plan = (name.clone(), start, end, sorted, reverse);
-                if sorted {
-                    return Some(plan); // prefer a plan that also satisfies ORDER BY
+                let better = match &best {
+                    None => true,
+                    // Selectivity first — a tight range beats a sorted full
+                    // scan; sorted breaks ties.
+                    Some((_, bs, bsorted)) => {
+                        score > *bs || (score == *bs && sorted && !bsorted)
+                    }
+                };
+                if better {
+                    best = Some((plan, score, sorted));
                 }
-                fallback.get_or_insert(plan);
             }
         }
-        fallback
+        best.map(|(plan, _, _)| plan)
     }
 
     /// The `(name, paths)` of every index defined on `table`.

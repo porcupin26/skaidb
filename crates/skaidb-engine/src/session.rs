@@ -201,6 +201,40 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    /// The production dedup shape must plan onto its composite index —
+    /// probe timing: an indexed point lookup on 20k rows is microseconds;
+    /// a fallback full scan is not.
+    #[test]
+    fn dedup_shape_plans_onto_composite_index() {
+        let mut s = Session::open(tmp()).unwrap();
+        s.execute("CREATE TABLE gmail_emails (PRIMARY KEY (id));").unwrap();
+        // The production index set: sibling indexes whose leading column
+        // also appears in the dedup filter. Planner must pick the index
+        // consuming BOTH equalities, not whichever HashMap yields first —
+        // the account-only prefix matches ~half the table.
+        s.execute("CREATE INDEX i_status ON gmail_emails (account, tomb, is_read);").unwrap();
+        s.execute("CREATE INDEX i_date ON gmail_emails (account, date);").unwrap();
+        s.execute("CREATE INDEX i_dedup ON gmail_emails (gmail_id, account);").unwrap();
+        for i in 0..20000 {
+            s.execute(&format!(
+                "INSERT INTO gmail_emails (id, gmail_id, account, body) VALUES ('k{i}', 'g{i}', 'a@x', 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx');"
+            ))
+            .unwrap();
+        }
+        let t0 = std::time::Instant::now();
+        for _ in 0..50 {
+            let got = rows(
+                s.execute(
+                    "SELECT id FROM gmail_emails WHERE \"gmail_id\" = 'g19999' AND \"account\" = 'a@x' LIMIT 1;",
+                )
+                .unwrap(),
+            );
+            assert_eq!(got.len(), 1);
+        }
+        let dt = t0.elapsed();
+        assert!(dt.as_millis() < 500, "50 indexed point lookups took {dt:?} — not using the index");
+    }
+
     #[test]
     fn default_is_current_on_open() {
         let s = Session::open(tmp()).unwrap();
