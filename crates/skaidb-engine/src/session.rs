@@ -446,6 +446,22 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(got[0][0], skaidb_types::Value::Int(400));
+        // With (account, tomb, archived) indexed, the same count must be
+        // answered by the covering complement — COUNT(rest) − COUNT(rest AND
+        // archived = true) — and stay exact.
+        s.execute("CREATE INDEX i_arch ON emails (account, tomb, archived);").unwrap();
+        let got = rows(
+            s.execute(
+                "SELECT COUNT(*) FROM emails WHERE account = 'a@x' AND tomb = false AND archived != true;",
+            )
+            .unwrap(),
+        );
+        assert_eq!(got[0][0], skaidb_types::Value::Int(400));
+        // Negated-eq as the WHOLE filter: total-rows complement.
+        let got = rows(
+            s.execute("SELECT COUNT(*) FROM emails WHERE archived != true;").unwrap(),
+        );
+        assert_eq!(got[0][0], skaidb_types::Value::Int(400));
     }
 
     #[test]

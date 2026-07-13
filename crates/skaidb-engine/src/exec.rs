@@ -3205,10 +3205,50 @@ impl Database {
         let Some(expr) = filter else {
             return Ok(None);
         };
+        if let Some(n) = self.covering_count(table, expr)? {
+            return Ok(Some(n));
+        }
+        // One negated equality (`col != lit`) beside an otherwise-covering
+        // conjunction: count by complement — COUNT(rest) − COUNT(rest AND
+        // col = lit) — when BOTH sides are covering. The UI's default mail
+        // view (`is_archived != true`) hits exactly this; its streamed
+        // fallback walked 183k rows per pagination count.
+        if let Some((rest, col, lit)) = split_one_negated_eq(expr) {
+            let eq = Expr::Binary {
+                op: BinaryOp::Eq,
+                left: Box::new(Expr::Column(col)),
+                right: Box::new(Expr::Literal(lit)),
+            };
+            let with_eq = match &rest {
+                Some(r) => Expr::Binary {
+                    op: BinaryOp::And,
+                    left: Box::new(r.clone()),
+                    right: Box::new(eq),
+                },
+                None => eq,
+            };
+            let total = match &rest {
+                Some(r) => self.covering_count(table, r)?,
+                // No other terms: the unfiltered storage count is exact.
+                None => self.local_count_rows(table)?,
+            };
+            if let (Some(total), Some(matching)) =
+                (total, self.covering_count(table, &with_eq)?)
+            {
+                return Ok(Some(total.saturating_sub(matching)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// `Some(count)` when a covering index answers `expr` exactly (see
+    /// `plan_covering`); `None` otherwise.
+    fn covering_count(&self, table: &str, expr: &Expr) -> Result<Option<usize>> {
         if !filter_is_conjunctive(expr) {
             return Ok(None);
         }
-        let constraints = column_constraints(filter);
+        let filter = Some(expr.clone());
+        let constraints = column_constraints(&filter);
         if constraints.is_empty() {
             return Ok(None);
         }
@@ -7026,6 +7066,50 @@ fn column_constraints(filter: &Option<Expr>) -> Vec<(String, ColConstraint)> {
         }
     }
     by_col
+}
+
+/// Split a conjunction holding exactly one `col != lit` term (count-safe
+/// literal) into `(rest_of_conjunction, col, lit)`. `rest` is `None` when the
+/// negated equality is the whole filter. Any other shape returns `None`.
+fn split_one_negated_eq(expr: &Expr) -> Option<(Option<Expr>, String, Value)> {
+    fn collect(expr: &Expr, keep: &mut Vec<Expr>, neg: &mut Vec<(String, Value)>) -> bool {
+        match expr {
+            Expr::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => collect(left, keep, neg) && collect(right, keep, neg),
+            Expr::Binary {
+                op: BinaryOp::NotEq,
+                left,
+                right,
+            } => match (left.as_ref(), right.as_ref()) {
+                (Expr::Column(c), Expr::Literal(v)) | (Expr::Literal(v), Expr::Column(c))
+                    if count_safe_literal(v) =>
+                {
+                    neg.push((c.clone(), v.clone()));
+                    true
+                }
+                _ => false,
+            },
+            other => {
+                keep.push(other.clone());
+                true
+            }
+        }
+    }
+    let mut keep = Vec::new();
+    let mut neg = Vec::new();
+    if !collect(expr, &mut keep, &mut neg) || neg.len() != 1 {
+        return None;
+    }
+    let rest = keep.into_iter().reduce(|a, b| Expr::Binary {
+        op: BinaryOp::And,
+        left: Box::new(a),
+        right: Box::new(b),
+    });
+    let (col, lit) = neg.pop().expect("checked len");
+    Some((rest, col, lit))
 }
 
 /// Whether `expr` is a pure conjunction of `column <op> literal` comparisons —
