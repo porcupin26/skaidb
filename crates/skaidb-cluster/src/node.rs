@@ -321,6 +321,11 @@ const REPAIR_PAIR_PAUSE: Duration = Duration::from_millis(250);
 #[cfg(test)]
 const REPAIR_PAGE_ROWS: usize = 8;
 
+/// Candidate-key count up to which a gathered index range is resolved by
+/// per-key quorum point reads; past it, one paged LWW merge over the table
+/// answers with the same guarantee at far fewer round-trips.
+const INDEX_POINT_READ_MAX: usize = 256;
+
 /// Rows per `ScanPage` pulled from each member during a distributed
 /// full-table gather (`cluster_scan`): bounds the coordinator's transient
 /// buffering to a few in-flight pages regardless of table size, instead of
@@ -5096,7 +5101,7 @@ impl Node {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        self.cluster_scan_collect(table, oc, Some(limit), None)
+        self.cluster_scan_collect(table, oc, Some(limit), None, &None)
     }
 
     /// Paged, LWW-merged scan collecting at most `limit` rows (all when
@@ -5111,6 +5116,7 @@ impl Node {
         oc: Option<Consistency>,
         limit: Option<usize>,
         keep: Option<&BTreeMap<Vec<u8>, ()>>,
+        filter: &Option<Expr>,
     ) -> EngineResult<Vec<(Vec<u8>, Document)>> {
         self.counters.reads_total.fetch_add(1, Ordering::Relaxed);
         let needed = oc
@@ -5209,6 +5215,9 @@ impl Node {
                     if let Value::Document(doc) = Value::decode(&bytes)
                         .map_err(|e| EngineError::Cluster(format!("corrupt row: {e}")))?
                     {
+                        if !skaidb_engine::matches_filter(filter, &doc)? {
+                            continue;
+                        }
                         out.push((k, doc));
                         if filled(&out) {
                             break;
@@ -5342,9 +5351,21 @@ impl Node {
         end: Option<Vec<u8>>,
         oc: Option<Consistency>,
     ) -> EngineResult<Vec<(Vec<u8>, Document)>> {
-        let mut keys: BTreeMap<Vec<u8>, ()> = BTreeMap::new();
+        let keys = self.index_candidate_keys(table, index, start, end)?;
+        self.resolve_candidates(table, keys, oc)
+    }
 
-        // Local index shard.
+    /// Gather the candidate row keys of one index byte range from the local
+    /// shard and every reachable peer (unreachable peers are skipped —
+    /// their rows still reach us via other replicas at resolve time).
+    fn index_candidate_keys(
+        &self,
+        _table: &str,
+        index: &str,
+        start: Option<Vec<u8>>,
+        end: Option<Vec<u8>>,
+    ) -> EngineResult<BTreeMap<Vec<u8>, ()>> {
+        let mut keys: BTreeMap<Vec<u8>, ()> = BTreeMap::new();
         {
             let db = self
                 .local
@@ -5354,9 +5375,6 @@ impl Node {
                 keys.insert(k, ());
             }
         }
-
-        // Peer index shards, scattered concurrently (unreachable peers are
-        // skipped, exactly as before).
         let req = Request::IndexScan {
             index: index.to_string(),
             start,
@@ -5371,8 +5389,7 @@ impl Node {
                 keys.insert(k, ());
             }
         }
-
-        self.resolve_candidates(table, keys, oc)
+        Ok(keys)
     }
 
     /// Resolve a gathered candidate-key set to authoritative rows.
@@ -5389,8 +5406,7 @@ impl Node {
         keys: BTreeMap<Vec<u8>, ()>,
         oc: Option<Consistency>,
     ) -> EngineResult<Vec<(Vec<u8>, Document)>> {
-        const POINT_READ_MAX: usize = 256;
-        if keys.len() <= POINT_READ_MAX {
+        if keys.len() <= INDEX_POINT_READ_MAX {
             let mut out = Vec::new();
             for key in keys.into_keys() {
                 skaidb_engine::scan_meter::tick(1)?;
@@ -5403,7 +5419,7 @@ impl Node {
         // materialized every row on the coordinator (4.6 GB allocated,
         // OOM-killed two production nodes, 2026-07-13); the sliding merge
         // holds one page window per source and keeps only matching rows.
-        self.cluster_scan_collect(table, oc, None, Some(&keys))
+        self.cluster_scan_collect(table, oc, None, Some(&keys), &None)
     }
 
     /// Distributed **filter pushdown** for a non-indexed `WHERE`: scatter the
@@ -6420,6 +6436,33 @@ impl Cluster for Coordinator {
         // key than the on-disk key order — both keep the default full gather.
         if let (None, None, Some(lim)) = (filter, order, fetch_limit) {
             let rows = self.node.cluster_scan_limited(table, self.oc, lim)?;
+            return Ok((rows, false));
+        }
+        // Filtered + limited, no order: a selective filter takes the index
+        // point-read path via matching_rows; a broad one (index candidates
+        // over the point-read budget, or no index at all) walks the sliding
+        // merge WITH the filter and stops at the limit — resolving 150k
+        // candidates for a LIMIT 3 took tens of seconds and tripped
+        // statement timeouts (2026-07-13).
+        if let (Some(f), None, Some(lim)) = (filter, order, fetch_limit) {
+            let pk = self.primary_key(table)?;
+            if pk_point_key(&pk, filter).is_some() {
+                let mut rows = self.matching_rows(table, filter)?;
+                rows.truncate(lim);
+                return Ok((rows, false));
+            }
+            if let Some((index, start, end)) = self.plan_index_scan(table, filter)? {
+                let keys = self.node.index_candidate_keys(table, &index, start, end)?;
+                if keys.len() <= INDEX_POINT_READ_MAX {
+                    let rows = self.node.resolve_candidates(table, keys, self.oc)?;
+                    let mut rows = filter_rows(&Some(f.clone()), rows)?;
+                    rows.truncate(lim);
+                    return Ok((rows, false));
+                }
+            }
+            let rows =
+                self.node
+                    .cluster_scan_collect(table, self.oc, Some(lim), None, filter)?;
             return Ok((rows, false));
         }
         // Ordered gather at caller-chosen consistency ONE on a full-copy

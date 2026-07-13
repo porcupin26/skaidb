@@ -7184,7 +7184,7 @@ fn flip_op(op: BinaryOp) -> BinaryOp {
     }
 }
 
-fn matches_filter(filter: &Option<Expr>, doc: &Document) -> Result<bool> {
+pub fn matches_filter(filter: &Option<Expr>, doc: &Document) -> Result<bool> {
     match filter {
         Some(expr) => eval_predicate(expr, doc),
         None => Ok(true),
