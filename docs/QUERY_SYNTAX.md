@@ -113,6 +113,10 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
 
 - `CREATE TABLE` declares **only the primary key** — there is no column list;
   documents are schema-less. A composite PK lists several columns.
+  `WITH (memory = true)` makes the table **RAM-only**: no write-ahead log
+  fsyncs, never flushed to disk, empty after a restart, and skipped by
+  repair/reshard data motion — for short-lived bounded data (node stats,
+  caches); pair with a `ttl`. Indexes on memory tables are not supported.
   `WITH (ttl = <duration>)` makes rows **expire**: a row older than the TTL
   (measured from its write's HLC timestamp) becomes invisible to every read
   and is physically dropped at the next compaction. TTL is a read-visibility

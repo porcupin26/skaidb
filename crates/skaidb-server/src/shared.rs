@@ -34,6 +34,15 @@ pub enum Backend {
 }
 
 impl Backend {
+    /// Whether `table` exists and is a memory table (`None` = no such table).
+    pub fn table_is_memory(&self, table: &str) -> Option<bool> {
+        let name = skaidb_engine::namespace::qualify(skaidb_engine::DEFAULT_DATABASE, table);
+        match self {
+            Backend::Local(db) => db.read().ok().and_then(|db| db.table_is_memory(&name)),
+            Backend::Cluster(node) => node.with_local_read(|db| db.table_is_memory(&name)).flatten(),
+        }
+    }
+
     /// Graceful-shutdown hook: flush memtables + commit search writers (see
     /// `Node::prepare_shutdown`); the local backend does the same directly.
     pub fn prepare_shutdown(&self) {

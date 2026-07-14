@@ -563,6 +563,40 @@ mod tests {
         }
     }
 
+    /// Memory tables: normal reads/writes and TTL, nothing survives reopen,
+    /// and indexes on them are rejected.
+    #[test]
+    fn memory_tables_are_ephemeral() {
+        let dir = tmp();
+        {
+            let mut s = Session::open(&dir).unwrap();
+            s.execute("CREATE TABLE stats (PRIMARY KEY (node)) WITH (memory = true);")
+                .unwrap();
+            for i in 0..50 {
+                s.execute(&format!(
+                    "INSERT INTO stats (node, cpu) VALUES ('n{i}', {i});"
+                ))
+                .unwrap();
+            }
+            let got = rows(s.execute("SELECT COUNT(*) FROM stats;").unwrap());
+            assert_eq!(got[0][0], skaidb_types::Value::Int(50));
+            // Overwrite on PK works like any table.
+            s.execute("INSERT INTO stats (node, cpu) VALUES ('n1', 99);").unwrap();
+            let got = rows(s.execute("SELECT cpu FROM stats WHERE node = 'n1';").unwrap());
+            assert_eq!(got[0][0], skaidb_types::Value::Int(99));
+            // Indexes are rejected.
+            let err = s.execute("CREATE INDEX i_c ON stats (cpu);").unwrap_err();
+            assert!(err.to_string().contains("memory tables"), "{err}");
+        }
+        // Reopen: table exists (schema persists), data does not.
+        let mut s = Session::open(&dir).unwrap();
+        let got = rows(s.execute("SELECT COUNT(*) FROM stats;").unwrap());
+        assert_eq!(got[0][0], skaidb_types::Value::Int(0), "memory table data survived reopen");
+        s.execute("INSERT INTO stats (node, cpu) VALUES ('again', 1);").unwrap();
+        let got = rows(s.execute("SELECT COUNT(*) FROM stats;").unwrap());
+        assert_eq!(got[0][0], skaidb_types::Value::Int(1));
+    }
+
     #[test]
     fn default_is_current_on_open() {
         let s = Session::open(tmp()).unwrap();

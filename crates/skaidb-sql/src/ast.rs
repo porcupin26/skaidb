@@ -277,6 +277,8 @@ pub struct CreateTable {
     /// `WITH (ttl = <duration>)` — rows expire (become invisible, then
     /// reclaimed) after this age. `None` = no expiry.
     pub ttl_ms: Option<i64>,
+    /// `WITH (memory = true)`: RAM-resident, never flushed, empty on restart.
+    pub memory: bool,
 }
 
 /// `CREATE TIMESERIES TABLE [IF NOT EXISTS] name (SERIES KEY (l1 [, ...])

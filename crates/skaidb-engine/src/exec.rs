@@ -223,7 +223,9 @@ impl Database {
 
         let mut tables = HashMap::new();
         for name in catalog.tables.keys() {
-            let mut engine = StorageEngine::open_with_options(table_dir(&dir, name), opts)?;
+            let mut table_opts = opts;
+            table_opts.ephemeral = catalog.tables[name].memory;
+            let mut engine = StorageEngine::open_with_options(table_dir(&dir, name), table_opts)?;
             engine.set_ttl(catalog.tables[name].ttl_ms.map(|ms| ms as u64));
             tables.insert(name.clone(), engine);
         }
@@ -1835,7 +1837,7 @@ impl Database {
         skaidb_sql::resolve_now(&mut stmt, now_ms());
         match stmt {
             Statement::CreateTable(ct) => {
-                self.create_table(&ct.name, ct.primary_key, ct.ttl_ms, ct.if_not_exists)
+                self.create_table(&ct.name, ct.primary_key, ct.ttl_ms, ct.memory, ct.if_not_exists)
             }
             Statement::CreateTimeseriesTable(ct) => self.create_timeseries_table(
                 &ct.name,
@@ -2265,6 +2267,7 @@ impl Database {
         name: &str,
         pk: Vec<String>,
         ttl_ms: Option<i64>,
+        memory: bool,
         if_not_exists: bool,
     ) -> Result<QueryOutput> {
         if pk.is_empty() {
@@ -2285,8 +2288,9 @@ impl Database {
             }
             return Err(EngineError::TableExists(name.to_string()));
         }
-        let mut engine =
-            StorageEngine::open_with_options(table_dir(&self.dir, name), self.storage_opts)?;
+        let mut opts = self.storage_opts;
+        opts.ephemeral = memory;
+        let mut engine = StorageEngine::open_with_options(table_dir(&self.dir, name), opts)?;
         engine.set_ttl(ttl_ms.map(|ms| ms as u64));
         self.tables.insert(name.to_string(), engine);
         self.catalog.tables.insert(
@@ -2294,6 +2298,7 @@ impl Database {
             TableDef {
                 primary_key: pk,
                 ttl_ms,
+                memory,
             },
         );
         self.record_schema(key, hlc, false);
@@ -2759,6 +2764,11 @@ impl Database {
                 return Ok(QueryOutput::Ddl);
             }
             return Err(EngineError::IndexExists(name.to_string()));
+        }
+        if self.catalog.tables.get(table).is_some_and(|t| t.memory) {
+            return Err(EngineError::Unsupported(
+                "indexes on memory tables are not supported".into(),
+            ));
         }
         // Create the index store and backfill it from the existing rows.
         // Stream one row at a time (see rebuild_vector_index): whole-table
@@ -3664,6 +3674,23 @@ impl Database {
         self.catalog.tables.keys().cloned().collect()
     }
 
+    /// Names of tables whose data is worth moving between nodes: memory
+    /// tables are ephemeral by contract (empty on restart, healed by their
+    /// writers), so repair and reshard traffic skips them.
+    pub fn persistent_table_names(&self) -> Vec<String> {
+        self.catalog
+            .tables
+            .iter()
+            .filter(|(_, def)| !def.memory)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Whether `table` exists and is a memory table.
+    pub fn table_is_memory(&self, table: &str) -> Option<bool> {
+        self.catalog.tables.get(table).map(|d| d.memory)
+    }
+
     /// The directory backing this database — the cluster layer persists its
     /// membership/topology alongside the data here.
     pub fn dir(&self) -> &Path {
@@ -3699,8 +3726,9 @@ impl Database {
             out.push((
                 db.to_string(),
                 format!(
-                    "CREATE TABLE IF NOT EXISTS {bare} (PRIMARY KEY ({}))",
-                    def.primary_key.join(", ")
+                    "CREATE TABLE IF NOT EXISTS {bare} (PRIMARY KEY ({})){}",
+                    def.primary_key.join(", "),
+                    table_with_options(def)
                 ),
                 ver(&format!("t:{name}")),
             ));
@@ -3838,8 +3866,9 @@ impl Database {
             out.push((
                 db.to_string(),
                 format!(
-                    "CREATE TABLE IF NOT EXISTS {bare} (PRIMARY KEY ({}))",
-                    def.primary_key.join(", ")
+                    "CREATE TABLE IF NOT EXISTS {bare} (PRIMARY KEY ({})){}",
+                    def.primary_key.join(", "),
+                    table_with_options(def)
                 ),
             ));
         }
@@ -4344,7 +4373,9 @@ impl Database {
         if per_table {
             for (name, engine) in &self.tables {
                 let s = engine.stats();
-                let ks = engine.key_stats().unwrap_or_default();
+                // Approximate (version counts): SHOW STATUS iterated every
+                // key of every table exactly — 22s on a populated node.
+                let ks = engine.key_stats_fast();
                 let (db, bare) = namespace::split(name);
                 agg.per_table.push(TableStats {
                     database: db.to_string(),
@@ -7074,6 +7105,23 @@ fn save_vector_snapshot(path: &Path, hnsw: &Hnsw, watermark: Hlc) -> std::io::Re
     }
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// Render a table's `WITH (...)` options for schema statements — empty when
+/// every option is at its default.
+fn table_with_options(def: &TableDef) -> String {
+    let mut opts: Vec<String> = Vec::new();
+    if let Some(ms) = def.ttl_ms {
+        opts.push(format!("ttl = {ms}"));
+    }
+    if def.memory {
+        opts.push("memory = true".into());
+    }
+    if opts.is_empty() {
+        String::new()
+    } else {
+        format!(" WITH ({})", opts.join(", "))
+    }
 }
 
 fn new_hnsw(def: &VectorIndexDef) -> Hnsw {

@@ -577,10 +577,22 @@ impl Parser {
             self.expect(&Token::RParen)?;
             // Optional `WITH (ttl = <duration>)`.
             let mut ttl_ms = None;
+            let mut memory = false;
             if self.eat_ident_ci("with") {
                 self.expect(&Token::LParen)?;
                 for (opt, val) in self.parse_option_list()? {
                     match opt.as_str() {
+                        "memory" => {
+                            memory = match val.as_str() {
+                                "true" | "1" => true,
+                                "false" | "0" => false,
+                                other => {
+                                    return Err(ParseError::Other(format!(
+                                        "memory must be true or false, got '{other}'"
+                                    )))
+                                }
+                            };
+                        }
                         "ttl" => {
                             let ms: i64 = val.parse().map_err(|_| {
                                 ParseError::Other(format!(
@@ -596,7 +608,7 @@ impl Parser {
                         }
                         other => {
                             return Err(ParseError::Other(format!(
-                                "unknown table option '{other}' (only ttl is supported)"
+                                "unknown table option '{other}' (supported: ttl, memory)"
                             )))
                         }
                     }
@@ -607,6 +619,7 @@ impl Parser {
                 if_not_exists,
                 primary_key,
                 ttl_ms,
+                memory,
             }))
         } else if self.eat_keyword(Keyword::Timeseries) {
             // CREATE TIMESERIES TABLE [IF NOT EXISTS] name
@@ -1531,6 +1544,7 @@ mod tests {
                 if_not_exists: false,
                 primary_key: vec!["id".into()],
                 ttl_ms: None,
+                memory: false,
             })
         );
     }
@@ -1864,6 +1878,7 @@ mod tests {
                 if_not_exists: false,
                 primary_key: vec!["use".into()],
                 ttl_ms: None,
+                memory: false,
             })
         );
         // A database genuinely named "database" is still selectable.
@@ -1895,6 +1910,7 @@ mod tests {
                 if_not_exists: false,
                 primary_key: vec!["id".into()],
                 ttl_ms: None,
+                memory: false,
             })
         );
         // Joins and the ON-table of an index can be qualified too.

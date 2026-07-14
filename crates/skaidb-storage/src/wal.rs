@@ -98,6 +98,10 @@ impl WalRecord {
 #[derive(Debug)]
 pub struct WalSync {
     file: File,
+    /// Ephemeral WAL (memory tables): the file is unlinked at open — writes
+    /// land in page cache of a deleted inode and durability is explicitly
+    /// not promised, so fsync is skipped entirely.
+    ephemeral: bool,
     /// Next free append offset (advanced by serialized appends).
     write_offset: AtomicU64,
     /// Bytes known durable on disk.
@@ -117,6 +121,9 @@ impl WalSync {
     /// callers (group commit). A commit from a superseded generation is already
     /// durable elsewhere and returns immediately.
     pub fn sync_through(&self, commit: WalCommit) -> Result<()> {
+        if self.ephemeral {
+            return Ok(());
+        }
         if self.generation.load(Ordering::SeqCst) != commit.generation
             || self.synced.load(Ordering::SeqCst) >= commit.offset
         {
@@ -172,6 +179,7 @@ impl Wal {
 
         let sync = Arc::new(WalSync {
             file,
+            ephemeral: false,
             write_offset: AtomicU64::new(good_len),
             synced: AtomicU64::new(good_len),
             generation: AtomicU64::new(0),
@@ -179,6 +187,31 @@ impl Wal {
             sync_lock: Mutex::new(()),
         });
         Ok((Wal { sync, path }, records))
+    }
+
+    /// A WAL for a memory table: created then immediately unlinked, so writes
+    /// land in the page cache of a deleted inode, nothing survives a restart,
+    /// and fsync is skipped ([`WalSync::sync_through`] no-ops). The engine's
+    /// write paths stay identical; only durability is (deliberately) absent.
+    pub fn open_ephemeral(path: impl AsRef<Path>) -> Result<Wal> {
+        let path = path.as_ref().to_path_buf();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)?;
+        let _ = std::fs::remove_file(&path); // unlink: page-cache only
+        let sync = Arc::new(WalSync {
+            file,
+            ephemeral: true,
+            write_offset: AtomicU64::new(0),
+            synced: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
+            fsyncs: AtomicU64::new(0),
+            sync_lock: Mutex::new(()),
+        });
+        Ok(Wal { sync, path })
     }
 
     /// Append a record (positional write, no fsync) and return its commit point.

@@ -61,6 +61,11 @@ pub struct SsTable {
     blocks: Vec<BlockMeta>,
     bloom: Bloom,
     entry_count: u64,
+    /// `(put_versions, delete_versions)` in this file, computed on first use
+    /// and cached forever (files are immutable). Version counts, not merged
+    /// uniques: a key rewritten across files counts once per file until
+    /// compaction collapses it.
+    version_counts: std::sync::OnceLock<(u64, u64)>,
     /// On-disk file size, captured at write/open time (files are immutable) so
     /// metrics scrapes don't stat every table.
     disk_len: u64,
@@ -143,6 +148,7 @@ impl SsTable {
         let mut bloom = Bloom::with_capacity(expected_entries, BLOOM_FP_RATE);
         let mut offset: u64 = 0;
         let mut entry_count: u64 = 0;
+        let mut delete_count: u64 = 0;
 
         // Group entries into uncompressed blocks of ~BLOCK_TARGET bytes; seal,
         // compress and write each block as soon as it fills.
@@ -170,6 +176,9 @@ impl SsTable {
             }
             bloom.add(&e.key);
             entry_count += 1;
+            if matches!(e.value, VersionValue::Delete) {
+                delete_count += 1;
+            }
             encode_entry(&mut buf, &e);
             if buf.len() >= BLOCK_TARGET {
                 blocks.push(seal(&mut buf, &mut first, &mut writer)?);
@@ -211,6 +220,8 @@ impl SsTable {
         drop(file);
         let file = File::open(&path)?;
 
+        let version_counts = std::sync::OnceLock::new();
+        let _ = version_counts.set((entry_count - delete_count, delete_count));
         Ok(SsTable {
             file,
             path,
@@ -219,6 +230,7 @@ impl SsTable {
             bloom,
             entry_count,
             disk_len,
+            version_counts,
             block_cache: BlockCache::default(),
         })
     }
@@ -263,6 +275,7 @@ impl SsTable {
             blocks,
             bloom,
             entry_count,
+            version_counts: std::sync::OnceLock::new(),
             disk_len: file_len,
             block_cache: BlockCache::default(),
         })
@@ -275,6 +288,24 @@ impl SsTable {
 
     pub fn is_empty(&self) -> bool {
         self.entry_count == 0
+    }
+
+    /// `(puts, deletes)` version counts for this immutable file — computed on
+    /// first call by one streaming pass, cached forever. Fresh files (just
+    /// written) already carry the counts for free.
+    pub fn version_counts(&self) -> (u64, u64) {
+        *self.version_counts.get_or_init(|| {
+            let mut puts = 0u64;
+            let mut dels = 0u64;
+            for row in self.iter() {
+                match row {
+                    Ok(e) if matches!(e.value, VersionValue::Delete) => dels += 1,
+                    Ok(_) => puts += 1,
+                    Err(_) => {}
+                }
+            }
+            (puts, dels)
+        })
     }
 
     /// Path backing this table.

@@ -2125,7 +2125,7 @@ impl Node {
             .local
             .read()
             .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
-            .table_names();
+            .persistent_table_names();
         tables.sort();
 
         for table in tables {
@@ -2214,7 +2214,7 @@ impl Node {
             .local
             .read()
             .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
-            .table_names();
+            .persistent_table_names();
         for table in tables {
             // Page through the shard so drain memory is one page + the
             // per-destination groups of that page, independent of shard size.
@@ -2509,7 +2509,7 @@ impl Node {
             .local
             .read()
             .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
-            .table_names();
+            .persistent_table_names();
 
         let mut total = 0;
         for table in tables {
@@ -2701,7 +2701,7 @@ impl Node {
             .local
             .read()
             .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
-            .table_names();
+            .persistent_table_names();
 
         // Reconcile each (table, peer) pair as a merge-join over two paged,
         // key-ordered streams — memory stays O(page) regardless of table size
@@ -2987,6 +2987,12 @@ impl Node {
     /// a full search-index rebuild (~15 min) because uncommitted writer state
     /// forced replay from a stale watermark. Bounded lock wait: a wedged
     /// engine must not stall exit past systemd's kill window.
+    /// Run `f` under a shared lock on the local database (`None` if the
+    /// lock is poisoned). For cheap catalog reads from the server layer.
+    pub fn with_local_read<T>(&self, f: impl FnOnce(&Database) -> T) -> Option<T> {
+        self.local.read().ok().map(|db| f(&db))
+    }
+
     pub fn prepare_shutdown(&self) {
         // Wait up to 60s (systemd allows 90 before SIGKILL): giving up early
         // and exiting over an in-flight flush is what tore .3's manifest on

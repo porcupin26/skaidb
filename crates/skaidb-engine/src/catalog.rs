@@ -167,6 +167,10 @@ pub struct TableDef {
     /// storage engine on open.
     #[serde(default)]
     pub ttl_ms: Option<i64>,
+    /// RAM-resident table: unlinked WAL, never flushed, empty on restart.
+    /// For short-lived bounded data (stats, caches) — pair with a TTL.
+    #[serde(default)]
+    pub memory: bool,
 }
 
 /// A time-series table definition: label columns and optional retention.

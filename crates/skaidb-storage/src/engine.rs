@@ -61,6 +61,10 @@ pub struct EngineOptions {
     /// `0` disables it. Recent data is already served from the memtable, so this
     /// only helps reads of keys that have been flushed to SSTables.
     pub read_cache_capacity: usize,
+    /// Memory (ephemeral) engine: unlinked WAL with no fsync, never flushes
+    /// to SSTables, empty on every open. For short-lived bounded data
+    /// (stats, caches) where restart loss is fine — pair with a table TTL.
+    pub ephemeral: bool,
     /// Per-statement scan budget: the maximum rows a single statement may
     /// examine (decode + filter) across all its gathers before it errors.
     /// Guards the node against filters that match (almost) nothing walking
@@ -114,6 +118,7 @@ impl Default for EngineOptions {
             // (per-block codec byte).
             bottom_compression: Codec::Lz4,
             read_cache_capacity: DEFAULT_READ_CACHE_CAPACITY,
+            ephemeral: false,
             scan_row_budget: DEFAULT_SCAN_ROW_BUDGET,
             statement_timeout_secs: DEFAULT_STATEMENT_TIMEOUT_SECS,
             search_writer_heap_bytes: DEFAULT_SEARCH_WRITER_HEAP,
@@ -210,7 +215,16 @@ impl Engine {
         std::fs::create_dir_all(&dir)?;
         std::fs::create_dir_all(dir.join("sst"))?;
 
-        let (wal, records) = Wal::open(dir.join("wal.log"))?;
+        let (wal, records) = if opts.ephemeral {
+            // Memory table: fresh unlinked WAL, and any stale on-disk state
+            // from a previous life as a persistent table is discarded.
+            let _ = std::fs::remove_file(dir.join("wal.log"));
+            let _ = std::fs::remove_dir_all(dir.join("sst"));
+            std::fs::create_dir_all(dir.join("sst"))?;
+            (Wal::open_ephemeral(dir.join("wal.ephemeral"))?, Vec::new())
+        } else {
+            Wal::open(dir.join("wal.log"))?
+        };
         let mut mem = Memtable::new();
         let mut max_hlc = Hlc::MIN;
         for rec in records {
@@ -222,7 +236,11 @@ impl Engine {
             mem.insert(rec.key, rec.hlc, value);
         }
 
-        let (l0, levels, next_seq) = load_manifest(&dir)?;
+        let (l0, levels, next_seq) = if opts.ephemeral {
+            (Vec::new(), Vec::new(), 0)
+        } else {
+            load_manifest(&dir)?
+        };
 
         let clock = HlcClock::new();
         if max_hlc > Hlc::MIN {
@@ -587,6 +605,11 @@ impl Engine {
 
     /// Force the active memtable to flush to an SSTable (no-op if empty).
     pub fn flush(&mut self) -> Result<()> {
+        if self.opts.ephemeral {
+            // Memory table: the memtable IS the table; flushing would move
+            // the data to disk (or, worse, truncate the WAL it lives behind).
+            return Ok(());
+        }
         if self.mem.is_empty() {
             return Ok(());
         }
@@ -734,6 +757,28 @@ impl Engine {
 
     /// Live-key and tombstone counts via a full merged scan (O(rows) time,
     /// O(block) memory — the scan streams).
+    /// Approximate key statistics in O(memtable + #sstables): sums each
+    /// immutable file's cached version counts plus the memtable's. Counts
+    /// VERSIONS, not merged uniques — a key rewritten across files counts
+    /// once per file until compaction collapses it, so this drifts high
+    /// under overwrite churn and self-heals at compaction. Use for
+    /// dashboards/metrics; `key_stats` stays exact for `COUNT(*)`.
+    pub fn key_stats_fast(&self) -> KeyStats {
+        let mut stats = KeyStats::default();
+        for sst in self.sstables_newest_first() {
+            let (puts, dels) = sst.version_counts();
+            stats.live_keys += puts as usize;
+            stats.tombstones += dels as usize;
+        }
+        for (_k, _hlc, v) in self.mem.iter_latest_lazy() {
+            match v {
+                VersionValue::Put(_) => stats.live_keys += 1,
+                VersionValue::Delete => stats.tombstones += 1,
+            }
+        }
+        stats
+    }
+
     pub fn key_stats(&self) -> Result<KeyStats> {
         let mut stats = KeyStats::default();
         for item in self.merged_iter() {

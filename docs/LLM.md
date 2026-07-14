@@ -87,6 +87,10 @@ Key facts an agent must know:
 - **ORDER BY**: a multi-key `ORDER BY` whose leading key is indexed walks the
   index bounded by LIMIT plus the leading-key tie group, then re-sorts by the
   full clause — exact, without gathering every matching row.
+- **Memory tables**: `CREATE TABLE t (...) WITH (memory = true)` — RAM-only
+  (no WAL fsync, never flushed, empty on restart, excluded from repair);
+  pair with `ttl`. `SHOW STATUS` table counts are approximate version
+  counts (exact after compaction).
 - **Scan budget**: one statement may examine at most `storage.scan_row_budget`
   rows (default 250k; 0 disables) and run at most
   `storage.statement_timeout_secs` (default 120s; 0 disables) — past either it

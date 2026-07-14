@@ -33,10 +33,17 @@ fn exec(ctx: &Shared, sql: &str) -> Result<Response, String> {
 }
 
 /// Idempotent DDL for the stats table (broadcasts across the cluster).
+/// Memory table: one overwritten row per node, disposable on restart —
+/// keeping it RAM-only removes a per-tick WAL fsync and repair traffic.
+/// An older persistent definition is migrated by drop + recreate (the
+/// data is a single per-node sample; the next tick repopulates it).
 pub fn ensure_table(ctx: &Shared) -> Result<(), String> {
+    if ctx.backend.table_is_memory(TABLE) == Some(false) {
+        exec(ctx, &format!("DROP TABLE IF EXISTS {TABLE}"))?;
+    }
     exec(
         ctx,
-        &format!("CREATE TABLE IF NOT EXISTS {TABLE} (PRIMARY KEY (node))"),
+        &format!("CREATE TABLE IF NOT EXISTS {TABLE} (PRIMARY KEY (node)) WITH (memory = true)"),
     )
     .map(|_| ())
 }
