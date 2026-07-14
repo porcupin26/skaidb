@@ -135,6 +135,9 @@ DROP TABLE [IF EXISTS] t                    -- cascades to the table's
 ALTER TABLE t RENAME TO t2
 ALTER TABLE t RENAME COLUMN a TO b          -- rewrites rows, rebuilds indexes
 CREATE INDEX [IF NOT EXISTS] i ON t (path [, path ...])   -- composite = leftmost-prefix
+--   a `path[]` component makes the index MULTIKEY: one entry per array
+--   element, so `col = 'x'` containment is an index probe (exact counts);
+--   planner requires equality through the [] column; max one [] per index
 DROP INDEX [IF EXISTS] i
 CREATE VECTOR INDEX [IF NOT EXISTS] v ON t (path) DIM n [USING cosine|l2|dot]
 DROP VECTOR INDEX [IF EXISTS] v

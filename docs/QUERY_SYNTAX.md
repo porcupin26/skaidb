@@ -27,7 +27,7 @@ CREATE ROLLUP [IF NOT EXISTS] <name> ON <ts-table> BUCKET <duration>
        [RETENTION <duration>]
 DROP   TABLE [IF EXISTS] <table>
        -- cascades to every derived index on the table (secondary, search, vector)
-CREATE INDEX [IF NOT EXISTS] <name> ON <table> (<path> [, <path> ...])
+CREATE INDEX [IF NOT EXISTS] <name> ON <table> (<path>[[]] [, <path>[[]] ...])
 DROP   INDEX [IF EXISTS] <name>
 CREATE VECTOR INDEX [IF NOT EXISTS] <name> ON <table> (<path>) DIM <n> [USING <metric>]
 DROP   VECTOR INDEX [IF EXISTS] <name>
@@ -125,6 +125,13 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   read). Useful for caches, sessions, and rolling event windows.
 - `CREATE INDEX` with one path is a single-column index; with several it is a
   **composite** index (ordered left-to-right). See indexing notes below.
+- A `[]` suffix on one path (`CREATE INDEX i ON t (account, labels[])`) marks
+  a **multikey** component: the value there is an array and each element gets
+  its own index entry, so `labels = 'x'` (element containment) becomes an
+  index probe — including exact index-only counts. At most one `[]` per
+  index. The planner uses a multikey index only when every column through
+  the `[]` component is equality-constrained; other shapes (ranges or sorts
+  on the array column) fall back to a scan.
 - `CREATE VECTOR INDEX` builds an HNSW index for nearest-neighbor search over the
   float array at `<path>`. `DIM <n>` (the vector dimension) is **required**;
   `USING <metric>` is `cosine` (default), `l2`, or `dot`. It broadcasts across

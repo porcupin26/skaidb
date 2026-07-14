@@ -247,6 +247,66 @@ mod tests {
         assert!(dt.as_millis() < 500, "50 indexed point lookups took {dt:?} — not using the index");
     }
 
+    /// Multikey (`[]`) indexes: one entry per array element makes element
+    /// equality an index probe. Counts are exact — entry keys embed the row
+    /// key, so a duplicate element in one array collapses to one entry —
+    /// and the planner refuses the index when the `[]` component is not
+    /// equality-pinned (below that, a row surfaces once per element).
+    #[test]
+    fn multikey_index_serves_element_equality() {
+        let mut opts = skaidb_storage::EngineOptions {
+            scan_row_budget: 900,
+            ..Default::default()
+        };
+        opts.statement_timeout_secs = 0;
+        let mut s = Session::open_with_options(tmp(), opts).unwrap();
+        s.execute("CREATE TABLE emails (PRIMARY KEY (id));").unwrap();
+        s.execute("CREATE INDEX i_al ON emails (account, labels[]);").unwrap();
+        // Two multikey components is undefined blow-up — rejected.
+        let err = s
+            .execute("CREATE INDEX i_bad ON emails (labels[], tags[]);")
+            .unwrap_err();
+        assert!(err.to_string().contains("multikey"), "{err}");
+        for i in 0..2000 {
+            let labels = match i % 4 {
+                0 => "['news', 'dev']",
+                1 => "['news', 'news']", // duplicate element in ONE array
+                2 => "['spam']",
+                _ => "[]",
+            };
+            s.execute(&format!(
+                "INSERT INTO emails (id, account, labels) VALUES ('k{i:05}', 'a@x', {labels});"
+            ))
+            .unwrap();
+        }
+        // Index-only exact count: 1000 rows carry 'news' (the dup-element
+        // rows count ONCE). The 900-row budget proves no scan ran — the
+        // streamed fallback would tick 2000 rows and die.
+        let got = rows(
+            s.execute("SELECT count(*) FROM emails WHERE account = 'a@x' AND labels = 'news';")
+                .unwrap(),
+        );
+        assert_eq!(got, vec![vec![skaidb_types::Value::Int(1000)]]);
+        // Row fetch through the index: each matching row exactly once.
+        let got = rows(
+            s.execute(
+                "SELECT id FROM emails WHERE account = 'a@x' AND labels = 'spam' LIMIT 600;",
+            )
+            .unwrap(),
+        );
+        assert_eq!(got.len(), 500);
+        let unique: std::collections::BTreeSet<_> =
+            got.iter().map(|r| format!("{:?}", r[0])).collect();
+        assert_eq!(unique.len(), 500, "no duplicate rows through the multikey index");
+        // The [] component NOT equality-pinned: the planner must skip the
+        // index (a range spans every element — duplicate rows, overcounts)
+        // and the fallback scan dies at the budget, proving the gate held.
+        let err = s
+            .execute("SELECT count(*) FROM emails WHERE account = 'a@x' AND labels >= 'news';")
+            .unwrap_err();
+        assert!(err.to_string().contains("scan budget"), "{err}");
+    }
+
     /// A filter matching nothing under ORDER BY .. LIMIT walks the whole
     /// index range; the scan budget must turn that into an error instead of
     /// unbounded work (the categorizer-poll shape that OOM-looped

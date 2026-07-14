@@ -784,9 +784,9 @@ impl Parser {
             self.expect_keyword(Keyword::On)?;
             let table = self.parse_table_name()?;
             self.expect(&Token::LParen)?;
-            let mut paths = vec![self.parse_path()?];
+            let mut paths = vec![self.parse_index_path()?];
             while self.eat(&Token::Comma) {
-                paths.push(self.parse_path()?);
+                paths.push(self.parse_index_path()?);
             }
             self.expect(&Token::RParen)?;
             Ok(Statement::CreateIndex(CreateIndex {
@@ -1237,6 +1237,18 @@ impl Parser {
         while self.eat(&Token::Dot) {
             path.push('.');
             path.push_str(&self.expect_ident()?);
+        }
+        Ok(path)
+    }
+
+    /// A secondary-index path: a plain path, or `path[]` marking a MULTIKEY
+    /// component (the value is an array; one index entry per element). The
+    /// `[]` stays part of the stored path string — the engine strips it.
+    fn parse_index_path(&mut self) -> Result<String, ParseError> {
+        let mut path = self.parse_path()?;
+        if self.eat(&Token::LBracket) {
+            self.expect(&Token::RBracket)?;
+            path.push_str("[]");
         }
         Ok(path)
     }

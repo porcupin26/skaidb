@@ -2925,6 +2925,11 @@ impl Database {
                 "indexes on memory tables are not supported".into(),
             ));
         }
+        if paths.iter().filter(|p| p.ends_with("[]")).count() > 1 {
+            return Err(EngineError::Unsupported(
+                "at most one multikey ([]) component per index".into(),
+            ));
+        }
         // Create the index store and backfill it from the existing rows.
         // Stream one row at a time (see rebuild_vector_index): whole-table
         // Document materialization via scan_docs OOM-killed a 4 GB node
@@ -2938,8 +2943,10 @@ impl Database {
             for row in engine.scan_versioned_iter() {
                 let (row_key, bytes, _hlc) = row?;
                 if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
-                    let values = index_values(&doc, paths);
-                    index_engine.put(&index_entry_key(&values, &row_key), row_key.clone())?;
+                    for values in index_value_tuples(&doc, paths) {
+                        index_engine
+                            .put(&index_entry_key(&values, &row_key), row_key.clone())?;
+                    }
                 }
             }
         }
@@ -3042,6 +3049,8 @@ impl Database {
             for p in idx.paths.iter_mut() {
                 if p == from {
                     *p = to.to_string();
+                } else if p.strip_suffix("[]") == Some(from) {
+                    *p = format!("{to}[]");
                 }
             }
         }
@@ -3135,8 +3144,9 @@ impl Database {
             for row in table_engine.scan_versioned_iter() {
                 let (row_key, bytes, _hlc) = row?;
                 if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
-                    let values = index_values(&doc, &idx_paths);
-                    engine.put(&index_entry_key(&values, &row_key), row_key.clone())?;
+                    for values in index_value_tuples(&doc, &idx_paths) {
+                        engine.put(&index_entry_key(&values, &row_key), row_key.clone())?;
+                    }
                 }
             }
         }
@@ -3449,7 +3459,20 @@ impl Database {
             return Ok(None);
         }
         for (name, idx) in self.catalog.indexes.iter().filter(|(_, i)| i.table == table) {
-            let Some((start, end)) = plan_covering(&idx.paths, &constraints) else {
+            let names = index_key_names(&idx.paths);
+            // Same multikey gate as `plan_index`: with the [] component
+            // equality-pinned, one entry per (element, row) makes the range
+            // cardinality an exact ROW count; unpinned, it would overcount
+            // a row once per element.
+            if let Some(m) = multi_pos(&idx.paths) {
+                let eq_through = names[..=m].iter().all(|p| {
+                    constraints.iter().any(|(c, cc)| c == p && cc.eq.is_some())
+                });
+                if !eq_through {
+                    continue;
+                }
+            }
+            let Some((start, end)) = plan_covering(&names, &constraints) else {
                 continue;
             };
             let Some(engine) = self.indexes.get(name) else {
@@ -3651,10 +3674,23 @@ impl Database {
         let mut best_sorted: Option<(IndexPlan, (usize, usize))> = None;
         let mut best_unsorted: Option<(IndexPlan, (usize, usize))> = None;
         for (name, idx) in self.catalog.indexes.iter().filter(|(_, i)| i.table == table) {
+            let names = index_key_names(&idx.paths);
+            // A multikey index is usable only when every column through the
+            // [] component is equality-pinned (the element probe). Below
+            // that, a row surfaces once per array element — duplicate rows
+            // in walks, overcounts in counts.
+            if let Some(m) = multi_pos(&idx.paths) {
+                let eq_through = names[..=m].iter().all(|p| {
+                    constraints.iter().any(|(c, cc)| c == p && cc.eq.is_some())
+                });
+                if !eq_through {
+                    continue;
+                }
+            }
             if let Some((start, end, sorted, reverse)) =
-                plan_for_index(&idx.paths, &constraints, order)
+                plan_for_index(&names, &constraints, order)
             {
-                let score = selectivity(&idx.paths);
+                let score = selectivity(&names);
                 let plan = (name.clone(), start, end, sorted, reverse);
                 let slot = if sorted { &mut best_sorted } else { &mut best_unsorted };
                 if slot.as_ref().is_none_or(|(_, bs)| score > *bs) {
@@ -3755,9 +3791,10 @@ impl Database {
         doc: &Document,
         row_key: &[u8],
     ) -> Result<()> {
-        let values = index_values(doc, paths);
         if let Some(engine) = self.indexes.get_mut(name) {
-            engine.put(&index_entry_key(&values, row_key), row_key.to_vec())?;
+            for values in index_value_tuples(doc, paths) {
+                engine.put(&index_entry_key(&values, row_key), row_key.to_vec())?;
+            }
         }
         Ok(())
     }
@@ -3771,10 +3808,16 @@ impl Database {
         doc: &Document,
         row_key: &[u8],
     ) -> Result<Option<(Arc<WalSync>, WalCommit)>> {
-        let values = index_values(doc, paths);
         if let Some(engine) = self.indexes.get_mut(name) {
-            let (_, commit) = engine.put_deferred(&index_entry_key(&values, row_key), row_key.to_vec())?;
-            return Ok(Some((engine.wal_sync_handle(), commit)));
+            let mut last = None;
+            for values in index_value_tuples(doc, paths) {
+                let (_, commit) =
+                    engine.put_deferred(&index_entry_key(&values, row_key), row_key.to_vec())?;
+                last = Some(commit);
+            }
+            if let Some(commit) = last {
+                return Ok(Some((engine.wal_sync_handle(), commit)));
+            }
         }
         Ok(None)
     }
@@ -3787,9 +3830,10 @@ impl Database {
         doc: &Document,
         row_key: &[u8],
     ) -> Result<()> {
-        let values = index_values(doc, paths);
         if let Some(engine) = self.indexes.get_mut(name) {
-            engine.delete(&index_entry_key(&values, row_key))?;
+            for values in index_value_tuples(doc, paths) {
+                engine.delete(&index_entry_key(&values, row_key))?;
+            }
         }
         Ok(())
     }
@@ -3803,10 +3847,15 @@ impl Database {
         doc: &Document,
         row_key: &[u8],
     ) -> Result<Option<(Arc<WalSync>, WalCommit)>> {
-        let values = index_values(doc, paths);
         if let Some(engine) = self.indexes.get_mut(name) {
-            let (_, commit) = engine.delete_deferred(&index_entry_key(&values, row_key))?;
-            return Ok(Some((engine.wal_sync_handle(), commit)));
+            let mut last = None;
+            for values in index_value_tuples(doc, paths) {
+                let (_, commit) = engine.delete_deferred(&index_entry_key(&values, row_key))?;
+                last = Some(commit);
+            }
+            if let Some(commit) = last {
+                return Ok(Some((engine.wal_sync_handle(), commit)));
+            }
         }
         Ok(None)
     }
@@ -7341,6 +7390,46 @@ fn index_values(doc: &Document, paths: &[String]) -> Vec<Value> {
         .iter()
         .map(|p| doc.get_path(p).cloned().unwrap_or(Value::Null))
         .collect()
+}
+
+/// Position of the MULTIKEY component (`path[]` in CREATE INDEX), if any.
+fn multi_pos(paths: &[String]) -> Option<usize> {
+    paths.iter().position(|p| p.ends_with("[]"))
+}
+
+/// Index paths with the `[]` multikey marker stripped — the column names the
+/// planner matches filter constraints against.
+fn index_key_names(paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|p| p.trim_end_matches("[]").to_string())
+        .collect()
+}
+
+/// Every index entry tuple for `doc`: one tuple for a plain index; for a
+/// multikey index, one per element of the array at the `[]` component (a
+/// scalar there indexes as itself; an empty array yields no entries — no
+/// element equality can match it). Duplicate elements collapse structurally:
+/// the entry key embeds the row key, so identical (element, row) pairs are
+/// one entry — which is what makes an exact-element `count_range` an exact
+/// ROW count.
+fn index_value_tuples(doc: &Document, paths: &[String]) -> Vec<Vec<Value>> {
+    let Some(m) = multi_pos(paths) else {
+        return vec![index_values(doc, paths)];
+    };
+    let names = index_key_names(paths);
+    let base = index_values(doc, &names);
+    match &base[m] {
+        Value::Array(items) => items
+            .iter()
+            .map(|el| {
+                let mut t = base.clone();
+                t[m] = el.clone();
+                t
+            })
+            .collect(),
+        _ => vec![base],
+    }
 }
 
 /// Index entry key: `[v1, .., vk, row_key]` encoded order-preservingly, so all
