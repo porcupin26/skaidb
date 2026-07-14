@@ -6440,6 +6440,17 @@ impl Cluster for Coordinator {
         col: &str,
         filter: &Option<Expr>,
     ) -> EngineResult<Option<Vec<Value>>> {
+        // Caller-chosen ONE on a full-copy cluster: the local replica's
+        // streamed distinct answers in one table scan — the quorum merge
+        // below pulls every replica's pages over the wire and cannot be
+        // interactive on large tables.
+        if self.oc == Some(Consistency::One)
+            && self.node.cfg.replication_factor >= self.node.member_count()
+        {
+            if let Some(db) = self.node.local_read_bounded() {
+                return db.local_distinct_values(table, col, filter).map(Some);
+            }
+        }
         // Streamed distinct at the read quorum via the sliding LWW merge —
         // one value extracted per matching row, docs discarded. Memory is
         // the page window plus the distinct set.
