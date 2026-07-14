@@ -449,8 +449,28 @@ fn lex_number(input: &str, start: usize) -> Result<(Token, usize), LexError> {
         }
         i += 1;
     }
+    // Scientific notation: `e`/`E`, an optional sign, then digits — floats
+    // rendered by most languages' default formatting (`1.2e-05`) failed to
+    // lex, which broke embedding-vector literals whose components crossed
+    // 1e-5 (a categorizer stored vectors this way, 2026-07-14). Ambiguity
+    // free: identifiers cannot start with a digit and `e` is not a duration
+    // unit.
+    let mut is_float = seen_dot;
+    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+        let mut j = i + 1;
+        if j < bytes.len() && (bytes[j] == b'+' || bytes[j] == b'-') {
+            j += 1;
+        }
+        if j < bytes.len() && bytes[j].is_ascii_digit() {
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            i = j;
+            is_float = true;
+        }
+    }
     let text = &input[start..i];
-    if seen_dot {
+    if is_float {
         return Ok((
             Token::Float(
                 text.parse()
@@ -511,6 +531,32 @@ fn lex_word_end(input: &str, start: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scientific_notation_floats() {
+        for (text, want) in [
+            ("1.2e-05", 1.2e-05_f64),
+            ("3E8", 3e8),
+            ("2.5e+3", 2.5e3),
+            ("7e2", 700.0),
+        ] {
+            let (tok, end) = super::lex_number(text, 0).unwrap();
+            assert_eq!(end, text.len(), "{text}");
+            match tok {
+                super::Token::Float(f) => assert!((f - want).abs() < 1e-12, "{text}"),
+                other => panic!("{text}: {other:?}"),
+            }
+        }
+        // NOT scientific: `e` followed by a non-digit stays an identifier
+        // boundary, and duration suffixes still work.
+        let (tok, end) = super::lex_number("15s", 0).unwrap();
+        assert_eq!(end, 3);
+        assert!(matches!(tok, super::Token::Duration(_)), "{tok:?}");
+        let (tok, end) = super::lex_number("5east", 0).unwrap();
+        let _ = (tok, end); // whatever it lexes to must not consume 'east'
+        let (tok2, _) = super::lex_number("42", 0).unwrap();
+        assert!(matches!(tok2, super::Token::Int(42)));
+    }
+
     use super::*;
 
     #[test]

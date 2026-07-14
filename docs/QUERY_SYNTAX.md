@@ -245,7 +245,7 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
 
 ## Expressions
 
-- **Literals:** integer (`42`), float (`3.14`), string (`'ada'`), `TRUE`,
+- **Literals:** integer (`42`), float (`3.14`, scientific `1.2e-5`/`3E8`), string (`'ada'`), `TRUE`,
   `FALSE`, `NULL`, and **array** literals `[<lit> [, <lit> ...]]` (constant
   elements only — a literal or a negated number, e.g. `[0.1, -0.2, 0.3]`).
   There is no object/nested-document literal.

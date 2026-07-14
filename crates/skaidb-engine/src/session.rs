@@ -539,6 +539,30 @@ mod tests {
         assert_eq!(got[0][0], skaidb_types::Value::String("b".into()));
     }
 
+    /// Array literals with scientific-notation floats — the form default
+    /// float formatting emits below 1e-4 — must parse and round-trip.
+    #[test]
+    fn scientific_floats_in_array_literals() {
+        let mut s = Session::open(tmp()).unwrap();
+        s.execute("CREATE TABLE v (PRIMARY KEY (id));").unwrap();
+        s.execute("INSERT INTO v (id, emb) VALUES ('a', [1.2e-05, 3E2, -4.5e+1, 0.25]);")
+            .unwrap();
+        let got = rows(s.execute("SELECT emb FROM v WHERE id = 'a';").unwrap());
+        match &got[0][0] {
+            skaidb_types::Value::Array(items) => {
+                let f = |v: &skaidb_types::Value| match v {
+                    skaidb_types::Value::Float(f) => *f,
+                    skaidb_types::Value::Int(i) => *i as f64,
+                    other => panic!("{other:?}"),
+                };
+                assert!((f(&items[0]) - 1.2e-05).abs() < 1e-15);
+                assert!((f(&items[1]) - 300.0).abs() < 1e-9);
+                assert!((f(&items[2]) + 45.0).abs() < 1e-9);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn default_is_current_on_open() {
         let s = Session::open(tmp()).unwrap();
