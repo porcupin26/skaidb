@@ -109,7 +109,8 @@ Key facts an agent must know:
   of any size); one NULL-safe negated equality (`col != v OR col IS NULL`,
   the Mongo-`$ne` shape) beside a covering conjunction counts by complement
   (two index-range cardinalities); other filtered counts stream with
-  bounded memory,
+  bounded memory (at consistency "one" on a full-copy cluster: a single
+  local pass, like DISTINCT),
   `APPROX_COUNT_DISTINCT(expr)` (opt-in HLL on the search pushdown, exact
   everywhere else), `SUM`, `AVG`, `MIN`, `MAX`; time-series only: `RATE`,
   `INCREASE`, `DELTA`, `FIRST`, `LAST`.

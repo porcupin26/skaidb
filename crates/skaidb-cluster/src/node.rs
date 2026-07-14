@@ -6467,6 +6467,18 @@ impl Cluster for Coordinator {
     }
 
     fn count_matching(&self, table: &str, filter: &Option<Expr>) -> EngineResult<Option<usize>> {
+        // Caller-chosen ONE on a full-copy cluster: one local streamed pass,
+        // same gate as `distinct_values`. Without it a non-covering count
+        // ignored the caller's consistency and always ran the cross-replica
+        // merge below — the tag-view pagination count asked for "one" and
+        // still died at the statement timeout (124 s, 2026-07-14).
+        if self.oc == Some(Consistency::One)
+            && self.node.cfg.replication_factor >= self.node.member_count()
+        {
+            if let Some(db) = self.node.local_read_bounded() {
+                return db.local_count_matching(table, filter).map(Some);
+            }
+        }
         // Streamed count at the read quorum: the sliding LWW merge walks the
         // table page-window by page-window, evaluates the filter, and keeps
         // only a counter — the materializing fallback held every matching
@@ -7889,6 +7901,62 @@ mod tests {
             );
             assert_eq!(rs.rows.len(), 10, "dead peer skipped, replicas answer");
         }
+    }
+
+    #[test]
+    fn non_covering_count_at_one_reads_only_the_local_replica() {
+        // A count whose filter no index covers must honor caller-chosen ONE
+        // with a single local pass — the cross-replica page merge it used to
+        // run regardless of consistency took 124 s on a 183k-row table
+        // (2026-07-14). Full-copy 2-node ring: a row injected into b only is
+        // visible to a's quorum merge but invisible to a's local pass, so the
+        // counts differ exactly when the local path is taken.
+        let (a, b) = (free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b)];
+        let na = Node::new(
+            Database::open(temp_dir("cone-a")).unwrap(),
+            cfg("a", &a, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("cone-b")).unwrap(),
+            cfg("b", &b, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        na.execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 10), (3, 10)").unwrap();
+
+        let mut doc = Document::new();
+        doc.insert("id", Value::Int(4));
+        doc.insert("v", Value::Int(10));
+        let r = internode::call(
+            &b,
+            &Request::ApplyPut {
+                table: "t".into(),
+                key: Value::Array(vec![Value::Int(4)]).encode_key(),
+                value: Value::Document(doc).encode(),
+                hlc: Hlc::new(9_000, 0),
+            },
+        )
+        .unwrap();
+        assert!(matches!(r, Response::Ack));
+
+        let count = |consistency: Option<Consistency>| -> i64 {
+            let out = match na
+                .execute_session_with("default", "SELECT count(*) FROM t WHERE v = 10", consistency)
+                .unwrap()
+            {
+                SessionEffect::Output(o) => rows(o),
+                SessionEffect::UseDatabase(_) => unreachable!(),
+            };
+            match out.rows[0][0] {
+                Value::Int(n) => n,
+                ref other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(count(None), 4, "quorum merge sees b's extra row");
+        assert_eq!(count(Some(Consistency::One)), 3, "ONE is one local pass");
     }
 
     #[test]
