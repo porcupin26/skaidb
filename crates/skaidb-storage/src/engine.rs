@@ -1063,6 +1063,63 @@ fn load_manifest(dir: &Path) -> Result<(Vec<SsTable>, Vec<SsTable>, u64)> {
 }
 
 #[cfg(test)]
+mod forensics {
+    use super::*;
+
+    /// Not a test of the code — a debug dump tool: set SKAIDB_DUMP_DIR to a
+    /// copied table directory and this prints every version of every key
+    /// (superseded ones included) from all SSTables and the memtable/WAL,
+    /// with HLC wall-clock timestamps. Used for the 2026-07-14
+    /// gmail_accounts tombstone investigation.
+    #[test]
+    fn dump_all_versions() {
+        let Ok(dir) = std::env::var("SKAIDB_DUMP_DIR") else {
+            return; // no-op in normal test runs
+        };
+        let engine = Engine::open(&dir).expect("open copied table dir");
+        for sst in engine.sstables_newest_first() {
+            eprintln!("== sstable {:?}", sst.path());
+            for row in sst.iter() {
+                let e = row.expect("entry");
+                let kind = match e.value {
+                    VersionValue::Put(ref b) => format!("PUT {}B", b.len()),
+                    VersionValue::Delete => "DELETE".into(),
+                };
+                eprintln!(
+                    "  hlc={}({}) key={} {}",
+                    e.hlc.physical,
+                    chrono_ish(e.hlc.physical),
+                    String::from_utf8_lossy(&e.key).chars().take(60).collect::<String>(),
+                    kind
+                );
+            }
+        }
+        eprintln!("== memtable (WAL replayed)");
+        for (key, hlc, v) in engine.mem.iter_latest_lazy() {
+            let kind = match v {
+                VersionValue::Put(b) => format!("PUT {}B", b.len()),
+                VersionValue::Delete => "DELETE".into(),
+            };
+            eprintln!(
+                "  hlc={}({}) key={} {}",
+                hlc.physical,
+                chrono_ish(hlc.physical),
+                String::from_utf8_lossy(key).chars().take(60).collect::<String>(),
+                kind
+            );
+        }
+    }
+
+    fn chrono_ish(ms: u64) -> String {
+        // crude UTC render without a chrono dep: days since epoch + hh:mm:ss
+        let secs = ms / 1000;
+        let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
+        let days = secs / 86400;
+        format!("d{days} {h:02}:{m:02}:{s:02}Z")
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};

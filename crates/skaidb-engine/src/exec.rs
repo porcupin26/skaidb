@@ -3529,6 +3529,31 @@ impl Database {
             .collect()
     }
 
+    /// Remove the secondary-index entries of the row's PREVIOUS version
+    /// before an overwrite. Without this, a put whose indexed values changed
+    /// leaves the old entries behind: row queries re-filter them away, but
+    /// index-only counts overcount and the entries never get cleaned.
+    /// UPDATE used to mask this by modelling every rewrite as delete+put —
+    /// which lost rows when the put half's quorum failed (2026-07-13).
+    /// No-op (no read) on tables without secondary indexes.
+    fn index_del_previous(&mut self, table: &str, key: &[u8]) -> Result<()> {
+        if self.catalog.indexes.values().all(|i| i.table != table) {
+            return Ok(());
+        }
+        let existing = match self.tables.get(table) {
+            Some(engine) => engine.get(key)?,
+            None => None,
+        };
+        if let Some(bytes) = existing {
+            if let Ok(Value::Document(old)) = Value::decode(&bytes) {
+                for (name, path) in self.indexes_on(table) {
+                    self.index_del(&name, &path, &old, key)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Add an index entry for `doc`'s values at `paths` pointing to `row_key`.
     fn index_put(
         &mut self,
@@ -4466,6 +4491,9 @@ impl Database {
         } else {
             None
         };
+        if doc.is_some() {
+            self.index_del_previous(table, key)?;
+        }
         self.table_engine_mut(table)?
             .put_with_hlc(key, bytes, hlc)?;
         if let Some(doc) = doc {
@@ -4547,6 +4575,9 @@ impl Database {
         } else {
             None
         };
+        if doc.is_some() {
+            self.index_del_previous(table, key)?;
+        }
         let (commit, handle) = {
             let engine = self.table_engine_mut(table)?;
             let commit = engine.append_put_buffered(key, bytes, hlc)?;
@@ -6222,10 +6253,24 @@ fn run_update(upd: Update, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
             set_path(&mut new_doc, path, val);
         }
         let new_key = primary_key_bytes(&pk, &new_doc)?;
-        // Model the rewrite as delete-old then put-new (covers PK changes and
-        // keeps index/replica maintenance uniform).
-        cluster.delete(&upd.table, &old_key, &old_doc)?;
-        cluster.put(&upd.table, &new_key, &new_doc)?;
+        if new_key == old_key {
+            // Key unchanged (the overwhelmingly common case): one atomic
+            // LWW overwrite. The old delete-then-put pair LOST THE ROW when
+            // the put's quorum failed between the two — the delete had
+            // already committed and nothing re-put the document. Two
+            // production account rows died exactly this way, each while a
+            // rolling restart window failed the put half (2026-07-13,
+            // forensically confirmed from sstable version history). The put
+            // path maintains secondary/search/vector indexes for overwrites
+            // (it reads the existing version and removes stale entries).
+            cluster.put(&upd.table, &new_key, &new_doc)?;
+        } else {
+            // PK change: put the new row FIRST, delete the old second — a
+            // failure between the two leaves a recoverable duplicate rather
+            // than a lost row.
+            cluster.put(&upd.table, &new_key, &new_doc)?;
+            cluster.delete(&upd.table, &old_key, &old_doc)?;
+        }
     }
     Ok(QueryOutput::Mutation { affected })
 }
@@ -6327,6 +6372,7 @@ impl<'a> LocalCluster<'a> {
             return Ok(false);
         }
         self.table_indexes(table);
+        self.db.index_del_previous(table, key)?;
         let engine = self.db.table_engine_mut(table)?;
         let (hlc, commit) = engine.put_deferred(key, Value::encode_document(doc))?;
         self.pending

@@ -513,6 +513,32 @@ mod tests {
         assert_eq!(got.len(), 3, "{got:?}");
     }
 
+    /// UPDATE with an unchanged primary key must be a single overwrite that
+    /// keeps secondary indexes exact; a PK-changing UPDATE must move the row
+    /// (new key exists, old key gone, index follows). Guards the fix for
+    /// the delete-then-put pair that lost rows when the put half failed.
+    #[test]
+    fn update_overwrites_and_moves_keys_with_indexes() {
+        let mut s = Session::open(tmp()).unwrap();
+        s.execute("CREATE TABLE t (PRIMARY KEY (id));").unwrap();
+        s.execute("CREATE INDEX i_v ON t (v);").unwrap();
+        s.execute("INSERT INTO t (id, v, x) VALUES ('a', 'old', 1);").unwrap();
+        // Key-stable update: value moves in the index, row intact.
+        s.execute("UPDATE t SET v = 'new' WHERE id = 'a';").unwrap();
+        let got = rows(s.execute("SELECT id FROM t WHERE v = 'new';").unwrap());
+        assert_eq!(got.len(), 1);
+        let got = rows(s.execute("SELECT id FROM t WHERE v = 'old';").unwrap());
+        assert_eq!(got.len(), 0, "stale index entry after overwrite");
+        // PK-changing update: row moves keys.
+        s.execute("UPDATE t SET id = 'b' WHERE id = 'a';").unwrap();
+        let got = rows(s.execute("SELECT v FROM t WHERE id = 'b';").unwrap());
+        assert_eq!(got.len(), 1);
+        let got = rows(s.execute("SELECT v FROM t WHERE id = 'a';").unwrap());
+        assert_eq!(got.len(), 0, "old key survived a PK-changing update");
+        let got = rows(s.execute("SELECT id FROM t WHERE v = 'new';").unwrap());
+        assert_eq!(got[0][0], skaidb_types::Value::String("b".into()));
+    }
+
     #[test]
     fn default_is_current_on_open() {
         let s = Session::open(tmp()).unwrap();
