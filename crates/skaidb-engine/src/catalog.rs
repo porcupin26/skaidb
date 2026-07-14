@@ -44,6 +44,11 @@ impl SchemaVersion {
 pub struct IndexDef {
     pub table: String,
     pub paths: Vec<String>,
+    /// This node's backfill is still running: the planner must not use the
+    /// index (its entries are incomplete). LOCAL state — every node flips
+    /// its own flag when its own backfill finishes.
+    #[serde(default)]
+    pub building: bool,
 }
 
 /// A vector (HNSW) index declaration for approximate nearest-neighbor search

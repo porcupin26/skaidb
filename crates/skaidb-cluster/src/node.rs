@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 use std::thread;
 
 use skaidb_engine::{
-    filter_rows, namespace, pk_point_key, run, Cluster, Database, DbStats, EngineError,
-    IndexScanRange, QueryOutput, SessionEffect, DEFAULT_DATABASE,
+    filter_rows, namespace, pk_point_key, run, Cluster, Database, DbStats, DecodedMaint,
+    EngineError, IndexScanRange, MaintTask, QueryOutput, SessionEffect, DEFAULT_DATABASE,
 };
 use skaidb_sql::ast::{Expr, Statement};
 use skaidb_sql::parse;
@@ -173,6 +173,12 @@ pub struct Node {
     host_cache: Mutex<HashMap<NodeId, (crate::host::HostStats, Instant, bool)>>,
     /// QoS: bounds concurrent inbound bulk appliers (see [`BulkGate`]).
     bulk_gate: BulkGate,
+    /// Journal-ack writes: deferred index/vector/search maintenance tasks,
+    /// bounded — a full queue blocks the ack path, which is the backpressure
+    /// (sustained overload, not per-burst shedding).
+    maint_tx: Mutex<mpsc::SyncSender<MaintTask>>,
+    /// Maintenance tasks enqueued but not yet applied (drain gate).
+    maint_pending: AtomicUsize,
     /// True while an anti-entropy pass runs here (any trigger: the hourly
     /// loop or an admin REPAIR). Served to peers in HostStats so they defer
     /// their own pass — concurrent passes dent write quorum.
@@ -335,6 +341,12 @@ enum CollectSink<'a> {
 /// per-key quorum point reads; past it, one paged LWW merge over the table
 /// answers with the same guarantee at far fewer round-trips.
 const INDEX_POINT_READ_MAX: usize = 256;
+
+/// Journal-ack applier queue bound: past this, write acks block until the
+/// applier drains — sustained-overload backpressure, not per-burst shedding.
+const MAINT_QUEUE_MAX: usize = 8192;
+/// Deferred-maintenance tasks applied per engine-lock acquisition.
+const MAINT_BATCH_MAX: usize = 256;
 
 /// Rows per `ScanPage` pulled from each member during a distributed
 /// full-table gather (`cluster_scan`): bounds the coordinator's transient
@@ -574,6 +586,10 @@ impl Node {
     /// while this one was up), it is loaded so the node rejoins with the **live**
     /// ring rather than its bootstrap `cfg.members`.
     pub fn new(local: Database, cfg: NodeConfig) -> Arc<Node> {
+        let mut local = local;
+        // Cluster mode: DDL acks at schema-apply; the background worker
+        // below pages index backfills without monopolizing the write lock.
+        local.set_defer_backfills(true);
         let path = membership_path(local.dir());
         let (members, epoch) = match load_membership(&path) {
             Some((members, epoch)) => (members, epoch),
@@ -582,6 +598,7 @@ impl Node {
         let topo = Topology::from_members(&members, &cfg.id, cfg.vnodes_per_node, epoch);
         let auth = cfg.auth.clone();
         let (bg, bg_rx) = mpsc::sync_channel(BG_QUEUE_MAX);
+        let (maint_tx, maint_rx) = mpsc::sync_channel::<MaintTask>(MAINT_QUEUE_MAX);
         let node = Arc::new(Node {
             id: cfg.id.clone(),
             local: RwLock::new(local),
@@ -596,6 +613,8 @@ impl Node {
             acked: Mutex::new(HashMap::new()),
             host_cache: Mutex::new(HashMap::new()),
             bulk_gate: BulkGate::new(),
+            maint_tx: Mutex::new(maint_tx),
+            maint_pending: AtomicUsize::new(0),
             repairing: AtomicBool::new(false),
             write_watermark: AtomicU64::new(0),
             membership_lock: Mutex::new(()),
@@ -618,6 +637,168 @@ impl Node {
             node.disk_hints.store(1, Ordering::Relaxed);
             skaidb_types::slog!("skaidb: inherited on-disk hint logs found — queueing drain");
         }
+        // Journal-ack applier: drains deferred maintenance (secondary-index
+        // del/put, HNSW, FTS) off the write-ack path. Documents decode HERE,
+        // outside the engine lock; the lock is held only for the index
+        // writes themselves, per small batch. Holds a Weak so an abandoned
+        // Node (tests) can drop.
+        let applier_weak = Arc::downgrade(&node);
+        thread::spawn(move || {
+            loop {
+                let first = match maint_rx.recv_timeout(Duration::from_millis(200)) {
+                    Ok(t) => Some(t),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                };
+                let Some(node) = applier_weak.upgrade() else { return };
+                let Some(first) = first else { continue };
+                let mut batch = vec![first];
+                while batch.len() < MAINT_BATCH_MAX {
+                    match maint_rx.try_recv() {
+                        Ok(t) => batch.push(t),
+                        Err(_) => break,
+                    }
+                }
+                let n = batch.len();
+                // Decode outside the lock — the CPU-heavy half.
+                let decoded: Vec<DecodedMaint> =
+                    batch.into_iter().map(MaintTask::decode).collect();
+                let mut marks: HashMap<String, Hlc> = HashMap::new();
+                for m in &decoded {
+                    let e = marks.entry(m.table.clone()).or_insert(m.hlc);
+                    if m.hlc > *e {
+                        *e = m.hlc;
+                    }
+                }
+                if let Ok(mut db) = node.local.write() {
+                    for m in &decoded {
+                        if let Err(e) = db.apply_maintenance(m) {
+                            skaidb_types::slog!(
+                                "skaidb: deferred maintenance failed on {}: {e}",
+                                m.table
+                            );
+                        }
+                    }
+                    for (table, hlc) in &marks {
+                        db.set_applied_watermark(table, *hlc);
+                        let _ = db.search_refresh(table);
+                    }
+                    if let Err(e) = db.persist_applied_watermarks() {
+                        skaidb_types::slog!("skaidb: watermark persist failed: {e}");
+                    }
+                }
+                node.maint_pending.fetch_sub(n, Ordering::SeqCst);
+            }
+        });
+        // Background storage flusher: builds SSTables and compaction merges
+        // OUTSIDE the engine lock — the write path only freezes memtables
+        // (an fsync + rename) and moves on. The lock is held briefly to
+        // take/install jobs; the heavy I/O runs here.
+        let flusher_weak = Arc::downgrade(&node);
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_millis(100));
+            let Some(node) = flusher_weak.upgrade() else { return };
+            // Deferred startup search catch-ups: page with brief locks so
+            // the listener serves everything else while FTS re-indexes.
+            let search_pending = match node.local.write() {
+                Ok(mut db) => db.take_pending_search_catchups(),
+                Err(_) => return,
+            };
+            for (name, watermark) in search_pending {
+                let mut cursor = None;
+                loop {
+                    let step = match node.local.write() {
+                        Ok(mut db) => db.search_catchup_page(&name, watermark, cursor.take(), 1024),
+                        Err(_) => return,
+                    };
+                    match step {
+                        Ok(Some(next)) => {
+                            cursor = Some(next);
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Ok(None) => {
+                            skaidb_types::slog!("skaidb: background search catch-up complete: {name}");
+                            break;
+                        }
+                        Err(e) => {
+                            skaidb_types::slog!("skaidb: search catch-up failed on {name}: {e}");
+                            break;
+                        }
+                    }
+                }
+            }
+            // Index backfills first: page through with brief locks so DDL
+            // that acked at schema-apply completes soon after.
+            let pending = match node.local.write() {
+                Ok(mut db) => db.take_pending_backfills(),
+                Err(_) => return,
+            };
+            for name in pending {
+                let mut cursor = None;
+                loop {
+                    let step = match node.local.write() {
+                        Ok(mut db) => db.backfill_index_page(&name, cursor.take(), 2048),
+                        Err(_) => return,
+                    };
+                    match step {
+                        Ok(Some(next)) => {
+                            cursor = Some(next);
+                            // Breather so queued writers/readers interleave.
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Ok(None) => {
+                            skaidb_types::slog!("skaidb: background index backfill complete: {name}");
+                            break;
+                        }
+                        Err(e) => {
+                            skaidb_types::slog!("skaidb: index backfill failed on {name}: {e}");
+                            break;
+                        }
+                    }
+                }
+            }
+            loop {
+                let jobs = match node.local.write() {
+                    Ok(mut db) => db.background_flush_jobs(),
+                    Err(_) => return,
+                };
+                let compacts = if jobs.is_empty() {
+                    match node.local.write() {
+                        Ok(mut db) => db.background_compact_jobs(),
+                        Err(_) => return,
+                    }
+                } else {
+                    Vec::new()
+                };
+                if jobs.is_empty() && compacts.is_empty() {
+                    break;
+                }
+                for (is_index, name, job) in jobs {
+                    let built = skaidb_engine::build_flush_sstable(&job).map_err(EngineError::from);
+                    if let Ok(mut db) = node.local.write() {
+                        if let Err(e) = db.finish_flush_job(is_index, &name, job, built) {
+                            skaidb_types::slog!("skaidb: background flush install failed on {name}: {e}");
+                        }
+                    }
+                }
+                for (is_index, name, job) in compacts {
+                    match skaidb_engine::build_compact_sstable(&job) {
+                        Ok(new_run) => {
+                            if let Ok(mut db) = node.local.write() {
+                                if let Err(e) = db.finish_compact_job(is_index, &name, job, new_run) {
+                                    skaidb_types::slog!(
+                                        "skaidb: background compaction install failed on {name}: {e}"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            skaidb_types::slog!("skaidb: background compaction build failed on {name}: {e}");
+                        }
+                    }
+                }
+            }
+        });
         // Hint-drain retry ticker. Hinted handoff is event-driven — each write
         // queues one coalesced flush — so a drain that aborted (peer busy,
         // restart mid-pass) had nothing to retry it: a 2.5 GB inherited
@@ -2994,6 +3175,11 @@ impl Node {
     }
 
     pub fn prepare_shutdown(&self) {
+        // Deferred maintenance first: a clean shutdown should leave the
+        // watermarks current so the next open skips replay entirely.
+        if !self.drain_maintenance(Duration::from_secs(20)) {
+            skaidb_types::slog!("skaidb: shutdown with maintenance backlog — next open replays it");
+        }
         // Wait up to 60s (systemd allows 90 before SIGKILL): giving up early
         // and exiting over an in-flight flush is what tore .3's manifest on
         // 2026-07-12 — the storage-level ordering now makes even that safe,
@@ -4523,20 +4709,60 @@ impl Node {
         op: &WriteOp,
         hlc: Hlc,
     ) -> EngineResult<()> {
-        // Append + apply under the write lock (fast), then fsync outside the lock
-        // so concurrent writers' fsyncs coalesce (group commit).
-        let (commit, handle) = {
+        // Journal-ack: append + memtable insert under the write lock (the
+        // microseconds half — read-your-writes preserved), fsync outside it
+        // (group commit), THEN ack. Index/vector/FTS maintenance rides the
+        // applier queue — flush stalls, HNSW inserts, and FTS indexing no
+        // longer sit inside write latency. Index-served reads see the write
+        // after the applier lands it (NRT-style lag, normally sub-ms).
+        let (commit, handle, task) = {
             let mut db = self
                 .local
                 .write()
                 .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
             match op {
-                WriteOp::Put(bytes) => db.apply_put_buffered(table, key, bytes.clone(), hlc)?,
-                WriteOp::Delete => db.apply_delete_buffered(table, key, hlc)?,
+                WriteOp::Put(bytes) => {
+                    db.apply_put_row_only(table, key, bytes.clone(), hlc)?
+                }
+                WriteOp::Delete => db.apply_delete_row_only(table, key, hlc)?,
             }
         };
         handle.sync_through(commit)?;
+        if let Some(task) = task {
+            self.enqueue_maintenance(task)?;
+        }
         Ok(())
+    }
+
+    /// Hand one deferred-maintenance task to the applier. Blocks when the
+    /// queue is full (bounded backpressure); errs only if the applier died.
+    fn enqueue_maintenance(&self, task: MaintTask) -> EngineResult<()> {
+        self.maint_pending.fetch_add(1, Ordering::SeqCst);
+        let sent = {
+            let tx = self
+                .maint_tx
+                .lock()
+                .map_err(|_| EngineError::Cluster("maint sender poisoned".into()))?;
+            tx.send(task)
+        };
+        if sent.is_err() {
+            self.maint_pending.fetch_sub(1, Ordering::SeqCst);
+            return Err(EngineError::Cluster("maintenance applier gone".into()));
+        }
+        Ok(())
+    }
+
+    /// Block until every enqueued maintenance task has been applied (bounded
+    /// wait). Shutdown and index-critical barriers use this.
+    pub fn drain_maintenance(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while self.maint_pending.load(Ordering::SeqCst) > 0 {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        true
     }
 
     /// Apply a batch of writes to one table under a single write-lock
@@ -4642,10 +4868,20 @@ impl Node {
         table: &str,
         rows: &[BatchRow],
     ) -> EngineResult<Option<(WalCommit, Arc<WalSync>)>> {
-        self.local
+        // Journal-ack: rows only under the lock; maintenance rides the
+        // applier queue after the caller's group-commit fsync. Enqueueing
+        // before the fsync would be harmless (the applier's index writes
+        // don't imply row durability), but keeping the order matches the
+        // single-row path.
+        let (last, tasks) = self
+            .local
             .write()
             .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
-            .apply_batch_buffered(table, rows)
+            .apply_batch_row_only(table, rows)?;
+        for task in tasks {
+            self.enqueue_maintenance(task)?;
+        }
+        Ok(last)
     }
 
     /// Point-read `key` from its replica set, resolving by last-writer-wins,
@@ -7957,6 +8193,59 @@ mod tests {
         };
         assert_eq!(count(None), 4, "quorum merge sees b's extra row");
         assert_eq!(count(Some(Consistency::One)), 3, "ONE is one local pass");
+    }
+
+    #[test]
+    fn create_index_acks_at_schema_apply_and_backfills_in_background() {
+        // Cluster DDL used to stream the whole backfill inside the DDL RPC:
+        // minutes-long write-lock holds, client timeouts, and "DDL quorum
+        // not met" while peers were merely busy. Now the DDL acks at
+        // schema-apply and the background worker pages the backfill.
+        let (a, b) = (free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b)];
+        let na = Node::new(
+            Database::open(temp_dir("bgddl-a")).unwrap(),
+            cfg("a", &a, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("bgddl-b")).unwrap(),
+            cfg("b", &b, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        for i in 0..500 {
+            na.execute(&format!("INSERT INTO t (id, v) VALUES ({i}, {})", i % 7)).unwrap();
+        }
+        let t0 = std::time::Instant::now();
+        na.execute("CREATE INDEX i_v ON t (v)").unwrap();
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "DDL acked without waiting for the backfill: {:?}",
+            t0.elapsed()
+        );
+        // The worker completes the pages shortly after; poll both nodes.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let built = [&na, &nb].iter().all(|n| {
+                let out = n.execute("SHOW INDEXES").unwrap();
+                let rs = rows(out);
+                rs.rows.iter().any(|r| {
+                    matches!(&r[0], Value::String(s) if s == "i_v")
+                        && matches!(&r[2], Value::String(s) if s == "secondary")
+                })
+            });
+            if built {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "backfill never completed");
+            thread::sleep(Duration::from_millis(100));
+        }
+        // Index-only count answers exactly once built.
+        let out = na.execute("SELECT count(*) FROM t WHERE v = 3").unwrap();
+        let rs = rows(out);
+        assert_eq!(rs.rows[0][0], Value::Int(71), "500 rows, i%7==3 -> 71");
     }
 
     #[test]

@@ -13,6 +13,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::cache::{CacheStats, ReadCache};
 use crate::compress::Codec;
@@ -71,6 +72,11 @@ pub struct EngineOptions {
     /// entire large tables per query — LIMIT bounds output, not scan work.
     /// `0` disables. Consumed by the engine layer via the scan meter.
     pub scan_row_budget: usize,
+    /// Defer search-index catch-up/rebuild at open to a background worker
+    /// (the server sets this; a full FTS rebuild blocked node startup for
+    /// ~15 minutes on a large table). Single-node/Session keeps the inline
+    /// behavior so an opened database is immediately fully queryable.
+    pub defer_search_startup: bool,
     /// Wall-clock ceiling per statement in seconds; past it the statement
     /// errors at its next scan-meter check. Kills zombie queries whose
     /// client has long since timed out and disconnected (the server used
@@ -119,6 +125,7 @@ impl Default for EngineOptions {
             bottom_compression: Codec::Lz4,
             read_cache_capacity: DEFAULT_READ_CACHE_CAPACITY,
             ephemeral: false,
+            defer_search_startup: false,
             scan_row_budget: DEFAULT_SCAN_ROW_BUDGET,
             statement_timeout_secs: DEFAULT_STATEMENT_TIMEOUT_SECS,
             search_writer_heap_bytes: DEFAULT_SEARCH_WRITER_HEAP,
@@ -127,12 +134,56 @@ impl Default for EngineOptions {
     }
 }
 
+/// A memtable sealed for background flush: immutable, still serving reads
+/// (newer than every SSTable, older than the active memtable), backed by its
+/// own sealed WAL segment until the flush lands.
+#[derive(Debug)]
+pub struct FrozenMem {
+    mem: Arc<Memtable>,
+    /// Sealed WAL segment holding exactly this memtable's records.
+    wal_seq: u64,
+    /// Newest stamp inside (drives the maintenance truncation gate).
+    max_hlc: Option<Hlc>,
+    /// A flush job for this memtable is in flight.
+    building: bool,
+}
+
+/// A background flush work order: build the SSTable OUTSIDE the engine lock
+/// from the immutable frozen memtable, then install under a brief lock.
+#[derive(Debug)]
+pub struct FlushJob {
+    pub mem: Arc<Memtable>,
+    pub path: PathBuf,
+    pub codec: Codec,
+    /// Which frozen entry this belongs to (its WAL segment number).
+    pub wal_seq: u64,
+}
+
+/// A background compaction work order: inputs are pinned by path and
+/// re-opened read-only by the builder; `epoch` detects concurrent table-set
+/// changes (the install is discarded on mismatch).
+#[derive(Debug)]
+pub struct CompactJob {
+    pub inputs: Vec<PathBuf>,
+    pub output: PathBuf,
+    pub deepest: bool,
+    pub codec: Codec,
+    pub expire_before: Option<u64>,
+    pub epoch: u64,
+}
+
 /// A single-node, single-keyspace LSM storage engine.
 #[derive(Debug)]
 pub struct Engine {
     dir: PathBuf,
     wal: Wal,
     mem: Memtable,
+    /// Sealed memtables awaiting background flush, oldest first.
+    frozen: Vec<FrozenMem>,
+    /// Next WAL segment number for a freeze.
+    next_wal_seq: u64,
+    /// Bumped on every l0/levels mutation; stale compaction installs abort.
+    table_epoch: u64,
     clock: HlcClock,
     /// Row time-to-live in ms (`Some` = expiring table). A row is invisible
     /// once its stamp's physical age exceeds this; compaction drops it. A
@@ -154,6 +205,12 @@ pub struct Engine {
     /// Point reads that fell through to the SSTable layer and found nothing —
     /// i.e. Bloom-filtered negative lookups served without touching a data block.
     sst_negative_lookups: AtomicU64,
+    /// Deferred-maintenance watermark: every write stamped `<=` this has had
+    /// its secondary-index/vector/search maintenance applied. Flush must not
+    /// truncate a WAL still holding writes past it — after a crash they are
+    /// the only replay source for the deferred half. `Hlc::MAX` (the default)
+    /// means no deferred consumers: truncate freely.
+    maint_watermark: Hlc,
 }
 
 /// A point-in-time snapshot of a single storage engine's internal state,
@@ -263,6 +320,10 @@ impl Engine {
             compactions: 0,
             compaction_bytes: 0,
             sst_negative_lookups: AtomicU64::new(0),
+            maint_watermark: Hlc::MAX,
+            frozen: Vec::new(),
+            next_wal_seq: 1,
+            table_epoch: 0,
         })
     }
 
@@ -390,6 +451,11 @@ impl Engine {
         if let Some((hlc, entry)) = self.mem.get_entry_versioned(key) {
             return Ok(Some((hlc, entry)));
         }
+        for f in self.frozen.iter().rev() {
+            if let Some((hlc, entry)) = f.mem.get_entry_versioned(key) {
+                return Ok(Some((hlc, entry)));
+            }
+        }
         if let Some(cached) = self.read_cache.get(key) {
             return Ok(cached);
         }
@@ -419,6 +485,14 @@ impl Engine {
         if self.mem.get_entry(key).is_some() {
             // The memtable has a version, but none at or before `as_of`.
             return Ok(None);
+        }
+        for f in self.frozen.iter().rev() {
+            if let Some(v) = f.mem.get_as_of(key, as_of) {
+                return Ok(Some(v.to_vec()));
+            }
+            if f.mem.get_entry(key).is_some() {
+                return Ok(None);
+            }
         }
         for sst in self.sstables_newest_first() {
             if let Some((hlc, value)) = sst.get(key)? {
@@ -507,6 +581,11 @@ impl Engine {
         sources.push(Box::new(
             self.mem.range_latest_page(after, limit).into_iter().map(Ok),
         ));
+        for f in self.frozen.iter().rev() {
+            sources.push(Box::new(
+                f.mem.range_latest_page(after, limit).into_iter().map(Ok),
+            ));
+        }
         for sst in self.sstables_newest_first() {
             let iter = match after {
                 Some(a) => sst.iter_from(a),
@@ -549,6 +628,9 @@ impl Engine {
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut sources: Vec<MergeSource<'_>> = Vec::with_capacity(1 + self.sstable_count());
         sources.push(Box::new(self.mem.range_latest(start, end).into_iter().map(Ok)));
+        for f in self.frozen.iter().rev() {
+            sources.push(Box::new(f.mem.range_latest(start, end).into_iter().map(Ok)));
+        }
         for sst in self.sstables_newest_first() {
             let entries = sst.range(start, end)?;
             sources.push(Box::new(
@@ -571,6 +653,9 @@ impl Engine {
     pub fn count_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<usize> {
         let mut sources: Vec<MergeSource<'_>> = Vec::with_capacity(1 + self.sstable_count());
         sources.push(Box::new(self.mem.range_latest(start, end).into_iter().map(Ok)));
+        for f in self.frozen.iter().rev() {
+            sources.push(Box::new(f.mem.range_latest(start, end).into_iter().map(Ok)));
+        }
         for sst in self.sstables_newest_first() {
             let entries = sst.range(start, end)?;
             sources.push(Box::new(
@@ -603,6 +688,12 @@ impl Engine {
         let in_range =
             |key: &[u8]| start.is_none_or(|s| key >= s) && end.is_none_or(|e| key < e);
         let mut raw = self.mem.range_latest(start, end).len();
+        for f in self.frozen.iter() {
+            if raw > cap {
+                return Ok(cap + 1);
+            }
+            raw += f.mem.range_latest(start, end).len();
+        }
         if raw > cap {
             return Ok(cap + 1);
         }
@@ -637,6 +728,13 @@ impl Engine {
                 .iter_latest_lazy()
                 .map(|(k, hlc, v)| Ok((k.to_vec(), hlc, v.clone()))),
         ));
+        for f in self.frozen.iter().rev() {
+            sources.push(Box::new(
+                f.mem
+                    .iter_latest_lazy()
+                    .map(|(k, hlc, v)| Ok((k.to_vec(), hlc, v.clone()))),
+            ));
+        }
         for sst in self.sstables_newest_first() {
             sources.push(Box::new(
                 sst.iter().map(|r| r.map(|e| (e.key, e.hlc, e.value))),
@@ -645,47 +743,264 @@ impl Engine {
         KWayMerge::new(sources)
     }
 
-    /// Force the active memtable to flush to an SSTable (no-op if empty).
+    /// Force everything in memory (active + frozen) into SSTables, inline.
+    /// The synchronous path for shutdown, memory pressure, and tests; the
+    /// hot write path never calls this — it freezes and lets the background
+    /// flusher do the work (see [`Engine::take_flush_job`]).
     pub fn flush(&mut self) -> Result<()> {
         if self.opts.ephemeral {
             // Memory table: the memtable IS the table; flushing would move
             // the data to disk (or, worse, truncate the WAL it lives behind).
             return Ok(());
         }
-        if self.mem.is_empty() {
-            return Ok(());
+        if !self.mem.is_empty() {
+            self.freeze()?;
         }
-        let path = self.next_table_path();
-        let codec = self.opts.compression;
-        let entries = self.mem.iter_latest_lazy().map(|(key, hlc, value)| {
+        while let Some(job) = self.take_flush_job() {
+            let sst = Engine::build_flush(&job)?;
+            self.install_flush(job, sst)?;
+        }
+        self.maybe_compact()?;
+        Ok(())
+    }
+
+    /// Seal the active memtable behind its own WAL segment and open a fresh
+    /// one — the write-path half of a flush (an fsync + rename, no SSTable
+    /// build). The heavy work happens off the write path.
+    fn freeze(&mut self) -> Result<()> {
+        let seq = self.next_wal_seq;
+        self.next_wal_seq += 1;
+        self.wal.rotate(seq)?;
+        let mem = std::mem::take(&mut self.mem);
+        self.frozen.push(FrozenMem {
+            max_hlc: mem.max_hlc(),
+            mem: Arc::new(mem),
+            wal_seq: seq,
+            building: false,
+        });
+        Ok(())
+    }
+
+    /// The oldest frozen memtable not yet being built, as a work order for
+    /// the background flusher. Single in-flight job per engine — installs
+    /// must land oldest-first to keep L0 newest-first.
+    pub fn take_flush_job(&mut self) -> Option<FlushJob> {
+        if self.opts.ephemeral {
+            return None;
+        }
+        let path = if self.frozen.first().is_some_and(|f| !f.building) {
+            self.next_table_path()
+        } else {
+            return None;
+        };
+        let f = self.frozen.first_mut().expect("checked above");
+        f.building = true;
+        Some(FlushJob {
+            mem: Arc::clone(&f.mem),
+            path,
+            codec: self.opts.compression,
+            wal_seq: f.wal_seq,
+        })
+    }
+
+    /// Build the SSTable for a flush job. Pure I/O over an immutable
+    /// memtable — call WITHOUT holding the engine lock.
+    pub fn build_flush(job: &FlushJob) -> Result<SsTable> {
+        let entries = job.mem.iter_latest_lazy().map(|(key, hlc, value)| {
             Ok(SstEntry {
                 key: key.to_vec(),
                 hlc,
                 value: value.clone(),
             })
         });
-        let sst = SsTable::write_stream(&path, entries, self.mem.version_count(), codec)?;
-        self.l0.insert(0, sst);
+        SsTable::write_stream(&job.path, entries, job.mem.version_count(), job.codec)
+    }
 
-        // Persist the manifest BEFORE truncating the WAL: a kill between the
-        // two must leave the WAL intact so the flushed rows replay at open
-        // (LWW dedupes the overlap). The old order (truncate, then persist)
-        // had a window where the new SSTable existed unreferenced and the
-        // WAL was already gone — a process exit there lost the memtable and
-        // left a stale manifest (observed 2026-07-12: graceful shutdown gave
-        // up its bounded lock wait and exited over an in-flight flush).
+    /// Install a built flush: L0 gains the table, the manifest persists
+    /// BEFORE the sealed WAL segment drops (a kill between the two leaves
+    /// the segment to replay — LWW dedupes the overlap; the ordering that
+    /// prevented the 2026-07-12 manifest tear, kept). The maintenance
+    /// watermark gates segment deletion exactly as it gated truncation.
+    pub fn install_flush(&mut self, job: FlushJob, sst: SsTable) -> Result<()> {
+        self.l0.insert(0, sst);
+        self.table_epoch += 1;
         self.persist_manifest()?;
-        self.mem = Memtable::new();
-        self.wal.truncate()?;
-        self.maybe_compact()?;
+        if let Some(idx) = self.frozen.iter().position(|f| f.wal_seq == job.wal_seq) {
+            let f = self.frozen.remove(idx);
+            if f.max_hlc.is_none_or(|h| h <= self.maint_watermark) {
+                self.wal.drop_segments_through(f.wal_seq)?;
+            }
+        }
         Ok(())
     }
 
-    fn maybe_flush(&mut self) -> Result<()> {
-        if self.mem.approx_bytes() >= self.opts.flush_threshold_bytes {
-            self.flush()?;
+    /// Whether the background flusher has work here (a freeze to build or a
+    /// compaction trigger met).
+    pub fn has_background_work(&self) -> bool {
+        (!self.frozen.is_empty() && !self.frozen[0].building)
+            || self.l0.len() >= self.opts.l0_compaction_trigger
+    }
+
+    /// Un-mark a flush job whose build failed so a later cycle retries it.
+    pub fn abort_flush(&mut self, job: &FlushJob) {
+        if let Some(f) = self.frozen.iter_mut().find(|f| f.wal_seq == job.wal_seq) {
+            f.building = false;
         }
-        Ok(())
+        let _ = std::fs::remove_file(&job.path);
+    }
+
+    /// One background compaction step as a work order, if a trigger is met:
+    /// the L0→L1 merge first, else the first over-capacity level cascade
+    /// step. Inputs are pinned by path (the builder reopens them read-only);
+    /// `epoch` invalidates the install if the table set changed meanwhile.
+    pub fn take_compact_job(&mut self) -> Option<CompactJob> {
+        if self.opts.ephemeral {
+            return None;
+        }
+        let expire_before = self.ttl_ms.map(|ttl| now_wall_ms().saturating_sub(ttl));
+        if self.l0.len() >= self.opts.l0_compaction_trigger {
+            let deepest = self.levels.len() <= 1;
+            let mut inputs: Vec<PathBuf> =
+                self.l0.iter().map(|t| t.path().to_path_buf()).collect();
+            if let Some(l1) = self.levels.first() {
+                inputs.push(l1.path().to_path_buf());
+            }
+            return Some(CompactJob {
+                inputs,
+                output: self.next_table_path(),
+                deepest,
+                codec: self.codec_for(deepest),
+                expire_before,
+                epoch: self.table_epoch,
+            });
+        }
+        for level in 0..self.levels.len() {
+            let capacity = self.opts.level1_capacity * 10u64.pow(level as u32);
+            if self.levels[level].len() <= capacity {
+                continue;
+            }
+            let has_next = level + 1 < self.levels.len();
+            let deepest = !has_next;
+            let mut inputs = vec![self.levels[level].path().to_path_buf()];
+            if has_next {
+                inputs.push(self.levels[level + 1].path().to_path_buf());
+            }
+            return Some(CompactJob {
+                inputs,
+                output: self.next_table_path(),
+                deepest,
+                codec: self.codec_for(deepest),
+                expire_before,
+                epoch: self.table_epoch,
+            });
+        }
+        None
+    }
+
+    /// Build a compaction job's output OUTSIDE the engine lock, reopening
+    /// the pinned inputs read-only.
+    pub fn build_compact(job: &CompactJob) -> Result<SsTable> {
+        let inputs: Vec<SsTable> = job
+            .inputs
+            .iter()
+            .map(SsTable::open)
+            .collect::<Result<_>>()?;
+        let refs: Vec<&SsTable> = inputs.iter().collect();
+        merge_write(&job.output, &refs, job.deepest, job.codec, job.expire_before)
+    }
+
+    /// Install a built compaction. Discards the output (returning `false`)
+    /// when the table set changed since the job was taken — a flush landed
+    /// or an inline compaction ran; the next cycle re-plans from the new
+    /// state. Retired inputs are deleted only after the manifest points at
+    /// the replacement (the ordering that ended the manifest tears).
+    pub fn install_compact(&mut self, job: CompactJob, new_run: SsTable) -> Result<bool> {
+        if job.epoch != self.table_epoch {
+            let _ = std::fs::remove_file(&job.output);
+            return Ok(false);
+        }
+        let is_l0_merge = self
+            .l0
+            .first()
+            .is_some_and(|t| job.inputs.iter().any(|p| p == t.path()));
+        self.compactions += 1;
+        self.compaction_bytes += new_run.disk_len();
+        if is_l0_merge {
+            self.l0.clear();
+            if self.levels.is_empty() {
+                self.levels.push(new_run);
+            } else {
+                self.levels[0] = new_run;
+            }
+        } else {
+            // A level-cascade step: the first input names the source level.
+            let Some(level) = self
+                .levels
+                .iter()
+                .position(|t| Some(t.path()) == job.inputs.first().map(PathBuf::as_path))
+            else {
+                let _ = std::fs::remove_file(&job.output);
+                return Ok(false);
+            };
+            if level + 1 < self.levels.len() {
+                self.levels[level + 1] = new_run;
+                self.levels.remove(level);
+            } else {
+                self.levels.push(new_run);
+                self.levels.remove(level);
+            }
+        }
+        self.table_epoch += 1;
+        self.persist_manifest()?;
+        for p in &job.inputs {
+            let _ = std::fs::remove_file(p);
+        }
+        Ok(true)
+    }
+
+    /// Advance the deferred-maintenance watermark (see the field docs).
+    /// The first call switches the engine from "no deferred consumers"
+    /// (`Hlc::MAX`) into tracking mode; later calls only move forward.
+    pub fn set_maintenance_watermark(&mut self, hlc: Hlc) {
+        if self.maint_watermark == Hlc::MAX || hlc > self.maint_watermark {
+            self.maint_watermark = hlc;
+        }
+    }
+
+    /// Every memtable version: keys ascending, newest-first per key. The
+    /// crash-recovery replay of deferred maintenance walks this (the WAL has
+    /// re-populated the memtable by the time it runs).
+    pub fn mem_versions(&self) -> impl Iterator<Item = (&[u8], Hlc, &VersionValue)> {
+        self.mem.iter_versions()
+    }
+
+    /// Latest version of `key` from the flushed (SSTable) layer only — the
+    /// state a key had before everything currently in the memtable. The
+    /// maintenance replay uses it as the "previous document" base for the
+    /// first in-memtable version of a key.
+    pub fn get_flushed(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        for sst in self.sstables_newest_first() {
+            if let Some((hlc, value)) = sst.get(key)? {
+                if self.is_expired(hlc) {
+                    return Ok(None);
+                }
+                return Ok(version_to_value(value));
+            }
+        }
+        Ok(None)
+    }
+
+    fn maybe_flush(&mut self) -> Result<()> {
+        if self.mem.approx_bytes() < self.opts.flush_threshold_bytes || self.opts.ephemeral {
+            return Ok(());
+        }
+        // Backpressure: if the background flusher has fallen this far
+        // behind, degrade to the old inline flush instead of hoarding
+        // frozen memtables without bound.
+        if self.frozen.len() >= 4 {
+            return self.flush();
+        }
+        self.freeze()
     }
 
     /// Physically drop every key for which `keep` returns false, leaving **no
@@ -747,7 +1062,10 @@ impl Engine {
             self.levels.push(sst);
         }
         self.mem = Memtable::new();
+        self.frozen.clear();
+        self.table_epoch += 1;
         self.wal.truncate()?;
+        let _ = self.wal.drop_segments_through(self.next_wal_seq);
         self.read_cache = ReadCache::new(self.opts.read_cache_capacity);
         self.persist_manifest()?;
         remove_files(&old_paths);
@@ -783,8 +1101,10 @@ impl Engine {
             .map(|t| t.disk_len())
             .sum();
         EngineStats {
-            memtable_bytes: self.mem.approx_bytes(),
-            memtable_versions: self.mem.version_count(),
+            memtable_bytes: self.mem.approx_bytes()
+                + self.frozen.iter().map(|f| f.mem.approx_bytes()).sum::<usize>(),
+            memtable_versions: self.mem.version_count()
+                + self.frozen.iter().map(|f| f.mem.version_count()).sum::<usize>(),
             sstable_count: self.sstable_count(),
             sstables_per_level: per_level,
             disk_bytes,
@@ -811,6 +1131,14 @@ impl Engine {
             let (puts, dels) = sst.version_counts();
             stats.live_keys += puts as usize;
             stats.tombstones += dels as usize;
+        }
+        for f in self.frozen.iter() {
+            for (_k, _hlc, v) in f.mem.iter_latest_lazy() {
+                match v {
+                    VersionValue::Put(_) => stats.live_keys += 1,
+                    VersionValue::Delete => stats.tombstones += 1,
+                }
+            }
         }
         for (_k, _hlc, v) in self.mem.iter_latest_lazy() {
             match v {
@@ -928,6 +1256,7 @@ impl Engine {
             level += 1;
         }
 
+        self.table_epoch += 1;
         self.persist_manifest()?;
         remove_files(&retired);
         Ok(())
@@ -1262,6 +1591,40 @@ mod tests {
         e.put(b"k", b"new".to_vec()).unwrap();
         assert_eq!(e.get(b"k").unwrap(), Some(b"new".to_vec()));
         assert_eq!(e.get_as_of(b"k", snap).unwrap(), Some(b"old".to_vec()));
+    }
+
+    #[test]
+    fn background_flush_freezes_then_installs_and_replays_on_crash() {
+        let dir = tempdir();
+        {
+            let mut e = Engine::open_with_options(&dir, small_opts()).unwrap();
+            for i in 0..8u32 {
+                e.put(format!("k{i:02}").as_bytes(), vec![i as u8; 64]).unwrap();
+            }
+            // Freeze whatever is active: reads must keep serving from the
+            // frozen layer with nothing yet in SSTables for those rows.
+            e.freeze().unwrap();
+            assert_eq!(e.get(b"k00").unwrap(), Some(vec![0u8; 64]));
+            assert_eq!(e.get(b"k07").unwrap(), Some(vec![7u8; 64]));
+            assert_eq!(e.scan_prefix(b"k").unwrap().len(), 8);
+            // Background cycle: take → build (no lock needed) → install.
+            let job = e.take_flush_job().expect("frozen memtable pending");
+            let sst = Engine::build_flush(&job).unwrap();
+            e.install_flush(job, sst).unwrap();
+            assert_eq!(e.get(b"k03").unwrap(), Some(vec![3u8; 64]));
+            // A second freeze that never gets built = the crash window.
+            e.put(b"late", b"survives".to_vec()).unwrap();
+            e.freeze().unwrap();
+            // e dropped here with a sealed, unflushed WAL segment.
+        }
+        let e = Engine::open_with_options(&dir, small_opts()).unwrap();
+        assert_eq!(
+            e.get(b"late").unwrap(),
+            Some(b"survives".to_vec()),
+            "sealed segment replayed at open"
+        );
+        assert_eq!(e.get(b"k00").unwrap(), Some(vec![0u8; 64]));
+        assert_eq!(e.scan_prefix(b"k").unwrap().len(), 8);
     }
 
     #[test]

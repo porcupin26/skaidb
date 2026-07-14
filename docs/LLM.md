@@ -377,6 +377,26 @@ the table on open. Distributed: scatter, merge by distance.
 
 ## 7. Cluster semantics
 
+- **Journal-ack writes** (v0.81): a replicated write acks after WAL
+  append + fsync + memtable insert — point reads see it immediately
+  (read-your-writes kept). Secondary-index/vector/FTS maintenance applies
+  asynchronously (normally sub-ms lag): an index-served read or index-only
+  count can trail a write briefly, like FTS NRT visibility. Crash recovery
+  replays the un-applied suffix from the WAL (per-table watermarks).
+- **Background flush/compaction** (v0.81): a full memtable freezes (WAL
+  segment seal — microseconds) and SSTable builds/compaction merges run on
+  a background worker; the write path never builds tables. Sustained
+  overload degrades to inline flushing past 4 frozen memtables.
+- **DDL acks at schema-apply** (v0.81): CREATE INDEX (and rename-triggered
+  rebuilds) return once the schema exists everywhere; each node pages its
+  own backfill in the background. `SHOW INDEXES` shows
+  `secondary (building)` until that node's pages complete; the planner
+  never uses a building index.
+- **Non-blocking FTS startup** (v0.81): a node opens and serves everything
+  immediately; search-index catch-up/rebuild pages in the background.
+  `MATCH` against a still-rebuilding index errors with "rebuilding after
+  restart — retry shortly" instead of blocking startup (formerly ~15 min).
+
 - **Topology**: static seed list in config (`cluster.seeds`), or runtime
   `add-node`/`remove-node` (online resharding: dual-ring placement during
   the change, data migrates, epoch bumps). `vnodes_per_node` (256) balances

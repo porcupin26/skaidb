@@ -32,6 +32,20 @@ impl Memtable {
         Memtable::default()
     }
 
+    /// Every stored version: keys ascending, versions newest-first within a
+    /// key (the map's natural order). The maintenance-replay path walks this
+    /// after a crash to rebuild deferred index updates.
+    pub fn iter_versions(&self) -> impl Iterator<Item = (&[u8], Hlc, &VersionValue)> {
+        self.map
+            .iter()
+            .map(|((k, Reverse(h)), v)| (k.as_slice(), *h, v))
+    }
+
+    /// The newest stamp present, if any version is stored.
+    pub fn max_hlc(&self) -> Option<Hlc> {
+        self.map.keys().map(|(_, Reverse(h))| *h).max()
+    }
+
     /// Record a versioned mutation.
     pub fn insert(&mut self, key: Vec<u8>, hlc: Hlc, value: VersionValue) {
         let val_bytes = match &value {

@@ -154,6 +154,33 @@ impl WalSync {
     }
 }
 
+/// Path of sealed segment `seq` for the WAL at `base`.
+fn segment_path(base: &Path, seq: u64) -> PathBuf {
+    let name = base.file_name().and_then(|n| n.to_str()).unwrap_or("wal");
+    base.with_file_name(format!("{name}.seg.{seq:06}"))
+}
+
+/// Sealed segment numbers next to `base`, ascending.
+fn list_segments(base: &Path) -> Result<Vec<u64>> {
+    let dir = base.parent().unwrap_or_else(|| Path::new("."));
+    let name = base.file_name().and_then(|n| n.to_str()).unwrap_or("wal");
+    let prefix = format!("{name}.seg.");
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            if let Some(fname) = e.file_name().to_str() {
+                if let Some(seq) = fname.strip_prefix(&prefix) {
+                    if let Ok(n) = seq.parse::<u64>() {
+                        out.push(n);
+                    }
+                }
+            }
+        }
+    }
+    out.sort_unstable();
+    Ok(out)
+}
+
 /// An append-only write-ahead log file.
 #[derive(Debug)]
 pub struct Wal {
@@ -174,7 +201,17 @@ impl Wal {
             .truncate(false)
             .open(&path)?;
 
-        let (records, good_len) = replay(&file)?;
+        // Sealed segments (frozen memtables whose background flush never
+        // completed) replay first, ascending, then the active log — the same
+        // order the writes happened in.
+        let mut records = Vec::new();
+        for seq in list_segments(&path)? {
+            let seg = OpenOptions::new().read(true).open(segment_path(&path, seq))?;
+            let (mut seg_records, _) = replay(&seg)?;
+            records.append(&mut seg_records);
+        }
+        let (mut active_records, good_len) = replay(&file)?;
+        records.append(&mut active_records);
         file.set_len(good_len)?; // drop any torn trailing bytes
 
         let sync = Arc::new(WalSync {
@@ -261,6 +298,48 @@ impl Wal {
     /// Convenience: make `commit` durable immediately (append-then-sync callers).
     pub fn commit_sync(&self, commit: WalCommit) -> Result<()> {
         self.sync.sync_through(commit)
+    }
+
+    /// Seal the active log as numbered segment `seq` and start a fresh one.
+    /// The sealed file holds exactly the records of a memtable being frozen
+    /// for background flush; [`Wal::drop_segments_through`] deletes it once
+    /// that memtable is durably an SSTable. Pre-rotation commit handles keep
+    /// referring to the sealed file's inode — their fsyncs still work — and
+    /// the fsync here makes everything sealed durable anyway.
+    pub fn rotate(&mut self, seq: u64) -> Result<()> {
+        {
+            let _guard = self.sync.sync_lock.lock().expect("wal sync lock");
+            self.sync.file.sync_data()?;
+        }
+        let sealed = segment_path(&self.path, seq);
+        std::fs::rename(&self.path, &sealed)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&self.path)?;
+        self.sync = Arc::new(WalSync {
+            file,
+            ephemeral: false,
+            write_offset: AtomicU64::new(0),
+            synced: AtomicU64::new(0),
+            generation: AtomicU64::new(self.sync.generation.load(Ordering::SeqCst) + 1),
+            fsyncs: AtomicU64::new(0),
+            sync_lock: Mutex::new(()),
+        });
+        Ok(())
+    }
+
+    /// Delete sealed segments numbered `<= seq` (their contents are durable
+    /// in SSTables). Missing files are fine — deletion is idempotent.
+    pub fn drop_segments_through(&self, seq: u64) -> Result<()> {
+        for s in list_segments(&self.path)? {
+            if s <= seq {
+                let _ = std::fs::remove_file(segment_path(&self.path, s));
+            }
+        }
+        Ok(())
     }
 
     /// Truncate the log to empty and bump the generation. Called after a flush

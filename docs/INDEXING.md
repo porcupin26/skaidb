@@ -29,10 +29,12 @@ SHOW INDEXES;          -- name, table, type, paths (multikey paths keep their []
 DROP INDEX IF EXISTS i_mail_star;
 ```
 
-- DDL broadcasts cluster-wide; each node backfills its shard by **streaming**
-  the table one row at a time (a 183k-row backfill runs ~6 min per node and
-  is memory-flat). The client call may time out while the backfill finishes
-  server-side — poll `SHOW INDEXES` per node.
+- DDL broadcasts cluster-wide and **acks at schema-apply**; each node then
+  pages its backfill in the background (brief locks, memory-flat — a
+  183k-row backfill takes a few minutes per node). `SHOW INDEXES` shows
+  `secondary (building)` until that node completes; the planner never uses
+  a building index, so queries fall back to their pre-index plans until
+  then.
 - Every statement, DDL included, lands in the query log with its real
   duration; slow ones also land in the slow-query log (see *Spotting the
   missing index* below).

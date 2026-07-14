@@ -20,10 +20,22 @@ pub use exec::{
     Database, DbStats, IndexScanRange, Inventory, InventoryIndex, InventorySearch,
     InventoryTable, InventoryTimeseries, InventoryVector, pk_point_key, TableStats,
     TsRollupInfo,
+    DecodedMaint, MaintTask,
 };
 pub use skaidb_storage::{Codec, EngineOptions, DEFAULT_SEARCH_WRITER_HEAP};
 pub use namespace::DEFAULT_DATABASE;
 pub use result::{QueryOutput, ResultSet, SessionEffect};
+
+/// Build a background flush's SSTable outside any lock (see the Node flusher).
+pub fn build_flush_sstable(job: &skaidb_storage::FlushJob) -> skaidb_storage::Result<skaidb_storage::SsTable> {
+    skaidb_storage::Engine::build_flush(job)
+}
+
+/// Build a background compaction's output outside any lock.
+pub fn build_compact_sstable(job: &skaidb_storage::CompactJob) -> skaidb_storage::Result<skaidb_storage::SsTable> {
+    skaidb_storage::Engine::build_compact(job)
+}
+
 pub use session::Session;
 pub use ts_query::{ts_partialize, TsPartial};
 

@@ -15,7 +15,8 @@ use skaidb_sql::parse;
 use std::sync::Arc;
 
 use skaidb_storage::{
-    Engine as StorageEngine, EngineOptions, Hlc, HlcClock, VersionValue, WalCommit, WalSync,
+    CompactJob, Engine as StorageEngine, EngineOptions, FlushJob, Hlc, HlcClock, VersionValue,
+    WalCommit, WalSync,
 };
 use skaidb_types::{Document, Value};
 
@@ -48,7 +49,58 @@ type KeyedRows = Vec<(Vec<u8>, Document)>;
 type OrderedRows = (KeyedRows, bool);
 /// A chosen index access path: `(index_name, start_key, end_key, sorted)` where
 /// `sorted` is whether the scan order already satisfies the query's `ORDER BY`.
+/// The deferred half of one replicated write: everything the applier needs
+/// to maintain secondary indexes, vectors, and search off the ack path. The
+/// raw bytes ride along so decoding happens outside the write lock.
+#[derive(Debug)]
+pub struct MaintTask {
+    pub table: String,
+    pub key: Vec<u8>,
+    pub hlc: Hlc,
+    /// Previous row version at capture time (already-encoded), if any.
+    pub old: Option<Vec<u8>>,
+    /// New row version; `None` = delete.
+    pub new: Option<Vec<u8>>,
+}
+
+/// A [`MaintTask`] with its documents decoded (outside the write lock).
+#[derive(Debug)]
+pub struct DecodedMaint {
+    pub table: String,
+    pub key: Vec<u8>,
+    pub hlc: Hlc,
+    pub old_doc: Option<Document>,
+    pub new_doc: Option<Document>,
+}
+
+impl MaintTask {
+    /// Decode the old/new payloads (CPU-heavy for large JSON rows — the
+    /// entire reason maintenance is deferred). Non-document payloads decode
+    /// to `None` and are skipped by maintenance, matching the sync path.
+    pub fn decode(self) -> DecodedMaint {
+        let doc = |b: Option<Vec<u8>>| {
+            b.and_then(|bytes| match Value::decode(&bytes) {
+                Ok(Value::Document(d)) => Some(d),
+                _ => None,
+            })
+        };
+        DecodedMaint {
+            table: self.table,
+            key: self.key,
+            hlc: self.hlc,
+            old_doc: doc(self.old),
+            new_doc: doc(self.new),
+        }
+    }
+}
+
 type IndexPlan = (String, Option<Vec<u8>>, Option<Vec<u8>>, bool, bool);
+/// Per-key version chain: `(hlc, Some(bytes) | None-tombstone)`, used by the
+/// deferred-maintenance crash replay.
+type VersionChain = Vec<(Hlc, Option<Vec<u8>>)>;
+/// A buffered batch apply's result: the last commit handle (for one group
+/// fsync) plus the deferred-maintenance tasks.
+type BatchRowOnly = (Option<(WalCommit, Arc<WalSync>)>, Vec<MaintTask>);
 
 /// Candidate-range size below which the planner abandons a sorted
 /// ORDER BY + LIMIT walk for a strictly more selective unsorted index.
@@ -96,6 +148,24 @@ pub struct Database {
     /// Wall-clock spent reopening/replaying/rebuilding search indexes during
     /// the last `open`, in milliseconds.
     search_rebuild_ms: u64,
+    /// Indexes created/imported here whose backfill hasn't been driven yet.
+    /// A Session drains inline after DDL; a cluster node's background worker
+    /// pages through them without monopolizing the write lock.
+    pending_backfills: Vec<String>,
+    /// Cluster mode: leave pending backfills for the background worker
+    /// instead of draining inline after each statement, so DDL acks at
+    /// schema-apply (single-node/Session keeps run-to-completion DDL).
+    defer_backfills: bool,
+    /// Search indexes whose startup catch-up was deferred (server mode),
+    /// with the committed watermark to replay from (`None` = full rebuild;
+    /// the index was already cleared at open).
+    pending_search_catchups: Vec<(String, Option<Hlc>)>,
+    /// Per-table applier watermark: every write stamped `<=` it has had its
+    /// deferred index/vector/search maintenance applied. Persisted to
+    /// `applier.watermarks`; drives crash-recovery replay and the storage
+    /// layer's WAL-truncation gate. Absent entry = table has never had a
+    /// deferred write (sync path or no consumers).
+    applied_watermarks: HashMap<String, Hlc>,
 }
 
 /// A search index plus its NRT refresh state: writes apply immediately but
@@ -109,6 +179,9 @@ struct LiveSearchIndex {
     index: SearchIndex,
     last_commit: std::time::Instant,
     refresh_ms: u64,
+    /// Startup catch-up/rebuild still paging in the background: MATCH errors
+    /// clearly instead of silently returning partial results.
+    building: bool,
 }
 
 impl LiveSearchIndex {
@@ -374,6 +447,7 @@ impl Database {
         // definition-mismatched index is wiped and rebuilt from the table.
         let rebuild_start = std::time::Instant::now();
         let mut search_indexes = HashMap::new();
+        let mut pending_search: Vec<(String, Option<Hlc>)> = Vec::new();
         for (name, def) in &catalog.search_indexes {
             let (cfg, refresh_ms) =
                 SearchIndexConfig::from_declaration(&def.paths, &def.options)?;
@@ -387,43 +461,57 @@ impl Database {
                     SearchIndex::open(&idx_dir, &cfg, heap)?
                 }
             };
+            let mut building = false;
             if let Some(engine) = tables.get(&def.table) {
-                match index.committed_watermark() {
-                    // Catch-up: replay every put/delete stamped after the
-                    // watermark (deletes included, so a row removed while the
-                    // delete was uncommitted stays removed).
-                    Some(w) => {
-                        let watermark = watermark_to_hlc(w);
-                        // Stream the shard: a full `Vec` gather here OOM'd small
-                        // nodes catching up an index over a large table.
-                        for row in engine.scan_versioned_with_tombstones_iter() {
-                            let (key, hlc, value) = row?;
-                            if hlc <= watermark {
-                                continue;
-                            }
-                            match value {
-                                Some(bytes) => {
-                                    if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
-                                        index.put(&key, &doc, hlc_to_watermark(hlc))?;
-                                    }
+                let watermark = index.committed_watermark();
+                if opts.defer_search_startup {
+                    // Server mode: the catch-up/rebuild pages run in the
+                    // background worker; the node's listener opens without
+                    // waiting behind minutes of FTS indexing. MATCH on this
+                    // index errors clearly until the pages complete.
+                    if watermark.is_none() {
+                        index.clear()?;
+                    }
+                    building = true;
+                    pending_search.push((name.clone(), watermark.map(watermark_to_hlc)));
+                } else {
+                    match watermark {
+                        // Catch-up: replay every put/delete stamped after the
+                        // watermark (deletes included, so a row removed while
+                        // the delete was uncommitted stays removed).
+                        Some(w) => {
+                            let watermark = watermark_to_hlc(w);
+                            // Stream the shard: a full `Vec` gather here OOM'd
+                            // small nodes catching up over a large table.
+                            for row in engine.scan_versioned_with_tombstones_iter() {
+                                let (key, hlc, value) = row?;
+                                if hlc <= watermark {
+                                    continue;
                                 }
-                                None => index.delete(&key, hlc_to_watermark(hlc)),
+                                match value {
+                                    Some(bytes) => {
+                                        if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
+                                            index.put(&key, &doc, hlc_to_watermark(hlc))?;
+                                        }
+                                    }
+                                    None => index.delete(&key, hlc_to_watermark(hlc)),
+                                }
                             }
                         }
-                    }
-                    // Never committed: full rebuild from the table.
-                    None => {
-                        index.clear()?;
-                        for row in engine.scan_versioned_iter() {
-                            let (key, bytes, hlc) = row?;
-                            if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
-                                index.put(&key, &doc, hlc_to_watermark(hlc))?;
+                        // Never committed: full rebuild from the table.
+                        None => {
+                            index.clear()?;
+                            for row in engine.scan_versioned_iter() {
+                                let (key, bytes, hlc) = row?;
+                                if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
+                                    index.put(&key, &doc, hlc_to_watermark(hlc))?;
+                                }
                             }
                         }
                     }
                 }
             }
-            if index.dirty() {
+            if !building && index.dirty() {
                 index.commit()?;
             }
             search_indexes.insert(
@@ -432,6 +520,7 @@ impl Database {
                     index,
                     last_commit: std::time::Instant::now(),
                     refresh_ms,
+                    building,
                 },
             );
         }
@@ -448,7 +537,19 @@ impl Database {
         }
 
         let role_store = build_role_store(&catalog);
-        Ok(Database {
+        // Applier watermarks persisted by the deferred-maintenance path.
+        let applied_watermarks: HashMap<String, Hlc> =
+            match std::fs::read(dir.join("applier.watermarks")) {
+                Ok(bytes) => serde_json::from_slice::<Vec<(String, u64, u32)>>(&bytes)
+                    .map(|v| {
+                        v.into_iter()
+                            .map(|(t, wall, ctr)| (t, Hlc::new(wall, ctr)))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                Err(_) => HashMap::new(),
+            };
+        let mut db = Database {
             dir,
             storage_opts: opts,
             catalog,
@@ -464,7 +565,23 @@ impl Database {
             ddl_hlc: None,
             vector_rebuild_ms,
             search_rebuild_ms,
-        })
+            applied_watermarks,
+            pending_backfills: Vec::new(),
+            pending_search_catchups: pending_search,
+            defer_backfills: false,
+        };
+        // Re-arm the storage truncation gates, then replay any deferred
+        // maintenance the crash interrupted (WAL replay above re-populated
+        // the memtables the replay walks).
+        let gates: Vec<(String, Hlc)> =
+            db.applied_watermarks.iter().map(|(t, h)| (t.clone(), *h)).collect();
+        for (table, hlc) in gates {
+            if let Ok(engine) = db.table_engine_mut(&table) {
+                engine.set_maintenance_watermark(hlc);
+            }
+        }
+        db.recover_deferred_maintenance()?;
+        Ok(db)
     }
 
     /// Resolve the HLC for the DDL about to run: the replicated stamp if one was
@@ -665,6 +782,7 @@ impl Database {
                 index,
                 last_commit: std::time::Instant::now(),
                 refresh_ms,
+                building: false,
             },
         );
         self.catalog.search_indexes.insert(c.name.clone(), def);
@@ -806,6 +924,7 @@ impl Database {
                 index,
                 last_commit: std::time::Instant::now(),
                 refresh_ms,
+                building: false,
             },
         );
         Ok(())
@@ -997,7 +1116,7 @@ impl Database {
 
     /// One NRT refresh check for every search index on `table`: commit an
     /// index whose refresh interval elapsed since its last commit.
-    pub(crate) fn search_refresh(&mut self, table: &str) -> Result<()> {
+    pub fn search_refresh(&mut self, table: &str) -> Result<()> {
         for name in self.search_indexes_on(table) {
             if let Some(live) = self.search_indexes.get_mut(&name) {
                 live.maybe_refresh()?;
@@ -1119,7 +1238,13 @@ impl Database {
         let live = self
             .search_indexes
             .get(&name)
-            .ok_or(EngineError::IndexNotFound(name))?;
+            .ok_or_else(|| EngineError::IndexNotFound(name.clone()))?;
+        if live.building {
+            return Err(EngineError::Unsupported(format!(
+                "search index '{}' is rebuilding after restart — retry shortly",
+                namespace::split(&name).1
+            )));
+        }
         match k {
             Some(n) => Ok(live
                 .index
@@ -1723,6 +1848,12 @@ impl Database {
             .search_indexes
             .get(name)
             .ok_or_else(|| EngineError::IndexNotFound(name.to_string()))?;
+        if live.building {
+            return Err(EngineError::Unsupported(format!(
+                "search index '{}' is rebuilding after restart — retry shortly",
+                namespace::split(name).1
+            )));
+        }
         let table_engine = self
             .tables
             .get(table)
@@ -1987,6 +2118,19 @@ impl Database {
     /// [`Session`](crate::Session) dispatch a statement it has classified
     /// without re-parsing it.
     pub fn execute_statement(&mut self, stmt: Statement) -> Result<QueryOutput> {
+        let out = self.execute_statement_inner(stmt)?;
+        // Single-node semantics: DDL returns with its index backfills done.
+        // Cluster nodes set `defer_backfills` and drive the pages from their
+        // background worker so DDL acks at schema-apply.
+        if !self.defer_backfills && !self.pending_backfills.is_empty() {
+            for name in self.take_pending_backfills() {
+                self.run_index_backfill(&name)?;
+            }
+        }
+        Ok(out)
+    }
+
+    fn execute_statement_inner(&mut self, stmt: Statement) -> Result<QueryOutput> {
         let _meter = self.arm_scan_meter();
         let mut stmt = stmt;
         skaidb_sql::resolve_now(&mut stmt, now_ms());
@@ -2374,7 +2518,9 @@ impl Database {
             rows.push(vec![
                 Value::String(namespace::split(name).1.to_string()),
                 Value::String(namespace::split(&idx.table).1.to_string()),
-                Value::String("secondary".into()),
+                Value::String(
+                    if idx.building { "secondary (building)" } else { "secondary" }.into(),
+                ),
                 Value::String(idx.paths.join(", ")),
             ]);
         }
@@ -2930,37 +3076,149 @@ impl Database {
                 "at most one multikey ([]) component per index".into(),
             ));
         }
-        // Create the index store and backfill it from the existing rows.
-        // Stream one row at a time (see rebuild_vector_index): whole-table
-        // Document materialization via scan_docs OOM-killed a 4 GB node
-        // backfilling a 183k-row index (2026-07-13).
-        let mut index_engine = StorageEngine::open_with_options(index_dir(&self.dir, name), self.storage_opts)?;
-        {
-            let engine = self
-                .tables
-                .get(table)
-                .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
-            for row in engine.scan_versioned_iter() {
-                let (row_key, bytes, _hlc) = row?;
-                if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
-                    for values in index_value_tuples(&doc, paths) {
-                        index_engine
-                            .put(&index_entry_key(&values, &row_key), row_key.clone())?;
-                    }
-                }
-            }
-        }
+        // Schema-only: the index exists (empty, marked `building`) the
+        // moment DDL acks; the backfill runs in pages afterwards — inline
+        // for a single-node Session (`run_index_backfill`), in a background
+        // thread with brief per-page locks on a cluster node. Writes landing
+        // meanwhile maintain the index normally (idempotent overlap with the
+        // pages), and the planner refuses `building` indexes.
+        let index_engine =
+            StorageEngine::open_with_options(index_dir(&self.dir, name), self.storage_opts)?;
         self.indexes.insert(name.to_string(), index_engine);
         self.catalog.indexes.insert(
             name.to_string(),
             IndexDef {
                 table: table.to_string(),
                 paths: paths.to_vec(),
+                building: true,
             },
         );
         self.record_schema(key, hlc, false);
         self.save_catalog()?;
+        self.pending_backfills.push(name.to_string());
         Ok(QueryOutput::Ddl)
+    }
+
+    /// One page of an index backfill: copy up to `limit` rows after `cursor`
+    /// into the index, returning the next cursor — `None` when the backfill
+    /// is complete (the index is then unmarked `building` and the catalog
+    /// saved). Page-sized so a cluster node holds its write lock for
+    /// milliseconds at a time instead of the whole table stream.
+    pub fn backfill_index_page(
+        &mut self,
+        name: &str,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(def) = self.catalog.indexes.get(name).cloned() else {
+            return Ok(None); // dropped mid-backfill
+        };
+        if !def.building {
+            return Ok(None);
+        }
+        let rows = {
+            let Some(engine) = self.tables.get(&def.table) else {
+                return Ok(None);
+            };
+            engine.scan_versioned_page(cursor.as_deref(), limit)?
+        };
+        let done = rows.len() < limit;
+        let next = rows.last().map(|(k, _, _)| k.clone());
+        if let Some(index_engine) = self.indexes.get_mut(name) {
+            for (row_key, _hlc, bytes) in rows {
+                let Some(bytes) = bytes else { continue }; // tombstone
+                if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
+                    for values in index_value_tuples(&doc, &def.paths) {
+                        index_engine
+                            .put(&index_entry_key(&values, &row_key), row_key.clone())?;
+                    }
+                }
+            }
+        }
+        if done {
+            if let Some(def) = self.catalog.indexes.get_mut(name) {
+                def.building = false;
+            }
+            self.save_catalog()?;
+            return Ok(None);
+        }
+        Ok(next)
+    }
+
+    /// Run an index backfill to completion, inline. The single-node path
+    /// (Session, tests); cluster nodes page it in a background thread.
+    pub fn run_index_backfill(&mut self, name: &str) -> Result<()> {
+        let mut cursor = None;
+        loop {
+            match self.backfill_index_page(name, cursor, 4096)? {
+                Some(next) => cursor = Some(next),
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// Names of indexes whose backfill this node still owes (freshly created
+    /// or imported via schema sync). The cluster's background worker drains
+    /// this; a Session drains it inline right after the DDL.
+    pub fn take_pending_backfills(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_backfills)
+    }
+
+    /// Cluster mode: DDL acks at schema-apply and index backfills run in the
+    /// node's background worker (see [`Database::take_pending_backfills`]).
+    pub fn set_defer_backfills(&mut self, defer: bool) {
+        self.defer_backfills = defer;
+    }
+
+    /// Deferred startup search catch-ups (server mode): `(name, watermark)`.
+    pub fn take_pending_search_catchups(&mut self) -> Vec<(String, Option<Hlc>)> {
+        std::mem::take(&mut self.pending_search_catchups)
+    }
+
+    /// One page of a deferred search catch-up: replay up to `limit` rows
+    /// after `cursor` (skipping those at or below `watermark`) into the
+    /// index. Returns the next cursor; `None` when complete — the index is
+    /// committed and unmarked `building`. Runs under the caller's write
+    /// lock, page-sized so queries interleave.
+    pub fn search_catchup_page(
+        &mut self,
+        name: &str,
+        watermark: Option<Hlc>,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(def) = self.catalog.search_indexes.get(name) else {
+            return Ok(None); // dropped mid-catch-up
+        };
+        let table = def.table.clone();
+        let rows = {
+            let Some(engine) = self.tables.get(&table) else {
+                return Ok(None);
+            };
+            engine.scan_versioned_page(cursor.as_deref(), limit)?
+        };
+        let done = rows.len() < limit;
+        let next = rows.last().map(|(k, _, _)| k.clone());
+        if let Some(live) = self.search_indexes.get_mut(name) {
+            for (key, hlc, bytes) in rows {
+                if watermark.is_some_and(|w| hlc <= w) {
+                    continue;
+                }
+                match bytes {
+                    Some(bytes) => {
+                        if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
+                            live.index.put(&key, &doc, hlc_to_watermark(hlc))?;
+                        }
+                    }
+                    None => live.index.delete(&key, hlc_to_watermark(hlc)),
+                }
+            }
+            if done {
+                live.index.commit()?;
+                live.building = false;
+            }
+        }
+        Ok(if done { None } else { next })
     }
 
     fn drop_index(&mut self, name: &str, if_exists: bool) -> Result<QueryOutput> {
@@ -3121,36 +3379,24 @@ impl Database {
         Ok(QueryOutput::Ddl)
     }
 
-    /// Wipe and re-backfill a secondary index from its table's current rows.
+    /// Wipe an index and queue its re-backfill (marked `building`; the
+    /// planner skips it until the pages complete). Formerly streamed the
+    /// whole table inline — minutes under the write lock for a large table.
     fn rebuild_index(&mut self, name: &str) -> Result<()> {
-        let def = self
-            .catalog
-            .indexes
-            .get(name)
-            .ok_or_else(|| EngineError::IndexNotFound(name.to_string()))?;
-        let (idx_table, idx_paths) = (def.table.clone(), def.paths.clone());
+        if !self.catalog.indexes.contains_key(name) {
+            return Err(EngineError::IndexNotFound(name.to_string()));
+        }
         self.indexes.remove(name);
         let dir = index_dir(&self.dir, name);
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
         }
-        let mut engine = StorageEngine::open_with_options(dir, self.storage_opts)?;
-        {
-            // Stream (see create_index): scan_docs materializes the table.
-            let table_engine = self
-                .tables
-                .get(&idx_table)
-                .ok_or_else(|| EngineError::TableNotFound(idx_table.clone()))?;
-            for row in table_engine.scan_versioned_iter() {
-                let (row_key, bytes, _hlc) = row?;
-                if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
-                    for values in index_value_tuples(&doc, &idx_paths) {
-                        engine.put(&index_entry_key(&values, &row_key), row_key.clone())?;
-                    }
-                }
-            }
-        }
+        let engine = StorageEngine::open_with_options(dir, self.storage_opts)?;
         self.indexes.insert(name.to_string(), engine);
+        if let Some(def) = self.catalog.indexes.get_mut(name) {
+            def.building = true;
+        }
+        self.pending_backfills.push(name.to_string());
         Ok(())
     }
 
@@ -3458,7 +3704,12 @@ impl Database {
         if constraints.is_empty() {
             return Ok(None);
         }
-        for (name, idx) in self.catalog.indexes.iter().filter(|(_, i)| i.table == table) {
+        for (name, idx) in self
+            .catalog
+            .indexes
+            .iter()
+            .filter(|(_, i)| i.table == table && !i.building)
+        {
             let names = index_key_names(&idx.paths);
             // Same multikey gate as `plan_index`: with the [] component
             // equality-pinned, one entry per (element, row) makes the range
@@ -3673,7 +3924,12 @@ impl Database {
         let sorted_first = order.is_some() && fetch_limit.is_some();
         let mut best_sorted: Option<(IndexPlan, (usize, usize))> = None;
         let mut best_unsorted: Option<(IndexPlan, (usize, usize))> = None;
-        for (name, idx) in self.catalog.indexes.iter().filter(|(_, i)| i.table == table) {
+        for (name, idx) in self
+            .catalog
+            .indexes
+            .iter()
+            .filter(|(_, i)| i.table == table && !i.building)
+        {
             let names = index_key_names(&idx.paths);
             // A multikey index is usable only when every column through the
             // [] component is equality-pinned (the element probe). Below
@@ -4735,6 +4991,286 @@ impl Database {
         })
     }
 
+    /// The ack half of a replicated write: capture the previous row version
+    /// (deferred index maintenance needs it — after the memtable insert it is
+    /// no longer the latest), append to the WAL + memtable, and hand back a
+    /// [`MaintTask`] for the applier when any index/vector/search consumer
+    /// needs the document. This is the journal-ack write path: everything
+    /// expensive (decode, per-index engine writes and their fsyncs, HNSW,
+    /// FTS) happens later, off the ack.
+    pub fn apply_put_row_only(
+        &mut self,
+        table: &str,
+        key: &[u8],
+        bytes: Vec<u8>,
+        hlc: Hlc,
+    ) -> Result<(WalCommit, Arc<WalSync>, Option<MaintTask>)> {
+        let task = if self.needs_doc_on_write(table) {
+            let old = self.tables.get(table).and_then(|e| e.get(key).ok().flatten());
+            Some(MaintTask {
+                table: table.to_string(),
+                key: key.to_vec(),
+                hlc,
+                old,
+                new: Some(bytes.clone()),
+            })
+        } else {
+            None
+        };
+        let (commit, handle) = {
+            let engine = self.table_engine_mut(table)?;
+            let commit = engine.append_put_buffered(key, bytes, hlc)?;
+            (commit, engine.wal_sync_handle())
+        };
+        Ok((commit, handle, task))
+    }
+
+    /// The ack half of a replicated delete; see [`Database::apply_put_row_only`].
+    pub fn apply_delete_row_only(
+        &mut self,
+        table: &str,
+        key: &[u8],
+        hlc: Hlc,
+    ) -> Result<(WalCommit, Arc<WalSync>, Option<MaintTask>)> {
+        let task = if self.needs_doc_on_write(table) {
+            let old = self.tables.get(table).and_then(|e| e.get(key).ok().flatten());
+            Some(MaintTask {
+                table: table.to_string(),
+                key: key.to_vec(),
+                hlc,
+                old,
+                new: None,
+            })
+        } else {
+            None
+        };
+        let (commit, handle) = {
+            let engine = self.table_engine_mut(table)?;
+            let commit = engine.append_delete_buffered(key, hlc)?;
+            (commit, engine.wal_sync_handle())
+        };
+        Ok((commit, handle, task))
+    }
+
+    /// The deferred half: index delete/put, vector, and search maintenance
+    /// for one write, from documents the applier decoded OUTSIDE the write
+    /// lock. Called by the applier thread and by crash-recovery replay.
+    pub fn apply_maintenance(&mut self, m: &DecodedMaint) -> Result<()> {
+        if let Some(old) = &m.old_doc {
+            for (name, path) in self.indexes_on(&m.table) {
+                self.index_del(&name, &path, old, &m.key)?;
+            }
+        }
+        match &m.new_doc {
+            Some(new) => {
+                for (name, path) in self.indexes_on(&m.table) {
+                    self.index_put(&name, &path, new, &m.key)?;
+                }
+                self.maintain_vectors_put(&m.table, new, &m.key, m.hlc);
+                self.search_put_unrefreshed(&m.table, new, &m.key, m.hlc)?;
+            }
+            None => {
+                self.maintain_vectors_del(&m.table, &m.key, m.hlc);
+                self.search_del_unrefreshed(&m.table, &m.key, m.hlc)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Background-flusher work orders across every table and index engine:
+    /// `(is_index, engine_name, job)`. Marks each frozen memtable as
+    /// building; abort or install must follow.
+    pub fn background_flush_jobs(&mut self) -> Vec<(bool, String, FlushJob)> {
+        let mut out = Vec::new();
+        for (name, e) in self.tables.iter_mut() {
+            if let Some(job) = e.take_flush_job() {
+                out.push((false, name.clone(), job));
+            }
+        }
+        for (name, e) in self.indexes.iter_mut() {
+            if let Some(job) = e.take_flush_job() {
+                out.push((true, name.clone(), job));
+            }
+        }
+        out
+    }
+
+    /// Install (or on `sst: Err`, abort) one built background flush.
+    pub fn finish_flush_job(
+        &mut self,
+        is_index: bool,
+        name: &str,
+        job: FlushJob,
+        sst: std::result::Result<skaidb_storage::SsTable, EngineError>,
+    ) -> Result<()> {
+        let engine = if is_index {
+            self.indexes.get_mut(name)
+        } else {
+            self.tables.get_mut(name)
+        };
+        let Some(engine) = engine else {
+            return Ok(()); // dropped table/index — job is moot
+        };
+        match sst {
+            Ok(sst) => engine.install_flush(job, sst)?,
+            Err(_) => engine.abort_flush(&job),
+        }
+        Ok(())
+    }
+
+    /// One background compaction work order per engine over its trigger.
+    pub fn background_compact_jobs(&mut self) -> Vec<(bool, String, CompactJob)> {
+        let mut out = Vec::new();
+        for (name, e) in self.tables.iter_mut() {
+            if let Some(job) = e.take_compact_job() {
+                out.push((false, name.clone(), job));
+            }
+        }
+        for (name, e) in self.indexes.iter_mut() {
+            if let Some(job) = e.take_compact_job() {
+                out.push((true, name.clone(), job));
+            }
+        }
+        out
+    }
+
+    /// Install one built background compaction (stale epochs self-discard).
+    pub fn finish_compact_job(
+        &mut self,
+        is_index: bool,
+        name: &str,
+        job: CompactJob,
+        new_run: skaidb_storage::SsTable,
+    ) -> Result<()> {
+        let engine = if is_index {
+            self.indexes.get_mut(name)
+        } else {
+            self.tables.get_mut(name)
+        };
+        if let Some(engine) = engine {
+            engine.install_compact(job, new_run)?;
+        }
+        Ok(())
+    }
+
+    /// Whether any engine has background flush/compaction work pending.
+    pub fn has_background_storage_work(&self) -> bool {
+        self.tables.values().any(StorageEngine::has_background_work)
+            || self.indexes.values().any(StorageEngine::has_background_work)
+    }
+
+    /// Advance the applier watermark for `table`: every write stamped `<=`
+    /// `hlc` has had its deferred maintenance applied. Unblocks WAL
+    /// truncation at the storage layer and is persisted (throttled by the
+    /// caller) for crash-recovery replay.
+    pub fn set_applied_watermark(&mut self, table: &str, hlc: Hlc) {
+        self.applied_watermarks.insert(table.to_string(), hlc);
+        if let Ok(engine) = self.table_engine_mut(table) {
+            engine.set_maintenance_watermark(hlc);
+        }
+    }
+
+    /// Persist the applier watermarks (atomic rename). Cheap — one tiny file.
+    pub fn persist_applied_watermarks(&self) -> Result<()> {
+        let tmp = self.dir.join("applier.watermarks.tmp");
+        let dst = self.dir.join("applier.watermarks");
+        let entries: Vec<(String, u64, u32)> = self
+            .applied_watermarks
+            .iter()
+            .map(|(t, h)| (t.clone(), h.physical, h.logical))
+            .collect();
+        let bytes = serde_json::to_vec(&entries)
+            .map_err(|e| EngineError::Constraint(format!("watermark encode: {e}")))?;
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, &dst)?;
+        Ok(())
+    }
+
+    /// Replay deferred maintenance for writes newer than each table's
+    /// persisted watermark. Runs at open, after WAL replay re-populated the
+    /// memtables: the truncation gate guarantees every unapplied write is
+    /// still there. Idempotent — re-applying an already-applied write puts
+    /// the same index entries back.
+    fn recover_deferred_maintenance(&mut self) -> Result<()> {
+        let tables: Vec<String> = self
+            .catalog
+            .tables
+            .keys()
+            .filter(|t| self.needs_doc_on_write(t))
+            .cloned()
+            .collect();
+        for table in tables {
+            let wm = self.applied_watermarks.get(&table).copied();
+            let Some(wm) = wm else { continue };
+            // Collect (key, ascending versions past the watermark) chains.
+            let mut chains: Vec<(Vec<u8>, VersionChain)> = Vec::new();
+            {
+                let Some(engine) = self.tables.get(&table) else { continue };
+                let mut cur_key: Option<Vec<u8>> = None;
+                for (key, hlc, vv) in engine.mem_versions() {
+                    if hlc <= wm {
+                        continue;
+                    }
+                    let val = match vv {
+                        VersionValue::Put(b) => Some(b.clone()),
+                        VersionValue::Delete => None,
+                    };
+                    if cur_key.as_deref() != Some(key) {
+                        cur_key = Some(key.to_vec());
+                        chains.push((key.to_vec(), Vec::new()));
+                    }
+                    // mem_versions yields newest-first per key; build then reverse.
+                    chains.last_mut().expect("pushed above").1.push((hlc, val));
+                }
+            }
+            if chains.is_empty() {
+                continue;
+            }
+            let mut max_seen = wm;
+            for (key, mut versions) in chains {
+                versions.reverse(); // oldest first
+                // Base: the newest version at-or-below the watermark — from
+                // the memtable chain if present, else the flushed layer.
+                let mut prev: Option<Vec<u8>> = {
+                    let engine = self.tables.get(&table).expect("checked above");
+                    let mem_base = engine
+                        .mem_versions()
+                        .filter(|(k, h, _)| *k == key.as_slice() && *h <= wm)
+                        .max_by_key(|(_, h, _)| *h)
+                        .map(|(_, _, vv)| match vv {
+                            VersionValue::Put(b) => Some(b.clone()),
+                            VersionValue::Delete => None,
+                        });
+                    match mem_base {
+                        Some(v) => v,
+                        None => engine.get_flushed(&key)?,
+                    }
+                };
+                for (hlc, new) in versions {
+                    let decode = |b: &Vec<u8>| match Value::decode(b) {
+                        Ok(Value::Document(d)) => Some(d),
+                        _ => None,
+                    };
+                    let m = DecodedMaint {
+                        table: table.clone(),
+                        key: key.clone(),
+                        hlc,
+                        old_doc: prev.as_ref().and_then(decode),
+                        new_doc: new.as_ref().and_then(decode),
+                    };
+                    self.apply_maintenance(&m)?;
+                    if hlc > max_seen {
+                        max_seen = hlc;
+                    }
+                    prev = new;
+                }
+            }
+            self.set_applied_watermark(&table, max_seen);
+        }
+        self.persist_applied_watermarks()?;
+        Ok(())
+    }
+
     /// Apply a replicated row write at an explicit stamp, maintaining indexes.
     pub fn apply_put(&mut self, table: &str, key: &[u8], bytes: Vec<u8>, hlc: Hlc) -> Result<()> {
         // Decode lazily: only index maintenance reads the document, and
@@ -4917,6 +5453,30 @@ impl Database {
         }
         self.search_refresh(table)?;
         Ok(last)
+    }
+
+    /// Journal-ack twin of [`Database::apply_batch_buffered`]: rows land in
+    /// the WAL + memtable only; the returned [`MaintTask`]s carry the
+    /// deferred index/vector/search half to the applier.
+    pub fn apply_batch_row_only(
+        &mut self,
+        table: &str,
+        rows: &[(Vec<u8>, Vec<u8>, Hlc, bool)],
+    ) -> Result<BatchRowOnly> {
+        let mut last = None;
+        let mut tasks = Vec::new();
+        for (key, value, hlc, is_put) in rows {
+            let (commit, handle, task) = if *is_put {
+                self.apply_put_row_only(table, key, value.clone(), *hlc)?
+            } else {
+                self.apply_delete_row_only(table, key, *hlc)?
+            };
+            last = Some((commit, handle));
+            if let Some(t) = task {
+                tasks.push(t);
+            }
+        }
+        Ok((last, tasks))
     }
 
     // ---- helpers ----
@@ -8448,6 +9008,194 @@ fn apply_offset_limit<T>(rows: &mut Vec<T>, offset: Option<u64>, limit: Option<u
     }
     if let Some(lim) = limit {
         rows.truncate(lim as usize);
+    }
+}
+
+#[cfg(test)]
+mod journal_ack_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn tmp() -> std::path::PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "skaidb-jack-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    fn doc(id: i64, v: &str) -> Vec<u8> {
+        let mut d = Document::new();
+        d.insert("id", Value::Int(id));
+        d.insert("v", Value::String(v.into()));
+        Value::Document(d).encode()
+    }
+    fn key(id: i64) -> Vec<u8> {
+        Value::Array(vec![Value::Int(id)]).encode_key()
+    }
+
+    /// Kill-crash semantics for the deferred half: rows landed via the
+    /// row-only path with their maintenance never applied (the "crash before
+    /// the applier ran" state) must be replayed into the index at the next
+    /// open — including the delete of a superseded version's entries.
+    #[test]
+    fn deferred_maintenance_replays_after_crash() {
+        let dir = tmp();
+        let clock = HlcClock::new();
+        {
+            let mut db = Database::open(&dir).unwrap();
+            db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+            db.execute("CREATE INDEX i_v ON t (v)").unwrap();
+            // Applied baseline: one row through the sync path, watermark at
+            // its stamp.
+            let h0 = clock.now();
+            db.apply_put(&namespace::qualify(DEFAULT_DATABASE, "t"), &key(1), doc(1, "old"), h0)
+                .unwrap();
+            db.set_applied_watermark(&namespace::qualify(DEFAULT_DATABASE, "t"), h0);
+            db.persist_applied_watermarks().unwrap();
+            // "Crash window": two writes land rows-only — an overwrite of
+            // row 1 (index entry must MOVE old->new) and a fresh row 2 —
+            // and their MaintTasks are dropped on the floor.
+            let t = namespace::qualify(DEFAULT_DATABASE, "t");
+            let (c1, h1, _lost1) =
+                db.apply_put_row_only(&t, &key(1), doc(1, "new"), clock.now()).unwrap();
+            h1.sync_through(c1).unwrap();
+            let (c2, h2, _lost2) =
+                db.apply_put_row_only(&t, &key(2), doc(2, "fresh"), clock.now()).unwrap();
+            h2.sync_through(c2).unwrap();
+            // db dropped without maintenance = the crash.
+        }
+        let mut db = Database::open(&dir).unwrap();
+        // Replay happened at open: the index answers through fresh entries.
+        let out = db
+            .execute("SELECT id FROM t WHERE v = 'fresh'")
+            .unwrap();
+        let rows = match out {
+            QueryOutput::Rows(rs) => rs.rows,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(rows.len(), 1, "replayed index entry for row 2");
+        // The overwrite's OLD entry must be gone (exact covering count).
+        let out = db.execute("SELECT count(*) FROM t WHERE v = 'old'").unwrap();
+        let n = match out {
+            QueryOutput::Rows(rs) => rs.rows[0][0].clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(n, Value::Int(0), "superseded entry replayed away");
+        let out = db.execute("SELECT count(*) FROM t WHERE v = 'new'").unwrap();
+        let n = match out {
+            QueryOutput::Rows(rs) => rs.rows[0][0].clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(n, Value::Int(1));
+    }
+
+    /// The row half is visible to point reads immediately (read-your-writes
+    /// is not deferred), before any maintenance runs.
+    #[test]
+    fn row_visible_before_maintenance() {
+        let dir = tmp();
+        let clock = HlcClock::new();
+        let mut db = Database::open(&dir).unwrap();
+        db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        db.execute("CREATE INDEX i_v ON t (v)").unwrap();
+        let t = namespace::qualify(DEFAULT_DATABASE, "t");
+        let (c, h, task) =
+            db.apply_put_row_only(&t, &key(7), doc(7, "x"), clock.now()).unwrap();
+        h.sync_through(c).unwrap();
+        assert!(task.is_some(), "indexed table produces a maintenance task");
+        let out = db.execute("SELECT v FROM t WHERE id = 7").unwrap();
+        let rows = match out {
+            QueryOutput::Rows(rs) => rs.rows,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(rows.len(), 1, "PK read sees the row pre-maintenance");
+        // And applying the task catches the index up.
+        let m = task.expect("checked above").decode();
+        db.apply_maintenance(&m).unwrap();
+        let out = db.execute("SELECT count(*) FROM t WHERE v = 'x'").unwrap();
+        let n = match out {
+            QueryOutput::Rows(rs) => rs.rows[0][0].clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(n, Value::Int(1));
+    }
+}
+
+#[cfg(test)]
+mod deferred_fts_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn tmp() -> std::path::PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "skaidb-dfts-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    /// Server-mode open must not pay the FTS rebuild: the index reopens
+    /// marked `building` (MATCH errors clearly), and paging the catch-up in
+    /// the background brings it live with complete results.
+    #[test]
+    fn deferred_search_startup_pages_to_live() {
+        let dir = tmp();
+        {
+            let mut db = Database::open(&dir).unwrap();
+            db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+            db.execute("CREATE SEARCH INDEX s_body ON t (body)").unwrap();
+            for i in 0..300 {
+                db.execute(&format!(
+                    "INSERT INTO t (id, body) VALUES ({i}, 'findable text {i}')"
+                ))
+                .unwrap();
+            }
+            // dropped WITHOUT the shutdown commit: the reopen must catch up.
+        }
+        let opts = EngineOptions {
+            defer_search_startup: true,
+            ..Default::default()
+        };
+        let mut db = Database::open_with_options(&dir, opts).unwrap();
+        let err = db
+            .execute("SELECT id FROM t WHERE MATCH(body, 'findable')")
+            .unwrap_err();
+        assert!(err.to_string().contains("rebuilding"), "{err}");
+        // Rows themselves are fully readable meanwhile.
+        let out = db.execute("SELECT count(*) FROM t").unwrap();
+        let n = match out {
+            QueryOutput::Rows(rs) => rs.rows[0][0].clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(n, Value::Int(300));
+        // Drive the deferred pages (the cluster worker's job, inline here).
+        let pending = db.take_pending_search_catchups();
+        assert_eq!(pending.len(), 1);
+        for (name, watermark) in pending {
+            let mut cursor = None;
+            while let Some(next) =
+                db.search_catchup_page(&name, watermark, cursor.take(), 64).unwrap()
+            {
+                cursor = Some(next);
+            }
+        }
+        let out = db
+            .execute("SELECT id FROM t WHERE MATCH(body, 'findable') ORDER BY score() DESC LIMIT 500")
+            .unwrap();
+        let rows = match out {
+            QueryOutput::Rows(rs) => rs.rows,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(rows.len(), 300, "catch-up indexed every row");
     }
 }
 

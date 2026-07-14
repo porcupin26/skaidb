@@ -162,6 +162,9 @@ pub fn run(
         ts_head_max_bytes,
         scan_row_budget: config.storage.scan_row_budget as usize,
         statement_timeout_secs: config.storage.statement_timeout_secs,
+        // Server mode: a large FTS rebuild pages in the background instead
+        // of blocking the listener for minutes at startup (#75).
+        defer_search_startup: true,
         ..Default::default()
     };
     let db = Database::open_with_options(&config.server.data_dir, storage_opts)?;
