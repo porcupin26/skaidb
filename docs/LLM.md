@@ -87,6 +87,9 @@ Key facts an agent must know:
 - **ORDER BY**: a multi-key `ORDER BY` whose leading key is indexed walks the
   index bounded by LIMIT plus the leading-key tie group, then re-sorts by the
   full clause — exact, without gathering every matching row.
+- **DISTINCT**: `SELECT DISTINCT <one column>` streams the value set (no
+  row materialization; array columns dedupe as whole arrays). At
+  consistency "one" on a full-copy cluster it is a single local pass.
 - **Memory tables**: `CREATE TABLE t (...) WITH (memory = true)` — RAM-only
   (no WAL fsync, never flushed, empty on restart, excluded from repair);
   pair with `ttl`. `SHOW STATUS` table counts are approximate version
@@ -431,7 +434,9 @@ anti_entropy_interval_secs; `[auth]` scram_enabled, superuser,
 superuser_password, internode_auth (none/token/mtls); `[storage]`
 memory_target (`"auto"`, `"1GB"` — budgets memtable + read cache + FTS
 writer heaps + TS heads; set explicitly in containers), memtable_size_mb,
-read_cache_entries; `[observability]` slow_query_ms, query_log_*,
+read_cache_entries, scan_row_budget (rows one statement may examine,
+default 250000, 0 = off), statement_timeout_secs (default 120, 0 = off);
+`[observability]` slow_query_ms, query_log_*,
 log_format/log_file, per_table_metrics, prometheus_port, self_scrape,
 self_scrape_interval_secs, node_stats, node_stats_interval_secs; `[ui]` enabled.
 **Live-mutable** (no restart): all `observability.*` log/slow-query keys,

@@ -198,7 +198,10 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
     quorum/hinted-handoff/read-repair path as the `default` database. The REST
     `/query` gateway is stateless — it always starts at `default`, so reach other
     databases there with `db.table` qualifiers rather than `USE`.
-- **`DISTINCT`** removes duplicate output rows. **`HAVING`** filters groups after
+- **`DISTINCT`** removes duplicate output rows. `SELECT DISTINCT <one
+  plain column>` (no ORDER BY/GROUP BY/JOIN) streams the value set without
+  materializing rows — safe on tables of any size; an array-valued column
+  dedupes whole arrays. **`HAVING`** filters groups after
   aggregation (it may reference aggregates and the `GROUP BY` columns).
 - **`GROUP BY ... TOP <k> BY <expr> [ASC|DESC]`** — per-group top-k **rows**:
   instead of one aggregated row per group, each group contributes its `k`

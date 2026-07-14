@@ -283,7 +283,13 @@ down replica is buffered and replayed when it returns). Hints are held in
 memory up to a per-replica cap and **spill to a per-replica on-disk log**
 beyond it — so a replica that stays down or keeps shedding for a long time
 loses no writes (bounded memory, durable across restarts) rather than
-dropping the overflow. For a full sweep — e.g.
+dropping the overflow. A drain that aborts (peer busy, restart mid-pass)
+is retried by a 60-second ticker while any backlog exists, with delivered
+work logged — a large backlog deferred at an unreachable peer logs its
+size instead of waiting silently. Tables created `WITH (memory = true)`
+are excluded from hinted handoff's durability story and from repair and
+reshard data motion entirely: they are ephemeral by contract (empty on
+restart, repopulated by their writers). For a full sweep — e.g.
 after a node was down a long time — run an active **repair**
 (`Node::repair`/`repair_cluster`), which reconciles every co-replica pair in both
 directions, **including the catalog**: databases, tables, and indexes are synced
