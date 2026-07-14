@@ -86,7 +86,11 @@ Key facts an agent must know:
   `time_bucket(step, ts)` (floor to bucket: `time_bucket(5m, ts)`).
 - **ORDER BY**: a multi-key `ORDER BY` whose leading key is indexed walks the
   index bounded by LIMIT plus the leading-key tie group, then re-sorts by the
-  full clause — exact, without gathering every matching row.
+  full clause — exact, without gathering every matching row. When a strictly
+  more selective equality index also covers the filter, the planner probes
+  its range first (capped peek): if it holds ≤256 candidates it gathers and
+  sorts those instead — a filter matching (almost) nothing answers through
+  the index instead of walking the whole sorted range finding nothing.
 - **DISTINCT**: `SELECT DISTINCT <one column>` streams the value set (no
   row materialization; array columns dedupe as whole arrays). At
   consistency "one" on a full-copy cluster it is a single local pass.

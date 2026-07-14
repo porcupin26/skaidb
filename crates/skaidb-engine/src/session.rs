@@ -290,10 +290,22 @@ mod tests {
             "sorted plan not chosen under ORDER BY + LIMIT: {:?}",
             t0.elapsed()
         );
-        // Residual filter never matches: the walk must die at the budget.
+        // Residual filter never matches but a sibling equality index covers
+        // it: the planner's range probe must see the empty range and answer
+        // through the index — no walk, no budget death (the empty Archived
+        // view burned 9.5 s walking 183k rows per click, 2026-07-14).
+        let got = rows(
+            s.execute(
+                "SELECT id FROM emails WHERE account = 'a@x' AND flag = true ORDER BY date DESC LIMIT 3;",
+            )
+            .unwrap(),
+        );
+        assert_eq!(got.len(), 0);
+        // Never-matching residual on a column NO index covers: the sorted
+        // walk is the only plan, and the budget must bound it.
         let err = s
             .execute(
-                "SELECT id FROM emails WHERE account = 'a@x' AND flag = true ORDER BY date DESC LIMIT 3;",
+                "SELECT id FROM emails WHERE account = 'a@x' AND body = 'nope' ORDER BY date DESC LIMIT 3;",
             )
             .unwrap_err();
         assert!(

@@ -586,6 +586,48 @@ impl Engine {
         Ok(n)
     }
 
+    /// "Is `[start, end)` small?" for the query planner: returns
+    /// `min(live_count, cap + 1)`, so `result <= cap` means the range holds
+    /// at most `cap` live keys. Cost is O(cap) regardless of the range —
+    /// [`Engine::count_range`] is O(range), which a per-statement planner
+    /// probe cannot afford. First bounds the RAW version count with lazy
+    /// per-source iterators (raw ≥ live, so overshooting on shadowed or
+    /// deleted versions only flips small→big — the conservative direction);
+    /// only a provably small range pays for the exact merged count.
+    pub fn count_range_at_most(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        cap: usize,
+    ) -> Result<usize> {
+        let in_range =
+            |key: &[u8]| start.is_none_or(|s| key >= s) && end.is_none_or(|e| key < e);
+        let mut raw = self.mem.range_latest(start, end).len();
+        if raw > cap {
+            return Ok(cap + 1);
+        }
+        for sst in self.sstables_newest_first() {
+            let iter: Box<dyn Iterator<Item = _>> = match start {
+                Some(s) => Box::new(sst.iter_from(s)),
+                None => Box::new(sst.iter()),
+            };
+            for item in iter {
+                let entry = item?;
+                if end.is_some_and(|e| entry.key.as_slice() >= e) {
+                    break;
+                }
+                if !in_range(&entry.key) {
+                    continue;
+                }
+                raw += 1;
+                if raw > cap {
+                    return Ok(cap + 1);
+                }
+            }
+        }
+        Ok(self.count_range(start, end)?.min(cap + 1))
+    }
+
     /// Stream the latest version per key (newest stamp wins) across the
     /// memtable and all SSTables, in key order.
     fn merged_iter(&self) -> KWayMerge<'_> {

@@ -50,6 +50,12 @@ type OrderedRows = (KeyedRows, bool);
 /// `sorted` is whether the scan order already satisfies the query's `ORDER BY`.
 type IndexPlan = (String, Option<Vec<u8>>, Option<Vec<u8>>, bool, bool);
 
+/// Candidate-range size below which the planner abandons a sorted
+/// ORDER BY + LIMIT walk for a strictly more selective unsorted index.
+/// Matches the cluster's point-read gather ceiling (`INDEX_POINT_READ_MAX`),
+/// so a "small" verdict here lands on the cheap resolve path there.
+const PLANNER_PROBE_MAX: usize = 256;
+
 /// An embedded skaidb database: catalog plus one storage engine per table and
 /// per secondary index.
 #[derive(Debug)]
@@ -3642,29 +3648,57 @@ impl Database {
         // gets built either way, so the tightest range wins — the dedup
         // shape (two equalities, no order) must take its covering index.
         let sorted_first = order.is_some() && fetch_limit.is_some();
-        let mut best: Option<(IndexPlan, (usize, usize), bool)> = None;
+        let mut best_sorted: Option<(IndexPlan, (usize, usize))> = None;
+        let mut best_unsorted: Option<(IndexPlan, (usize, usize))> = None;
         for (name, idx) in self.catalog.indexes.iter().filter(|(_, i)| i.table == table) {
             if let Some((start, end, sorted, reverse)) =
                 plan_for_index(&idx.paths, &constraints, order)
             {
                 let score = selectivity(&idx.paths);
                 let plan = (name.clone(), start, end, sorted, reverse);
-                let better = match &best {
-                    None => true,
-                    Some((_, bs, bsorted)) => {
-                        if sorted_first && sorted != *bsorted {
-                            sorted
-                        } else {
-                            score > *bs || (score == *bs && sorted && !bsorted)
-                        }
-                    }
-                };
-                if better {
-                    best = Some((plan, score, sorted));
+                let slot = if sorted { &mut best_sorted } else { &mut best_unsorted };
+                if slot.as_ref().is_none_or(|(_, bs)| score > *bs) {
+                    *slot = Some((plan, score));
                 }
             }
         }
-        best.map(|(plan, _, _)| plan)
+        match (best_sorted, best_unsorted) {
+            (Some((sp, ss)), Some((up, us))) => {
+                // The sorted walk's blind spot: when the residual filter
+                // matches (almost) nothing, "stops after limit matches"
+                // never happens and the walk degenerates into a full
+                // partition scan — the empty Archived view burned 9.5 s
+                // re-reading 183k rows per click while a sibling equality
+                // index knew the answer was 0 (2026-07-14). When a strictly
+                // more selective unsorted plan exists, probe its local range
+                // (O(cap)); if it is point-read small, gathering + sorting
+                // those few rows beats any walk. Past the cap the walk keeps
+                // its win — probing is a bounded peek, never a full count.
+                if us > ss
+                    && (!sorted_first || self.index_range_at_most(&up, PLANNER_PROBE_MAX)
+                        <= PLANNER_PROBE_MAX)
+                {
+                    Some(up)
+                } else {
+                    Some(sp)
+                }
+            }
+            (s, u) => s.or(u).map(|(plan, _)| plan),
+        }
+    }
+
+    /// `min(live entries, cap + 1)` of an index plan's byte range on the
+    /// local shard — the planner's cheap cardinality peek. Local is a proxy
+    /// for the cluster (replicas hold supersets per shard; a tiny local
+    /// range and a huge cluster range can't coexist under our replication),
+    /// and an unreadable index reports "big", which keeps the sorted plan —
+    /// the status quo, never a new failure mode.
+    fn index_range_at_most(&self, plan: &IndexPlan, cap: usize) -> usize {
+        let (name, start, end, _, _) = plan;
+        self.indexes
+            .get(name)
+            .and_then(|e| e.count_range_at_most(start.as_deref(), end.as_deref(), cap).ok())
+            .unwrap_or(cap + 1)
     }
 
     /// The `(name, paths)` of every index defined on `table`.
