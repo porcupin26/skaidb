@@ -181,6 +181,27 @@ fn eval_binary(op: BinaryOp, left: &Expr, right: &Expr, row: &Document) -> Resul
 }
 
 fn eval_comparison(op: BinaryOp, l: &Value, r: &Value) -> Value {
+    // Mongo-style array membership: comparing an array-valued column to a
+    // non-array scalar tests CONTAINMENT for =/!= (`labels = 'work'` matches
+    // rows whose labels array holds 'work'). SQL's own semantics made this
+    // NULL/never-true — useless, and it silently emptied every tag-filtered
+    // view of a Mongo-shaped app (2026-07-14). Array-to-array comparison
+    // keeps whole-value equality.
+    match (op, l, r) {
+        (BinaryOp::Eq, Value::Array(items), other) if !matches!(other, Value::Array(_)) => {
+            if other.is_null() {
+                return Value::Null;
+            }
+            return Value::Bool(items.iter().any(|it| compare(it, other) == Some(Ordering::Equal)));
+        }
+        (BinaryOp::NotEq, Value::Array(items), other) if !matches!(other, Value::Array(_)) => {
+            if other.is_null() {
+                return Value::Null;
+            }
+            return Value::Bool(!items.iter().any(|it| compare(it, other) == Some(Ordering::Equal)));
+        }
+        _ => {}
+    }
     match compare(l, r) {
         None => Value::Null, // NULL or incomparable types
         Some(ord) => {

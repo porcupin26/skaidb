@@ -252,6 +252,10 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
 
 ## Expressions
 
+- **Array membership:** comparing an array-valued column to a non-array
+  scalar tests containment, Mongo-style: `labels = 'work'` matches rows
+  whose array holds `'work'`; `!=` is not-contains. Array-to-array
+  comparison remains whole-value equality.
 - **Literals:** integer (`42`), float (`3.14`, scientific `1.2e-5`/`3E8`), string (`'ada'`), `TRUE`,
   `FALSE`, `NULL`, and **array** literals `[<lit> [, <lit> ...]]` (constant
   elements only — a literal or a negated number, e.g. `[0.1, -0.2, 0.3]`).

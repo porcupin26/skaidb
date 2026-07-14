@@ -597,6 +597,24 @@ mod tests {
         assert_eq!(got[0][0], skaidb_types::Value::Int(1));
     }
 
+    /// `array_col = scalar` is Mongo-style containment (and != is
+    /// not-contains); array-to-array stays whole-value equality.
+    #[test]
+    fn array_column_scalar_equality_is_containment() {
+        let mut s = Session::open(tmp()).unwrap();
+        s.execute("CREATE TABLE m (PRIMARY KEY (id));").unwrap();
+        s.execute("INSERT INTO m (id, labels) VALUES ('a', ['work','urgent']);").unwrap();
+        s.execute("INSERT INTO m (id, labels) VALUES ('b', ['home']);").unwrap();
+        s.execute("INSERT INTO m (id, labels) VALUES ('c', []);").unwrap();
+        let got = rows(s.execute("SELECT id FROM m WHERE labels = 'work';").unwrap());
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0][0], skaidb_types::Value::String("a".into()));
+        let got = rows(s.execute("SELECT id FROM m WHERE labels != 'work';").unwrap());
+        assert_eq!(got.len(), 2, "{got:?}");
+        let got = rows(s.execute("SELECT COUNT(*) FROM m WHERE labels = 'home';").unwrap());
+        assert_eq!(got[0][0], skaidb_types::Value::Int(1));
+    }
+
     #[test]
     fn default_is_current_on_open() {
         let s = Session::open(tmp()).unwrap();
