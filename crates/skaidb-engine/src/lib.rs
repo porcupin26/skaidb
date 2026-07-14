@@ -17,7 +17,9 @@ pub mod vector;
 pub use error::EngineError;
 pub use exec::{
     filter_rows, filter_search_query, matches_filter, run, statement_is_read_only, Cluster,
-    Database, DbStats, IndexScanRange, pk_point_key, TableStats, TsRollupInfo,
+    Database, DbStats, IndexScanRange, Inventory, InventoryIndex, InventorySearch,
+    InventoryTable, InventoryTimeseries, InventoryVector, pk_point_key, TableStats,
+    TsRollupInfo,
 };
 pub use skaidb_storage::{Codec, EngineOptions, DEFAULT_SEARCH_WRITER_HEAP};
 pub use namespace::DEFAULT_DATABASE;

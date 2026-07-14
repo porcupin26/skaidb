@@ -188,6 +188,70 @@ pub struct TableStats {
     pub sstables: u64,
 }
 
+/// One node's schema + storage inventory (see [`Database::inventory`]).
+#[derive(Debug, Default)]
+pub struct Inventory {
+    pub tables: Vec<InventoryTable>,
+    pub timeseries: Vec<InventoryTimeseries>,
+    pub indexes: Vec<InventoryIndex>,
+    pub vector_indexes: Vec<InventoryVector>,
+    pub search_indexes: Vec<InventorySearch>,
+}
+
+#[derive(Debug)]
+pub struct InventoryTable {
+    pub name: String,
+    pub primary_key: Vec<String>,
+    pub ttl_ms: Option<i64>,
+    pub memory: bool,
+    pub live_keys: u64,
+    pub tombstones: u64,
+    pub disk_bytes: u64,
+    pub sstables: u64,
+}
+
+#[derive(Debug)]
+pub struct InventoryTimeseries {
+    pub name: String,
+    pub series_key: Vec<String>,
+    pub retention_ms: Option<i64>,
+    pub rollup_of: Option<String>,
+    pub series: u64,
+    pub disk_bytes: u64,
+}
+
+#[derive(Debug)]
+pub struct InventoryIndex {
+    pub name: String,
+    pub table: String,
+    pub paths: Vec<String>,
+    pub entries: u64,
+    pub disk_bytes: u64,
+}
+
+#[derive(Debug)]
+pub struct InventoryVector {
+    pub name: String,
+    pub table: String,
+    pub path: String,
+    pub metric: String,
+    pub dim: usize,
+    pub ef_search: Option<usize>,
+    pub vectors: u64,
+    pub snapshot_bytes: u64,
+}
+
+#[derive(Debug)]
+pub struct InventorySearch {
+    pub name: String,
+    pub table: String,
+    pub paths: Vec<String>,
+    pub docs: u64,
+    pub disk_bytes: u64,
+    pub uncommitted: u64,
+}
+
+
 /// Buffered writes of an open transaction: `(table, key) -> Some(doc)` for a
 /// put, `None` for a delete. Reads during the transaction merge this over
 /// committed storage (read-your-writes); `COMMIT` flushes it to storage and
@@ -1754,6 +1818,91 @@ impl Database {
                 }
             }
         }
+    }
+
+    /// One node's full schema-and-storage inventory: every table (regular,
+    /// timeseries, memory), secondary/vector/search index, with definition
+    /// details and this node's usage numbers. Table/index counts use the
+    /// O(files) approximate stats; disk sizes are exact. Names are
+    /// namespaced (`db\u{1f}table`) — callers split for display.
+    pub fn inventory(&self) -> Inventory {
+        let mut inv = Inventory::default();
+        for (name, def) in &self.catalog.tables {
+            let (ks, st) = match self.tables.get(name) {
+                Some(e) => (e.key_stats_fast(), e.stats()),
+                None => continue,
+            };
+            inv.tables.push(InventoryTable {
+                name: name.clone(),
+                primary_key: def.primary_key.clone(),
+                ttl_ms: def.ttl_ms,
+                memory: def.memory,
+                live_keys: ks.live_keys as u64,
+                tombstones: ks.tombstones as u64,
+                disk_bytes: st.disk_bytes,
+                sstables: st.sstable_count as u64,
+            });
+        }
+        for (name, def) in &self.catalog.timeseries {
+            let Some(store) = self.timeseries.get(name) else {
+                continue;
+            };
+            let ts = store.stats();
+            inv.timeseries.push(InventoryTimeseries {
+                name: name.clone(),
+                series_key: def.series_key.clone(),
+                retention_ms: def.retention_ms,
+                rollup_of: def.rollup_of.clone(),
+                series: ts.series as u64,
+                disk_bytes: ts.disk_bytes,
+            });
+        }
+        for (name, def) in &self.catalog.indexes {
+            let (ks, st) = match self.indexes.get(name) {
+                Some(e) => (e.key_stats_fast(), e.stats()),
+                None => continue,
+            };
+            inv.indexes.push(InventoryIndex {
+                name: name.clone(),
+                table: def.table.clone(),
+                paths: def.paths.clone(),
+                entries: ks.live_keys as u64,
+                disk_bytes: st.disk_bytes,
+            });
+        }
+        for (name, def) in &self.catalog.vector_indexes {
+            let Some(hnsw) = self.vector_indexes.get(name) else {
+                continue;
+            };
+            let snapshot_bytes = std::fs::metadata(vector_snapshot_path(&self.dir, name))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            inv.vector_indexes.push(InventoryVector {
+                name: name.clone(),
+                table: def.table.clone(),
+                path: def.path.clone(),
+                metric: def.metric.clone(),
+                dim: def.dim,
+                ef_search: def.ef_search,
+                vectors: hnsw.len() as u64,
+                snapshot_bytes,
+            });
+        }
+        for (name, def) in &self.catalog.search_indexes {
+            let Some(live) = self.search_indexes.get(name) else {
+                continue;
+            };
+            let fs = live.index.stats();
+            inv.search_indexes.push(InventorySearch {
+                name: name.clone(),
+                table: def.table.clone(),
+                paths: def.paths.clone(),
+                docs: fs.docs,
+                disk_bytes: fs.disk_bytes,
+                uncommitted: fs.uncommitted,
+            });
+        }
+        inv
     }
 
     /// The `(scan_row_budget, statement_timeout_secs)` pair for callers that

@@ -43,6 +43,15 @@ impl Backend {
         }
     }
 
+    /// This node's schema/storage inventory (`None` if the engine lock is
+    /// poisoned). Serves `GET /ui/inventory`.
+    pub fn inventory(&self) -> Option<skaidb_engine::Inventory> {
+        match self {
+            Backend::Local(db) => db.read().ok().map(|db| db.inventory()),
+            Backend::Cluster(node) => node.with_local_read(|db| db.inventory()),
+        }
+    }
+
     /// Graceful-shutdown hook: flush memtables + commit search writers (see
     /// `Node::prepare_shutdown`); the local backend does the same directly.
     pub fn prepare_shutdown(&self) {

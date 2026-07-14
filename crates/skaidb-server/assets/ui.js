@@ -175,6 +175,49 @@ function fmtLag(ms) {
 }
 
 // ---- tabs ----
+// ---- inventory tab: databases → tables and indexes, with usage ----
+async function loadInventory() {
+  const inv = await api("GET", "/ui/inventory");
+  const fmtTtl = (ms) => (ms == null ? "—" : ms >= 3600000 ? `${ms / 3600000}h` : `${ms / 1000}s`);
+  const cell = (text) => {
+    const td = document.createElement("td");
+    td.textContent = text;
+    return td;
+  };
+  const tb = $("inv-tables").querySelector("tbody");
+  const ib = $("inv-indexes").querySelector("tbody");
+  tb.textContent = "";
+  ib.textContent = "";
+  for (const db of inv.databases || []) {
+    for (const t of db.tables || []) {
+      const tr = document.createElement("tr");
+      tr.append(
+        cell(db.name), cell(t.name), cell(t.kind),
+        cell((t.key || []).join(", ")), cell(fmtTtl(t.ttl_ms)),
+        cell(t.live_keys ?? "—"), cell(t.tombstones ?? "—"),
+        cell(fmtBytes(t.disk_bytes ?? 0)), cell(t.files ?? "—"),
+      );
+      tb.append(tr);
+    }
+    for (const x of db.indexes || []) {
+      const detail =
+        x.kind === "vector"
+          ? `dim ${x.dim} · ${x.metric}${x.ef_search ? ` · ef ${x.ef_search}` : ""}`
+          : x.kind === "search"
+            ? `${x.uncommitted ?? 0} uncommitted`
+            : "";
+      const tr = document.createElement("tr");
+      tr.append(
+        cell(db.name), cell(x.name), cell(x.kind),
+        cell(`${x.table} (${(x.paths || []).join(", ")})`), cell(detail),
+        cell(x.entries ?? "—"), cell(fmtBytes(x.disk_bytes ?? 0)),
+      );
+      ib.append(tr);
+    }
+  }
+  $("inv-refreshed").textContent = `refreshed ${new Date().toLocaleTimeString()} · usage numbers are this node's (counts approximate until compaction)`;
+}
+
 function showTab(name) {
   for (const btn of document.querySelectorAll("#tabs button")) {
     btn.classList.toggle("active", btn.dataset.tab === name);
@@ -197,6 +240,7 @@ function showTab(name) {
     $("q-sql").focus();
   }
   if (name === "search") populateSearchTables();
+  if (name === "inventory") loadInventory().catch(authFail);
 }
 
 document.querySelector("#tabs").addEventListener("click", (ev) => {
@@ -768,12 +812,6 @@ async function refreshStats() {
     ["vector indexes", s.get("vector_indexes")],
   ]);
 
-  // `table.<db>.<table>.<field>` → a database column + a table column.
-  renderStatGroup("st-tables", statusResult.rows,
-    /^table\.([^.]+)\.([^.]+)\.(live_keys|tombstones|disk_bytes)$/,
-    ["live_keys", "tombstones", "disk_bytes"]);
-  renderStatGroup("st-indexes", statusResult.rows, /^search\.(.+)\.(docs|disk_bytes|uncommitted)$/,
-    ["docs", "disk_bytes", "uncommitted"]);
   $("stats-refreshed").textContent = `refreshed ${new Date().toLocaleTimeString()} · sparklines cover ${Math.round((statsHistory.length - 1) * STATS_INTERVAL_MS / 1000)}s`;
 }
 
@@ -875,37 +913,6 @@ function replLagCell(peer, isSelf) {
 
 // Rows like `<prefix>.<label>[.<label>...].<field>` → one row per label
 // tuple. The pattern's leading captures are label columns (e.g. database +
-// table); its final capture is the field name.
-function renderStatGroup(tableId, rows, pattern, fields) {
-  const groups = new Map();
-  for (const [metric, value] of rows) {
-    const match = String(metric).match(pattern);
-    if (!match) continue;
-    const labels = match.slice(1, match.length - 1);
-    const field = match[match.length - 1];
-    const key = labels.join(" ");
-    if (!groups.has(key)) groups.set(key, { labels, vals: {} });
-    groups.get(key).vals[field] = value;
-  }
-  const tbody = $(tableId).querySelector("tbody");
-  tbody.textContent = "";
-  for (const [, g] of [...groups].sort((a, b) => a[0].localeCompare(b[0]))) {
-    const tr = document.createElement("tr");
-    for (const label of g.labels) {
-      const td = document.createElement("td");
-      td.textContent = label;
-      tr.append(td);
-    }
-    for (const f of fields) {
-      const td = document.createElement("td");
-      const v = g.vals[f];
-      td.textContent = v === undefined ? "—" : f.includes("bytes") ? fmtBytes(v) : String(v);
-      tr.append(td);
-    }
-    tbody.append(tr);
-  }
-}
-
 function statsTick() {
   refreshStats().catch((e) => {
     if (e instanceof AuthError) logout();

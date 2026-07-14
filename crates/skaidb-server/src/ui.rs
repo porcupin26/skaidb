@@ -133,6 +133,85 @@ pub fn schema_json(ctx: &Shared, role: &str) -> (u16, String) {
     (200, json!({"databases": out}).to_string())
 }
 
+/// The inventory tab's data: databases → tables (all kinds) and indexes,
+/// definition plus this node's usage. RBAC-filtered like `schema_json`:
+/// a table (and its indexes) appears only for roles allowed to SELECT it.
+pub fn inventory_json(ctx: &Shared, role: &str) -> (u16, String) {
+    let Some(inv) = ctx.backend.inventory() else {
+        return (500, json!({"error": "engine unavailable"}).to_string());
+    };
+    let sep = '\u{1f}';
+    let split = |name: &str| -> (String, String) {
+        match name.split_once(sep) {
+            Some((db, bare)) => (db.to_string(), bare.to_string()),
+            None => (skaidb_engine::DEFAULT_DATABASE.to_string(), name.to_string()),
+        }
+    };
+    let visible = |db: &str, bare: &str| {
+        ctx.allowed_on_table(role, skaidb_auth::Privilege::Select, bare, db)
+    };
+    use std::collections::BTreeMap;
+    let mut dbs: BTreeMap<String, (Vec<Json>, Vec<Json>)> = BTreeMap::new();
+    for t in &inv.tables {
+        let (db, bare) = split(&t.name);
+        if !visible(&db, &bare) {
+            continue;
+        }
+        dbs.entry(db).or_default().0.push(json!({
+            "name": bare, "kind": if t.memory { "memory" } else { "table" },
+            "key": t.primary_key, "ttl_ms": t.ttl_ms,
+            "live_keys": t.live_keys, "tombstones": t.tombstones,
+            "disk_bytes": t.disk_bytes, "files": t.sstables,
+        }));
+    }
+    for t in &inv.timeseries {
+        let (db, bare) = split(&t.name);
+        if !visible(&db, &bare) {
+            continue;
+        }
+        dbs.entry(db).or_default().0.push(json!({
+            "name": bare, "kind": "timeseries", "key": t.series_key,
+            "ttl_ms": t.retention_ms, "rollup_of": t.rollup_of,
+            "live_keys": t.series, "disk_bytes": t.disk_bytes,
+        }));
+    }
+    let mut push_index = |name: &str, table: &str, detail: Json| {
+        let (db, bare) = split(name);
+        let (tdb, tbare) = split(table);
+        if !visible(&tdb, &tbare) {
+            return;
+        }
+        let mut obj = detail;
+        obj["name"] = json!(bare);
+        obj["table"] = json!(tbare);
+        dbs.entry(db).or_default().1.push(obj);
+    };
+    for i in &inv.indexes {
+        push_index(&i.name, &i.table, json!({
+            "kind": "secondary", "paths": i.paths,
+            "entries": i.entries, "disk_bytes": i.disk_bytes,
+        }));
+    }
+    for v in &inv.vector_indexes {
+        push_index(&v.name, &v.table, json!({
+            "kind": "vector", "paths": [v.path], "metric": v.metric,
+            "dim": v.dim, "ef_search": v.ef_search, "entries": v.vectors,
+            "disk_bytes": v.snapshot_bytes,
+        }));
+    }
+    for x in &inv.search_indexes {
+        push_index(&x.name, &x.table, json!({
+            "kind": "search", "paths": x.paths, "entries": x.docs,
+            "disk_bytes": x.disk_bytes, "uncommitted": x.uncommitted,
+        }));
+    }
+    let out: Vec<Json> = dbs
+        .into_iter()
+        .map(|(db, (tables, indexes))| json!({"name": db, "tables": tables, "indexes": indexes}))
+        .collect();
+    (200, json!({"databases": out}).to_string())
+}
+
 /// Per-node host statistics (CPU, RAM, disk IO, disk space) plus a
 /// cluster-level aggregate, for the stats tab's nodes view. Serves
 /// `GET /ui/hosts` (authenticated; rest.rs resolves the role first —

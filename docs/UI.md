@@ -42,9 +42,17 @@ http://127.0.0.1:7080/ui
   via `GET /ui/hosts`, with a cluster totals row on multi-node
   deployments and unreachable members flagged); then queries/s, mean
   latency, rows scanned/s, bytes returned/s with canvas sparklines (5 s
-  samples, 5 min window), storage/cache/WAL counters, and per-table /
-  per-search-index breakdowns from `SHOW STATUS`. Polls only while the
-  tab is visible.
+  samples, 5 min window), and storage/cache/WAL counters. Polls only
+  while the tab is visible. (Per-table and per-index breakdowns live on
+  the **inventory** tab.)
+- **inventory** — the consolidated schema-and-storage view
+  (`GET /ui/inventory`, RBAC-filtered like the schema browser): every
+  database's tables (type — table / memory / timeseries —, key, TTL,
+  approximate row count, tombstones, disk, file count) and indexes
+  (secondary / vector / search, with paths, vector dim·metric·ef,
+  entry/doc counts, disk). Usage numbers are the serving node's; counts
+  are approximate until compaction. The per-table and per-search-index
+  breakdowns that used to live on the stats tab moved here.
 - **config** — the masked config (`/admin/config`), one card per section,
   with per-key set. The result states whether the key applied live or
   needs a restart; every set persists to the node's config file.

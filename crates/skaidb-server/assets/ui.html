@@ -32,6 +32,7 @@
     <button data-tab="query">query</button>
     <button data-tab="search">search</button>
     <button data-tab="stats">stats</button>
+    <button data-tab="inventory">inventory</button>
     <button data-tab="config" hidden>config</button>
     <button data-tab="admin" hidden>admin</button>
   </nav>
@@ -174,22 +175,28 @@
         <h2>search &amp; timeseries</h2>
         <table class="kv" id="st-search"></table>
       </div>
+    </div>
+    <p class="muted" id="stats-refreshed"></p>
+  </section>
+
+  <section id="tab-inventory" hidden>
+    <div class="cards">
       <div class="card wide">
         <h2>tables</h2>
-        <div class="results"><table id="st-tables">
-          <thead><tr><th>database</th><th>table</th><th>live keys</th><th>tombstones</th><th>disk</th></tr></thead>
+        <div class="results"><table id="inv-tables">
+          <thead><tr><th>database</th><th>table</th><th>type</th><th>key</th><th>ttl</th><th>~rows</th><th>tombstones</th><th>disk</th><th>files</th></tr></thead>
           <tbody></tbody>
         </table></div>
       </div>
       <div class="card wide">
-        <h2>search indexes</h2>
-        <div class="results"><table id="st-indexes">
-          <thead><tr><th>index</th><th>docs</th><th>disk</th><th>uncommitted</th></tr></thead>
+        <h2>indexes</h2>
+        <div class="results"><table id="inv-indexes">
+          <thead><tr><th>database</th><th>index</th><th>type</th><th>on</th><th>detail</th><th>~entries</th><th>disk</th></tr></thead>
           <tbody></tbody>
         </table></div>
       </div>
     </div>
-    <p class="muted" id="stats-refreshed"></p>
+    <p class="muted" id="inv-refreshed"></p>
   </section>
 
   <section id="tab-config" hidden>

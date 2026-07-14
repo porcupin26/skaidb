@@ -90,6 +90,22 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) -> io::Result<()> {
                 let (status, body) = crate::ui::schema_json(&ctx, &role);
                 return write_json_body(&mut stream, status, &body);
             }
+            "/ui/inventory" => {
+                let enabled = ctx.config.read().map(|cfg| cfg.ui.enabled).unwrap_or(false);
+                if !enabled {
+                    return write_response(&mut stream, 404, &json!({"error": "not found"}));
+                }
+                let role = if ctx.authn.required {
+                    match basic_auth_role(&ctx, req.authorization.as_deref()) {
+                        Some(role) => role,
+                        None => return write_unauthorized(&mut stream),
+                    }
+                } else {
+                    ctx.superuser_role.clone()
+                };
+                let (status, body) = crate::ui::inventory_json(&ctx, &role);
+                return write_json_body(&mut stream, status, &body);
+            }
             // Per-node host stats for the stats tab: authenticated the same
             // way (no table data, but not anonymous either).
             "/ui/hosts" => {
