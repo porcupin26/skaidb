@@ -72,16 +72,28 @@ Key facts an agent must know:
   composite). `CREATE TABLE t (PRIMARY KEY (id))` is the whole schema.
 - **Types** (dynamic): `null`, `bool`, `int64`, `float64`, `decimal`,
   `string`, `bytes`, `uuid`, `timestamp` (Unix ms), `array`, `document`
-  (nested). SQL literals exist for int, float, string, bool, null, and
-  constant arrays (`[0.1, -0.2]`); the other types arrive via stored data.
+  (nested). SQL literals exist for int, float, string, bool, null,
+  constant arrays (`[0.1, -0.2]`), and constant objects
+  (`{name: 'ada', addr: {city: 'x'}}` — quote reserved-word keys:
+  `{'from': 1}`); the other types arrive via stored data or bound params.
+  `SET meta.addr = {…}` replaces that whole sub-document; dotted-path `SET`
+  updates one scalar leaf.
 - **Paths**: dotted paths reach nested fields everywhere —
   `address.city`, in projections, WHERE, GROUP BY, ORDER BY, UPDATE SET,
   and index declarations.
 - **Duration literals**: `250ms 15s 5m 2h 30d 1w` — integers in ms, usable
   wherever an integer is (`WHERE ts >= now() - 1h`).
 - **Operators** (rising precedence): `OR`; `AND`; `NOT`; comparisons
-  `= != <> < <= > >=`; `IS [NOT] NULL`; `[NOT] IN (v, ...)`; `+ -`; `* /`;
+  `= != <> < <= > >=`; `IS [NOT] NULL`; postfix `[NOT] IN (v, ...)` /
+  `[NOT] BETWEEN lo AND hi` / `[NOT] LIKE|ILIKE pat`; `+ -`; `* /`;
   unary `-`; parens. Three-valued logic: `NULL` comparisons are unknown.
+  `in/between/like/ilike` are contextual (still valid column names).
+- **`BETWEEN`**: inclusive range, sugar for `>= lo AND <= hi`; literal
+  bounds join index/PK range pushdown like the two comparisons would.
+- **`LIKE` / `ILIKE`**: exact substring/prefix match (`%` any run, `_` one
+  char, no escape); `ILIKE` folds case. Non-string operands → unknown, not
+  an error. Residual filter (no index acceleration) — complements analyzed
+  `MATCH()` word search; same scan-budget caveat as `IN` on large scans.
 - **`IN` / `NOT IN`**: `x IN (a, b, c)` set membership (≥1 element; `IN ()`
   errors). An array-valued element is flattened, so `WHERE id IN (?)` bound
   to `[1,2,3]` tests membership in that set — the "fetch these N ids"

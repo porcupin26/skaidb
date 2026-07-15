@@ -1,6 +1,6 @@
 //! Recursive-descent / precedence-climbing parser for the skaidb SQL subset.
 
-use skaidb_types::Value;
+use skaidb_types::{Document, Value};
 
 use crate::ast::*;
 use crate::token::{tokenize, Keyword, LexError, Token};
@@ -1328,18 +1328,23 @@ impl Parser {
             });
         }
 
-        // Postfix set membership: `expr [NOT] IN (list)`. `IN` is a contextual
-        // identifier (not a reserved keyword), so it stays usable as a column
-        // name elsewhere. A leading `NOT` here belongs to `NOT IN`; the prefix
-        // `NOT` operator is handled in `parse_not`, so only consume it when an
-        // `IN` immediately follows.
-        let negated_in = self.peek() == &Token::Keyword(Keyword::Not)
-            && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("in"));
-        if negated_in {
-            self.advance(); // NOT
+        // Postfix predicates: `expr [NOT] IN (list)`, `expr [NOT] BETWEEN lo
+        // AND hi`, `expr [NOT] LIKE/ILIKE pattern`. The operator words are
+        // contextual identifiers (not reserved keywords), so they stay usable
+        // as column names elsewhere. A leading `NOT` here belongs to the
+        // postfix predicate; the prefix `NOT` operator is handled in
+        // `parse_not`, so only consume it when an operator word immediately
+        // follows.
+        const POSTFIX_OPS: [&str; 4] = ["in", "between", "like", "ilike"];
+        let negated = self.peek() == &Token::Keyword(Keyword::Not)
+            && matches!(
+                self.tokens.get(self.pos + 1),
+                Some(Token::Ident(s)) if POSTFIX_OPS.iter().any(|w| s.eq_ignore_ascii_case(w))
+            );
+        if negated {
+            self.advance(); // NOT — the lookahead guarantees an operator word.
         }
-        if negated_in || self.peek_ident_ci("in") {
-            self.eat_ident_ci("in");
+        if self.eat_ident_ci("in") {
             self.expect(&Token::LParen)?;
             // At least one element; an empty `IN ()` is a parse error, as in
             // standard SQL.
@@ -1351,7 +1356,31 @@ impl Parser {
             return Ok(Expr::InList {
                 expr: Box::new(left),
                 list,
-                negated: negated_in,
+                negated,
+            });
+        }
+        if self.eat_ident_ci("between") {
+            // Bounds parse at additive precedence so the mandatory `AND`
+            // separator is not swallowed by the boolean connective.
+            let lo = self.parse_additive()?;
+            self.expect_keyword(Keyword::And)?;
+            let hi = self.parse_additive()?;
+            return Ok(Expr::Between {
+                expr: Box::new(left),
+                lo: Box::new(lo),
+                hi: Box::new(hi),
+                negated,
+            });
+        }
+        let ilike = self.peek_ident_ci("ilike");
+        if ilike || self.peek_ident_ci("like") {
+            self.advance(); // LIKE / ILIKE
+            let pattern = self.parse_additive()?;
+            return Ok(Expr::Like {
+                expr: Box::new(left),
+                pattern: Box::new(pattern),
+                case_insensitive: ilike,
+                negated,
             });
         }
 
@@ -1477,6 +1506,44 @@ impl Parser {
                     self.expect(&Token::RBracket)?;
                 }
                 Ok(Expr::Literal(Value::Array(items)))
+            }
+            // Object/document literal `{key: value, ...}` — the way to write a
+            // nested document in `SET`/`VALUES`. Keys are bare identifiers or
+            // string literals; values must be constant (a literal, a negated
+            // number, or a nested array/object literal). A duplicate key keeps
+            // the last value.
+            Token::LBrace => {
+                self.advance();
+                let mut doc = Document::new();
+                if !self.eat(&Token::RBrace) {
+                    loop {
+                        let key = match self.advance() {
+                            Token::Ident(s) | Token::Str(s) => s,
+                            other => {
+                                return Err(ParseError::Unexpected {
+                                    found: format!("{other:?}"),
+                                    expected:
+                                        "object key (identifier or string; quote reserved words: \
+                                         {'from': ...})"
+                                            .into(),
+                                })
+                            }
+                        };
+                        self.expect(&Token::Colon)?;
+                        let e = self.parse_expr()?;
+                        let v = const_value(e).ok_or_else(|| {
+                            ParseError::Other(
+                                "object values must be constant literals".into(),
+                            )
+                        })?;
+                        doc.insert(key, v);
+                        if !self.eat(&Token::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(&Token::RBrace)?;
+                }
+                Ok(Expr::Literal(Value::Document(doc)))
             }
             Token::Keyword(kw) if agg_func(*kw).is_some() => {
                 let func = agg_func(*kw).unwrap();
@@ -2051,5 +2118,108 @@ mod tests {
         }
         // Empty `IN ()` is a parse error.
         assert!(parse("SELECT id FROM t WHERE id IN ()").is_err());
+    }
+
+    #[test]
+    fn parse_between_and_like() {
+        let filter = |sql: &str| match parse(sql).unwrap() {
+            Statement::Select(s) => s.filter.unwrap(),
+            other => panic!("{other:?}"),
+        };
+        // BETWEEN parses both bounds and does not swallow a trailing AND.
+        match filter("SELECT id FROM t WHERE ts BETWEEN 1 AND 5 AND x = 2") {
+            Expr::Binary { op: BinaryOp::And, left, .. } => match *left {
+                Expr::Between { negated, ref lo, ref hi, .. } => {
+                    assert!(!negated);
+                    assert_eq!(**lo, Expr::Literal(Value::Int(1)));
+                    assert_eq!(**hi, Expr::Literal(Value::Int(5)));
+                }
+                ref other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+        // NOT BETWEEN.
+        match filter("SELECT id FROM t WHERE ts NOT BETWEEN 1 AND 5") {
+            Expr::Between { negated, .. } => assert!(negated),
+            other => panic!("{other:?}"),
+        }
+        // LIKE / ILIKE / NOT LIKE.
+        match filter("SELECT id FROM t WHERE name LIKE '%ada%'") {
+            Expr::Like { case_insensitive, negated, .. } => {
+                assert!(!case_insensitive);
+                assert!(!negated);
+            }
+            other => panic!("{other:?}"),
+        }
+        match filter("SELECT id FROM t WHERE name NOT ILIKE 'A_a'") {
+            Expr::Like { case_insensitive, negated, .. } => {
+                assert!(case_insensitive);
+                assert!(negated);
+            }
+            other => panic!("{other:?}"),
+        }
+        // The pattern can be a bound parameter.
+        match filter("SELECT id FROM t WHERE name LIKE ?") {
+            Expr::Like { pattern, .. } => assert_eq!(*pattern, Expr::Parameter(0)),
+            other => panic!("{other:?}"),
+        }
+        // `between` / `like` stay usable as column names outside the operator
+        // position.
+        assert!(parse("SELECT between, like FROM t").is_ok());
+    }
+
+    #[test]
+    fn parse_object_literal() {
+        use skaidb_types::Document;
+        let first_value = |sql: &str| match parse(sql).unwrap() {
+            Statement::Insert(i) => i.rows[0][1].clone(),
+            other => panic!("{other:?}"),
+        };
+        // Bare-identifier and string keys, nested array + object values.
+        match first_value(
+            "INSERT INTO t (id, meta) VALUES (1, {name: 'ada', 'full name': 'Ada L', tags: ['a', 'b'], nested: {n: 1}})",
+        ) {
+            Expr::Literal(Value::Document(d)) => {
+                assert_eq!(d.0.get("name"), Some(&Value::String("ada".into())));
+                assert_eq!(d.0.get("full name"), Some(&Value::String("Ada L".into())));
+                assert_eq!(
+                    d.0.get("tags"),
+                    Some(&Value::Array(vec![
+                        Value::String("a".into()),
+                        Value::String("b".into())
+                    ]))
+                );
+                let mut nested = Document::new();
+                nested.insert("n", Value::Int(1));
+                assert_eq!(d.0.get("nested"), Some(&Value::Document(nested)));
+            }
+            other => panic!("{other:?}"),
+        }
+        // A reserved word as a bare key is rejected with a hint; string-quoting
+        // it works.
+        assert!(parse("INSERT INTO t (id, m) VALUES (1, {from: 1})").is_err());
+        match first_value("INSERT INTO t (id, m) VALUES (1, {'from': 1})") {
+            Expr::Literal(Value::Document(d)) => {
+                assert_eq!(d.0.get("from"), Some(&Value::Int(1)))
+            }
+            other => panic!("{other:?}"),
+        }
+        // Empty object.
+        match first_value("INSERT INTO t (id, meta) VALUES (1, {})") {
+            Expr::Literal(Value::Document(d)) => assert!(d.0.is_empty()),
+            other => panic!("{other:?}"),
+        }
+        // Object literals work as UPDATE SET values.
+        match parse("UPDATE t SET meta = {a: 1} WHERE id = 1").unwrap() {
+            Statement::Update(u) => match &u.assignments[0].1 {
+                Expr::Literal(Value::Document(d)) => {
+                    assert_eq!(d.0.get("a"), Some(&Value::Int(1)))
+                }
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+        // Non-constant values are rejected.
+        assert!(parse("INSERT INTO t (id, m) VALUES (1, {a: col})").is_err());
     }
 }

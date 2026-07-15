@@ -115,19 +115,21 @@ prepared-statement work in phase 1.
   makes `executemany` prepare once and reuse the id across rows (no re-parse).
   A single-round-trip batched wire path remains an optional future optimization.
 
-**Phase 3 — P1 SQL grammar** (grouped to amortize the new-`Expr`-variant
-match fan-out; use contextual idents, not reserved keywords)
+**Phase 3 — P1 SQL grammar** ✅ shipped
 
-- [ ] **[sql] `BETWEEN`** — `col BETWEEN a AND b` (mind the embedded
-  `AND`); new `Expr::Between`; maps onto `lo`/`hi` in `column_constraints`
-  for real range pushdown.
-- [ ] **[sql] `LIKE` / `ILIKE`** — exact substring/prefix matching
-  (complements FTS `MATCH`); new `Expr::Like` + a `%`/`_` glob matcher in
-  eval; residual eval suffices, `'prefix%'` → optional prefix-range scan.
-- [ ] **[sql] Object/document literals** — a `{…}` literal building
-  `Value::Document` for `SET`/`VALUES` (array literals already parse).
-  Also document dotted-path `SET a.b = 'x'` (already works) as the blessed
-  scalar-leaf idiom.
+- [x] **[sql] `BETWEEN`** — `Expr::Between`, contextual-ident parse (bounds at
+  additive precedence so the separator `AND` survives), three-valued eval;
+  literal bounds feed `collect_comparisons` → real index/PK **range pushdown**.
+- [x] **[sql] `LIKE` / `ILIKE`** — `Expr::Like` + a `%`/`_` two-pointer glob
+  matcher (no escape sequence); `ILIKE` lowercases both sides; non-string
+  operands are unknown (never a query error on mixed-type columns). Residual
+  filter only — a `'prefix%'` → prefix-range scan remains a future optimization.
+- [x] **[sql] Object/document literals** — `{key: lit, ...}` builds
+  `Value::Document` in any expression position (keys: bare idents or strings,
+  reserved words need quoting; values constant, nesting allowed). `SET
+  meta.addr = {…}` replaces the sub-document; dotted-path `SET` documented as
+  the scalar-leaf idiom. All three predicates travel the internode filter
+  codec, so clustered filtered scans serve them.
 
 **Phase 4 — P2 SQL niceties**
 

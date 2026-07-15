@@ -155,6 +155,15 @@ fn visit_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
                 visit_expr(item, f);
             }
         }
+        Expr::Between { expr, lo, hi, .. } => {
+            visit_expr(expr, f);
+            visit_expr(lo, f);
+            visit_expr(hi, f);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            visit_expr(expr, f);
+            visit_expr(pattern, f);
+        }
         Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) => {}
     }
 }
@@ -242,6 +251,15 @@ fn mutate_expr(e: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
             for item in list {
                 mutate_expr(item, f);
             }
+        }
+        Expr::Between { expr, lo, hi, .. } => {
+            mutate_expr(expr, f);
+            mutate_expr(lo, f);
+            mutate_expr(hi, f);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            mutate_expr(expr, f);
+            mutate_expr(pattern, f);
         }
         Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) => {}
     }

@@ -295,9 +295,17 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   whose array holds `'work'`; `!=` is not-contains. Array-to-array
   comparison remains whole-value equality.
 - **Literals:** integer (`42`), float (`3.14`, scientific `1.2e-5`/`3E8`), string (`'ada'`), `TRUE`,
-  `FALSE`, `NULL`, and **array** literals `[<lit> [, <lit> ...]]` (constant
-  elements only — a literal or a negated number, e.g. `[0.1, -0.2, 0.3]`).
-  There is no object/nested-document literal.
+  `FALSE`, `NULL`, **array** literals `[<lit> [, <lit> ...]]` (constant
+  elements only — a literal or a negated number, e.g. `[0.1, -0.2, 0.3]`),
+  and **object/document** literals `{<key>: <lit> [, ...]}` — the way to write
+  a nested document in `SET`/`VALUES`. Keys are bare identifiers or string
+  literals (quote reserved words: `{'from': 1}`); values must be constant and
+  may nest arrays and objects: `{name: 'ada', tags: ['x'], addr: {city: 'paris'}}`.
+  A duplicate key keeps the last value; `{}` is the empty document. Assigning
+  an object literal to a path (`SET meta.addr = {…}`) **replaces** that whole
+  sub-document (sibling fields outside the path survive); dotted-path `SET`
+  (`SET meta.addr.city = 'x'`) remains the idiom for updating a single scalar
+  leaf in place.
 - **Column / field paths:** `name`, or a dotted path into a nested document:
   `address.city`, `a.b.c`. Usable in projections, `WHERE`, `GROUP BY`,
   `ORDER BY`, and `UPDATE … SET` targets.
@@ -307,11 +315,16 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   3. `NOT <expr>`
   4. comparison: `=`, `!=` (or `<>`), `<`, `<=`, `>`, `>=`
   5. `<expr> IS [NOT] NULL`
-  6. `<expr> [NOT] IN (<expr> [, <expr> ...])`
+  6. postfix predicates: `<expr> [NOT] IN (<expr> [, ...])`,
+     `<expr> [NOT] BETWEEN <expr> AND <expr>`,
+     `<expr> [NOT] { LIKE | ILIKE } <pattern-expr>`
   7. additive: `+`, `-`
   8. multiplicative: `*`, `/`
   9. unary: `-<expr>`, `NOT <expr>`
   10. parentheses `( … )`
+
+  `in`, `between`, `like`, and `ilike` are contextual keywords — still usable
+  as column names outside the operator position.
 - **`IN` / `NOT IN`** — set membership: `x IN (a, b, c)` is true when `x`
   equals any listed element (three-valued: unknown if `x` is `NULL`, or if
   no element matches but some element is `NULL`); `NOT IN` negates it. The
@@ -321,13 +334,30 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   with `?` = `[1, 2, 3]` tests membership in that set (the "fetch these N
   ids" pattern). When the left side is an array column, `IN` matches if the
   array holds any listed value, mirroring the `=` containment rule above.
-  `in` is a contextual keyword — still usable as a column name elsewhere.
   > **Performance note:** `IN`/`NOT IN` currently evaluate as a residual
   > row filter — they are *not* yet pushed to a primary-key/index probe, so
   > `col IN (…)` scans the candidate range and a large unindexed scan can
   > trip `scan budget exceeded`. Prefer it on primary-key point sets that
   > stay within the scan budget, or pair with a narrowing indexed predicate,
   > until multi-probe pushdown lands.
+- **`BETWEEN`** — `x BETWEEN lo AND hi` is the inclusive range
+  `x >= lo AND x <= hi` (three-valued: a `NULL` operand or bound makes the
+  undecided side unknown); `NOT BETWEEN` negates it. A `col BETWEEN lo AND hi`
+  with literal bounds contributes both bounds to index/PK **range pushdown**,
+  exactly like writing the two comparisons.
+- **`LIKE` / `ILIKE`** — SQL pattern match on strings: `%` matches any run of
+  characters (including none), `_` matches exactly one; every other character
+  matches itself, and there is **no escape sequence** (a literal `%`/`_` in the
+  data cannot be targeted — use equality or a search index). `ILIKE` is
+  case-insensitive (Unicode-aware lowercasing). The pattern is any expression
+  (usually a literal or a `?` parameter). Non-string operands — including
+  `NULL` — compare as unknown, so a mixed-type column never errors the query.
+  This is **exact substring/prefix matching**, complementing the analyzed
+  full-text `MATCH()` (which tokenizes words): use `LIKE '%needle%'` for
+  verbatim fragments, `MATCH` for word search.
+  > **Performance note:** `LIKE`/`ILIKE` evaluate as a residual row filter
+  > (no index acceleration, including `'prefix%'` for now) — the same
+  > scan-budget caveat as `IN` applies on large unindexed scans.
 - **Aggregate functions:** `COUNT(*)` / `COUNT(<expr>)` /
   `COUNT(DISTINCT <expr>)` (exact distinct non-null values),
   `APPROX_COUNT_DISTINCT(<expr>)` (opt-in approximate distinct: the
@@ -369,9 +399,10 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
 
 Values are dynamically typed: `null`, `bool`, `int64`, `float64`, `decimal`,
 `string`, `bytes`, `uuid`, `timestamp` (Unix time, milliseconds), `array`,
-`document`. Only `int`, `float`, `string`, `bool`, `null`, and `array` literals
-can be written directly in SQL; `decimal`/`uuid`/`bytes`/`timestamp`/`document`
-values arrive via stored data or the value codec, not as SQL literals.
+`document`. Only `int`, `float`, `string`, `bool`, `null`, `array`, and
+`document` (object) literals can be written directly in SQL;
+`decimal`/`uuid`/`bytes`/`timestamp` values arrive via stored data or the
+value codec (e.g. bound parameters), not as SQL literals.
 
 ## Vector search (`NEAREST`)
 

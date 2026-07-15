@@ -1507,6 +1507,30 @@ fn put_expr(o: &mut Vec<u8>, e: &Expr) {
             }
             o.push(u8::from(*negated));
         }
+        Expr::Between {
+            expr,
+            lo,
+            hi,
+            negated,
+        } => {
+            o.push(6);
+            put_expr(o, expr);
+            put_expr(o, lo);
+            put_expr(o, hi);
+            o.push(u8::from(*negated));
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            case_insensitive,
+            negated,
+        } => {
+            o.push(7);
+            put_expr(o, expr);
+            put_expr(o, pattern);
+            o.push(u8::from(*case_insensitive));
+            o.push(u8::from(*negated));
+        }
         // Not valid in a pushed filter: aggregates never are, parameters are
         // substituted by `bind`, and scalar functions (`now()` resolves to a
         // literal; `time_bucket` never lands in an index-pushdown filter) are
@@ -1759,6 +1783,30 @@ impl<'a> Cur<'a> {
                 Expr::InList {
                     expr,
                     list,
+                    negated,
+                }
+            }
+            6 => {
+                let expr = Box::new(self.expr()?);
+                let lo = Box::new(self.expr()?);
+                let hi = Box::new(self.expr()?);
+                let negated = self.u8()? != 0;
+                Expr::Between {
+                    expr,
+                    lo,
+                    hi,
+                    negated,
+                }
+            }
+            7 => {
+                let expr = Box::new(self.expr()?);
+                let pattern = Box::new(self.expr()?);
+                let case_insensitive = self.u8()? != 0;
+                let negated = self.u8()? != 0;
+                Expr::Like {
+                    expr,
+                    pattern,
+                    case_insensitive,
                     negated,
                 }
             }
@@ -2038,6 +2086,34 @@ mod tests {
                 Expr::Literal(Value::Int(3)),
             ],
             negated: true,
+        };
+        let req = Request::FilteredScan {
+            table: "t".into(),
+            filter,
+        };
+        assert_eq!(Request::decode(&req.encode()).unwrap(), req);
+    }
+
+    #[test]
+    fn filtered_scan_between_and_like_roundtrip() {
+        use skaidb_sql::ast::Expr;
+        use skaidb_types::Value;
+        // BETWEEN and LIKE pushed to a peer must survive the wire so the
+        // predicates are served by clustered filtered scans.
+        let filter = Expr::Binary {
+            op: skaidb_sql::ast::BinaryOp::And,
+            left: Box::new(Expr::Between {
+                expr: Box::new(Expr::Column("ts".into())),
+                lo: Box::new(Expr::Literal(Value::Int(100))),
+                hi: Box::new(Expr::Literal(Value::Int(200))),
+                negated: false,
+            }),
+            right: Box::new(Expr::Like {
+                expr: Box::new(Expr::Column("subject".into())),
+                pattern: Box::new(Expr::Literal(Value::String("%invoice%".into()))),
+                case_insensitive: true,
+                negated: true,
+            }),
         };
         let req = Request::FilteredScan {
             table: "t".into(),

@@ -520,6 +520,24 @@ pub enum Expr {
         list: Vec<Expr>,
         negated: bool,
     },
+    /// `expr [NOT] BETWEEN lo AND hi` — inclusive range, sugar for
+    /// `expr >= lo AND expr <= hi` under three-valued logic.
+    Between {
+        expr: Box<Expr>,
+        lo: Box<Expr>,
+        hi: Box<Expr>,
+        negated: bool,
+    },
+    /// `expr [NOT] LIKE/ILIKE pattern` — SQL pattern match (`%` = any run,
+    /// `_` = any one char; no escape sequence). `case_insensitive` is `ILIKE`.
+    /// Non-string operands compare as unknown (`NULL`), matching how
+    /// incomparable types behave in ordinary comparisons.
+    Like {
+        expr: Box<Expr>,
+        pattern: Box<Expr>,
+        case_insensitive: bool,
+        negated: bool,
+    },
     /// An aggregate function call (`COUNT(*)`, `SUM(x)`, ...).
     Aggregate { func: AggFunc, arg: AggArg },
     /// A scalar function call (`time_bucket(5m, ts)`, `now()`). Names are

@@ -148,6 +148,81 @@ mod tests {
         assert_eq!(rs.rows, vec![vec![Value::Int(1)]]);
     }
 
+    #[test]
+    fn between_and_like_end_to_end() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE mail (PRIMARY KEY (id))").unwrap();
+        db.execute(
+            "INSERT INTO mail (id, subject, date) VALUES \
+             (1, 'Invoice #42 overdue', 100), \
+             (2, 'lunch on friday?', 200), \
+             (3, 'RE: invoice paid', 300)",
+        )
+        .unwrap();
+
+        // BETWEEN is an inclusive range (and pushes down onto the PK range).
+        let rs = rows(
+            db.execute("SELECT id FROM mail WHERE date BETWEEN 100 AND 200 ORDER BY id")
+                .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+        let rs = rows(
+            db.execute("SELECT id FROM mail WHERE date NOT BETWEEN 100 AND 200")
+                .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(3)]]);
+
+        // LIKE is exact substring/prefix matching; ILIKE folds case.
+        let rs = rows(
+            db.execute("SELECT id FROM mail WHERE subject LIKE '%invoice%'")
+                .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(3)]]);
+        let rs = rows(
+            db.execute("SELECT id FROM mail WHERE subject ILIKE '%invoice%' ORDER BY id")
+                .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(1)], vec![Value::Int(3)]]);
+        let rs = rows(
+            db.execute("SELECT id FROM mail WHERE subject LIKE 'RE:%'")
+                .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(3)]]);
+    }
+
+    #[test]
+    fn object_literal_end_to_end() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE users (PRIMARY KEY (id))").unwrap();
+        // Whole nested document written in plain SQL — no REST round-trip.
+        db.execute(
+            "INSERT INTO users (id, meta) VALUES (1, {name: 'ada', tags: ['x'], addr: {city: 'paris'}})",
+        )
+        .unwrap();
+
+        // Dotted-path reads see the nested fields.
+        let rs = rows(db.execute("SELECT meta.addr.city FROM users WHERE id = 1").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::String("paris".into())]]);
+
+        // UPDATE SET can replace a whole sub-document with an object literal.
+        db.execute("UPDATE users SET meta.addr = {city: 'london', zip: 'E1'} WHERE id = 1")
+            .unwrap();
+        let rs = rows(
+            db.execute("SELECT meta.addr.city, meta.addr.zip FROM users WHERE id = 1")
+                .unwrap(),
+        );
+        assert_eq!(
+            rs.rows,
+            vec![vec![
+                Value::String("london".into()),
+                Value::String("E1".into())
+            ]]
+        );
+        // The untouched sibling field survived the sub-document swap.
+        let rs = rows(db.execute("SELECT meta.name FROM users WHERE id = 1").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::String("ada".into())]]);
+    }
+
     /// Shared fixture: a TS table with two hosts sampling `value` every 15 s
     /// for two minutes (values rise 1/s), plus a `temp` field on host a.
     fn ts_fixture(db: &mut Database) {

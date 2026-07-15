@@ -26,6 +26,41 @@ pub fn eval(expr: &Expr, row: &Document) -> Result<Value> {
             list,
             negated,
         } => eval_in_list(expr, list, *negated, row),
+        Expr::Between {
+            expr,
+            lo,
+            hi,
+            negated,
+        } => {
+            // Sugar for `expr >= lo AND expr <= hi` under three-valued logic.
+            let v = eval(expr, row)?;
+            let l = eval(lo, row)?;
+            let h = eval(hi, row)?;
+            let ge = Ternary::from_option(compare(&v, &l).map(|o| o != Ordering::Less));
+            let le = Ternary::from_option(compare(&v, &h).map(|o| o != Ordering::Greater));
+            let t = ge.and(le);
+            Ok(ternary_to_value(if *negated { !t } else { t }))
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            case_insensitive,
+            negated,
+        } => {
+            let v = eval(expr, row)?;
+            let p = eval(pattern, row)?;
+            // Non-string operands (including NULL) compare as unknown, the
+            // same as incomparable types in ordinary comparisons.
+            let (Value::String(s), Value::String(pat)) = (&v, &p) else {
+                return Ok(Value::Null);
+            };
+            let matched = if *case_insensitive {
+                like_match(&s.to_lowercase(), &pat.to_lowercase())
+            } else {
+                like_match(s, pat)
+            };
+            Ok(Value::Bool(matched != *negated))
+        }
         Expr::Unary { op, expr } => eval_unary(*op, eval(expr, row)?),
         Expr::Binary { op, left, right } => eval_binary(*op, left, right, row),
         // Parameters are substituted by `bind` before execution; one
@@ -263,6 +298,40 @@ fn eval_in_list(expr: &Expr, list: &[Expr], negated: bool, row: &Document) -> Re
     Ok(ternary_to_value(if negated { !result } else { result }))
 }
 
+/// SQL `LIKE` pattern match: `%` matches any run of characters (including the
+/// empty run), `_` matches exactly one character, anything else matches
+/// itself. No escape sequence — a literal `%`/`_` cannot be matched (use
+/// `MATCH`/equality for such data). Iterative two-pointer scan over chars,
+/// backtracking to the most recent `%` on mismatch: O(len(s)·len(pattern))
+/// worst case, no allocation beyond the two char vectors.
+fn like_match(s: &str, pattern: &str) -> bool {
+    let s: Vec<char> = s.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    let (mut si, mut pi) = (0usize, 0usize);
+    // Position of the last `%` seen, and where its match run started in `s`.
+    let mut star: Option<usize> = None;
+    let mut mark = 0usize;
+    while si < s.len() {
+        if pi < p.len() && p[pi] == '%' {
+            star = Some(pi);
+            mark = si;
+            pi += 1;
+        } else if pi < p.len() && (p[pi] == '_' || p[pi] == s[si]) {
+            si += 1;
+            pi += 1;
+        } else if let Some(sp) = star {
+            // Mismatch after a `%`: widen the `%`'s run by one and retry.
+            mark += 1;
+            si = mark;
+            pi = sp + 1;
+        } else {
+            return false;
+        }
+    }
+    // Only trailing `%`s may remain unconsumed.
+    p[pi..].iter().all(|&c| c == '%')
+}
+
 /// SQL comparison: `None` when either side is `NULL` or the types do not
 /// compare. Numeric types compare across each other.
 pub fn compare(l: &Value, r: &Value) -> Option<Ordering> {
@@ -486,6 +555,69 @@ mod tests {
         let row = doc(&[("a", Value::Int(2))]);
         assert!(eval_predicate(&expr("a IN ([1, 2, 3])"), &row).unwrap());
         assert!(!eval_predicate(&expr("a IN ([4, 5])"), &row).unwrap());
+    }
+
+    #[test]
+    fn like_matcher() {
+        // (%: any run, _: exactly one char)
+        assert!(like_match("invoice 42", "%invoice%"));
+        assert!(like_match("invoice", "invoice"));
+        assert!(like_match("invoice", "inv%"));
+        assert!(like_match("invoice", "%ice"));
+        assert!(like_match("invoice", "in_oice"));
+        assert!(like_match("", "%"));
+        assert!(like_match("", ""));
+        assert!(like_match("abc", "%%%"));
+        assert!(like_match("aXbXc", "a%b%c"));
+        assert!(!like_match("invoice", "voice")); // no implicit anchors
+        assert!(!like_match("invoice", "in_ice")); // _ is exactly one
+        assert!(!like_match("abc", ""));
+        assert!(!like_match("ab", "a_c"));
+        // Backtracking: the first % try must not starve the second.
+        assert!(like_match("a-b-c-b-d", "a%b%d"));
+        // Unicode chars count as one `_`.
+        assert!(like_match("naïve", "na_ve"));
+    }
+
+    #[test]
+    fn like_and_ilike_predicates() {
+        let row = doc(&[("subject", Value::String("Invoice #42 overdue".into()))]);
+        assert!(eval_predicate(&expr("subject LIKE '%#42%'"), &row).unwrap());
+        assert!(!eval_predicate(&expr("subject LIKE '%invoice%'"), &row).unwrap());
+        assert!(eval_predicate(&expr("subject ILIKE '%invoice%'"), &row).unwrap());
+        assert!(eval_predicate(&expr("subject NOT LIKE 'x%'"), &row).unwrap());
+        // NULL / non-string operands are unknown, not errors.
+        let row = doc(&[("subject", Value::Null), ("n", Value::Int(3))]);
+        assert_eq!(eval(&expr("subject LIKE '%a%'"), &row).unwrap(), Value::Null);
+        assert_eq!(eval(&expr("n LIKE '3'"), &row).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn between_predicate() {
+        let row = doc(&[("ts", Value::Int(5))]);
+        assert!(eval_predicate(&expr("ts BETWEEN 1 AND 10"), &row).unwrap());
+        assert!(eval_predicate(&expr("ts BETWEEN 5 AND 5"), &row).unwrap()); // inclusive
+        assert!(!eval_predicate(&expr("ts BETWEEN 6 AND 10"), &row).unwrap());
+        assert!(eval_predicate(&expr("ts NOT BETWEEN 6 AND 10"), &row).unwrap());
+        // NULL operand or bound -> unknown (kept out by predicates, and NOT
+        // BETWEEN stays unknown too).
+        let row = doc(&[("ts", Value::Null)]);
+        assert_eq!(eval(&expr("ts BETWEEN 1 AND 10"), &row).unwrap(), Value::Null);
+        assert_eq!(
+            eval(&expr("ts NOT BETWEEN 1 AND 10"), &row).unwrap(),
+            Value::Null
+        );
+        let row = doc(&[("ts", Value::Int(5))]);
+        assert_eq!(
+            eval(&expr("ts BETWEEN NULL AND 10"), &row).unwrap(),
+            Value::Null
+        );
+        // ...but a definite False short-circuits an unknown bound:
+        // 5 <= NULL is unknown, 5 >= 20 is false -> false.
+        assert_eq!(
+            eval(&expr("ts BETWEEN 20 AND NULL"), &row).unwrap(),
+            Value::Bool(false)
+        );
     }
 
     #[test]

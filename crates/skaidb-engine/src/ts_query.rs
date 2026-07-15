@@ -301,6 +301,15 @@ fn walk(e: &Expr, f: &mut impl FnMut(&Expr)) {
                 walk(a, f);
             }
         }
+        Expr::Between { expr, lo, hi, .. } => {
+            walk(expr, f);
+            walk(lo, f);
+            walk(hi, f);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            walk(expr, f);
+            walk(pattern, f);
+        }
         Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) => {}
     }
 }
@@ -575,8 +584,9 @@ fn plan_expr_ok(e: &Expr, plan: &mut PartialsPlan) -> bool {
             plan_expr_ok(left, plan) && plan_expr_ok(right, plan)
         }
         Expr::Func { args, .. } => args.iter().all(|a| plan_expr_ok(a, plan)),
-        // `IN` predicates aren't part of the partials fast path; fall back.
-        Expr::InList { .. } => false,
+        // `IN`/`BETWEEN`/`LIKE` predicates aren't part of the partials fast
+        // path; fall back to the exact row path.
+        Expr::InList { .. } | Expr::Between { .. } | Expr::Like { .. } => false,
     }
 }
 
@@ -998,6 +1008,15 @@ fn rewrite_aggs(e: &mut Expr) {
             for a in list {
                 rewrite_aggs(a);
             }
+        }
+        Expr::Between { expr, lo, hi, .. } => {
+            rewrite_aggs(expr);
+            rewrite_aggs(lo);
+            rewrite_aggs(hi);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            rewrite_aggs(expr);
+            rewrite_aggs(pattern);
         }
         Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) => {}
     }

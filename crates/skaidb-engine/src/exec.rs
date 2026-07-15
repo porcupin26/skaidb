@@ -6264,6 +6264,12 @@ fn expr_has_func(expr: &Expr, pred: &impl Fn(&str) -> bool) -> bool {
         Expr::InList { expr, list, .. } => {
             expr_has_func(expr, pred) || list.iter().any(|a| expr_has_func(a, pred))
         }
+        Expr::Between { expr, lo, hi, .. } => {
+            expr_has_func(expr, pred) || expr_has_func(lo, pred) || expr_has_func(hi, pred)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            expr_has_func(expr, pred) || expr_has_func(pattern, pred)
+        }
         Expr::Aggregate { .. } | Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) => false,
     }
 }
@@ -6943,6 +6949,15 @@ fn collect_highlights(sel: &Select) -> Result<Vec<(String, usize)>> {
             Expr::InList { expr, list, .. } => {
                 walk(expr, out)?;
                 list.iter().try_for_each(|a| walk(a, out))
+            }
+            Expr::Between { expr, lo, hi, .. } => {
+                walk(expr, out)?;
+                walk(lo, out)?;
+                walk(hi, out)
+            }
+            Expr::Like { expr, pattern, .. } => {
+                walk(expr, out)?;
+                walk(pattern, out)
             }
             Expr::Aggregate { .. } | Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) => {
                 Ok(())
@@ -8736,6 +8751,29 @@ fn collect_comparisons(expr: &Expr, out: &mut Vec<(String, BinaryOp, Value)>) {
                 _ => {}
             }
         }
+        // `col BETWEEN lo AND hi` implies `col >= lo` and `col <= hi`, so each
+        // literal bound contributes a range constraint (either alone is still
+        // a sound superset — the residual filter re-checks). `NOT BETWEEN`
+        // implies neither bound and contributes nothing.
+        Expr::Between {
+            expr,
+            lo,
+            hi,
+            negated: false,
+        } => {
+            if let Expr::Column(c) = expr.as_ref() {
+                if let Expr::Literal(v) = lo.as_ref() {
+                    if !v.is_null() {
+                        out.push((c.clone(), BinaryOp::GtEq, v.clone()));
+                    }
+                }
+                if let Expr::Literal(v) = hi.as_ref() {
+                    if !v.is_null() {
+                        out.push((c.clone(), BinaryOp::LtEq, v.clone()));
+                    }
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -8821,6 +8859,12 @@ fn contains_aggregate(expr: &Expr) -> bool {
         Expr::Func { args, .. } => args.iter().any(contains_aggregate),
         Expr::InList { expr, list, .. } => {
             contains_aggregate(expr) || list.iter().any(contains_aggregate)
+        }
+        Expr::Between { expr, lo, hi, .. } => {
+            contains_aggregate(expr) || contains_aggregate(lo) || contains_aggregate(hi)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            contains_aggregate(expr) || contains_aggregate(pattern)
         }
         Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) => false,
     }
@@ -9111,6 +9155,28 @@ fn lower_aggregates(expr: &Expr, docs: &[Document]) -> Result<Expr> {
                 .iter()
                 .map(|a| lower_aggregates(a, docs))
                 .collect::<Result<Vec<_>>>()?,
+            negated: *negated,
+        },
+        Expr::Between {
+            expr,
+            lo,
+            hi,
+            negated,
+        } => Expr::Between {
+            expr: Box::new(lower_aggregates(expr, docs)?),
+            lo: Box::new(lower_aggregates(lo, docs)?),
+            hi: Box::new(lower_aggregates(hi, docs)?),
+            negated: *negated,
+        },
+        Expr::Like {
+            expr,
+            pattern,
+            case_insensitive,
+            negated,
+        } => Expr::Like {
+            expr: Box::new(lower_aggregates(expr, docs)?),
+            pattern: Box::new(lower_aggregates(pattern, docs)?),
+            case_insensitive: *case_insensitive,
             negated: *negated,
         },
         Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) => expr.clone(),
