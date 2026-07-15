@@ -283,6 +283,61 @@ mod tests {
         assert_eq!(rs.rows, vec![vec![Value::Timestamp(2 * 86_400_000)]]);
     }
 
+    /// A replayed `CREATE ... IF NOT EXISTS` carrying a NEWER schema stamp and
+    /// a different definition must REPLACE the stale def and rebuild — the
+    /// schema-sync convergence that the production `.6` node lacked (its
+    /// search index covered fewer columns than its peers forever).
+    #[test]
+    fn create_if_not_exists_supersedes_stale_index_defs() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE m (PRIMARY KEY (id))").unwrap();
+        db.execute("INSERT INTO m (id, text, chan) VALUES (1, 'hello world', 'general')")
+            .unwrap();
+        // Narrow def first (the stale state).
+        db.execute("CREATE SEARCH INDEX m_fts ON m (text)").unwrap();
+        let err = db
+            .execute("SELECT id FROM m WHERE MATCH(chan, 'general')")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("covers column"), "{err}");
+        // The replayed wider def (newer stamp): must replace + rebuild.
+        db.execute(
+            "CREATE SEARCH INDEX IF NOT EXISTS m_fts ON m (text, chan) \
+             WITH (chan.type = 'keyword')",
+        )
+        .unwrap();
+        let rs = rows(db.execute("SELECT id FROM m WHERE MATCH(chan, 'general')").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::Int(1)]]);
+        // Same def replayed again: a no-op (no rebuild churn), still serving.
+        db.execute(
+            "CREATE SEARCH INDEX IF NOT EXISTS m_fts ON m (text, chan) \
+             WITH (chan.type = 'keyword')",
+        )
+        .unwrap();
+        let rs = rows(db.execute("SELECT id FROM m WHERE MATCH(chan, 'general')").unwrap());
+        assert_eq!(rs.rows.len(), 1);
+
+        // Vector defs converge the same way (path change replaces).
+        db.execute("INSERT INTO m (id, va, vb) VALUES (2, [0.1, 0.2], [0.9, 0.8])")
+            .unwrap();
+        db.execute("CREATE VECTOR INDEX m_vec ON m (va) DIM 2").unwrap();
+        db.execute("CREATE VECTOR INDEX IF NOT EXISTS m_vec ON m (vb) DIM 2")
+            .unwrap();
+        let rs = rows(db.execute("SHOW INDEXES").unwrap());
+        let vec_row = rs
+            .rows
+            .iter()
+            .find(|r| r[0] == Value::String("m_vec".into()))
+            .unwrap()
+            .clone();
+        assert_eq!(vec_row[3], Value::String("vb".into())); // replaced path
+        // The new `local` health column reports this node's live state.
+        assert_eq!(rs.columns[4], "local");
+        for r in &rs.rows {
+            assert_eq!(r[4], Value::String("ok".into()), "{r:?}");
+        }
+    }
+
     /// Shared fixture: a TS table with two hosts sampling `value` every 15 s
     /// for two minutes (values rise 1/s), plus a `temp` field on host a.
     fn ts_fixture(db: &mut Database) {
@@ -1391,7 +1446,7 @@ mod tests {
                 .unwrap();
             db.execute("INSERT INTO docs (id, cat, embedding) VALUES (4, 'b', [0.9, 0.1, 0.0])")
                 .unwrap();
-            db.create_vector_index("docs_emb", "docs", "embedding", "cosine", None)
+            db.create_vector_index("docs_emb", "docs", "embedding", "cosine", None, false)
                 .unwrap();
 
             // Nearest to [1,0,0]: id 1 (exact), then id 4 (close direction).

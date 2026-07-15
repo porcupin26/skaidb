@@ -343,6 +343,13 @@ enum CollectSink<'a> {
 /// answers with the same guarantee at far fewer round-trips.
 const INDEX_POINT_READ_MAX: usize = 256;
 
+/// Largest `LIMIT` served by the distributed sorted top-k (past it the
+/// candidate union — members × 4×k — stops beating the exact full gather).
+const SORTED_TOPK_MAX: usize = 1000;
+
+/// Rows keyed by their storage key (the gather result shape).
+type KeyedRows = Vec<(Vec<u8>, Document)>;
+
 /// Journal-ack applier queue bound: past this, write acks block until the
 /// applier drains — sustained-overload backpressure, not per-burst shedding.
 const MAINT_QUEUE_MAX: usize = 8192;
@@ -3909,6 +3916,25 @@ impl Node {
                 },
                 None => Response::Err("busy: engine write-locked, retry".into()),
             },
+            Request::SortedScan {
+                table,
+                filter,
+                col,
+                desc,
+                fetch,
+            } => match self.local_read_bounded() {
+                Some(db) => {
+                    match db.local_sorted_candidates(&table, &filter, &col, desc, fetch as usize)
+                    {
+                        Ok(Some(keys)) => Response::Keys { keys },
+                        // No local index serves this order: the coordinator
+                        // must fall back to the full gather.
+                        Ok(None) => Response::Err("unsorted: no order-serving index".into()),
+                        Err(e) => Response::Err(e.to_string()),
+                    }
+                }
+                None => Response::Err("busy: engine write-locked, retry".into()),
+            },
             Request::VectorSearch { index, query, k } => match self.local_read_bounded() {
                 Some(db) => match db.vector_search_local(&index, &query, k as usize) {
                     Ok(hits) => Response::VectorHits { hits },
@@ -6442,6 +6468,65 @@ impl Coordinator {
     }
 }
 
+impl Coordinator {
+    /// The distributed sorted top-k gather: union every member's local
+    /// index-ordered candidates (each overfetched to absorb per-shard
+    /// staleness in the sort column and boundary ties), quorum re-read the
+    /// bounded union, and re-apply the filter. `None` means "can't serve it
+    /// exactly — take the full gather": any member unreachable or unable to
+    /// walk in order, or fewer resolved matches than `k` (candidates may
+    /// have missed rows buried by divergence, so only a result that provably
+    /// filled the limit is trusted). Every RETURNED row is quorum-fresh; the
+    /// caller re-sorts by the full ORDER BY and truncates.
+    fn sorted_topk(
+        &self,
+        table: &str,
+        filter: &Option<Expr>,
+        col: &str,
+        desc: bool,
+        k: usize,
+    ) -> EngineResult<Option<KeyedRows>> {
+        let fetch = k.saturating_mul(4).max(k.saturating_add(32));
+        // Local candidates first — same schema everywhere, so if the local
+        // plan cannot serve the order, peers cannot either.
+        let local = match self.node.with_local_read(|db| {
+            db.local_sorted_candidates(table, filter, col, desc, fetch)
+        }) {
+            Some(Ok(Some(keys))) => keys,
+            Some(Ok(None)) => return Ok(None),
+            Some(Err(e)) => return Err(e),
+            None => return Ok(None), // engine busy: keep the exact path
+        };
+        let mut keys: BTreeMap<Vec<u8>, ()> = local.into_iter().map(|kk| (kk, ())).collect();
+        let req = Request::SortedScan {
+            table: table.to_string(),
+            filter: filter.clone(),
+            col: col.to_string(),
+            desc,
+            fetch: fetch as u32,
+        };
+        let addrs = self.node.peer_addrs();
+        for resp in scatter(&addrs, |addr| self.node.pool.call(addr, &req)) {
+            match resp {
+                Ok(Response::Keys { keys: ks }) => {
+                    for kk in ks {
+                        keys.insert(kk, ());
+                    }
+                }
+                // A member that cannot contribute (unreachable, busy, or no
+                // order-serving index) makes the candidate union unsound.
+                _ => return Ok(None),
+            }
+        }
+        let rows = self.node.resolve_candidates(table, keys, self.oc)?;
+        let rows = filter_rows(filter, rows)?;
+        if rows.len() < k {
+            return Ok(None);
+        }
+        Ok(Some(rows))
+    }
+}
+
 impl Cluster for Coordinator {
     fn primary_key(&self, table: &str) -> EngineResult<Vec<String>> {
         self.node
@@ -6858,6 +6943,20 @@ impl Cluster for Coordinator {
                 return db.local_matching_rows_ordered(table, filter, order, fetch_limit);
             }
         }
+        // Distributed sorted top-k for the remaining (quorum) ordered case:
+        // every member contributes its local index-ordered top candidates,
+        // the bounded union is quorum re-read, and the executor re-sorts —
+        // `ORDER BY date DESC LIMIT 1` reads ~members × overfetch rows
+        // instead of gathering the whole match set (which timed a 150k-row
+        // account out at the statement limit, wishlist E-3). Single-key
+        // exact orders only; anything else keeps the exact full gather.
+        if let (Some((col, desc, true)), Some(k)) = (order, fetch_limit) {
+            if k <= SORTED_TOPK_MAX {
+                if let Some(rows) = self.sorted_topk(table, filter, col, desc, k)? {
+                    return Ok((rows, false));
+                }
+            }
+        }
         Ok((self.matching_rows(table, filter)?, false))
     }
 
@@ -7206,6 +7305,96 @@ mod tests {
         nc.execute("DELETE FROM t WHERE id = 2").unwrap();
         let rs = rows(na.execute("SELECT id FROM t ORDER BY id").unwrap());
         assert_eq!(rs.rows, vec![vec![Value::Int(1)], vec![Value::Int(3)]]);
+    }
+
+    /// QUORUM `ORDER BY <indexed> LIMIT k` takes the distributed sorted
+    /// top-k (member candidates + quorum re-read) and returns exactly the
+    /// brute-force answer — including after an update that moves a row into
+    /// the top spot via a different coordinator, and for sparse matches
+    /// where the completeness check forces the exact-gather fallback.
+    #[test]
+    fn quorum_ordered_limit_is_distributed_top_k() {
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let na = Node::new(
+            Database::open(temp_dir("stka")).unwrap(),
+            cfg("a", &a, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("stkb")).unwrap(),
+            cfg("b", &b, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nc = Node::new(
+            Database::open(temp_dir("stkc")).unwrap(),
+            cfg("c", &c, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        nc.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE emails (PRIMARY KEY (id))").unwrap();
+        na.execute("CREATE INDEX i_ad ON emails (account, date)").unwrap();
+        for i in 0..200 {
+            let acct = if i % 3 == 0 { "a@x" } else { "b@x" };
+            na.execute(&format!(
+                "INSERT INTO emails (id, account, date) VALUES ('k{i:03}', '{acct}', {})",
+                (i * 37) % 1000
+            ))
+            .unwrap();
+        }
+        // Brute force via an unordered projection.
+        let mut dates: Vec<i64> = rows(
+            nb.execute("SELECT date FROM emails WHERE account = 'b@x'").unwrap(),
+        )
+        .rows
+        .into_iter()
+        .map(|r| match r[0] {
+            Value::Int(d) => d,
+            ref other => panic!("{other:?}"),
+        })
+        .collect();
+        dates.sort_unstable();
+        dates.reverse();
+        // QUORUM ordered read via a different coordinator.
+        let got = rows(
+            nb.execute(
+                "SELECT date FROM emails WHERE account = 'b@x' ORDER BY date DESC LIMIT 3",
+            )
+            .unwrap(),
+        );
+        let got: Vec<i64> = got
+            .rows
+            .into_iter()
+            .map(|r| match r[0] {
+                Value::Int(d) => d,
+                ref other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(got, dates[..3].to_vec(), "top-3 matches brute force");
+
+        // An update via C must surface at the top via A (quorum re-read).
+        nc.execute("UPDATE emails SET date = 5000 WHERE id = 'k001'").unwrap();
+        let top = rows(
+            na.execute(
+                "SELECT id, date FROM emails WHERE account = 'b@x' ORDER BY date DESC LIMIT 1",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            top.rows[0],
+            vec![Value::String("k001".into()), Value::Int(5000)]
+        );
+
+        // Sparse match (fewer rows than LIMIT): completeness check falls back
+        // to the exact gather and still answers correctly.
+        let sparse = rows(
+            nc.execute(
+                "SELECT id FROM emails WHERE account = 'b@x' AND date = 5000 \
+                 ORDER BY date DESC LIMIT 10",
+            )
+            .unwrap(),
+        );
+        assert_eq!(sparse.rows.len(), 1);
     }
 
     #[test]

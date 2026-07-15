@@ -352,6 +352,17 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) -> io::Result<()> {
         }
         None => execute_as(&ctx, &role, &sql),
     };
+    // Row results stream as chunked JSON — one bounded buffer at a time, so
+    // a big result never materializes a response-sized string (a multi-GB
+    // /query serialization pinned a production node at its cgroup ceiling,
+    // 2026-07-15; this also lifts the 64 MiB response cap for row results,
+    // matching the binary protocol's QueryStream). Everything else keeps the
+    // single-frame path.
+    if let Response::Rows { columns, rows } = response {
+        let sent = write_rows_chunked(&mut stream, &columns, &rows)?;
+        ctx.metrics.add_bytes_returned(Endpoint::Rest, sent);
+        return Ok(());
+    }
     let (status, payload) = response_to_json(response);
     // Serialize the payload exactly once: the same string feeds both the
     // bytes-returned metric and the wire.
@@ -359,6 +370,52 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) -> io::Result<()> {
     ctx.metrics
         .add_bytes_returned(Endpoint::Rest, body.len() as u64);
     write_json_body(&mut stream, status, &body)
+}
+
+/// Stream `{"columns": [...], "rows": [...]}` as a chunked HTTP response,
+/// serializing ~64 KiB at a time. Returns the body bytes written. The
+/// socket's write timeout bounds each chunk, so a stalled reader aborts the
+/// handler instead of pinning the buffers.
+fn write_rows_chunked(
+    stream: &mut TcpStream,
+    columns: &[String],
+    rows: &[Vec<skaidb_types::Value>],
+) -> io::Result<u64> {
+    const FLUSH_AT: usize = 64 * 1024;
+    stream.write_all(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+    )?;
+    let mut sent: u64 = 0;
+    let mut buf = String::with_capacity(FLUSH_AT + 8 * 1024);
+    fn flush_chunk(stream: &mut TcpStream, buf: &mut String) -> io::Result<u64> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let n = buf.len() as u64;
+        stream.write_all(format!("{:x}\r\n", buf.len()).as_bytes())?;
+        stream.write_all(buf.as_bytes())?;
+        stream.write_all(b"\r\n")?;
+        buf.clear();
+        Ok(n)
+    }
+    buf.push_str("{\"columns\":");
+    buf.push_str(&serde_json::to_string(columns).unwrap_or_else(|_| "[]".into()));
+    buf.push_str(",\"rows\":[");
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            buf.push(',');
+        }
+        let j = Json::Array(row.iter().map(|v| v.to_json()).collect());
+        buf.push_str(&j.to_string());
+        if buf.len() >= FLUSH_AT {
+            sent += flush_chunk(stream, &mut buf)?;
+        }
+    }
+    buf.push_str("]}");
+    sent += flush_chunk(stream, &mut buf)?;
+    stream.write_all(b"0\r\n\r\n")?;
+    stream.flush()?;
+    Ok(sent)
 }
 
 /// A parsed HTTP request (just the parts the gateway needs).

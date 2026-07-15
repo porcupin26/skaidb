@@ -1618,6 +1618,43 @@ impl Parser {
             }
             Token::Ident(_) => {
                 let path = self.parse_path()?;
+                // `CAST(expr AS type)` — standard-SQL spelling, desugared at
+                // parse time into the matching `to_<type>()` scalar function
+                // (one evaluation path, no dedicated AST node). `CAST` is
+                // contextual: still usable as a column name.
+                if path.eq_ignore_ascii_case("cast") && self.peek() == &Token::LParen {
+                    self.advance();
+                    let inner = self.parse_expr()?;
+                    self.expect_keyword(Keyword::As)?;
+                    let ty = match self.advance() {
+                        Token::Ident(t) => t,
+                        other => {
+                            return Err(ParseError::Unexpected {
+                                found: format!("{other:?}"),
+                                expected: "a type name (INT/FLOAT/STRING/BOOL/TIMESTAMP)"
+                                    .into(),
+                            })
+                        }
+                    };
+                    self.expect(&Token::RParen)?;
+                    let func = match ty.to_ascii_lowercase().as_str() {
+                        "int" | "integer" | "bigint" | "long" => "to_int",
+                        "float" | "double" | "real" => "to_float",
+                        "string" | "text" | "varchar" => "to_string",
+                        "bool" | "boolean" => "to_bool",
+                        "timestamp" | "datetime" => "to_timestamp",
+                        other => {
+                            return Err(ParseError::Other(format!(
+                                "CAST target type {other:?} is not supported \
+                                 (INT/FLOAT/STRING/BOOL/TIMESTAMP)"
+                            )))
+                        }
+                    };
+                    return Ok(Expr::Func {
+                        name: func.into(),
+                        args: vec![inner],
+                    });
+                }
                 // A bare name directly followed by `(` is a function call:
                 // the time-series aggregates get `Expr::Aggregate` (the
                 // executor treats them like other aggregates), everything

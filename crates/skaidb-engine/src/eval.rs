@@ -133,6 +133,77 @@ fn eval_func(name: &str, args: &[Expr], row: &Document) -> Result<Value> {
                 _ => Value::Null,
             })
         }
+        // The remaining coercions (the `CAST(x AS t)` desugar targets). Same
+        // policy as `to_timestamp`: unconvertible input is `NULL`, never an
+        // error — one odd row in a schema-less column must not kill a query.
+        "to_int" => {
+            let v = one_arg("to_int", args, row)?;
+            Ok(match v {
+                Value::Int(i) => Value::Int(i),
+                Value::Float(f) if f.is_finite() => Value::Int(f as i64),
+                Value::Bool(b) => Value::Int(i64::from(b)),
+                Value::Timestamp(t) => Value::Int(t),
+                Value::Decimal(d) => 10i128
+                    .checked_pow(d.scale)
+                    .map(|div| Value::Int((d.mantissa / div) as i64))
+                    .unwrap_or(Value::Null),
+                Value::String(s) => {
+                    let s = s.trim();
+                    s.parse::<i64>()
+                        .ok()
+                        .or_else(|| s.parse::<f64>().ok().filter(|f| f.is_finite()).map(|f| f as i64))
+                        .map(Value::Int)
+                        .unwrap_or(Value::Null)
+                }
+                _ => Value::Null,
+            })
+        }
+        "to_float" => {
+            let v = one_arg("to_float", args, row)?;
+            Ok(match v {
+                Value::Float(f) => Value::Float(f),
+                Value::Int(i) => Value::Float(i as f64),
+                Value::Bool(b) => Value::Float(if b { 1.0 } else { 0.0 }),
+                Value::Timestamp(t) => Value::Float(t as f64),
+                Value::Decimal(d) => {
+                    Value::Float(d.mantissa as f64 / 10f64.powi(d.scale as i32))
+                }
+                Value::String(s) => s
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|f| f.is_finite())
+                    .map(Value::Float)
+                    .unwrap_or(Value::Null),
+                _ => Value::Null,
+            })
+        }
+        "to_string" => {
+            let v = one_arg("to_string", args, row)?;
+            Ok(match v {
+                Value::String(s) => Value::String(s),
+                Value::Int(i) => Value::String(i.to_string()),
+                Value::Float(f) => Value::String(f.to_string()),
+                Value::Bool(b) => Value::String(b.to_string()),
+                Value::Timestamp(t) => Value::String(format_iso8601_ms(t)),
+                Value::Uuid(u) => Value::String(u.to_string()),
+                Value::Decimal(d) => Value::String(d.to_string()),
+                _ => Value::Null,
+            })
+        }
+        "to_bool" => {
+            let v = one_arg("to_bool", args, row)?;
+            Ok(match v {
+                Value::Bool(b) => Value::Bool(b),
+                Value::Int(i) => Value::Bool(i != 0),
+                Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+                    "true" | "t" | "1" => Value::Bool(true),
+                    "false" | "f" | "0" => Value::Bool(false),
+                    _ => Value::Null,
+                },
+                _ => Value::Null,
+            })
+        }
         // `score()` reads the BM25 score the search gather injects into each
         // hit; outside a search query there is nothing to read.
         "score" => {
@@ -171,6 +242,40 @@ fn eval_func(name: &str, args: &[Expr], row: &Document) -> Result<Value> {
             )))
         }
         other => Err(EngineError::Type(format!("unknown function {other}()"))),
+    }
+}
+
+/// Evaluate the single argument of a one-arg scalar function.
+fn one_arg(name: &str, args: &[Expr], row: &Document) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(EngineError::Type(format!(
+            "{name}(value) takes exactly one argument"
+        )));
+    }
+    eval(&args[0], row)
+}
+
+/// Format epoch milliseconds as UTC ISO-8601 (`YYYY-MM-DDTHH:MM:SS[.mmm]Z`),
+/// the inverse of [`parse_iso8601_ms`] (Howard Hinnant's civil-from-days).
+fn format_iso8601_ms(ms: i64) -> String {
+    let days = ms.div_euclid(86_400_000);
+    let rem = ms.rem_euclid(86_400_000);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    let (secs, ms_part) = (rem / 1000, rem % 1000);
+    let (hh, mm, ss) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if ms_part == 0 {
+        format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+    } else {
+        format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{ms_part:03}Z")
     }
 }
 
@@ -842,6 +947,52 @@ mod tests {
             &row
         )
         .unwrap());
+    }
+
+    #[test]
+    fn cast_desugars_to_coercions() {
+        let row = doc(&[
+            ("s", Value::String("42".into())),
+            ("f", Value::Float(3.9)),
+            ("iso", Value::String("1970-01-02T00:00:00Z".into())),
+            ("junk", Value::String("not a number".into())),
+        ]);
+        assert_eq!(eval(&expr("CAST(s AS INT)"), &row).unwrap(), Value::Int(42));
+        assert_eq!(eval(&expr("CAST(f AS INT)"), &row).unwrap(), Value::Int(3));
+        assert_eq!(
+            eval(&expr("CAST(s AS FLOAT)"), &row).unwrap(),
+            Value::Float(42.0)
+        );
+        assert_eq!(
+            eval(&expr("CAST(f AS STRING)"), &row).unwrap(),
+            Value::String("3.9".into())
+        );
+        assert_eq!(
+            eval(&expr("CAST(iso AS TIMESTAMP)"), &row).unwrap(),
+            Value::Timestamp(86_400_000)
+        );
+        assert_eq!(
+            eval(&expr("CAST('true' AS BOOL)"), &row).unwrap(),
+            Value::Bool(true)
+        );
+        // Unconvertible -> NULL, never an error.
+        assert_eq!(eval(&expr("CAST(junk AS INT)"), &row).unwrap(), Value::Null);
+        // Timestamp -> ISO string round-trips through the parser.
+        assert_eq!(
+            eval(&expr("CAST(CAST(iso AS TIMESTAMP) AS STRING)"), &row).unwrap(),
+            Value::String("1970-01-02T00:00:00Z".into())
+        );
+        // `cast` is contextual: still a valid column name.
+        let row2 = doc(&[("cast", Value::Int(7))]);
+        assert_eq!(eval(&expr("cast + 1"), &row2).unwrap(), Value::Int(8));
+    }
+
+    #[test]
+    fn iso8601_formatter_roundtrips() {
+        for ms in [0i64, 86_400_000, 1_752_595_200_123, 253_402_300_799_000] {
+            let s = format_iso8601_ms(ms);
+            assert_eq!(parse_iso8601_ms(&s), Some(ms), "{s}");
+        }
     }
 
     #[test]

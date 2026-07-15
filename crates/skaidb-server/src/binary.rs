@@ -147,6 +147,51 @@ fn handle_connection(stream: TcpStream, ctx: Shared) {
                 },
                 None => Response::Error(format!("unknown prepared statement id {id}")),
             },
+            Ok(ClientRequest::ExecuteBatch {
+                id,
+                rows,
+                consistency,
+            }) => match prepared.get(id as usize).and_then(Option::as_ref) {
+                Some(ps) => {
+                    // One round-trip for the whole batch; each row binds and
+                    // executes exactly like a looped Execute (per-row
+                    // autocommit, RBAC on the bound statement). On the first
+                    // failure the error names the row — earlier rows stay
+                    // applied, matching the loop the driver used to run.
+                    let c = Some(session_consistency.unwrap_or(consistency));
+                    let mut affected: u64 = 0;
+                    let mut failure = None;
+                    for (i, params) in rows.iter().enumerate() {
+                        let response = match skaidb_sql::bind(&ps.stmt, params) {
+                            Ok(bound) => execute_session_statement_as(
+                                &ctx,
+                                &role,
+                                &mut current_db,
+                                &ps.sql,
+                                Ok(bound),
+                                c,
+                            ),
+                            Err(e) => Response::Error(e.to_string()),
+                        };
+                        match response {
+                            Response::Mutation { affected: n } => affected += n,
+                            Response::Ddl | Response::Rows { .. } => {}
+                            Response::Error(msg) => {
+                                failure = Some(Response::Error(format!(
+                                    "batch row {i}: {msg} ({affected} rows applied before it)"
+                                )));
+                                break;
+                            }
+                            other => {
+                                failure = Some(other);
+                                break;
+                            }
+                        }
+                    }
+                    failure.unwrap_or(Response::Mutation { affected })
+                }
+                None => Response::Error(format!("unknown prepared statement id {id}")),
+            },
             Ok(ClientRequest::Close { id }) => {
                 match prepared.get_mut(id as usize).map(Option::take) {
                     Some(Some(_)) => Response::Ddl,

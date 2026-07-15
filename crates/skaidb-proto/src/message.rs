@@ -68,6 +68,18 @@ pub enum ClientRequest {
     /// with a single ordinary frame. Old servers reject the opcode with
     /// [`Response::Error`], which callers surface as "server too old".
     QueryStream { sql: String, consistency: Consistency },
+    /// Execute a prepared statement once per parameter row — the wire form of
+    /// `executemany`: one round-trip for a whole bulk backfill instead of one
+    /// per row. Each row autocommits like a looped `Execute`; on a failure
+    /// the reply is an error naming the row index and earlier rows stay
+    /// applied. Answered with [`Response::Mutation`] carrying the total
+    /// affected count. Old servers reject the opcode with
+    /// [`Response::Error`], which drivers use to fall back to the loop.
+    ExecuteBatch {
+        id: u32,
+        rows: Vec<Vec<Value>>,
+        consistency: Consistency,
+    },
 }
 
 /// A server response.
@@ -114,6 +126,9 @@ const OP_QUERY_STREAM: u8 = 5;
 /// reject the opcode with an (untagged) [`Response::Error`], which pipelining
 /// clients surface as "server too old".
 const OP_TAGGED: u8 = 6;
+/// `u8 OP_EXECUTE_BATCH | u8 consistency | u32 id | u32 nrows |
+///  nrows × (u16 nparams | nparams × (u32 len | value bytes))`.
+const OP_EXECUTE_BATCH: u8 = 7;
 const RESP_ROWS: u8 = 0;
 const RESP_MUTATION: u8 = 1;
 const RESP_DDL: u8 = 2;
@@ -249,6 +264,26 @@ impl ClientRequest {
                 out.push(consistency.to_u8());
                 write_bytes(out, sql.as_bytes());
             }
+            ClientRequest::ExecuteBatch {
+                id,
+                rows,
+                consistency,
+            } => {
+                out.push(OP_EXECUTE_BATCH);
+                out.push(consistency.to_u8());
+                out.extend_from_slice(&id.to_le_bytes());
+                out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+                for params in rows {
+                    out.extend_from_slice(&(params.len() as u16).to_le_bytes());
+                    for v in params {
+                        let len_pos = out.len();
+                        out.extend_from_slice(&[0u8; 4]);
+                        v.encode_value_into(out);
+                        let len = (out.len() - len_pos - 4) as u32;
+                        out[len_pos..len_pos + 4].copy_from_slice(&len.to_le_bytes());
+                    }
+                }
+            }
         }
     }
 
@@ -284,6 +319,31 @@ impl ClientRequest {
                 }
             }
             OP_CLOSE => ClientRequest::Close { id: c.u32()? },
+            OP_EXECUTE_BATCH => {
+                let consistency = Consistency::from_u8(c.u8()?)
+                    .ok_or(ProtoError::Malformed("bad consistency"))?;
+                let id = c.u32()?;
+                let nrows = c.u32()? as usize;
+                let mut rows = Vec::with_capacity(nrows.min(1 << 16));
+                for _ in 0..nrows {
+                    let nparams =
+                        u16::from_le_bytes(c.take(2)?.try_into().unwrap()) as usize;
+                    let mut params = Vec::with_capacity(nparams);
+                    for _ in 0..nparams {
+                        let bytes = c.bytes()?;
+                        params.push(
+                            Value::decode(bytes)
+                                .map_err(|_| ProtoError::Malformed("bad value encoding"))?,
+                        );
+                    }
+                    rows.push(params);
+                }
+                ClientRequest::ExecuteBatch {
+                    id,
+                    rows,
+                    consistency,
+                }
+            }
             OP_QUERY_STREAM => {
                 let consistency = Consistency::from_u8(c.u8()?)
                     .ok_or(ProtoError::Malformed("bad consistency"))?;
@@ -536,6 +596,19 @@ mod tests {
                 consistency: Consistency::All,
             },
             ClientRequest::Close { id: 9 },
+            ClientRequest::ExecuteBatch {
+                id: 5,
+                rows: vec![
+                    vec![Value::Int(1), Value::Array(vec![Value::String("a".into())])],
+                    vec![Value::Int(2), Value::Null],
+                ],
+                consistency: Consistency::Quorum,
+            },
+            ClientRequest::ExecuteBatch {
+                id: 0,
+                rows: vec![],
+                consistency: Consistency::One,
+            },
         ] {
             assert_eq!(ClientRequest::decode(&req.encode()).unwrap(), req);
         }

@@ -113,6 +113,20 @@ pub enum Request {
         start: Option<Vec<u8>>,
         end: Option<Vec<u8>>,
     },
+    /// This shard's top-`fetch` candidate keys for `ORDER BY col [DESC]`
+    /// under `filter`, served only when a local index walks in that order
+    /// (answered with [`Response::Keys`]; an empty-handed node that cannot
+    /// serve the order answers `Response::Unsupported`-style error). Feeds
+    /// the distributed sorted top-k: the coordinator unions candidates from
+    /// every member, quorum re-reads them, and re-sorts — per-shard
+    /// staleness in the sort column is corrected by that re-read.
+    SortedScan {
+        table: String,
+        filter: Option<Expr>,
+        col: String,
+        desc: bool,
+        fetch: u32,
+    },
     /// Approximate `k` nearest keys to `query` from the node's local vector
     /// index (one shard). The coordinator merges these across nodes.
     VectorSearch {
@@ -351,6 +365,7 @@ const REQ_SEARCHAGG: u8 = 26;
 const REQ_SEARCHSORTED: u8 = 27;
 const REQ_SEARCHEXPLAIN: u8 = 28;
 const REQ_HOSTSTATS: u8 = 29;
+const REQ_SORTEDSCAN: u8 = 30;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
@@ -489,6 +504,26 @@ impl Request {
                 put_str(o, index);
                 put_opt_bytes(o, start.as_deref());
                 put_opt_bytes(o, end.as_deref());
+            }
+            Request::SortedScan {
+                table,
+                filter,
+                col,
+                desc,
+                fetch,
+            } => {
+                o.push(REQ_SORTEDSCAN);
+                put_str(o, table);
+                match filter {
+                    Some(f) => {
+                        o.push(1);
+                        put_expr(o, f);
+                    }
+                    None => o.push(0),
+                }
+                put_str(o, col);
+                o.push(u8::from(*desc));
+                o.extend_from_slice(&fetch.to_le_bytes());
             }
             Request::VectorSearch { index, query, k } => {
                 o.push(REQ_VECTOR);
@@ -683,6 +718,20 @@ impl Request {
                 start: c.opt_bytes()?,
                 end: c.opt_bytes()?,
             },
+            REQ_SORTEDSCAN => {
+                let table = c.string()?;
+                let filter = match c.u8()? {
+                    0 => None,
+                    _ => Some(c.expr()?),
+                };
+                Request::SortedScan {
+                    table,
+                    filter,
+                    col: c.string()?,
+                    desc: c.u8()? != 0,
+                    fetch: c.u32()?,
+                }
+            }
             REQ_VECTOR => {
                 let index = c.string()?;
                 let n = c.u32()? as usize;
@@ -2092,6 +2141,32 @@ mod tests {
             filter,
         };
         assert_eq!(Request::decode(&req.encode()).unwrap(), req);
+    }
+
+    #[test]
+    fn sorted_scan_roundtrips() {
+        use skaidb_sql::ast::{BinaryOp, Expr};
+        use skaidb_types::Value;
+        let req = Request::SortedScan {
+            table: "emails".into(),
+            filter: Some(Expr::Binary {
+                op: BinaryOp::Eq,
+                left: Box::new(Expr::Column("account".into())),
+                right: Box::new(Expr::Literal(Value::String("a@x".into()))),
+            }),
+            col: "date".into(),
+            desc: true,
+            fetch: 44,
+        };
+        assert_eq!(Request::decode(&req.encode()).unwrap(), req);
+        let bare = Request::SortedScan {
+            table: "t".into(),
+            filter: None,
+            col: "ts".into(),
+            desc: false,
+            fetch: 1,
+        };
+        assert_eq!(Request::decode(&bare.encode()).unwrap(), bare);
     }
 
     #[test]

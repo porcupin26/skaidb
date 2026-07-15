@@ -19,7 +19,7 @@ anti-entropy, online resharding. Two binaries ship: `skaidb` (server) and
 
 | Surface | Default port | Auth | Use for |
 |---|---|---|---|
-| Binary protocol (drivers, `skaidbsh`) | 7000 | SCRAM | sessions, prepared statements, pipelining, streaming |
+| Binary protocol (drivers, `skaidbsh`) | 7000 | SCRAM | sessions, prepared statements, batched executemany, pipelining, streaming |
 | REST `POST /query` | 7080 | HTTP Basic | one-shot SQL from anything that speaks HTTP |
 | ES-compatible REST subset | 7080 | HTTP Basic | existing ES clients / log shippers |
 | Prometheus `remote_write` + `/api/v1/*` | 7080 | HTTP Basic | metrics ingest + Grafana |
@@ -58,11 +58,10 @@ Key facts an agent must know:
 - **The REST gateway is stateless**: `USE db` does not persist between
   calls. Pass `{"sql": ..., "db": "mydb"}` per request, or qualify names
   (`mydb.orders`). Binary-protocol sessions do keep `USE` state.
-- **REST is bounded**: request bodies over 64 MiB → 413; a `/query` result
-  that would serialize past 64 MiB → an error suggesting `LIMIT` or the
-  binary protocol's streaming query (which has no such cap); sockets carry
-  30 s read / 60 s write timeouts, so a stalled client can't pin a handler.
-  Bulk transfers belong on the binary protocol.
+- **REST row results stream** (chunked JSON, ~64 KiB at a time): no
+  response-size cap and no response-sized buffer. Request bodies over
+  64 MiB → 413; sockets carry 30 s read / 60 s write timeouts, so a stalled
+  client can't pin a handler. Bulk WRITES belong on the binary protocol.
 - **String literals use single quotes** (`'ada'`, escape by doubling:
   `'O''Brien'`). **Double quotes are identifiers** (`"weird name"`). Sending
   `"text"` where a string is expected is a common LLM error.
@@ -111,7 +110,10 @@ Key facts an agent must know:
 - **Scalar functions**: `now()` (statement start, timestamp),
   `time_bucket(step, ts)` (floor to bucket: `time_bucket(5m, ts)`),
   `to_timestamp(v)` (epoch-ms number or ISO-8601 string → timestamp;
-  unparseable/mistyped → NULL — range-filter string timestamps in-query).
+  unparseable/mistyped → NULL — range-filter string timestamps in-query),
+  and `CAST(x AS INT|FLOAT|STRING|BOOL|TIMESTAMP)` (desugars to
+  `to_int`/`to_float`/`to_string`/`to_bool`/`to_timestamp`, same
+  NULL-on-unconvertible policy; timestamps stringify as ISO-8601).
 - **`SELECT <expr>` without FROM**: constant projection, one row
   (`SELECT 1` = liveness probe; needs no privilege). `*` and other
   clauses still require a table; a FROM-less leg works inside UNION.
@@ -291,7 +293,10 @@ owning table — a role that creates its indexes can drop them.
 **Indexing**: predicates on indexed columns (`=`, ranges, AND-combined) and
 matching `ORDER BY` accelerate; everything else scans with identical
 results. The primary key routes in a cluster: `WHERE pk = v` is a point
-read to the key's replica set.
+read to the key's replica set. QUORUM `ORDER BY <indexed> LIMIT k`
+(k ≤ 1000, single sort key) is a **distributed sorted top-k**: each member
+contributes its local index-ordered candidates, the bounded union is
+quorum re-read and re-sorted — reads ~members × 4k rows, not the match set.
 
 ---
 

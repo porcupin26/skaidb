@@ -533,6 +533,46 @@ mod tests {
     }
 
     #[test]
+    /// ExecuteBatch runs a prepared statement once per row in one
+    /// round-trip; a mid-batch failure names the row and keeps earlier rows.
+    #[test]
+    fn execute_batch_end_to_end() {
+        let ctx = temp_ctx();
+        let (addr, _h) = binary::spawn("127.0.0.1:0", ctx).unwrap();
+        let mut client = Client::connect(addr).unwrap();
+        client.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+
+        let mut ins = client
+            .prepare("INSERT INTO t (id, tags) VALUES (?, ?)")
+            .unwrap();
+        let rows: Vec<Vec<Value>> = (0..100i64)
+            .map(|i| {
+                vec![
+                    Value::Int(i),
+                    Value::Array(vec![Value::String(format!("t{}", i % 5))]),
+                ]
+            })
+            .collect();
+        assert_eq!(client.execute_batch(&mut ins, rows).unwrap(), 100);
+        match client.execute("SELECT count(*) FROM t").unwrap() {
+            Response::Rows { rows, .. } => assert_eq!(rows[0][0], Value::Int(100)),
+            other => panic!("{other:?}"),
+        }
+        // A bad row (arity) fails naming the row; the earlier row applied.
+        let mixed = vec![
+            vec![Value::Int(200), Value::Array(vec![])],
+            vec![Value::Int(201)], // wrong arity
+        ];
+        let err = client.execute_batch(&mut ins, mixed).unwrap_err().to_string();
+        assert!(err.contains("batch row 1"), "{err}");
+        assert!(err.contains("1 rows applied"), "{err}");
+        match client.execute("SELECT count(*) FROM t WHERE id = 200").unwrap() {
+            Response::Rows { rows, .. } => assert_eq!(rows[0][0], Value::Int(1)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn prepared_statements_end_to_end() {
         let ctx = temp_ctx();
         let (addr, _h) = binary::spawn("127.0.0.1:0", ctx).unwrap();
@@ -651,6 +691,61 @@ mod tests {
         // Selecting a missing table is a server-side error.
         let err = client.execute("SELECT * FROM missing").unwrap_err();
         assert!(err.to_string().contains("does not exist"), "got: {err}");
+    }
+
+    /// `/query` row results stream as chunked JSON (no response-sized buffer,
+    /// no 64 MiB row cap) and reassemble into exactly the old payload shape;
+    /// non-row responses keep the Content-Length single-frame path.
+    #[test]
+    fn rest_query_rows_stream_chunked() {
+        let ctx = temp_ctx();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
+        let http = |body: &str| -> String {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            let head = format!(
+                "POST /query HTTP/1.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(body.as_bytes()).unwrap();
+            let mut resp = String::new();
+            stream.read_to_string(&mut resp).unwrap();
+            resp
+        };
+        // DDL/mutations: plain Content-Length responses.
+        let resp = http("CREATE TABLE t (PRIMARY KEY (id))");
+        assert!(resp.contains("Content-Length:"), "{resp}");
+        // Enough rows to cross the 64 KiB flush threshold mid-stream.
+        for batch in 0..5 {
+            let mut vals = Vec::new();
+            for i in 0..200 {
+                let id = batch * 200 + i;
+                vals.push(format!("({id}, '{}')", "x".repeat(120)));
+            }
+            http(&format!("INSERT INTO t (id, v) VALUES {}", vals.join(", ")));
+        }
+        let resp = http("SELECT id, v FROM t");
+        assert!(resp.contains("Transfer-Encoding: chunked"), "{resp}");
+        // Reassemble the chunked body and parse it.
+        let body_start = resp.find("\r\n\r\n").unwrap() + 4;
+        let mut body = String::new();
+        let mut rest = &resp[body_start..];
+        loop {
+            let nl = rest.find("\r\n").unwrap();
+            let size = usize::from_str_radix(rest[..nl].trim(), 16).unwrap();
+            if size == 0 {
+                break;
+            }
+            body.push_str(&rest[nl + 2..nl + 2 + size]);
+            rest = &rest[nl + 2 + size + 2..];
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["columns"], serde_json::json!(["id", "v"]));
+        assert_eq!(parsed["rows"].as_array().unwrap().len(), 1000);
+        // Errors keep the single-frame path too.
+        let resp = http("SELECT * FROM missing");
+        assert!(resp.contains("Content-Length:"), "{resp}");
+        assert!(resp.contains("does not exist"), "{resp}");
     }
 
     #[test]

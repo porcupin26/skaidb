@@ -164,10 +164,14 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   `ADD`/`DROP COLUMN` — a field simply exists in the rows that set it.
 - **`SHOW TABLES`** lists catalog tables as `(table, primary_key)` rows;
   **`SHOW INDEXES`** lists secondary, vector, and search indexes as
-  `(index, table, kind, columns)`. Both are read-only and require no special
-  privilege, so a monitoring/tooling agent can enumerate the schema without
-  `/query` data access. In cluster mode they answer from the local catalog (the
-  schema is identical on every node).
+  `(index, table, kind, columns, local)` — `local` is **this node's** live
+  state for the index: `ok` (open and serving), `building` (backfill or
+  catch-up running), or `missing` (in the catalog but no live index — the
+  divergence that used to be invisible and made a per-node search outage a
+  multi-day mystery). Both are read-only and require no special privilege,
+  so a monitoring/tooling agent can enumerate the schema without `/query`
+  data access. In cluster mode they answer from the local catalog — ask each
+  node to compare `local` states across the ring.
 - **`DESCRIBE <table>`** (alias **`DESC <table>`**) is one table's structure as
   `(column, key, indexes)` rows — one per column that is part of the primary key
   or an index. `key` is `primary key` (with a `(n/m)` position for a composite
@@ -398,7 +402,12 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   `YYYY-MM-DD[T ]HH:MM[:SS[.fff]]`, optional `Z`/`±HH[:MM]` offset; no offset
   = UTC). Unparseable or mistyped input yields `NULL`, never an error — so
   string timestamps (e.g. from a Mongo migration) range-filter in-query:
-  `WHERE to_timestamp(created_at) >= now() - 30d`. A bare identifier
+  `WHERE to_timestamp(created_at) >= now() - 30d`. The standard spelling
+  **`CAST(<expr> AS <type>)`** (types: `INT`, `FLOAT`, `STRING`, `BOOL`,
+  `TIMESTAMP`) desugars to the matching coercion (`to_int`, `to_float`,
+  `to_string` — timestamps render as ISO-8601 —, `to_bool`,
+  `to_timestamp`), all with the same NULL-on-unconvertible policy. `cast`
+  stays usable as a column name. A bare identifier
   directly followed by `(` parses as a function call; unknown functions are
   execution errors. The full-text search functions `MATCH`, `MATCH_PHRASE`,
   `FUZZY`, `SEARCH`, and `score` parse the same way and are only valid in a

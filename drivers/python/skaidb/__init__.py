@@ -283,6 +283,7 @@ _OP_QUERY = 1
 _OP_PREPARE = 2
 _OP_EXECUTE = 3
 _OP_CLOSE = 4
+_OP_EXECUTE_BATCH = 7
 
 _RESP_ROWS = 0
 _RESP_MUTATION = 1
@@ -657,6 +658,24 @@ class Connection:
             req += vb
         return self._parse_result(self._roundtrip(bytes(req)))
 
+    def _execute_batch(self, stmt_id: int, rows: "list[Sequence[Any]]", consistency: int):
+        """One round-trip executing a prepared statement once per param row
+        (the `executemany` wire op). Returns the parsed result (total
+        affected). Raises `ProgrammingError` on a row failure (the server
+        names the failing row; earlier rows stay applied)."""
+        req = bytearray()
+        req.append(_OP_EXECUTE_BATCH)
+        req.append(consistency)
+        req += struct.pack("<I", stmt_id)
+        req += struct.pack("<I", len(rows))
+        for params in rows:
+            req += struct.pack("<H", len(params))
+            for p in params:
+                vb = _encode_value(p)
+                req += struct.pack("<I", len(vb))
+                req += vb
+        return self._parse_result(self._roundtrip(bytes(req)))
+
     def _close_prepared(self, stmt_id: int) -> None:
         """Best-effort free of a server-side prepared slot (it replies Ddl)."""
         req = bytes([_OP_CLOSE]) + struct.pack("<I", stmt_id)
@@ -764,8 +783,44 @@ class Cursor:
         return self
 
     def executemany(self, sql: str, seq_of_params: Iterable[Sequence[Any]]) -> None:
+        rows = [list(p) for p in seq_of_params]
+        if not rows:
+            self.rowcount = 0
+            return
+        # One round-trip for the whole batch via the ExecuteBatch wire op
+        # (prepare once, ship every param row in a single frame). Falls back
+        # to the per-row loop for unpreparable statements and for servers
+        # that predate the opcode.
+        try:
+            stmt_id, nparams, cached = self.connection._prepare(sql)
+        except _Unpreparable:
+            self._executemany_loop(sql, rows)
+            return
+        for i, params in enumerate(rows):
+            if len(params) != nparams:
+                raise ProgrammingError(
+                    f"row {i}: statement expects {nparams} parameters, got {len(params)}"
+                )
+        try:
+            kind, a, _ = self.connection._execute_batch(
+                stmt_id, rows, self._consistency
+            )
+        except ProgrammingError as e:
+            if "unknown opcode" in str(e):  # pre-batch server
+                self._executemany_loop(sql, rows)
+                return
+            raise
+        finally:
+            if not cached:
+                self.connection._close_prepared(stmt_id)
+        self.description = None
+        self._rows = []
+        self._pos = 0
+        self.rowcount = a if kind == "mutation" else -1
+
+    def _executemany_loop(self, sql: str, rows: "list[Sequence[Any]]") -> None:
         total = 0
-        for params in seq_of_params:
+        for params in rows:
             self.execute(sql, params)
             if self.rowcount and self.rowcount > 0:
                 total += self.rowcount

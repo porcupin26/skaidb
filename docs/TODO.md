@@ -83,35 +83,13 @@ k BY` per-group top-k). General window functions (`ROW_NUMBER() OVER
 ## agencik integration wishlist (open items)
 
 Gaps from migrating **agencik** onto native skaidb
-(`~/projects/agencik/docs/skaidb-wishlist.md`). Both rounds' shipped work
-(phases 1–5 in v0.83.0, round 2 in v0.85.x: prepared-statement Python
-driver with typed array/document binds, `IN`/`BETWEEN`/`LIKE`/object
-literals, `to_timestamp`, `SELECT 1`, `MONITOR`, table-scoped index DDL,
-PK-`IN` point-read sets, `LIMIT ?`/`OFFSET ?`, budget-bounded + fail-fast
-grouped-search fallback, search-index catalog/live heal, order-aware
-EXPLAIN, bindable EXPLAIN) lives in git history and the wishlist ledger.
-Still open:
+(`~/projects/agencik/docs/skaidb-wishlist.md`). Shipped work (v0.83.0
+through v0.87.x — see the wishlist ledger + git history; latest round:
+index-def convergence on schema sync + SHOW INDEXES `local` health,
+chunked-streaming REST rows, CAST syntax, batched executemany wire op,
+distributed sorted top-k for QUORUM ordered reads, humanized EXPLAIN
+names) lives in git history. Still open:
 
-- [ ] **[fts] Search-index defs don't converge via schema repair** (P1) —
-  the root cause of the production `.6` divergence (its def covered only
-  `text` while peers had `text, channel, ts`; fixed operationally by a
-  DROP+CREATE broadcast). Include search-index defs in schema repair, and
-  expose per-node index presence/health in `SHOW INDEXES`.
-- [ ] **[cluster] Distributed sorted top-k for QUORUM ordered reads**
-  (P2, E-3 rescoped) — the QUORUM ordered path gathers every match; a
-  per-member sorted-candidates scatter + bounded quorum re-read would give
-  `ORDER BY … LIMIT k` early-stop at quorum. (At ONE on a full-copy
-  cluster the local index-ordered walk already serves it; agencik's
-  adapter sends ONE for sorted cursors.)
-- [ ] **[sql] `CAST(x AS t)` syntax** (P2) — still a parse error;
-  `to_timestamp()` covers the timestamp case. Add when a client needs the
-  standard spelling (grammar + `Expr::Cast` + eval arm).
-- [ ] **[proto] Batched `executemany` wire op** (P2) — the driver prepares
-  once and reuses the statement, but still one round-trip per row; a
-  multi-row OP_EXECUTE batch would help bulk backfills (gmail categorizer).
-- [ ] **[explain] Humanize index names** (nit) — EXPLAIN leaks the internal
-  `\x1f` namespace separator in index names on non-default databases
-  (`agencik\x1fi_slack_…`); render as `db.name` like error messages do.
 - [ ] **[cluster] Global (value-sharded) secondary indexes** (deferred,
   large) — indexes are local per node, so a non-PK indexed read scatters
   to every member; a value-sharded index would route to the value's
@@ -120,6 +98,10 @@ Still open:
   — cluster mode autocommits per statement (`BEGIN/COMMIT/ROLLBACK`
   rejected); no 2PC/coordinator exists. agencik designs around it with
   idempotent PK overwrites.
+- [ ] **[fts] Per-vector-index `building` flag** (nit) — the SHOW INDEXES
+  `local` column reports vector indexes only as ok/missing; a rebuild in
+  progress has no per-index flag to surface (search and secondary have
+  one).
 
 ## Performance
 

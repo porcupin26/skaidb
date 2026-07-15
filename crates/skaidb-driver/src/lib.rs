@@ -329,6 +329,43 @@ impl Client {
         }
     }
 
+    /// Execute a prepared statement once per parameter row in a single
+    /// round-trip (the `executemany` wire op) at the default consistency.
+    /// Returns the total affected count. Each row autocommits like a looped
+    /// `execute_prepared`; on a failure the server error names the row and
+    /// earlier rows stay applied.
+    pub fn execute_batch(
+        &mut self,
+        stmt: &mut Prepared,
+        rows: Vec<Vec<Value>>,
+    ) -> Result<u64, DriverError> {
+        let consistency = self.default_consistency;
+        let req = ClientRequest::ExecuteBatch {
+            id: stmt.id,
+            rows: rows.clone(),
+            consistency,
+        };
+        let resp = match self.roundtrip(&req) {
+            Err(DriverError::Io(_)) => {
+                self.reconnect()?;
+                *stmt = self.prepare(&stmt.sql)?;
+                self.roundtrip(&ClientRequest::ExecuteBatch {
+                    id: stmt.id,
+                    rows,
+                    consistency,
+                })
+            }
+            other => other,
+        }?;
+        match resp {
+            Response::Mutation { affected } => Ok(affected),
+            Response::Error(e) => Err(DriverError::Server(e)),
+            other => Err(DriverError::Server(format!(
+                "unexpected response to ExecuteBatch: {other:?}"
+            ))),
+        }
+    }
+
     /// One request/response round-trip over the current stream (no reconnect).
     fn roundtrip(&mut self, req: &ClientRequest) -> Result<Response, DriverError> {
         write_frame(&mut self.stream, &req.encode())?;

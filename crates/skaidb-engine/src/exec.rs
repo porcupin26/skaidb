@@ -101,6 +101,15 @@ impl MaintTask {
 }
 
 type IndexPlan = (String, Option<Vec<u8>>, Option<Vec<u8>>, bool, bool);
+
+/// Which live map a catalog index name resolves against, for
+/// `Database::index_local_health` (the SHOW INDEXES `local` column).
+#[derive(Clone, Copy)]
+enum IndexClass {
+    Secondary,
+    Vector,
+    Search,
+}
 /// Per-key version chain: `(hlc, Some(bytes) | None-tombstone)`, used by the
 /// deferred-maintenance crash replay.
 type VersionChain = Vec<(Hlc, Option<Vec<u8>>)>;
@@ -642,6 +651,7 @@ impl Database {
         path: &str,
         metric: &str,
         dim: Option<usize>,
+        if_not_exists: bool,
     ) -> Result<QueryOutput> {
         if !self.catalog.tables.contains_key(table) {
             return Err(EngineError::TableNotFound(table.to_string()));
@@ -651,8 +661,34 @@ impl Database {
         if !self.schema_advances(&key, hlc) {
             return Ok(QueryOutput::Ddl);
         }
-        if self.catalog.vector_indexes.contains_key(name) {
-            return Err(EngineError::IndexExists(name.to_string()));
+        // The live-tunable `ef_search` survives a definition replacement.
+        let mut preserved_ef: Option<usize> = None;
+        if let Some(existing) = self.catalog.vector_indexes.get(name) {
+            if !if_not_exists {
+                return Err(EngineError::IndexExists(name.to_string()));
+            }
+            // Schema sync replays peer defs as IF NOT EXISTS with the peer's
+            // HLC; the stamp advanced, so a differing def is newer — replace
+            // and rebuild instead of letting a stale definition persist
+            // forever (the search-index `.6` divergence class).
+            let differs = existing.table != table
+                || existing.path != path
+                || !existing.metric.eq_ignore_ascii_case(metric)
+                || dim.is_some_and(|d| d != existing.dim);
+            if !differs {
+                self.record_schema(key, hlc, false);
+                self.save_catalog()?;
+                return Ok(QueryOutput::Ddl);
+            }
+            skaidb_types::slog!(
+                "skaidb: vector index '{name}' definition superseded by a newer \
+                 schema stamp — replacing and rebuilding"
+            );
+            preserved_ef = existing.ef_search;
+            self.catalog.vector_indexes.remove(name);
+            self.vector_indexes.remove(name);
+            self.vector_watermarks.remove(name);
+            let _ = std::fs::remove_file(vector_snapshot_path(&self.dir, name));
         }
         if Metric::parse(metric).is_none() {
             return Err(EngineError::Constraint(format!("unknown vector metric '{metric}'")));
@@ -721,6 +757,11 @@ impl Database {
         self.vector_watermarks.insert(name.to_string(), watermark);
         self.vector_indexes.insert(name.to_string(), hnsw);
         self.catalog.vector_indexes.insert(name.to_string(), def);
+        if preserved_ef.is_some() {
+            if let Some(d) = self.catalog.vector_indexes.get_mut(name) {
+                d.ef_search = preserved_ef;
+            }
+        }
         self.record_schema(key, hlc, false);
         self.save_catalog()?;
         Ok(QueryOutput::Ddl)
@@ -761,10 +802,39 @@ impl Database {
             self.heal_missing_live_search_index(&c.name)?;
             return Ok(QueryOutput::Ddl);
         }
-        if self.catalog.search_indexes.contains_key(&c.name) {
+        if let Some(existing) = self.catalog.search_indexes.get(&c.name) {
             if c.if_not_exists {
-                // Same heal on the idempotent-bootstrap path.
-                self.heal_missing_live_search_index(&c.name)?;
+                // The schema-sync path replays every peer def as
+                // `CREATE ... IF NOT EXISTS` with the peer's HLC. Mere name
+                // presence must NOT satisfy it: a node that missed the DDL
+                // that widened the definition keeps its stale, narrower def
+                // forever otherwise (the production `.6` divergence — its
+                // `slack_messages_fts` covered only `text` while peers had
+                // `text, channel, ts`, and repair never converged it). The
+                // HLC advanced, so the incoming def is newer: replace and
+                // rebuild when it differs.
+                let differs = existing.table != c.table
+                    || existing.paths != c.paths
+                    || existing.options != c.options;
+                if differs {
+                    skaidb_types::slog!(
+                        "skaidb: search index '{}' definition superseded by a newer \
+                         schema stamp — replacing and rebuilding",
+                        c.name
+                    );
+                    self.catalog.search_indexes.insert(
+                        c.name.clone(),
+                        SearchIndexDef {
+                            table: c.table.clone(),
+                            paths: c.paths.clone(),
+                            options: c.options.clone(),
+                        },
+                    );
+                    self.rebuild_search_index(&c.name)?;
+                } else {
+                    // Same definition: only heal a missing live index.
+                    self.heal_missing_live_search_index(&c.name)?;
+                }
                 self.record_schema(key, hlc, false);
                 self.save_catalog()?;
                 return Ok(QueryOutput::Ddl);
@@ -1642,7 +1712,12 @@ impl Database {
             columns: vec!["aspect".into(), "decision".into()],
             rows: rows
                 .into_iter()
-                .map(|(a, d)| vec![Value::String(a), Value::String(d)])
+                // Table/index names reaching here are internal
+                // (`db\u{1f}name`); render the namespace separator as `.` so
+                // the plan reads `agencik.i_slack…`, matching error messages.
+                .map(|(a, d)| {
+                    vec![Value::String(a), Value::String(d.replace('\u{1f}', "."))]
+                })
                 .collect(),
         })
     }
@@ -2249,7 +2324,14 @@ impl Database {
             }
             Statement::DropIndex { name, if_exists } => self.drop_index(&name, if_exists),
             Statement::CreateVectorIndex(ci) => {
-                self.create_vector_index(&ci.name, &ci.table, &ci.path, &ci.metric, Some(ci.dim))
+                self.create_vector_index(
+                    &ci.name,
+                    &ci.table,
+                    &ci.path,
+                    &ci.metric,
+                    Some(ci.dim),
+                    ci.if_not_exists,
+                )
             }
             Statement::DropVectorIndex { name, if_exists } => {
                 self.drop_vector_index(&name, if_exists)
@@ -2619,6 +2701,7 @@ impl Database {
                     if idx.building { "secondary (building)" } else { "secondary" }.into(),
                 ),
                 Value::String(idx.paths.join(", ")),
+                Value::String(self.index_local_health(name, IndexClass::Secondary).into()),
             ]);
         }
         for (name, v) in &self.catalog.vector_indexes {
@@ -2630,6 +2713,7 @@ impl Database {
                 Value::String(namespace::split(&v.table).1.to_string()),
                 Value::String(format!("vector({}, dim={})", v.metric, v.dim)),
                 Value::String(v.path.clone()),
+                Value::String(self.index_local_health(name, IndexClass::Vector).into()),
             ]);
         }
         for (name, s) in &self.catalog.search_indexes {
@@ -2641,6 +2725,7 @@ impl Database {
                 Value::String(namespace::split(&s.table).1.to_string()),
                 Value::String(format!("search({})", s.analyzer())),
                 Value::String(s.paths.join(", ")),
+                Value::String(self.index_local_health(name, IndexClass::Search).into()),
             ]);
         }
         rows.sort_by(|a, b| match (&a[0], &b[0]) {
@@ -2653,8 +2738,36 @@ impl Database {
                 "table".into(),
                 "kind".into(),
                 "columns".into(),
+                "local".into(),
             ],
             rows,
+        }
+    }
+
+    /// This node's live state for a catalog-listed index: `ok` (open and
+    /// serving), `building` (backfill/catch-up running), or `missing` (in the
+    /// catalog but no live index — the divergence SHOW INDEXES used to hide,
+    /// which made the production `.6` incident a multi-day mystery). Local by
+    /// design: introspection answers from the node you asked.
+    fn index_local_health(&self, name: &str, class: IndexClass) -> &'static str {
+        match class {
+            IndexClass::Secondary => match self.catalog.indexes.get(name) {
+                Some(d) if d.building => "building",
+                _ if self.indexes.contains_key(name) => "ok",
+                _ => "missing",
+            },
+            IndexClass::Vector => {
+                if self.vector_indexes.contains_key(name) {
+                    "ok"
+                } else {
+                    "missing"
+                }
+            }
+            IndexClass::Search => match self.search_indexes.get(name) {
+                Some(live) if live.building => "building",
+                Some(_) => "ok",
+                None => "missing",
+            },
         }
     }
 
@@ -3731,6 +3844,31 @@ impl Database {
             return Ok((self.gather_with_overlay(table, filter)?, false));
         }
         self.gather_rows_planned(table, filter, order, fetch_limit)
+    }
+
+    /// This shard's top-`fetch` candidate keys for an ordered read — served
+    /// only when a local index plan actually walks in `(col, desc)` order
+    /// (`None` otherwise, so a coordinator falls back to the full gather
+    /// rather than trusting an unordered heap). Feeds the distributed sorted
+    /// top-k: candidates are re-read at quorum and re-sorted by the caller,
+    /// so per-shard staleness in the sort column is corrected there.
+    pub fn local_sorted_candidates(
+        &self,
+        table: &str,
+        filter: &Option<Expr>,
+        col: &str,
+        desc: bool,
+        fetch: usize,
+    ) -> Result<Option<Vec<Vec<u8>>>> {
+        if self.txn.is_some() {
+            return Ok(None);
+        }
+        let (rows, sorted) =
+            self.gather_rows_planned(table, filter, Some((col, desc, true)), Some(fetch))?;
+        if !sorted {
+            return Ok(None);
+        }
+        Ok(Some(rows.into_iter().take(fetch).map(|(k, _)| k).collect()))
     }
 
     /// Live-row count of `table` straight from storage key statistics — no row
@@ -4889,6 +5027,7 @@ impl Database {
                 Value::String(idx.table.clone()),
                 Value::String("secondary".into()),
                 Value::String(idx.paths.join(", ")),
+                Value::String(self.index_local_health(name, IndexClass::Secondary).into()),
             ]);
         }
         for (name, v) in &self.catalog.vector_indexes {
@@ -4897,6 +5036,7 @@ impl Database {
                 Value::String(v.table.clone()),
                 Value::String(format!("vector({}, dim={})", v.metric, v.dim)),
                 Value::String(v.path.clone()),
+                Value::String(self.index_local_health(name, IndexClass::Vector).into()),
             ]);
         }
         for (name, s) in &self.catalog.search_indexes {
@@ -4905,6 +5045,7 @@ impl Database {
                 Value::String(s.table.clone()),
                 Value::String(format!("search({})", s.analyzer())),
                 Value::String(s.paths.join(", ")),
+                Value::String(self.index_local_health(name, IndexClass::Search).into()),
             ]);
         }
         rows.sort_by(|a, b| match (&a[0], &b[0]) {
@@ -4917,6 +5058,7 @@ impl Database {
                 "table".into(),
                 "kind".into(),
                 "columns".into(),
+                "local".into(),
             ],
             rows,
         }

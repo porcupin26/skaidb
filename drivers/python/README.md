@@ -79,6 +79,14 @@ with pool.connection() as conn:          # checked out, returned on exit
 pool.close()                             # closes idle connections
 ```
 
+### Bulk writes
+
+`executemany` prepares once and ships **every parameter row in a single
+round-trip** (the ExecuteBatch wire op) — bulk backfills run at wire speed
+instead of one RTT per row. Each row autocommits; on a failure the error
+names the row index and earlier rows stay applied. Falls back to the
+per-row loop automatically on servers that predate the opcode.
+
 ### Consistency
 
 skaidb is leaderless with tunable consistency. Default is `QUORUM`:
