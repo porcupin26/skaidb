@@ -754,10 +754,17 @@ impl Database {
         let hlc = self.ddl_stamp();
         let key = format!("s:{}", c.name);
         if !self.schema_advances(&key, hlc) {
+            // The DDL itself is a replay no-op — but a prior partial
+            // application can have left the catalog def WITHOUT a live index
+            // (the production `.6` divergence class: SHOW INDEXES lists it,
+            // every query fails). Heal instead of preserving the gap.
+            self.heal_missing_live_search_index(&c.name)?;
             return Ok(QueryOutput::Ddl);
         }
         if self.catalog.search_indexes.contains_key(&c.name) {
             if c.if_not_exists {
+                // Same heal on the idempotent-bootstrap path.
+                self.heal_missing_live_search_index(&c.name)?;
                 self.record_schema(key, hlc, false);
                 self.save_catalog()?;
                 return Ok(QueryOutput::Ddl);
@@ -878,6 +885,22 @@ impl Database {
 
     /// `REBUILD SEARCH INDEX`: discard the index data and re-index every row
     /// of the table (recovery / anti-entropy escape hatch).
+    /// If the catalog has a search-index def but the live map lacks the
+    /// index (a partial DDL application or lost directory), rebuild it from
+    /// the catalog def. No-op when both sides agree.
+    fn heal_missing_live_search_index(&mut self, name: &str) -> Result<()> {
+        if self.catalog.search_indexes.contains_key(name)
+            && !self.search_indexes.contains_key(name)
+        {
+            skaidb_types::slog!(
+                "skaidb: search index '{name}' is in the catalog but has no live \
+                 index — healing by rebuild"
+            );
+            self.rebuild_search_index(name)?;
+        }
+        Ok(())
+    }
+
     fn rebuild_search_index_cmd(&mut self, name: &str) -> Result<QueryOutput> {
         if !self.catalog.search_indexes.contains_key(name) {
             return Err(EngineError::IndexNotFound(name.to_string()));

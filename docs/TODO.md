@@ -188,12 +188,16 @@ rewritten wishlist:
   ranking picks `(account,_tombstone,is_archived)` over the order-serving
   `(account,date)` for `ORDER BY date DESC LIMIT 1` → whole-account sort
   (timeout at 150k rows). Prefer the order-serving index for small LIMITs.
-- [ ] **[fts] C-1 (P1): schema-registered search index missing on a node** —
-  `.6` listed `slack_messages_fts` in SHOW INDEXES but had no local tantivy
-  index → intermittent per-coordinator search failures. Asks: (a) a node
-  discovering a schema-registered search index it lacks should build it
-  (like secondary backfill); (b) SHOW INDEXES should expose per-node
-  presence/health. (Operational rebuild broadcast issued 2026-07-15.)
+- [ ] **[fts] C-1 (P1): search-index catalog/live divergence** — production
+  `.6` served errors while SHOW INDEXES listed the index. Root cause was a
+  **stale catalog def** (covered only `text`; fresh def covers
+  `text, channel, ts`): **schema repair does not converge search-index
+  defs** — that's the remaining fix, plus per-node presence/health in
+  SHOW INDEXES. Done so far: startup open already rebuilds a missing/empty
+  index dir; `create_search_index` replay paths now **heal** a
+  catalog-def-without-live-index gap by rebuilding (logged); operational
+  DROP+CREATE broadcast restored `.6` (fts count 130,227 on all nodes,
+  2026-07-15).
 
 **Phase 6 — deferred, large architecture** (already on the lists below)
 
