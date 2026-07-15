@@ -30,8 +30,14 @@ print(cur.description)    # column metadata
 conn.close()
 ```
 
-- **Placeholders** use `?` (the `qmark` style, like `sqlite3`). Parameters are
-  safely quoted client-side, so `"O'Brien"` just works.
+- **Placeholders** use `?` (the `qmark` style, like `sqlite3`). A parameterized
+  statement is **prepared** on the server and its values are bound as typed
+  values over the binary protocol — so `?` can carry a `list` (→ Array) or a
+  nested `dict` (→ Document), which have no SQL literal form, and `"O'Brien"`
+  needs no escaping. Prepared statements are cached per connection and reused.
+  A common use is set membership: `WHERE id IN (?)` bound to a `list` fetches
+  those ids in one shot. (Statement kinds the server won't prepare — DDL and
+  session control — fall back to client-side text binding for scalar params.)
 - `connect()` runs the SCRAM-SHA-256 handshake automatically. Omit
   `user`/`password` for a server with auth disabled.
 - Cursors are iterable; `fetchone()`, `fetchmany(n)`, `fetchall()`, `rowcount`,

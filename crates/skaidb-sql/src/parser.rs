@@ -1328,6 +1328,33 @@ impl Parser {
             });
         }
 
+        // Postfix set membership: `expr [NOT] IN (list)`. `IN` is a contextual
+        // identifier (not a reserved keyword), so it stays usable as a column
+        // name elsewhere. A leading `NOT` here belongs to `NOT IN`; the prefix
+        // `NOT` operator is handled in `parse_not`, so only consume it when an
+        // `IN` immediately follows.
+        let negated_in = self.peek() == &Token::Keyword(Keyword::Not)
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("in"));
+        if negated_in {
+            self.advance(); // NOT
+        }
+        if negated_in || self.peek_ident_ci("in") {
+            self.eat_ident_ci("in");
+            self.expect(&Token::LParen)?;
+            // At least one element; an empty `IN ()` is a parse error, as in
+            // standard SQL.
+            let mut list = vec![self.parse_expr()?];
+            while self.eat(&Token::Comma) {
+                list.push(self.parse_expr()?);
+            }
+            self.expect(&Token::RParen)?;
+            return Ok(Expr::InList {
+                expr: Box::new(left),
+                list,
+                negated: negated_in,
+            });
+        }
+
         let op = match self.peek() {
             Token::Eq => BinaryOp::Eq,
             Token::NotEq => BinaryOp::NotEq,
@@ -1981,5 +2008,48 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_in_and_not_in() {
+        let filter = |sql: &str| match parse(sql).unwrap() {
+            Statement::Select(s) => s.filter.unwrap(),
+            other => panic!("{other:?}"),
+        };
+        // IN (list) → InList { negated: false }.
+        match filter("SELECT id FROM t WHERE id IN (1, 2, 3)") {
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                assert_eq!(*expr, Expr::Column("id".into()));
+                assert_eq!(list.len(), 3);
+                assert!(!negated);
+            }
+            other => panic!("{other:?}"),
+        }
+        // NOT IN → negated. The `NOT` binds to IN, not the prefix operator.
+        match filter("SELECT id FROM t WHERE name NOT IN ('a', 'b')") {
+            Expr::InList { negated, list, .. } => {
+                assert!(negated);
+                assert_eq!(list.len(), 2);
+            }
+            other => panic!("{other:?}"),
+        }
+        // A single bound parameter as the whole list (`IN (?)`).
+        match filter("SELECT id FROM t WHERE id IN (?)") {
+            Expr::InList { list, .. } => {
+                assert_eq!(list, vec![Expr::Parameter(0)]);
+            }
+            other => panic!("{other:?}"),
+        }
+        // `in` stays usable as a column name outside the operator position.
+        match parse("SELECT in FROM t").unwrap() {
+            Statement::Select(s) => assert_eq!(s.items.len(), 1),
+            other => panic!("{other:?}"),
+        }
+        // Empty `IN ()` is a parse error.
+        assert!(parse("SELECT id FROM t WHERE id IN ()").is_err());
     }
 }

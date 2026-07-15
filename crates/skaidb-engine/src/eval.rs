@@ -21,6 +21,11 @@ pub fn eval(expr: &Expr, row: &Document) -> Result<Value> {
             let v = eval(expr, row)?;
             Ok(Value::Bool(v.is_null() != *negated))
         }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => eval_in_list(expr, list, *negated, row),
         Expr::Unary { op, expr } => eval_unary(*op, eval(expr, row)?),
         Expr::Binary { op, left, right } => eval_binary(*op, left, right, row),
         // Parameters are substituted by `bind` before execution; one
@@ -219,6 +224,45 @@ fn eval_comparison(op: BinaryOp, l: &Value, r: &Value) -> Value {
     }
 }
 
+/// `expr [NOT] IN (list)` under SQL three-valued logic. `x IN (...)` is a
+/// disjunction of equalities: TRUE if any element equals `x`; else NULL if
+/// any comparison was unknown (`x` NULL, or a NULL element); else FALSE.
+/// `NOT IN` negates the three-valued result. An element that evaluates to an
+/// array is flattened — each of its elements becomes a candidate — so a bound
+/// array parameter (`col IN (?)` with `?` = `['a','b']`) tests membership in
+/// that array. When `expr` is itself an array column, equality falls through
+/// to the Mongo-style containment in [`eval_comparison`].
+fn eval_in_list(expr: &Expr, list: &[Expr], negated: bool, row: &Document) -> Result<Value> {
+    let left = eval(expr, row)?;
+    let mut any_true = false;
+    let mut any_null = false;
+    'outer: for item in list {
+        let v = eval(item, row)?;
+        let candidates: &[Value] = match &v {
+            Value::Array(elems) => elems,
+            _ => std::slice::from_ref(&v),
+        };
+        for cand in candidates {
+            match eval_comparison(BinaryOp::Eq, &left, cand) {
+                Value::Bool(true) => {
+                    any_true = true;
+                    break 'outer;
+                }
+                Value::Null => any_null = true,
+                _ => {}
+            }
+        }
+    }
+    let result = if any_true {
+        Ternary::True
+    } else if any_null {
+        Ternary::Unknown
+    } else {
+        Ternary::False
+    };
+    Ok(ternary_to_value(if negated { !result } else { result }))
+}
+
 /// SQL comparison: `None` when either side is `NULL` or the types do not
 /// compare. Numeric types compare across each other.
 pub fn compare(l: &Value, r: &Value) -> Option<Ordering> {
@@ -394,5 +438,72 @@ mod tests {
     fn division_by_zero_is_null() {
         let row = doc(&[("a", Value::Int(1))]);
         assert_eq!(eval(&expr("a / 0"), &row).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn in_list_membership() {
+        let row = doc(&[("a", Value::Int(2))]);
+        assert!(eval_predicate(&expr("a IN (1, 2, 3)"), &row).unwrap());
+        assert!(!eval_predicate(&expr("a IN (5, 6)"), &row).unwrap());
+        assert!(!eval_predicate(&expr("a NOT IN (1, 2, 3)"), &row).unwrap());
+        assert!(eval_predicate(&expr("a NOT IN (5, 6)"), &row).unwrap());
+    }
+
+    #[test]
+    fn in_list_three_valued_logic() {
+        // Left is NULL → IN is Unknown → neither IN nor NOT IN keeps the row.
+        let row = doc(&[("a", Value::Null)]);
+        assert_eq!(eval(&expr("a IN (1, 2)"), &row).unwrap(), Value::Null);
+        assert_eq!(eval(&expr("a NOT IN (1, 2)"), &row).unwrap(), Value::Null);
+
+        // No match but a NULL element present → Unknown, not False.
+        let row = doc(&[("a", Value::Int(9))]);
+        assert_eq!(eval(&expr("a IN (1, NULL)"), &row).unwrap(), Value::Null);
+        // A concrete match wins over the NULL element → True.
+        let row = doc(&[("a", Value::Int(1))]);
+        assert_eq!(
+            eval(&expr("a IN (1, NULL)"), &row).unwrap(),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn in_list_against_array_column_is_containment() {
+        // Multikey column: `labels IN ('work', 'x')` matches if the array holds
+        // any listed value.
+        let row = doc(&[(
+            "labels",
+            Value::Array(vec![Value::String("home".into()), Value::String("work".into())]),
+        )]);
+        assert!(eval_predicate(&expr("labels IN ('work', 'x')"), &row).unwrap());
+        assert!(!eval_predicate(&expr("labels IN ('y', 'z')"), &row).unwrap());
+    }
+
+    #[test]
+    fn in_list_flattens_array_elements() {
+        // An array-valued list element expands to its members — the shape a
+        // bound array parameter takes (`col IN (?)` with `?` = ['a','b']).
+        let row = doc(&[("a", Value::Int(2))]);
+        assert!(eval_predicate(&expr("a IN ([1, 2, 3])"), &row).unwrap());
+        assert!(!eval_predicate(&expr("a IN ([4, 5])"), &row).unwrap());
+    }
+
+    #[test]
+    fn in_list_bound_array_parameter() {
+        // End-to-end: `WHERE a IN (?)` bound to an array value tests membership
+        // in that array — the agencik "fetch these N ids" pattern.
+        use skaidb_sql::{bind, parse, Statement};
+        let stmt = parse("SELECT a FROM t WHERE a IN (?)").unwrap();
+        let bound = bind(
+            &stmt,
+            &[Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)])],
+        )
+        .unwrap();
+        let Statement::Select(sel) = bound else {
+            panic!("expected select")
+        };
+        let filter = sel.filter.unwrap();
+        assert!(eval_predicate(&filter, &doc(&[("a", Value::Int(2))])).unwrap());
+        assert!(!eval_predicate(&filter, &doc(&[("a", Value::Int(9))])).unwrap());
     }
 }

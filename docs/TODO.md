@@ -80,6 +80,99 @@ Everything from the original gap list with real pull has shipped
 k BY` per-group top-k). General window functions (`ROW_NUMBER() OVER
 (...)`) remain unimplemented; `TOP k BY` covers the common case.
 
+## agencik integration wishlist (phased)
+
+Gaps found migrating **agencik** off its MongoDB-emulation façade onto
+native skaidb (`~/projects/agencik/docs/skaidb-wishlist.md`). The wishlist
+was probed against a *deployed* build; each item below was re-checked
+against `main`. Sequenced by priority × dependency. Phases 2/3/5 are
+independent tracks; only batched `executemany` (P2) depends on the Python
+prepared-statement work in phase 1.
+
+**Phase 1 — P0 unblockers (native adoption)**
+
+- [ ] **[driver] Python prepared statements** — the server, wire protocol,
+  and Rust driver already implement `OP_PREPARE`/`OP_EXECUTE` with typed
+  `Array`/`Document` value frames; the Python driver still interpolates
+  params client-side and raises `cannot bind value of type list/dict`
+  (`drivers/python/skaidb/__init__.py:210`). Add a value **encoder**
+  (list→Array, dict→Document, mirroring the existing decoder), implement
+  `prepare()` + `OP_EXECUTE`, handle `RESP_PREPARED`, route
+  `Cursor.execute` through it so `?` carries typed arrays/documents.
+  Removes the REST-vs-binary split transport.
+- [ ] **[sql] `IN` / `NOT IN`** — absent on `main` (`parse_comparison` has
+  only `= != < <= > >=` + `IS NULL`). Add as a postfix in
+  `parse_comparison` via a contextual ident; new `Expr::InList`; eval arm
+  reuses the array-membership logic. Pairs with a bound array param
+  (`col IN (?)`). Highest-value language add.
+
+**Phase 2 — P1 Python driver ergonomics** (all in `drivers/python`)
+
+- [ ] **[driver] `connect(database=…)`** — run `USE <db>` in the handshake
+  so pooled connections land in the app db.
+- [ ] **[driver] Multi-seed + failover + pool** — seed list (or `/status`
+  peer discovery), reconnect-on-failure, thread-safe pool helper; mirror
+  the Rust driver's `connect_many`/`add_endpoints`.
+- [ ] **[driver] Split connect/read timeout; wrap mid-query errors** — one
+  `timeout` covers both today; mid-query `socket.timeout` propagates raw
+  instead of as `OperationalError`. Add `connect_timeout`/`read_timeout`,
+  wrap all transport errors, expose an is-usable/ping check for pools.
+- [ ] **[driver] Batched `executemany`** (depends on prepared statements) —
+  prepare-once + execute-many over the wire, not the current N-round-trip
+  Python loop.
+
+**Phase 3 — P1 SQL grammar** (grouped to amortize the new-`Expr`-variant
+match fan-out; use contextual idents, not reserved keywords)
+
+- [ ] **[sql] `BETWEEN`** — `col BETWEEN a AND b` (mind the embedded
+  `AND`); new `Expr::Between`; maps onto `lo`/`hi` in `column_constraints`
+  for real range pushdown.
+- [ ] **[sql] `LIKE` / `ILIKE`** — exact substring/prefix matching
+  (complements FTS `MATCH`); new `Expr::Like` + a `%`/`_` glob matcher in
+  eval; residual eval suffices, `'prefix%'` → optional prefix-range scan.
+- [ ] **[sql] Object/document literals** — a `{…}` literal building
+  `Value::Document` for `SET`/`VALUES` (array literals already parse).
+  Also document dotted-path `SET a.b = 'x'` (already works) as the blessed
+  scalar-leaf idiom.
+
+**Phase 4 — P2 SQL niceties**
+
+- [ ] **[sql] `to_timestamp` / `CAST`** — unblocks Mongo-migrated ISO-8601
+  string timestamps. Ship `to_timestamp`/`parse_iso` as scalar functions
+  first (one `eval_func` arm each, no grammar change); `CAST(x AS t)`
+  syntax later if a client needs the standard spelling.
+- [ ] **[sql] `SELECT <expr>` without `FROM`** — lowest ROI (app falls back
+  to `SHOW TABLES`); `from` is non-optional engine-wide, so needs an
+  `Option`/sentinel + synthetic single-row source. Do only if justified.
+
+**Phase 5 — P1/P2 localized ops/RBAC tweaks** (`crates/skaidb-server`,
+`skaidb-auth`, engine)
+
+- [ ] **[ops] `DROP INDEX` table-scoped like `CREATE`** (P1) — `CreateIndex`
+  is `(Create, Table)` but `DropIndex` is `(Drop, Global)`, so an app role
+  can create indexes it can never drop. `DROP INDEX` carries only the index
+  name, so scoping needs an index→table catalog resolution in
+  `required_privilege` (or a narrower per-`Index` privilege).
+- [ ] **[ops] Read-only introspection grant** (P2) — `SHOW CLUSTER` /
+  `SHOW CONFIG` are `(Admin, Global)`; split the read-only members to a
+  lesser gate (relax the `admin::handle` re-check in lockstep). Precedent:
+  the redacted low-privilege topology read in `rest.rs`.
+- [ ] **[ops] Scan-budget error names the column** (P2) — enrich the
+  `scan budget exceeded (N rows examined)` message at the catch site (where
+  the parsed statement + catalog are in scope), not inside the
+  context-free thread-local meter.
+
+**Phase 6 — deferred, large architecture** (already on the lists below)
+
+- [ ] **[cluster] Global value-sharded secondary indexes** (C-1) — indexes
+  are local-per-node today, so a non-PK indexed read scatters to every
+  peer; a value-sharded global index would route it to the value's owner.
+  Rearchitects index maintenance + routing + ring + internode protocol.
+- [ ] **[cluster] Distributed / multi-key transactions** (C-2) — cluster is
+  single-node-only (`BEGIN/COMMIT/ROLLBACK` rejected; autocommit per
+  statement); no 2PC/coordinator exists. If the ask is only to *confirm +
+  document*, that is already the shipped behavior.
+
 ## Performance
 
 (The audit record — what already holds, measured dead ends, methodology —

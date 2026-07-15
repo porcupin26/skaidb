@@ -295,6 +295,12 @@ fn walk(e: &Expr, f: &mut impl FnMut(&Expr)) {
                 walk(a, f);
             }
         }
+        Expr::InList { expr, list, .. } => {
+            walk(expr, f);
+            for a in list {
+                walk(a, f);
+            }
+        }
         Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) => {}
     }
 }
@@ -569,6 +575,8 @@ fn plan_expr_ok(e: &Expr, plan: &mut PartialsPlan) -> bool {
             plan_expr_ok(left, plan) && plan_expr_ok(right, plan)
         }
         Expr::Func { args, .. } => args.iter().all(|a| plan_expr_ok(a, plan)),
+        // `IN` predicates aren't part of the partials fast path; fall back.
+        Expr::InList { .. } => false,
     }
 }
 
@@ -982,6 +990,12 @@ fn rewrite_aggs(e: &mut Expr) {
         }
         Expr::Func { args, .. } => {
             for a in args {
+                rewrite_aggs(a);
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            rewrite_aggs(expr);
+            for a in list {
                 rewrite_aggs(a);
             }
         }

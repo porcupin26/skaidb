@@ -511,6 +511,15 @@ pub enum Expr {
     },
     /// `expr IS [NOT] NULL`.
     IsNull { expr: Box<Expr>, negated: bool },
+    /// `expr [NOT] IN (list)` — set membership. An element that evaluates to
+    /// an array is flattened (each of its elements becomes a candidate), so a
+    /// bound array parameter — `col IN (?)` with `?` = `['a','b']` — tests
+    /// membership in that array. `negated` is `NOT IN`.
+    InList {
+        expr: Box<Expr>,
+        list: Vec<Expr>,
+        negated: bool,
+    },
     /// An aggregate function call (`COUNT(*)`, `SUM(x)`, ...).
     Aggregate { func: AggFunc, arg: AggArg },
     /// A scalar function call (`time_bucket(5m, ts)`, `now()`). Names are

@@ -1494,6 +1494,19 @@ fn put_expr(o: &mut Vec<u8>, e: &Expr) {
             put_expr(o, expr);
             o.push(u8::from(*negated));
         }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            o.push(5);
+            put_expr(o, expr);
+            o.extend_from_slice(&(list.len() as u32).to_le_bytes());
+            for item in list {
+                put_expr(o, item);
+            }
+            o.push(u8::from(*negated));
+        }
         // Not valid in a pushed filter: aggregates never are, parameters are
         // substituted by `bind`, and scalar functions (`now()` resolves to a
         // literal; `time_bucket` never lands in an index-pushdown filter) are
@@ -1734,6 +1747,20 @@ impl<'a> Cur<'a> {
                 let expr = Box::new(self.expr()?);
                 let negated = self.u8()? != 0;
                 Expr::IsNull { expr, negated }
+            }
+            5 => {
+                let expr = Box::new(self.expr()?);
+                let n = self.u32()? as usize;
+                let mut list = Vec::with_capacity(n.min(1 << 16));
+                for _ in 0..n {
+                    list.push(self.expr()?);
+                }
+                let negated = self.u8()? != 0;
+                Expr::InList {
+                    expr,
+                    list,
+                    negated,
+                }
             }
             _ => return Err(WireError::Malformed("unsupported filter expr")),
         })
@@ -1994,6 +2021,29 @@ mod tests {
     fn frame_decode_rejects_garbage() {
         assert!(frame_decode(&[]).is_err());
         assert!(frame_decode(&[99]).is_err()); // unknown codec tag
+    }
+
+    #[test]
+    fn filtered_scan_in_list_roundtrips() {
+        use skaidb_sql::ast::Expr;
+        use skaidb_types::Value;
+        // `WHERE id IN (1, 2, 3)` pushed to a peer must survive the wire so an
+        // IN predicate is served by a clustered filtered scan, not only
+        // single-node.
+        let filter = Expr::InList {
+            expr: Box::new(Expr::Column("id".into())),
+            list: vec![
+                Expr::Literal(Value::Int(1)),
+                Expr::Literal(Value::Int(2)),
+                Expr::Literal(Value::Int(3)),
+            ],
+            negated: true,
+        };
+        let req = Request::FilteredScan {
+            table: "t".into(),
+            filter,
+        };
+        assert_eq!(Request::decode(&req.encode()).unwrap(), req);
     }
 
     #[test]

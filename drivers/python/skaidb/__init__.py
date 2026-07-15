@@ -133,6 +133,9 @@ class _Reader:
     def u8(self) -> int:
         return self.take(1)[0]
 
+    def u16(self) -> int:
+        return struct.unpack_from("<H", self.take(2))[0]
+
     def u32(self) -> int:
         return struct.unpack_from("<I", self.take(4))[0]
 
@@ -180,6 +183,118 @@ def _decode_value(r: _Reader) -> Any:
             out[key] = _decode_value(r)
         return out
     raise InterfaceError(f"unknown value tag {tag}")
+
+
+def _decimal_parts(d: decimal.Decimal) -> "tuple[int, int]":
+    """A `Decimal` as `(mantissa: i128, scale: u32)` with `value = mantissa *
+    10**-scale`, matching skaidb's `Decimal` codec. `scale` is unsigned, so a
+    positive exponent is folded into the mantissa."""
+    sign, digits, exponent = d.as_tuple()
+    if not isinstance(exponent, int):  # 'n'/'N' (NaN) or 'F' (Infinity)
+        raise ProgrammingError("cannot bind non-finite Decimal")
+    mantissa = 0
+    for dig in digits:
+        mantissa = mantissa * 10 + dig
+    if sign:
+        mantissa = -mantissa
+    if exponent <= 0:
+        scale = -exponent
+    else:
+        mantissa *= 10**exponent
+        scale = 0
+    if not -(2**127) <= mantissa < 2**127:
+        raise ProgrammingError("Decimal is too large to bind (mantissa exceeds i128)")
+    return mantissa, scale
+
+
+def _encode_value_into(v: Any, out: bytearray) -> None:
+    """Encode `v` as a typed skaidb value (tag + payload), the inverse of
+    `_decode_value`. Lists/tuples become `Array`, dicts become `Document` —
+    the whole point of prepared-statement binding: arrays and nested documents
+    that have no SQL literal form travel as typed values, not interpolated
+    text. `bool` is checked before `int` (it is an `int` subclass)."""
+    if v is None:
+        out.append(_TAG_NULL)
+    elif isinstance(v, bool):
+        out.append(_TAG_BOOL)
+        out.append(1 if v else 0)
+    elif isinstance(v, int):
+        out.append(_TAG_INT)
+        out += struct.pack("<q", v)
+    elif isinstance(v, float):
+        if v != v or v in (float("inf"), float("-inf")):
+            raise ProgrammingError("cannot bind NaN/Infinity")
+        out.append(_TAG_FLOAT)
+        out += struct.pack("<d", v)
+    elif isinstance(v, decimal.Decimal):
+        mantissa, scale = _decimal_parts(v)
+        out.append(_TAG_DECIMAL)
+        out += mantissa.to_bytes(16, "little", signed=True)
+        out += struct.pack("<I", scale)
+    elif isinstance(v, str):
+        b = v.encode("utf-8")
+        out.append(_TAG_STRING)
+        out += struct.pack("<I", len(b))
+        out += b
+    elif isinstance(v, (bytes, bytearray)):
+        b = bytes(v)
+        out.append(_TAG_BYTES)
+        out += struct.pack("<I", len(b))
+        out += b
+    elif isinstance(v, uuid.UUID):
+        out.append(_TAG_UUID)
+        out += v.bytes
+    elif isinstance(v, _dt.datetime):
+        ms = int((v.astimezone(_UTC) - _EPOCH).total_seconds() * 1000)
+        out.append(_TAG_TIMESTAMP)
+        out += struct.pack("<q", ms)
+    elif isinstance(v, (list, tuple)):
+        out.append(_TAG_ARRAY)
+        out += struct.pack("<I", len(v))
+        for item in v:
+            _encode_value_into(item, out)
+    elif isinstance(v, dict):
+        out.append(_TAG_DOCUMENT)
+        out += struct.pack("<I", len(v))
+        for k, val in v.items():
+            if not isinstance(k, str):
+                raise ProgrammingError("document keys must be strings")
+            kb = k.encode("utf-8")
+            out += struct.pack("<I", len(kb))
+            out += kb
+            _encode_value_into(val, out)
+    else:
+        raise ProgrammingError(f"cannot bind value of type {type(v).__name__}")
+
+
+def _encode_value(v: Any) -> bytes:
+    out = bytearray()
+    _encode_value_into(v, out)
+    return bytes(out)
+
+
+# ---- Wire opcodes & response tags -----------------------------------------
+
+_OP_QUERY = 1
+_OP_PREPARE = 2
+_OP_EXECUTE = 3
+_OP_CLOSE = 4
+
+_RESP_ROWS = 0
+_RESP_MUTATION = 1
+_RESP_DDL = 2
+_RESP_ERROR = 3
+_RESP_PREPARED = 4
+
+# Keep the per-connection prepared-statement cache under the server's
+# MAX_PREPARED_PER_CONN (256): statements beyond this are prepared, executed,
+# and immediately closed rather than retained.
+_MAX_PREPARED_CACHE = 240
+
+
+class _Unpreparable(Exception):
+    """Internal: the server reported a statement kind that cannot be prepared
+    (DDL / session control). The caller falls back to client-side text binding."""
 
 
 # ---- Client-side parameter binding (§5) -----------------------------------
@@ -311,6 +426,9 @@ class Connection:
         self._consistency = Consistency.resolve(consistency)
         self._lock = threading.Lock()
         self.closed = False
+        # sql text -> (prepared_id, nparams) for this connection. Ids are
+        # per-connection slot indices assigned by the server.
+        self._prepared: "dict[str, tuple[int, int]]" = {}
         try:
             self._sock = socket.create_connection((host, port), timeout=timeout)
             self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -370,17 +488,11 @@ class Connection:
         else:
             raise OperationalError(f"authentication denied: {r.text()}")
 
-    # -- query --
-    def _query(self, sql: str, consistency: int):
-        if self.closed:
-            raise ProgrammingError("connection is closed")
-        req = bytes([1, consistency]) + struct.pack("<I", len(sql.encode("utf-8")))
-        req += sql.encode("utf-8")
-        with self._lock:
-            self._write_frame(req)
-            r = _Reader(self._read_frame())
+    # -- response parsing (shared by one-shot query and prepared execute) --
+    @staticmethod
+    def _parse_result(r: "_Reader"):
         tag = r.u8()
-        if tag == 0:  # Rows
+        if tag == _RESP_ROWS:
             ncols = r.u32()
             columns = [r.text() for _ in range(ncols)]
             rows = []
@@ -389,13 +501,99 @@ class Connection:
                 row = tuple(_decode_value(_Reader(r.blob())) for _ in range(ncells))
                 rows.append(row)
             return ("rows", columns, rows)
-        if tag == 1:  # Mutation
+        if tag == _RESP_MUTATION:
             return ("mutation", r.u64(), None)
-        if tag == 2:  # Ddl
+        if tag == _RESP_DDL:
             return ("ddl", 0, None)
-        if tag == 3:  # Error
+        if tag == _RESP_ERROR:
             raise ProgrammingError(r.text())
         raise InterfaceError(f"unknown response tag {tag}")
+
+    def _roundtrip(self, req: bytes) -> "_Reader":
+        """Send one request frame and read one response frame under the
+        connection lock. Transport failures surface as `OperationalError` so a
+        pool can recycle the connection cleanly."""
+        if self.closed:
+            raise ProgrammingError("connection is closed")
+        try:
+            with self._lock:
+                self._write_frame(req)
+                return _Reader(self._read_frame())
+        except OperationalError:
+            raise
+        except OSError as e:  # mid-query socket error: dead peer, timeout, ...
+            raise OperationalError(f"query transport failed: {e}") from e
+
+    # -- one-shot query (OP_QUERY) --
+    def _query(self, sql: str, consistency: int):
+        body = sql.encode("utf-8")
+        req = bytes([_OP_QUERY, consistency]) + struct.pack("<I", len(body)) + body
+        return self._parse_result(self._roundtrip(req))
+
+    # -- prepared statements (OP_PREPARE / OP_EXECUTE / OP_CLOSE) --
+    def _prepare(self, sql: str) -> "tuple[int, int, bool]":
+        """Prepare `sql`, returning `(id, nparams, cached)`. Reuses a cached id
+        when present. Raises `_Unpreparable` for DDL/session statements the
+        server refuses to prepare."""
+        hit = self._prepared.get(sql)
+        if hit is not None:
+            return (hit[0], hit[1], True)
+        body = sql.encode("utf-8")
+        req = bytes([_OP_PREPARE]) + struct.pack("<I", len(body)) + body
+        r = self._roundtrip(req)
+        tag = r.u8()
+        if tag == _RESP_PREPARED:
+            stmt_id = r.u32()
+            nparams = r.u16()
+            if len(self._prepared) < _MAX_PREPARED_CACHE:
+                self._prepared[sql] = (stmt_id, nparams)
+                return (stmt_id, nparams, True)
+            return (stmt_id, nparams, False)
+        if tag == _RESP_ERROR:
+            msg = r.text()
+            if "cannot be prepared" in msg:
+                raise _Unpreparable(msg)
+            raise ProgrammingError(msg)
+        raise InterfaceError(f"unexpected prepare response tag {tag}")
+
+    def _execute_prepared(self, stmt_id: int, params: Sequence[Any], consistency: int):
+        req = bytearray()
+        req.append(_OP_EXECUTE)
+        req.append(consistency)
+        req += struct.pack("<I", stmt_id)
+        req += struct.pack("<H", len(params))
+        for p in params:
+            vb = _encode_value(p)
+            req += struct.pack("<I", len(vb))
+            req += vb
+        return self._parse_result(self._roundtrip(bytes(req)))
+
+    def _close_prepared(self, stmt_id: int) -> None:
+        """Best-effort free of a server-side prepared slot (it replies Ddl)."""
+        req = bytes([_OP_CLOSE]) + struct.pack("<I", stmt_id)
+        try:
+            self._roundtrip(req)
+        except (OperationalError, ProgrammingError, InterfaceError):
+            pass
+
+    def _execute_params(self, sql: str, params: Sequence[Any], consistency: int):
+        """Run `sql` with `params` bound as typed values over the prepared
+        path. Falls back to client-side text interpolation for statement kinds
+        the server won't prepare (so scalar params still work on DDL/session
+        control, as before)."""
+        try:
+            stmt_id, nparams, cached = self._prepare(sql)
+        except _Unpreparable:
+            return self._query(_bind(sql, params), consistency)
+        if len(params) != nparams:
+            raise ProgrammingError(
+                f"statement expects {nparams} parameters, got {len(params)}"
+            )
+        try:
+            return self._execute_prepared(stmt_id, params, consistency)
+        finally:
+            if not cached:
+                self._close_prepared(stmt_id)
 
     # -- DB-API surface --
     def cursor(self) -> "Cursor":
@@ -453,8 +651,19 @@ class Cursor:
         self._consistency = Consistency.resolve(consistency)
 
     def execute(self, sql: str, params: Optional[Sequence[Any]] = None) -> "Cursor":
-        bound = _bind(sql, params)
-        kind, a, b = self.connection._query(bound, self._consistency)
+        if params:
+            # Bind as typed values over the prepared-statement path: `?` can
+            # carry arrays (list/tuple) and nested documents (dict), which have
+            # no SQL literal form. Falls back to text interpolation for
+            # statement kinds the server won't prepare.
+            kind, a, b = self.connection._execute_params(
+                sql, params, self._consistency
+            )
+        else:
+            # No parameters: one-shot query. `_bind` still rejects a stray `?`.
+            kind, a, b = self.connection._query(
+                _bind(sql, None), self._consistency
+            )
         if kind == "rows":
             columns, rows = a, b
             # description: 7-tuples per DB-API; only name is meaningful here

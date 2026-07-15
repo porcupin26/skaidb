@@ -149,6 +149,12 @@ fn visit_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
                 visit_expr(arg, f);
             }
         }
+        Expr::InList { expr, list, .. } => {
+            visit_expr(expr, f);
+            for item in list {
+                visit_expr(item, f);
+            }
+        }
         Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) => {}
     }
 }
@@ -229,6 +235,12 @@ fn mutate_expr(e: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
         Expr::Func { args, .. } => {
             for arg in args {
                 mutate_expr(arg, f);
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            mutate_expr(expr, f);
+            for item in list {
+                mutate_expr(item, f);
             }
         }
         Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) => {}

@@ -6261,6 +6261,9 @@ fn expr_has_func(expr: &Expr, pred: &impl Fn(&str) -> bool) -> bool {
             arg: AggArg::Expr(e),
             ..
         } => expr_has_func(e, pred),
+        Expr::InList { expr, list, .. } => {
+            expr_has_func(expr, pred) || list.iter().any(|a| expr_has_func(a, pred))
+        }
         Expr::Aggregate { .. } | Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) => false,
     }
 }
@@ -6937,6 +6940,10 @@ fn collect_highlights(sel: &Select) -> Result<Vec<(String, usize)>> {
                 arg: AggArg::Expr(e),
                 ..
             } => walk(e, out),
+            Expr::InList { expr, list, .. } => {
+                walk(expr, out)?;
+                list.iter().try_for_each(|a| walk(a, out))
+            }
             Expr::Aggregate { .. } | Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) => {
                 Ok(())
             }
@@ -8812,6 +8819,9 @@ fn contains_aggregate(expr: &Expr) -> bool {
         Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => contains_aggregate(expr),
         Expr::Binary { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
         Expr::Func { args, .. } => args.iter().any(contains_aggregate),
+        Expr::InList { expr, list, .. } => {
+            contains_aggregate(expr) || list.iter().any(contains_aggregate)
+        }
         Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) => false,
     }
 }
@@ -9090,6 +9100,18 @@ fn lower_aggregates(expr: &Expr, docs: &[Document]) -> Result<Expr> {
                 .iter()
                 .map(|a| lower_aggregates(a, docs))
                 .collect::<Result<Vec<_>>>()?,
+        },
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(lower_aggregates(expr, docs)?),
+            list: list
+                .iter()
+                .map(|a| lower_aggregates(a, docs))
+                .collect::<Result<Vec<_>>>()?,
+            negated: *negated,
         },
         Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) => expr.clone(),
     })

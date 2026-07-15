@@ -307,10 +307,27 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   3. `NOT <expr>`
   4. comparison: `=`, `!=` (or `<>`), `<`, `<=`, `>`, `>=`
   5. `<expr> IS [NOT] NULL`
-  6. additive: `+`, `-`
-  7. multiplicative: `*`, `/`
-  8. unary: `-<expr>`, `NOT <expr>`
-  9. parentheses `( … )`
+  6. `<expr> [NOT] IN (<expr> [, <expr> ...])`
+  7. additive: `+`, `-`
+  8. multiplicative: `*`, `/`
+  9. unary: `-<expr>`, `NOT <expr>`
+  10. parentheses `( … )`
+- **`IN` / `NOT IN`** — set membership: `x IN (a, b, c)` is true when `x`
+  equals any listed element (three-valued: unknown if `x` is `NULL`, or if
+  no element matches but some element is `NULL`); `NOT IN` negates it. The
+  list needs at least one element (`IN ()` is a parse error). A list element
+  that is an **array** is flattened — each of its elements becomes a
+  candidate — so a bound array parameter works directly: `WHERE id IN (?)`
+  with `?` = `[1, 2, 3]` tests membership in that set (the "fetch these N
+  ids" pattern). When the left side is an array column, `IN` matches if the
+  array holds any listed value, mirroring the `=` containment rule above.
+  `in` is a contextual keyword — still usable as a column name elsewhere.
+  > **Performance note:** `IN`/`NOT IN` currently evaluate as a residual
+  > row filter — they are *not* yet pushed to a primary-key/index probe, so
+  > `col IN (…)` scans the candidate range and a large unindexed scan can
+  > trip `scan budget exceeded`. Prefer it on primary-key point sets that
+  > stay within the scan budget, or pair with a narrowing indexed predicate,
+  > until multi-probe pushdown lands.
 - **Aggregate functions:** `COUNT(*)` / `COUNT(<expr>)` /
   `COUNT(DISTINCT <expr>)` (exact distinct non-null values),
   `APPROX_COUNT_DISTINCT(<expr>)` (opt-in approximate distinct: the

@@ -80,8 +80,15 @@ Key facts an agent must know:
 - **Duration literals**: `250ms 15s 5m 2h 30d 1w` — integers in ms, usable
   wherever an integer is (`WHERE ts >= now() - 1h`).
 - **Operators** (rising precedence): `OR`; `AND`; `NOT`; comparisons
-  `= != <> < <= > >=`; `IS [NOT] NULL`; `+ -`; `* /`; unary `-`; parens.
-  Three-valued logic: `NULL` comparisons are unknown.
+  `= != <> < <= > >=`; `IS [NOT] NULL`; `[NOT] IN (v, ...)`; `+ -`; `* /`;
+  unary `-`; parens. Three-valued logic: `NULL` comparisons are unknown.
+- **`IN` / `NOT IN`**: `x IN (a, b, c)` set membership (≥1 element; `IN ()`
+  errors). An array-valued element is flattened, so `WHERE id IN (?)` bound
+  to `[1,2,3]` tests membership in that set — the "fetch these N ids"
+  pattern, and the native replacement for the old `$in`→OR-chain. Array
+  columns match by containment (like `=`). Currently a residual filter (no
+  index/PK pushdown yet), so a large unindexed `IN` scan can hit the scan
+  budget.
 - **Scalar functions**: `now()` (statement start, timestamp),
   `time_bucket(step, ts)` (floor to bucket: `time_bucket(5m, ts)`).
 - **PK point reads & prefix slices**: a full composite-PK equality
@@ -121,7 +128,10 @@ Key facts an agent must know:
   everywhere else), `SUM`, `AVG`, `MIN`, `MAX`; time-series only: `RATE`,
   `INCREASE`, `DELTA`, `FIRST`, `LAST`.
 - **Bind parameters**: `?` in prepared `SELECT/INSERT/UPDATE/DELETE`
-  (binary protocol / drivers). Not on the one-shot REST path.
+  (binary protocol / drivers). Values bind as **typed** values, so `?` can
+  carry an array or nested document (e.g. Python `list`/`dict`) that has no
+  SQL literal form — including `WHERE id IN (?)` bound to an array. Not on the
+  one-shot REST path.
 
 **Not in the language**: subqueries, CTEs, window functions, `FULL OUTER
 JOIN`, `INTERSECT`/`EXCEPT`, `ADD/DROP COLUMN` (schema-less), `ORDER BY

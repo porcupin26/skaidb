@@ -91,6 +91,63 @@ mod tests {
         assert_eq!(rs.rows[1], vec![Value::Int(2), Value::String("bob".into())]);
     }
 
+    #[test]
+    fn in_and_not_in_end_to_end() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE users (PRIMARY KEY (id))").unwrap();
+        db.execute(
+            "INSERT INTO users (id, name) VALUES \
+             (1, 'ada'), (2, 'bob'), (3, 'cy'), (4, 'dot')",
+        )
+        .unwrap();
+
+        // IN over a literal list.
+        let rs = rows(
+            db.execute("SELECT id FROM users WHERE id IN (1, 3) ORDER BY id")
+                .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(1)], vec![Value::Int(3)]]);
+
+        // NOT IN is the complement.
+        let rs = rows(
+            db.execute("SELECT id FROM users WHERE id NOT IN (1, 3) ORDER BY id")
+                .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(2)], vec![Value::Int(4)]]);
+
+        // String IN.
+        let rs = rows(
+            db.execute("SELECT id FROM users WHERE name IN ('bob', 'dot', 'zzz') ORDER BY id")
+                .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(2)], vec![Value::Int(4)]]);
+
+        // Bound array parameter: `id IN (?)` with ? = [2, 4] — the fetch-N-ids
+        // shape, driven through prepare/bind.
+        let stmt = skaidb_sql::parse("SELECT id FROM users WHERE id IN (?) ORDER BY id").unwrap();
+        let bound =
+            skaidb_sql::bind(&stmt, &[Value::Array(vec![Value::Int(2), Value::Int(4)])]).unwrap();
+        let rs = rows(db.execute_statement(bound).unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::Int(2)], vec![Value::Int(4)]]);
+    }
+
+    #[test]
+    fn in_against_multikey_array_column_end_to_end() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE docs (PRIMARY KEY (id))").unwrap();
+        // labels is an array column (multikey containment).
+        db.execute("INSERT INTO docs (id, labels) VALUES (1, ['work', 'home'])")
+            .unwrap();
+        db.execute("INSERT INTO docs (id, labels) VALUES (2, ['play'])")
+            .unwrap();
+
+        let rs = rows(
+            db.execute("SELECT id FROM docs WHERE labels IN ('work', 'x') ORDER BY id")
+                .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(1)]]);
+    }
+
     /// Shared fixture: a TS table with two hosts sampling `value` every 15 s
     /// for two minutes (values rise 1/s), plus a `temp` field on host a.
     fn ts_fixture(db: &mut Database) {
