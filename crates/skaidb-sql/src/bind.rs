@@ -32,11 +32,18 @@ pub fn param_count(stmt: &Statement) -> Option<usize> {
         }
     });
     // `LIMIT ?` / `OFFSET ?` positions live outside the expression tree.
-    if let Statement::Select(s) = stmt {
-        for p in [s.limit_param, s.offset_param].into_iter().flatten() {
-            n = n.max(p as usize + 1);
+    fn count_limit_params(stmt: &Statement, n: &mut usize) {
+        match stmt {
+            Statement::Select(s) => {
+                for p in [s.limit_param, s.offset_param].into_iter().flatten() {
+                    *n = (*n).max(p as usize + 1);
+                }
+            }
+            Statement::Explain { statement } => count_limit_params(statement, n),
+            _ => {}
         }
     }
+    count_limit_params(stmt, &mut n);
     counted.then_some(n)
 }
 
@@ -59,23 +66,31 @@ pub fn bind(stmt: &Statement, params: &[Value]) -> Result<Statement, BindError> 
     });
     // `LIMIT ?` / `OFFSET ?`: the bound value must be a non-negative integer;
     // it lands in the plain `limit`/`offset` count, and the param slot clears.
-    if let Statement::Select(s) = &mut bound {
-        let as_count = |what: &str, v: &Value| -> Result<u64, BindError> {
-            match v {
-                Value::Int(n) if *n >= 0 => Ok(*n as u64),
-                other => Err(BindError::Value(format!(
-                    "{what} parameter must be a non-negative integer, got {:?}",
-                    other.type_of()
-                ))),
+    fn bind_counts(stmt: &mut Statement, params: &[Value]) -> Result<(), BindError> {
+        match stmt {
+            Statement::Explain { statement } => bind_counts(statement, params),
+            Statement::Select(s) => {
+                let as_count = |what: &str, v: &Value| -> Result<u64, BindError> {
+                    match v {
+                        Value::Int(n) if *n >= 0 => Ok(*n as u64),
+                        other => Err(BindError::Value(format!(
+                            "{what} parameter must be a non-negative integer, got {:?}",
+                            other.type_of()
+                        ))),
+                    }
+                };
+                if let Some(i) = s.limit_param.take() {
+                    s.limit = Some(as_count("LIMIT", &params[i as usize])?);
+                }
+                if let Some(i) = s.offset_param.take() {
+                    s.offset = Some(as_count("OFFSET", &params[i as usize])?);
+                }
+                Ok(())
             }
-        };
-        if let Some(i) = s.limit_param.take() {
-            s.limit = Some(as_count("LIMIT", &params[i as usize])?);
-        }
-        if let Some(i) = s.offset_param.take() {
-            s.offset = Some(as_count("OFFSET", &params[i as usize])?);
+            _ => Ok(()),
         }
     }
+    bind_counts(&mut bound, params)?;
     Ok(bound)
 }
 
@@ -87,6 +102,11 @@ fn visit_statement(stmt: &Statement, f: &mut impl FnMut(&Expr)) -> bool {
             visit_select(s, f);
             true
         }
+        // EXPLAIN of a preparable statement is itself preparable — you must
+        // be able to EXPLAIN exactly the bound query you run (a typed array
+        // param has no SQL text form, so client-side interpolation cannot
+        // render it for a one-shot EXPLAIN).
+        Statement::Explain { statement } => visit_statement(statement, f),
         Statement::Insert(i) => {
             visit_insert(i, f);
             true
@@ -231,6 +251,7 @@ fn mutate_select(s: &mut Select, f: &mut impl FnMut(&mut Expr)) {
 fn mutate_statement(stmt: &mut Statement, f: &mut impl FnMut(&mut Expr)) {
     match stmt {
         Statement::Select(s) => mutate_select(s, f),
+        Statement::Explain { statement } => mutate_statement(statement, f),
         Statement::Insert(i) => {
             for row in &mut i.rows {
                 for e in row {
@@ -378,6 +399,32 @@ mod tests {
         let stmt = parse("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
         assert_eq!(param_count(&stmt), None);
         assert_eq!(bind(&stmt, &[]), Err(BindError::Unpreparable));
+    }
+
+    /// EXPLAIN of a preparable statement binds like the statement itself —
+    /// you can EXPLAIN exactly the bound query you run (incl. an array
+    /// param, which has no SQL text form, and `LIMIT ?`).
+    #[test]
+    fn explain_of_preparable_binds() {
+        let stmt = parse("EXPLAIN SELECT v FROM t WHERE id IN (?) LIMIT ?").unwrap();
+        assert_eq!(param_count(&stmt), Some(2));
+        let bound = bind(
+            &stmt,
+            &[
+                Value::Array(vec![Value::Int(1), Value::Int(2)]),
+                Value::Int(5),
+            ],
+        )
+        .unwrap();
+        let Statement::Explain { statement } = &bound else { panic!() };
+        let Statement::Select(s) = statement.as_ref() else { panic!() };
+        assert_eq!(s.limit, Some(5));
+        assert_eq!(s.limit_param, None);
+        // EXPLAIN of DDL stays unpreparable.
+        let stmt = parse("EXPLAIN CREATE TABLE t (PRIMARY KEY (id))");
+        if let Ok(stmt) = stmt {
+            assert_eq!(param_count(&stmt), None);
+        }
     }
 
     #[test]

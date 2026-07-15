@@ -409,9 +409,10 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   `OFFSET ?` (the bound value must be a non-negative integer). Parameters
   are numbered by order of appearance and bound to values at execute time
   via the binary protocol's prepared-statement messages (or a driver's
-  `prepare`/`execute` API). DDL and session-control statements cannot be
-  prepared, and a `?` submitted through the plain one-shot query path is an
-  error at execution.
+  `prepare`/`execute` API). `EXPLAIN` of a preparable statement is itself
+  preparable, so the exact bound query can be explained. DDL and
+  session-control statements cannot be prepared, and a `?` submitted
+  through the plain one-shot query path is an error at execution.
 - Comparisons follow three-valued logic (`NULL` compares as unknown).
 
 ## Identifiers & literals (lexical)

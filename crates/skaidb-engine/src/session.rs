@@ -432,20 +432,29 @@ mod tests {
             ))
             .unwrap();
         }
-        // 300 matches >> budget 50: the fallback gather errors fast with the
-        // fix in the message instead of materializing everything.
+        // GROUP BY a column the index does not know AT ALL: immediate error
+        // with the fix — never index-answerable, and its fallback gathers
+        // every match (the production coordinator tie-up sat UNDER the
+        // default 250k scan budget, so the budget alone is not protection).
         let err = s
             .execute("SELECT \"user\", count(*) FROM msgs WHERE MATCH(text, 'hello') GROUP BY \"user\";")
             .unwrap_err()
             .to_string();
+        assert!(err.contains("not on the search index"), "{err}");
+        assert!(err.contains("keyword fast field"), "{err}");
+        // GROUP BY a DECLARED (text) column keeps the row fallback, but the
+        // gather is metered: 300 matches >> budget 50 errors with guidance.
+        let err = s
+            .execute("SELECT text, count(*) FROM msgs WHERE MATCH(text, 'hello') GROUP BY text;")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("scan budget"), "{err}");
         assert!(err.contains("keyword fast field"), "{err}");
-        // A narrow match set stays under budget and answers row-side.
+        // A narrow match set on the declared column stays under budget and
+        // answers row-side.
         let got = rows(
-            s.execute(
-                "SELECT \"user\", count(*) FROM msgs WHERE MATCH(text, '7') GROUP BY \"user\";",
-            )
-            .unwrap(),
+            s.execute("SELECT text, count(*) FROM msgs WHERE MATCH(text, '7') GROUP BY text;")
+                .unwrap(),
         );
         assert!(!got.is_empty());
     }

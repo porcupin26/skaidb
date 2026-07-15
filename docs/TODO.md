@@ -80,143 +80,46 @@ Everything from the original gap list with real pull has shipped
 k BY` per-group top-k). General window functions (`ROW_NUMBER() OVER
 (...)`) remain unimplemented; `TOP k BY` covers the common case.
 
-## agencik integration wishlist (phased)
+## agencik integration wishlist (open items)
 
-Gaps found migrating **agencik** off its MongoDB-emulation façade onto
-native skaidb (`~/projects/agencik/docs/skaidb-wishlist.md`). The wishlist
-was probed against a *deployed* build; each item below was re-checked
-against `main`. Sequenced by priority × dependency. Phases 2/3/5 are
-independent tracks; only batched `executemany` (P2) depends on the Python
-prepared-statement work in phase 1.
+Gaps from migrating **agencik** onto native skaidb
+(`~/projects/agencik/docs/skaidb-wishlist.md`). Both rounds' shipped work
+(phases 1–5 in v0.83.0, round 2 in v0.85.x: prepared-statement Python
+driver with typed array/document binds, `IN`/`BETWEEN`/`LIKE`/object
+literals, `to_timestamp`, `SELECT 1`, `MONITOR`, table-scoped index DDL,
+PK-`IN` point-read sets, `LIMIT ?`/`OFFSET ?`, budget-bounded + fail-fast
+grouped-search fallback, search-index catalog/live heal, order-aware
+EXPLAIN, bindable EXPLAIN) lives in git history and the wishlist ledger.
+Still open:
 
-**Phase 1 — P0 unblockers (native adoption)** ✅ shipped
-
-- [x] **[driver] Python prepared statements** — typed value encoder
-  (list→Array, dict→Document), `OP_PREPARE`/`OP_EXECUTE`/`OP_CLOSE`, per-conn
-  prepared cache, `RESP_PREPARED` handling, unpreparable-kind fallback to text
-  binding; `Cursor.execute` routes params through it. Removes the REST-vs-binary
-  split transport.
-- [x] **[sql] `IN` / `NOT IN`** — `Expr::InList`, contextual-ident parse,
-  three-valued eval with array-element flattening (bound array param) and
-  multikey containment, cluster filter-pushdown codec.
-- [x] **[sql] PK `IN` point-read pushdown** (v0.84.0) — every PK column pinned
-  by `=`/literal-`IN` resolves as a point-read set (`pk_point_keys`: cross
-  product on composite keys, ≤1000, dedup, ascending): bloom-gated gets on a
-  single node, `resolve_candidates` (per-key quorum reads / merged pass) on a
-  cluster; ordered+LIMIT path included; EXPLAIN shows `point-read set`.
-  Remaining slice: `IN` multi-probe on **secondary-index** columns (today
-  those shapes stay residual over the scanned/indexed range), and OR-of-PK-
-  equality folding into the same key-set path.
-
-**Phase 2 — P1 Python driver ergonomics** (all in `drivers/python`) ✅ shipped
-
-- [x] **[driver] `connect(database=…)`** — issues `USE <db>` as part of
-  connecting, so the session starts in the app database.
-- [x] **[driver] Multi-seed + failover + pool** — `seeds=[…]` tried in
-  randomized order until one connects; `reconnect()` fails over; thread-safe
-  `ConnectionPool` / `skaidb.pool(…)` discards broken connections on checkin.
-- [x] **[driver] Split connect/read timeout; wrap mid-query errors** —
-  `connect_timeout`/`read_timeout` split; all mid-query transport errors wrap
-  as `OperationalError`; `is_usable()` (cheap) + `ping()` (round-trip) for pools.
-- [x] **[driver] Batched `executemany`** — the per-connection prepared cache
-  makes `executemany` prepare once and reuse the id across rows (no re-parse).
-  A single-round-trip batched wire path remains an optional future optimization.
-
-**Phase 3 — P1 SQL grammar** ✅ shipped
-
-- [x] **[sql] `BETWEEN`** — `Expr::Between`, contextual-ident parse (bounds at
-  additive precedence so the separator `AND` survives), three-valued eval;
-  literal bounds feed `collect_comparisons` → real index/PK **range pushdown**.
-- [x] **[sql] `LIKE` / `ILIKE`** — `Expr::Like` + a `%`/`_` two-pointer glob
-  matcher (no escape sequence); `ILIKE` lowercases both sides; non-string
-  operands are unknown (never a query error on mixed-type columns). Residual
-  filter only — a `'prefix%'` → prefix-range scan remains a future optimization.
-- [x] **[sql] Object/document literals** — `{key: lit, ...}` builds
-  `Value::Document` in any expression position (keys: bare idents or strings,
-  reserved words need quoting; values constant, nesting allowed). `SET
-  meta.addr = {…}` replaces the sub-document; dotted-path `SET` documented as
-  the scalar-leaf idiom. All three predicates travel the internode filter
-  codec, so clustered filtered scans serve them.
-
-**Phase 4 — P2 SQL niceties** ✅ shipped
-
-- [x] **[sql] `to_timestamp(v)`** — scalar function: epoch-ms numbers pass
-  through, ISO-8601 strings parse (date, datetime, fraction, `Z`/`±HH[:MM]`);
-  unparseable/mistyped → `NULL`, never an error. Range-filters Mongo-migrated
-  string timestamps in-query. `CAST(x AS t)` *syntax* deferred until a client
-  needs the standard spelling.
-- [x] **[sql] `SELECT <expr>` without `FROM`** — constant projection over one
-  synthetic row (empty `from` sentinel; handled once in `run_select`, shared
-  by embedded + cluster paths, and in `project_core` for UNION legs). Needs no
-  privilege, so any authenticated role can `SELECT 1` as a liveness probe.
-  `SELECT *` and trailing clauses still require a table.
-
-**Phase 5 — P1/P2 localized ops/RBAC tweaks** ✅ shipped
-
-- [x] **[ops] Index DDL table-scoped** (P1) — `DROP INDEX` (and vector/search
-  drops, `REBUILD`/`ALTER`) now require `Create` on the index's **owning
-  table**, resolved through the catalog at check time — a role that creates
-  its own indexes can drop/retune them. Unknown index → no privilege
-  (`IF EXISTS` bootstrap stays an idempotent no-op; existence is already free
-  via `SHOW INDEXES`).
-- [x] **[ops] `MONITOR` privilege** (P2) — new grantable privilege
-  (`GRANT MONITOR ON *`): read-only control plane (`SHOW CLUSTER`,
-  `SHOW CONFIG` — secrets masked, `SHOW SLOW QUERIES`, read-only HTTP admin)
-  without an admin credential; mutations stay `ADMIN`, and `ADMIN` implies
-  `MONITOR`. The `admin::handle` re-check relaxed in lockstep.
-- [x] **[ops] Scan-budget error names table + filter columns** (P2) —
-  enriched at the `run_select` statement boundary (the meter stays
-  context-free): `… [table emails, filter column(s): sender, date]`.
-
-**Round 2 (agencik re-probe of v0.83.0, 2026-07-15)** — new items from the
-rewritten wishlist:
-
-- [x] **[fts] E-1 (P1): grouped-search fallback is scan-budget bounded** —
-  the exact-row gather (embedded `search_with_index` resolve + the cluster
-  coordinator's per-hit materialization) now ticks the scan meter, so a
-  non-fast-field `GROUP BY` under a search predicate dies at the budget in
-  ms with search-specific guidance ("declare the GROUP BY column as a
-  keyword fast field … + REBUILD") instead of tying the coordinator for the
-  full statement timeout. A hard fail-fast error was rejected: declared
-  text-column group-bys legitimately fall back and answer correctly on
-  small match sets (documented behavior, tested).
-- [x] **[sql] E-2 (P1): `?` in `LIMIT`/`OFFSET`** — bindable positions
-  (`limit_param`/`offset_param` on `Select`, substituted by `bind` with a
-  non-negative-integer type check); an unbound one reaching execution errors
-  like any unbound `?`. `NEAREST`'s query/k already bound.
-- [ ] **[cluster] E-3 (P2, rescoped): distributed sorted top-k for QUORUM
-  ordered reads** — diagnosis (2026-07-15): the *local* planner already
-  prefers the order-serving walk under ORDER BY + LIMIT (since the
-  9a9194b selective-range probe; verified empirically), and at consistency
-  ONE on a full-copy cluster the ordered read serves locally with early
-  stop. The timeout shape reproduces only at **QUORUM**, whose ordered
-  path gathers every match (no order-aware early stop — a per-member
-  sorted-candidates scatter + bounded quorum re-read would fix it).
-  Workaround (agencik's adapter already does this): send sorted+limited
-  cursors at consistency ONE. EXPLAIN now plans with ORDER BY/LIMIT and
-  reports `index-ordered walk … early-stop at LIMIT` instead of the
-  misleading order-blind equality plan.
-- [ ] **[fts] C-1 (P1): search-index catalog/live divergence** — production
-  `.6` served errors while SHOW INDEXES listed the index. Root cause was a
-  **stale catalog def** (covered only `text`; fresh def covers
-  `text, channel, ts`): **schema repair does not converge search-index
-  defs** — that's the remaining fix, plus per-node presence/health in
-  SHOW INDEXES. Done so far: startup open already rebuilds a missing/empty
-  index dir; `create_search_index` replay paths now **heal** a
-  catalog-def-without-live-index gap by rebuilding (logged); operational
-  DROP+CREATE broadcast restored `.6` (fts count 130,227 on all nodes,
-  2026-07-15).
-
-**Phase 6 — deferred, large architecture** (already on the lists below)
-
-- [ ] **[cluster] Global value-sharded secondary indexes** (C-1) — indexes
-  are local-per-node today, so a non-PK indexed read scatters to every
-  peer; a value-sharded global index would route it to the value's owner.
-  Rearchitects index maintenance + routing + ring + internode protocol.
-- [ ] **[cluster] Distributed / multi-key transactions** (C-2) — cluster is
-  single-node-only (`BEGIN/COMMIT/ROLLBACK` rejected; autocommit per
-  statement); no 2PC/coordinator exists. If the ask is only to *confirm +
-  document*, that is already the shipped behavior.
+- [ ] **[fts] Search-index defs don't converge via schema repair** (P1) —
+  the root cause of the production `.6` divergence (its def covered only
+  `text` while peers had `text, channel, ts`; fixed operationally by a
+  DROP+CREATE broadcast). Include search-index defs in schema repair, and
+  expose per-node index presence/health in `SHOW INDEXES`.
+- [ ] **[cluster] Distributed sorted top-k for QUORUM ordered reads**
+  (P2, E-3 rescoped) — the QUORUM ordered path gathers every match; a
+  per-member sorted-candidates scatter + bounded quorum re-read would give
+  `ORDER BY … LIMIT k` early-stop at quorum. (At ONE on a full-copy
+  cluster the local index-ordered walk already serves it; agencik's
+  adapter sends ONE for sorted cursors.)
+- [ ] **[sql] `CAST(x AS t)` syntax** (P2) — still a parse error;
+  `to_timestamp()` covers the timestamp case. Add when a client needs the
+  standard spelling (grammar + `Expr::Cast` + eval arm).
+- [ ] **[proto] Batched `executemany` wire op** (P2) — the driver prepares
+  once and reuses the statement, but still one round-trip per row; a
+  multi-row OP_EXECUTE batch would help bulk backfills (gmail categorizer).
+- [ ] **[explain] Humanize index names** (nit) — EXPLAIN leaks the internal
+  `\x1f` namespace separator in index names on non-default databases
+  (`agencik\x1fi_slack_…`); render as `db.name` like error messages do.
+- [ ] **[cluster] Global (value-sharded) secondary indexes** (deferred,
+  large) — indexes are local per node, so a non-PK indexed read scatters
+  to every member; a value-sharded index would route to the value's
+  owners. Rearchitects index maintenance, routing, ring, internode proto.
+- [ ] **[cluster] Distributed / multi-key transactions** (deferred, large)
+  — cluster mode autocommits per statement (`BEGIN/COMMIT/ROLLBACK`
+  rejected); no 2PC/coordinator exists. agencik designs around it with
+  idempotent PK overwrites.
 
 ## Performance
 

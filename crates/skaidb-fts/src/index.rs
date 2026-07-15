@@ -664,7 +664,25 @@ impl SearchIndex {
             Some(crate::AggGroupBy::Keyword(col))
                 if ftype_of(col) != Some(FieldType::Keyword) =>
             {
-                return Ok(None); // only keyword fast fields bucket exactly
+                // Only keyword fast fields bucket exactly; a declared
+                // non-keyword column or a queryable synthetic name
+                // (`.keyword` twin, copy_to target) keeps the row fallback
+                // (bounded by the scan budget). But a column the index does
+                // not know AT ALL can never be answered index-side, and its
+                // fallback gathers every match — the accidental-degradation
+                // shape that tied a production coordinator up for the full
+                // statement timeout under the default budget (2026-07-15).
+                // Fail fast with the fix, like MATCH does for uncovered
+                // columns.
+                if !self.runtimes.iter().any(|r| r.path == *col) {
+                    return Err(FtsError::Config(format!(
+                        "GROUP BY column '{col}' is not on the search index — declare \
+                         it as a keyword fast field (WITH ('{col}.type' = 'keyword') + \
+                         REBUILD SEARCH INDEX) to group index-side, or group without a \
+                         search predicate"
+                    )));
+                }
+                return Ok(None);
             }
             Some(crate::AggGroupBy::DateHistogram { column, interval_ms })
                 if ftype_of(column) != Some(FieldType::Date) || *interval_ms <= 0 =>

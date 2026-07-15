@@ -239,7 +239,13 @@ Two serving paths produce identical results:
 - **Row fallback**: everything else — grouped metrics, text-column
   grouping, residual predicates, HAVING, ORDER BY — gathers the matching
   rows (deduped by key at the coordinator, so correct at any replication
-  factor) and runs the ordinary grouped executor.
+  factor) and runs the ordinary grouped executor. The gather is **bounded
+  by the scan budget** (past it, the error names the fix: declare the
+  group column a keyword fast field), and a `GROUP BY` on a column **not
+  on the index at all** fails fast instead of gathering — it can never be
+  answered index-side, and on a large match set the silent gather tied a
+  production coordinator up for the full statement timeout. Group without
+  a search predicate to aggregate off-index columns row-side.
 
 SQL semantics hold on both paths: rows missing the group column form the
 NULL group, `SUM` over no values is NULL (ES-style aggregations would say
