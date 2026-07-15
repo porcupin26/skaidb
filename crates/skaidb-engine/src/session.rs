@@ -409,6 +409,19 @@ mod tests {
         assert!(err.to_string().contains("scan budget"), "{err}");
     }
 
+    /// `SELECT 1` must work in ANY session database: name resolution used to
+    /// qualify the FROM-less sentinel into `db.<nothing>`, so the liveness
+    /// probe failed with `table "" does not exist` everywhere except the
+    /// default database (found live by agencik, 2026-07-15).
+    #[test]
+    fn const_select_works_outside_default_database() {
+        let mut s = Session::open(tmp()).unwrap();
+        s.execute("CREATE DATABASE app;").unwrap();
+        s.execute("USE app;").unwrap();
+        let out = rows(s.execute("SELECT 1;").unwrap());
+        assert_eq!(out, vec![vec![skaidb_types::Value::Int(1)]]);
+    }
+
     /// `pk IN (...)` resolves to point reads, not a scan: with a scan budget
     /// far below the table size, the fetch-these-N-ids shape must still
     /// answer (a scan would trip the budget), including through a bound

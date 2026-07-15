@@ -257,7 +257,13 @@ impl Select {
     /// Visit the `FROM` table, every joined table, and the tables of any
     /// trailing `UNION` branches.
     pub fn for_each_table_mut(&mut self, f: &mut impl FnMut(&mut String)) {
-        f(&mut self.from);
+        // An empty `from` is the FROM-less constant-select sentinel
+        // (`SELECT 1`), not a table reference: database resolution must not
+        // qualify it into `db.<nothing>` (which broke `SELECT 1` for every
+        // session outside the default database).
+        if !self.from.is_empty() {
+            f(&mut self.from);
+        }
         for join in &mut self.joins {
             f(&mut join.table);
         }
