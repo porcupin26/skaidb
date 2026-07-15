@@ -52,6 +52,9 @@ UPDATE <table> SET <path> = <expr> [, <path> = <expr> ...] [WHERE <expr>]
 DELETE FROM <table> [WHERE <expr>]
 
 -- Query
+SELECT <expr> [[AS] <alias>] [, ...]   -- no FROM: constant projection, one row
+                                       -- (`SELECT 1` liveness probe; no other
+                                       --  clause may follow; `*` needs a table)
 SELECT [DISTINCT] <select-item> [, <select-item> ...]
 FROM <table> [[AS] <alias>]
 [ <join> ... ]
@@ -371,8 +374,14 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   `15s`, `5m`, `2h`, `30d`, `1w` — is a duration, valued as integer
   milliseconds (`5m` = `300000`). Usable anywhere an integer is.
 - **Scalar functions:** `now()` (the query's start time, as a timestamp —
-  one instant per statement) and `time_bucket(<step>, <ts>)` (floors `<ts>`
-  to a `<step>`-wide bucket: `time_bucket(5m, ts)`). A bare identifier
+  one instant per statement), `time_bucket(<step>, <ts>)` (floors `<ts>`
+  to a `<step>`-wide bucket: `time_bucket(5m, ts)`), and
+  `to_timestamp(<value>)` — coerce to a timestamp: numeric epoch-ms passes
+  through and an ISO-8601 string is parsed (`YYYY-MM-DD`,
+  `YYYY-MM-DD[T ]HH:MM[:SS[.fff]]`, optional `Z`/`±HH[:MM]` offset; no offset
+  = UTC). Unparseable or mistyped input yields `NULL`, never an error — so
+  string timestamps (e.g. from a Mongo migration) range-filter in-query:
+  `WHERE to_timestamp(created_at) >= now() - 30d`. A bare identifier
   directly followed by `(` parses as a function call; unknown functions are
   execution errors. The full-text search functions `MATCH`, `MATCH_PHRASE`,
   `FUZZY`, `SEARCH`, and `score` parse the same way and are only valid in a

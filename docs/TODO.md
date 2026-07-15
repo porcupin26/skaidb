@@ -131,15 +131,18 @@ prepared-statement work in phase 1.
   the scalar-leaf idiom. All three predicates travel the internode filter
   codec, so clustered filtered scans serve them.
 
-**Phase 4 — P2 SQL niceties**
+**Phase 4 — P2 SQL niceties** ✅ shipped
 
-- [ ] **[sql] `to_timestamp` / `CAST`** — unblocks Mongo-migrated ISO-8601
-  string timestamps. Ship `to_timestamp`/`parse_iso` as scalar functions
-  first (one `eval_func` arm each, no grammar change); `CAST(x AS t)`
-  syntax later if a client needs the standard spelling.
-- [ ] **[sql] `SELECT <expr>` without `FROM`** — lowest ROI (app falls back
-  to `SHOW TABLES`); `from` is non-optional engine-wide, so needs an
-  `Option`/sentinel + synthetic single-row source. Do only if justified.
+- [x] **[sql] `to_timestamp(v)`** — scalar function: epoch-ms numbers pass
+  through, ISO-8601 strings parse (date, datetime, fraction, `Z`/`±HH[:MM]`);
+  unparseable/mistyped → `NULL`, never an error. Range-filters Mongo-migrated
+  string timestamps in-query. `CAST(x AS t)` *syntax* deferred until a client
+  needs the standard spelling.
+- [x] **[sql] `SELECT <expr>` without `FROM`** — constant projection over one
+  synthetic row (empty `from` sentinel; handled once in `run_select`, shared
+  by embedded + cluster paths, and in `project_core` for UNION legs). Needs no
+  privilege, so any authenticated role can `SELECT 1` as a liveness probe.
+  `SELECT *` and trailing clauses still require a table.
 
 **Phase 5 — P1/P2 localized ops/RBAC tweaks** (`crates/skaidb-server`,
 `skaidb-auth`, engine)

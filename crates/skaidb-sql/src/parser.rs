@@ -981,6 +981,12 @@ impl Parser {
     fn parse_select(&mut self) -> Result<Select, ParseError> {
         let mut query = self.parse_select_core()?;
 
+        // A FROM-less core is a bare constant projection: no set ops or
+        // query-level clauses (leftover tokens error at the statement level).
+        if query.from.is_empty() {
+            return Ok(query);
+        }
+
         let mut set_ops = Vec::new();
         while self.eat_keyword(Keyword::Union) {
             let all = self.eat_keyword(Keyword::All);
@@ -1029,6 +1035,31 @@ impl Parser {
             }
         }
 
+        // `SELECT <expr> [, ...]` without FROM: a constant projection (the
+        // cheap liveness probe / expression calculator, `SELECT 1`). Modeled
+        // as an empty `from`; no other clause may follow. Wildcards need a
+        // table, so `SELECT *` still requires FROM.
+        if self.peek() != &Token::Keyword(Keyword::From) {
+            if items.iter().any(|i| matches!(i, SelectItem::Wildcard)) {
+                return Err(self.unexpected("From".into()));
+            }
+            return Ok(Select {
+                distinct,
+                nearest: None,
+                items,
+                from: String::new(),
+                from_alias: String::new(),
+                joins: Vec::new(),
+                filter: None,
+                group_by: Vec::new(),
+                group_top: None,
+                having: None,
+                set_ops: Vec::new(),
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+            });
+        }
         self.expect_keyword(Keyword::From)?;
         let from = self.parse_table_name()?;
         let from_alias = self
@@ -2221,5 +2252,28 @@ mod tests {
         }
         // Non-constant values are rejected.
         assert!(parse("INSERT INTO t (id, m) VALUES (1, {a: col})").is_err());
+    }
+
+    #[test]
+    fn parse_select_without_from() {
+        match parse("SELECT 1").unwrap() {
+            Statement::Select(s) => {
+                assert!(s.from.is_empty());
+                assert_eq!(s.items.len(), 1);
+            }
+            other => panic!("{other:?}"),
+        }
+        // Aliases and multiple expressions work.
+        match parse("SELECT 1 + 1 AS two, 'x'").unwrap() {
+            Statement::Select(s) => {
+                assert!(s.from.is_empty());
+                assert_eq!(s.items.len(), 2);
+            }
+            other => panic!("{other:?}"),
+        }
+        // A wildcard needs a table; clauses after a FROM-less select error.
+        assert!(parse("SELECT *").is_err());
+        assert!(parse("SELECT 1 WHERE x = 2").is_err());
+        assert!(parse("SELECT 1 ORDER BY 1").is_err());
     }
 }

@@ -981,6 +981,10 @@ fn slow_query_rows(payload: &Json, limit: Option<u64>) -> Response {
 
 fn required_privilege(stmt: &Statement) -> Option<(Privilege, Object)> {
     Some(match stmt {
+        // A FROM-less select (`SELECT 1`) projects constants over no table —
+        // nothing to protect, so any authenticated role may use it as a
+        // liveness probe.
+        Statement::Select(s) if s.from.is_empty() => return None,
         Statement::Select(s) => (Privilege::Select, Object::Table(s.from.clone())),
         // The score breakdown reads the row and the index — gate like SELECT.
         Statement::ExplainScore { select, .. } => {

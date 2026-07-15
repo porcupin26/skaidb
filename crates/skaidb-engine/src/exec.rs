@@ -6125,6 +6125,12 @@ fn run_insert(ins: Insert, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
 }
 
 fn run_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> {
+    // `SELECT <expr>` without FROM: constant projection over one empty row —
+    // the cheap liveness probe (`SELECT 1`) and expression calculator. Shared
+    // by the embedded and clustered paths since both funnel through here.
+    if sel.from.is_empty() {
+        return run_const_select(sel);
+    }
     // Time-series tables gather compressed samples with time-range + label
     // pushdown, then reuse the ordinary projection/aggregation machinery.
     if let Some(series_key) = cluster.ts_series_key(&sel.from)? {
@@ -6160,6 +6166,26 @@ fn run_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> {
     }
     // Simple single-table query: keep the index-accelerated ORDER BY / top-N path.
     run_simple_select(sel, cluster)
+}
+
+/// `SELECT <expr> [, ...]` with no FROM: evaluate each projected expression
+/// against an empty row and return the single constant row. Aggregates are
+/// rejected by scalar eval; a stray column reference evaluates to `NULL`
+/// (there is no row for it to come from).
+fn run_const_select(sel: &Select) -> Result<ResultSet> {
+    let empty = Document::new();
+    let mut columns = Vec::with_capacity(sel.items.len());
+    let mut row = Vec::with_capacity(sel.items.len());
+    for item in &sel.items {
+        let SelectItem::Expr { expr, alias } = item else {
+            return Err(EngineError::Unsupported(
+                "SELECT * requires a FROM table".into(),
+            ));
+        };
+        columns.push(alias.clone().unwrap_or_else(|| expr_name(expr)));
+        row.push(eval(expr, &empty)?);
+    }
+    Ok(ResultSet::new(columns, vec![row]))
 }
 
 /// Execute a `NEAREST` (vector search) select: resolve the query vector and
@@ -7079,6 +7105,10 @@ fn run_simple_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> {
 /// `ResultSet`, but **without** applying ORDER BY / LIMIT — those belong to the
 /// enclosing compound query. Join-aware.
 fn project_core(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> {
+    // A FROM-less UNION leg contributes its one constant row.
+    if sel.from.is_empty() {
+        return run_const_select(sel);
+    }
     let docs: Vec<Document> = if sel.joins.is_empty() {
         cluster
             .matching_rows(&sel.from, &sel.filter)?

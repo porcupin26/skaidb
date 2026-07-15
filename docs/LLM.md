@@ -102,7 +102,12 @@ Key facts an agent must know:
   index/PK pushdown yet), so a large unindexed `IN` scan can hit the scan
   budget.
 - **Scalar functions**: `now()` (statement start, timestamp),
-  `time_bucket(step, ts)` (floor to bucket: `time_bucket(5m, ts)`).
+  `time_bucket(step, ts)` (floor to bucket: `time_bucket(5m, ts)`),
+  `to_timestamp(v)` (epoch-ms number or ISO-8601 string → timestamp;
+  unparseable/mistyped → NULL — range-filter string timestamps in-query).
+- **`SELECT <expr>` without FROM**: constant projection, one row
+  (`SELECT 1` = liveness probe; needs no privilege). `*` and other
+  clauses still require a table; a FROM-less leg works inside UNION.
 - **PK point reads & prefix slices**: a full composite-PK equality
   (`channel = ? AND ts = ?` on PK `(channel, ts)`) is a single bloom-gated
   point read — even for an absent key (no full-table scan). A leftmost

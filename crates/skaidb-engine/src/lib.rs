@@ -223,6 +223,42 @@ mod tests {
         assert_eq!(rs.rows, vec![vec![Value::String("ada".into())]]);
     }
 
+    #[test]
+    fn const_select_and_to_timestamp_end_to_end() {
+        let mut db = Database::open(tempdir()).unwrap();
+
+        // The liveness probe: no table needed.
+        let rs = rows(db.execute("SELECT 1").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::Int(1)]]);
+        let rs = rows(db.execute("SELECT 2 + 3 AS five, 'ok'").unwrap());
+        assert_eq!(rs.columns, vec!["five", "expr"]);
+        assert_eq!(
+            rs.rows,
+            vec![vec![Value::Int(5), Value::String("ok".into())]]
+        );
+        // now() works without a table.
+        let rs = rows(db.execute("SELECT now()").unwrap());
+        assert!(matches!(rs.rows[0][0], Value::Timestamp(t) if t > 0));
+
+        // to_timestamp converts Mongo-migrated ISO strings for range filters.
+        db.execute("CREATE TABLE ev (PRIMARY KEY (id))").unwrap();
+        db.execute(
+            "INSERT INTO ev (id, created_at) VALUES \
+             (1, '1970-01-01T00:00:01Z'), (2, '1970-01-03T00:00:00Z'), (3, 'garbage')",
+        )
+        .unwrap();
+        let rs = rows(
+            db.execute(
+                "SELECT id FROM ev \
+                 WHERE to_timestamp(created_at) BETWEEN 0 AND 86400000 ORDER BY id",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(1)]]); // garbage row is NULL, excluded
+        let rs = rows(db.execute("SELECT to_timestamp(created_at) FROM ev WHERE id = 2").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::Timestamp(2 * 86_400_000)]]);
+    }
+
     /// Shared fixture: a TS table with two hosts sampling `value` every 15 s
     /// for two minutes (values rise 1/s), plus a `temp` field on host a.
     fn ts_fixture(db: &mut Database) {

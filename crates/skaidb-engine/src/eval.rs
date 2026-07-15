@@ -109,6 +109,30 @@ fn eval_func(name: &str, args: &[Expr], row: &Document) -> Result<Value> {
         "now" => Ok(Value::Timestamp(
             crate::exec::now_ms(),
         )),
+        // Coerce a value into a timestamp: numeric epoch-ms passes through,
+        // and an ISO-8601 string is parsed. The escape hatch for data whose
+        // timestamps landed as strings (e.g. a Mongo migration): the typed
+        // decode never triggers, so `to_timestamp(created_at) >= ?` converts
+        // in-query without a data rewrite. Unparseable or mistyped input is
+        // `NULL`, not an error — one bad row in a schema-less column must not
+        // kill the whole query (same policy as LIKE on non-strings).
+        "to_timestamp" => {
+            if args.len() != 1 {
+                return Err(EngineError::Type(
+                    "to_timestamp(value) takes exactly one argument".into(),
+                ));
+            }
+            let v = eval(&args[0], row)?;
+            Ok(match v {
+                Value::Timestamp(t) => Value::Timestamp(t),
+                Value::Int(i) => Value::Timestamp(i),
+                Value::Float(f) => Value::Timestamp(f as i64),
+                Value::String(s) => parse_iso8601_ms(s.trim())
+                    .map(Value::Timestamp)
+                    .unwrap_or(Value::Null),
+                _ => Value::Null,
+            })
+        }
         // `score()` reads the BM25 score the search gather injects into each
         // hit; outside a search query there is nothing to read.
         "score" => {
@@ -330,6 +354,133 @@ fn like_match(s: &str, pattern: &str) -> bool {
     }
     // Only trailing `%`s may remain unconsumed.
     p[pi..].iter().all(|&c| c == '%')
+}
+
+/// Parse an ISO-8601 date/datetime into Unix epoch milliseconds. Accepts
+/// `YYYY-MM-DD`, `YYYY-MM-DD[T ]HH:MM[:SS[.fff]]`, with an optional trailing
+/// `Z` or `±HH[:MM]` offset (no offset = UTC). Sub-millisecond digits are
+/// truncated. Returns `None` on anything malformed.
+fn parse_iso8601_ms(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    let digits = |i: usize, n: usize| -> Option<i64> {
+        let end = i.checked_add(n)?;
+        if end > b.len() || !b[i..end].iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(&b[i..end]).ok()?.parse().ok()
+    };
+
+    // Date part: YYYY-MM-DD.
+    let year = digits(0, 4)?;
+    if b.get(4) != Some(&b'-') {
+        return None;
+    }
+    let month = digits(5, 2)?;
+    if b.get(7) != Some(&b'-') {
+        return None;
+    }
+    let day = digits(8, 2)?;
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let dim = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ][month as usize - 1];
+    if !(1..=dim).contains(&day) {
+        return None;
+    }
+    // Days since the epoch for a civil date (Howard Hinnant's algorithm).
+    let (y, m, d) = (if month <= 2 { year - 1 } else { year }, month, day);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let epoch_days = era * 146097 + doe - 719_468;
+
+    let mut ms = epoch_days.checked_mul(86_400_000)?;
+    let mut i = 10;
+    if i == b.len() {
+        return Some(ms); // date only
+    }
+
+    // Time part: [T ]HH:MM[:SS[.fff]].
+    if b[i] != b'T' && b[i] != b' ' {
+        return None;
+    }
+    i += 1;
+    let hh = digits(i, 2)?;
+    if b.get(i + 2) != Some(&b':') {
+        return None;
+    }
+    let mm = digits(i + 3, 2)?;
+    if hh > 23 || mm > 59 {
+        return None;
+    }
+    ms += (hh * 3600 + mm * 60) * 1000;
+    i += 5;
+    if b.get(i) == Some(&b':') {
+        let ss = digits(i + 1, 2)?;
+        if ss > 60 {
+            return None; // allow a leap-second's `60`
+        }
+        ms += ss * 1000;
+        i += 3;
+        if b.get(i) == Some(&b'.') {
+            i += 1;
+            let start = i;
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i == start {
+                return None;
+            }
+            // First three fractional digits are milliseconds; rest truncate.
+            let frac = &s[start..(start + 3).min(i)];
+            let mut v: i64 = frac.parse().ok()?;
+            for _ in frac.len()..3 {
+                v *= 10;
+            }
+            ms += v;
+        }
+    }
+
+    // Offset: Z | ±HH[:MM] (absent = UTC).
+    match b.get(i) {
+        None => Some(ms),
+        Some(b'Z' | b'z') if i + 1 == b.len() => Some(ms),
+        Some(sign @ (b'+' | b'-')) => {
+            let oh = digits(i + 1, 2)?;
+            let om = match b.get(i + 3) {
+                None => 0,
+                Some(b':') => {
+                    let v = digits(i + 4, 2)?;
+                    if i + 6 != b.len() {
+                        return None;
+                    }
+                    v
+                }
+                _ => return None,
+            };
+            if oh > 14 || om > 59 {
+                return None;
+            }
+            let offset_ms = (oh * 3600 + om * 60) * 1000;
+            Some(if *sign == b'+' { ms - offset_ms } else { ms + offset_ms })
+        }
+        _ => None,
+    }
 }
 
 /// SQL comparison: `None` when either side is `NULL` or the types do not
@@ -618,6 +769,79 @@ mod tests {
             eval(&expr("ts BETWEEN 20 AND NULL"), &row).unwrap(),
             Value::Bool(false)
         );
+    }
+
+    #[test]
+    fn iso8601_parser() {
+        // Date-only, midnight UTC. 2026-07-15 is 20649 days after the epoch.
+        assert_eq!(parse_iso8601_ms("1970-01-01"), Some(0));
+        assert_eq!(parse_iso8601_ms("2026-07-15"), Some(20_649 * 86_400_000));
+        // Datetime with T or space, seconds optional.
+        assert_eq!(
+            parse_iso8601_ms("1970-01-01T01:02:03"),
+            Some(3_723_000)
+        );
+        assert_eq!(parse_iso8601_ms("1970-01-01 01:02"), Some(3_720_000));
+        // Fractional seconds: ms kept, extra digits truncate.
+        assert_eq!(
+            parse_iso8601_ms("1970-01-01T00:00:00.5"),
+            Some(500)
+        );
+        assert_eq!(
+            parse_iso8601_ms("1970-01-01T00:00:00.123456Z"),
+            Some(123)
+        );
+        // Offsets shift back to UTC.
+        assert_eq!(
+            parse_iso8601_ms("1970-01-01T02:00:00+02:00"),
+            Some(0)
+        );
+        assert_eq!(
+            parse_iso8601_ms("1969-12-31T22:00:00-02:00"),
+            Some(0)
+        );
+        // Leap day valid on leap years only.
+        assert!(parse_iso8601_ms("2024-02-29").is_some());
+        assert!(parse_iso8601_ms("2023-02-29").is_none());
+        // Malformed input.
+        for bad in [
+            "", "2026", "2026-13-01", "2026-00-10", "2026-07-32",
+            "2026-07-15X10:00", "2026-07-15T25:00", "2026-07-15T10:0",
+            "not a date", "2026-07-15T10:00:00+2", "2026-07-15T10:00:00Zx",
+        ] {
+            assert_eq!(parse_iso8601_ms(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn to_timestamp_function() {
+        let row = doc(&[
+            ("iso", Value::String("1970-01-02T00:00:00Z".into())),
+            ("n", Value::Int(1000)),
+            ("bad", Value::String("yesterday-ish".into())),
+            ("b", Value::Bool(true)),
+        ]);
+        assert_eq!(
+            eval(&expr("to_timestamp(iso)"), &row).unwrap(),
+            Value::Timestamp(86_400_000)
+        );
+        assert_eq!(
+            eval(&expr("to_timestamp(n)"), &row).unwrap(),
+            Value::Timestamp(1000)
+        );
+        // Unparseable / mistyped / NULL -> NULL, never an error.
+        assert_eq!(eval(&expr("to_timestamp(bad)"), &row).unwrap(), Value::Null);
+        assert_eq!(eval(&expr("to_timestamp(b)"), &row).unwrap(), Value::Null);
+        assert_eq!(
+            eval(&expr("to_timestamp(missing)"), &row).unwrap(),
+            Value::Null
+        );
+        // The point of it all: range-filter string timestamps in-query.
+        assert!(eval_predicate(
+            &expr("to_timestamp(iso) BETWEEN 0 AND 100000000"),
+            &row
+        )
+        .unwrap());
     }
 
     #[test]
