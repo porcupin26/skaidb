@@ -345,8 +345,11 @@ const INDEX_POINT_READ_MAX: usize = 256;
 /// Journal-ack applier queue bound: past this, write acks block until the
 /// applier drains — sustained-overload backpressure, not per-burst shedding.
 const MAINT_QUEUE_MAX: usize = 8192;
-/// Deferred-maintenance tasks applied per engine-lock acquisition.
+/// Deferred-maintenance tasks drained from the queue per applier cycle.
 const MAINT_BATCH_MAX: usize = 256;
+/// Tasks applied per engine-lock acquisition within a cycle — bounds the
+/// applier's lock tenure so readers interleave with FTS-heavy batches.
+const MAINT_LOCK_CHUNK: usize = 32;
 
 /// Rows per `ScanPage` pulled from each member during a distributed
 /// full-table gather (`cluster_scan`): bounds the coordinator's transient
@@ -670,15 +673,26 @@ impl Node {
                         *e = m.hlc;
                     }
                 }
-                if let Ok(mut db) = node.local.write() {
-                    for m in &decoded {
-                        if let Err(e) = db.apply_maintenance(m) {
-                            skaidb_types::slog!(
-                                "skaidb: deferred maintenance failed on {}: {e}",
-                                m.table
-                            );
+                // Bounded lock tenure: FTS indexing dominates maintenance
+                // cost, and one lock hold across a 256-task batch of slack
+                // messages stalled replica point reads 12s (2026-07-15).
+                // Apply in sub-chunks, re-acquiring with a breather so
+                // queued readers interleave; watermarks advance once at the
+                // end (they only gate truncation/replay, not visibility).
+                for chunk in decoded.chunks(MAINT_LOCK_CHUNK) {
+                    if let Ok(mut db) = node.local.write() {
+                        for m in chunk {
+                            if let Err(e) = db.apply_maintenance(m) {
+                                skaidb_types::slog!(
+                                    "skaidb: deferred maintenance failed on {}: {e}",
+                                    m.table
+                                );
+                            }
                         }
                     }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                if let Ok(mut db) = node.local.write() {
                     for (table, hlc) in &marks {
                         db.set_applied_watermark(table, *hlc);
                         let _ = db.search_refresh(table);
