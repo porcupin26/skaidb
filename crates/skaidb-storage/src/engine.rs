@@ -869,21 +869,31 @@ impl Engine {
             });
         }
         for level in 0..self.levels.len() {
+            // Only cascade a level DOWN into an existing next level. The
+            // deepest level has nowhere to go — it absorbs data and is
+            // allowed to exceed the (per-level) capacity budget, exactly as
+            // an LSM's last level does. Rewriting it in place doesn't shrink
+            // it, so a background compactor that re-checked capacity every
+            // tick rewrote a 900 MB+ deepest level forever (~40 MB/s of pure
+            // churn, prod 2026-07-15). The inline compactor never hit this:
+            // it ran once per flush and its level counter terminated the
+            // cascade after one pass.
+            if level + 1 >= self.levels.len() {
+                break;
+            }
             let capacity = self.opts.level1_capacity * 10u64.pow(level as u32);
             if self.levels[level].len() <= capacity {
                 continue;
             }
-            let has_next = level + 1 < self.levels.len();
-            let deepest = !has_next;
-            let mut inputs = vec![self.levels[level].path().to_path_buf()];
-            if has_next {
-                inputs.push(self.levels[level + 1].path().to_path_buf());
-            }
+            let inputs = vec![
+                self.levels[level].path().to_path_buf(),
+                self.levels[level + 1].path().to_path_buf(),
+            ];
             return Some(CompactJob {
                 inputs,
                 output: self.next_table_path(),
-                deepest,
-                codec: self.codec_for(deepest),
+                deepest: level + 1 == self.levels.len() - 1,
+                codec: self.codec_for(level + 1 == self.levels.len() - 1),
                 expire_before,
             });
         }
@@ -1598,22 +1608,74 @@ mod tests {
     }
 
     #[test]
+    fn deepest_level_over_capacity_does_not_re_compact_forever() {
+        // A deepest level larger than its per-level entry budget must NOT be
+        // re-selected for compaction: there is nowhere deeper to move it, so
+        // rewriting it in place is pure churn. The background compactor
+        // re-checked capacity every tick and rewrote a 900 MB+ deepest level
+        // forever (~40 MB/s, prod 2026-07-15).
+        let opts = EngineOptions {
+            flush_threshold_bytes: 1 << 20,
+            l0_compaction_trigger: 2,
+            level1_capacity: 8, // tiny: the merged L1 will exceed it
+            ..Default::default()
+        };
+        let mut e = Engine::open_with_options(tempdir(), opts).unwrap();
+        // Flush enough L0 tables to trigger an L0->L1 merge; the resulting
+        // L1 holds ~40 keys, far over the 8-entry "capacity".
+        for batch in 0..4u32 {
+            for i in 0..10u32 {
+                let k = batch * 10 + i;
+                e.put(format!("k{k:03}").as_bytes(), vec![k as u8; 32]).unwrap();
+            }
+            e.freeze().unwrap();
+            let j = e.take_flush_job().unwrap();
+            let sst = Engine::build_flush(&j).unwrap();
+            e.install_flush(j, sst).unwrap();
+        }
+        // Drain the L0->L1 merge.
+        while let Some(job) = e.take_compact_job() {
+            let built = Engine::build_compact(&job).unwrap();
+            assert!(e.install_compact(job, built).unwrap());
+        }
+        // L1 is now the deepest level and over the 8-entry budget — but there
+        // must be NO further compaction work (the loop is broken).
+        assert!(
+            e.take_compact_job().is_none(),
+            "deepest over-capacity level must not re-trigger compaction"
+        );
+        assert!(!e.has_background_work(), "no phantom background work");
+        // Data intact.
+        assert_eq!(e.get(b"k000").unwrap(), Some(vec![0u8; 32]));
+        assert_eq!(e.get(b"k039").unwrap(), Some(vec![39u8; 32]));
+    }
+
+    #[test]
     fn compaction_install_survives_a_concurrent_flush() {
         // A flush landing between take_compact_job and install_compact adds a
         // new L0 table. The compaction must still install (its own inputs are
         // untouched) AND the flushed table must survive — the global-epoch
         // discard re-planned the merge forever, a ~20 MB/s disk loop
         // (2026-07-15).
-        let mut e = Engine::open_with_options(tempdir(), small_opts()).unwrap();
-        // Build up several L0 tables to trigger a compaction.
-        for i in 0..60u32 {
-            e.put(format!("k{i:03}").as_bytes(), vec![i as u8; 64]).unwrap();
-            if i % 6 == 5 {
-                e.freeze().unwrap();
-                let j = e.take_flush_job().unwrap();
-                let sst = Engine::build_flush(&j).unwrap();
-                e.install_flush(j, sst).unwrap();
+        // Large level1_capacity so the deepest level never self-triggers —
+        // this test is about an L0->L1 merge racing a flush, not cascades.
+        let opts = EngineOptions {
+            flush_threshold_bytes: 1 << 20,
+            l0_compaction_trigger: 3,
+            level1_capacity: 1_000_000,
+            ..Default::default()
+        };
+        let mut e = Engine::open_with_options(tempdir(), opts).unwrap();
+        // Build up L0 tables (manual freeze/flush) past the trigger.
+        for batch in 0..4u32 {
+            for i in 0..10u32 {
+                let k = batch * 10 + i;
+                e.put(format!("k{k:03}").as_bytes(), vec![k as u8; 64]).unwrap();
             }
+            e.freeze().unwrap();
+            let j = e.take_flush_job().unwrap();
+            let sst = Engine::build_flush(&j).unwrap();
+            e.install_flush(j, sst).unwrap();
         }
         let job = e.take_compact_job().expect("l0 over trigger");
         let built = Engine::build_compact(&job).unwrap();
@@ -1628,7 +1690,7 @@ mod tests {
         assert!(e.install_compact(job, built).unwrap(), "compaction must install");
         // Both the compacted data AND the concurrently flushed row survive.
         assert_eq!(e.get(b"k000").unwrap(), Some(vec![0u8; 64]));
-        assert_eq!(e.get(b"k059").unwrap(), Some(vec![59u8; 64]));
+        assert_eq!(e.get(b"k039").unwrap(), Some(vec![39u8; 64]));
         assert_eq!(e.get(b"concurrent").unwrap(), Some(b"kept".to_vec()));
     }
 
