@@ -177,6 +177,16 @@ prepared-statement work in phase 1.
 (The audit record — what already holds, measured dead ends, methodology —
 lives in [BENCHMARKS.md](BENCHMARKS.md#performance-engineering-notes).)
 
+- [ ] **[perf] REST streaming results** — the gateway now bounds request
+  bodies and materialized `/query` results at 64 MiB with socket timeouts
+  (v0.83.1, after a multi-GB response serialization pinned a production node
+  at its cgroup ceiling for hours — stalled client, no write timeout, whole
+  JSON held live). The cap is a guardrail; chunked/streamed REST responses
+  would lift it properly. Binary-protocol `QueryStream` already streams.
+  Note: jemalloc background purge was ruled out as the culprit — the
+  `background_threads` build feature enables time-based decay purging; the
+  wedged memory was live serialization buffers, not retained pages.
+
 - [ ] **[perf] Merkle-tree anti-entropy** — paged repair compares every
   key each pass; a Merkle tree per table would make repair cost
   proportional to divergence, not table size.

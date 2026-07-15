@@ -8,12 +8,27 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use serde_json::{json, Value as Json};
 use skaidb_proto::Response;
 
 use crate::metrics::Endpoint;
 use crate::shared::{collect_runtime_metrics, execute_as, Shared};
+
+/// Socket timeouts for REST connections. A peer that stops reading (or a
+/// dead client behind a proxy) must not pin a handler thread — and its fully
+/// materialized response — forever: threads stuck mid-write on multi-GB
+/// responses held a production node at its cgroup ceiling for hours
+/// (2026-07-15 skai2 wedge). A timed-out write errors the handler out and
+/// drops the buffers.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Cap on a request body and on a materialized `/query` result, mirroring the
+/// binary protocol's frame limit: past it the gateway answers with guidance
+/// instead of ballooning the heap.
+const MAX_BODY_LEN: usize = skaidb_proto::MAX_FRAME_LEN as usize;
 
 /// Bind the REST endpoint and serve it on a background thread.
 pub fn spawn(addr: &str, ctx: Shared) -> io::Result<(std::net::SocketAddr, JoinHandle<()>)> {
@@ -26,6 +41,10 @@ pub fn spawn(addr: &str, ctx: Shared) -> io::Result<(std::net::SocketAddr, JoinH
 /// Accept connections forever, handling each on its own thread.
 pub fn serve(listener: TcpListener, ctx: Shared) {
     for stream in listener.incoming().flatten() {
+        // Best-effort: a socket that rejects the option still gets served,
+        // it just keeps the old unbounded behavior.
+        let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
         let ctx = ctx.clone();
         thread::spawn(move || {
             ctx.metrics.connection_opened(Endpoint::Rest);
@@ -39,6 +58,16 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) -> io::Result<()> {
     let req = match read_request(&mut stream) {
         Ok(Some(req)) => req,
         Ok(None) => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+            return write_response(
+                &mut stream,
+                413,
+                &json!({"error": format!(
+                    "request body exceeds the {} MiB limit; batch smaller or use the binary protocol",
+                    MAX_BODY_LEN / (1024 * 1024)
+                )}),
+            );
+        }
         Err(_) => {
             return write_response(&mut stream, 400, &json!({"error": "malformed request"}));
         }
@@ -377,6 +406,14 @@ fn read_request(stream: &mut TcpStream) -> io::Result<Option<HttpRequest>> {
         }
     }
 
+    // Cap before allocating: a huge (or hostile) Content-Length must not
+    // reserve gigabytes up front. Surfaced to the client as 413.
+    if content_length > MAX_BODY_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "request body over limit",
+        ));
+    }
     let mut body = vec![0u8; content_length];
     reader.read_exact(&mut body)?;
     Ok(Some(HttpRequest {
@@ -625,9 +662,50 @@ fn status_json(ctx: &Shared) -> Json {
     }
 }
 
+/// Rough serialized-JSON size of a value, for bounding a response without
+/// serializing it twice. Overestimates slightly (escape/base64 headroom).
+fn approx_json_len(v: &skaidb_types::Value) -> usize {
+    use skaidb_types::Value;
+    match v {
+        Value::Null => 4,
+        Value::Bool(_) => 5,
+        Value::Int(_) | Value::Float(_) | Value::Timestamp(_) => 20,
+        Value::Decimal(_) => 32,
+        Value::Uuid(_) => 40,
+        Value::String(s) => s.len() + 8,
+        Value::Bytes(b) => b.len() * 4 / 3 + 8,
+        Value::Array(items) => 2 + items.len() + items.iter().map(approx_json_len).sum::<usize>(),
+        Value::Document(d) => {
+            2 + d
+                .0
+                .iter()
+                .map(|(k, v)| k.len() + 4 + approx_json_len(v))
+                .sum::<usize>()
+        }
+    }
+}
+
 fn response_to_json(response: Response) -> (u16, Json) {
     match response {
         Response::Rows { columns, rows } => {
+            // Bound the materialized result like the binary protocol bounds
+            // its frames: past the cap, answer with guidance instead of
+            // ballooning the heap (a multi-GB `/query` serialization pinned a
+            // production node at its cgroup ceiling, 2026-07-15).
+            let mut approx = 0usize;
+            for row in &rows {
+                approx += 2 + row.iter().map(approx_json_len).sum::<usize>();
+                if approx > MAX_BODY_LEN {
+                    return (
+                        400,
+                        json!({ "error": format!(
+                            "result set exceeds the {} MiB response limit; add LIMIT or use the \
+                             binary protocol's streaming query",
+                            MAX_BODY_LEN / (1024 * 1024)
+                        )}),
+                    );
+                }
+            }
             let rows: Vec<Json> = rows
                 .into_iter()
                 .map(|row| Json::Array(row.iter().map(|v| v.to_json()).collect()))
@@ -702,7 +780,52 @@ fn http_reason(status: u16) -> &'static str {
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
+        413 => "Payload Too Large",
         503 => "Service Unavailable",
         _ => "Error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use skaidb_types::Value;
+
+    /// A result set past the cap answers with guidance instead of
+    /// materializing; small ones convert normally.
+    #[test]
+    fn rows_response_is_bounded() {
+        let small = Response::Rows {
+            columns: vec!["v".into()],
+            rows: vec![vec![Value::String("x".repeat(100))]],
+        };
+        let (status, body) = response_to_json(small);
+        assert_eq!(status, 200);
+        assert!(body["rows"].is_array());
+
+        // 70 rows × ~1 MiB of string comfortably exceeds the 64 MiB cap.
+        let big = Response::Rows {
+            columns: vec!["v".into()],
+            rows: (0..70)
+                .map(|_| vec![Value::String("y".repeat(1024 * 1024))])
+                .collect(),
+        };
+        let (status, body) = response_to_json(big);
+        assert_eq!(status, 400);
+        let msg = body["error"].as_str().unwrap();
+        assert!(msg.contains("response limit"), "{msg}");
+        assert!(msg.contains("LIMIT"), "{msg}");
+    }
+
+    /// The size estimate covers every value shape and scales with payload.
+    #[test]
+    fn approx_json_len_scales() {
+        assert!(approx_json_len(&Value::Null) < 10);
+        assert!(approx_json_len(&Value::String("abc".into())) >= 3);
+        let big = Value::Array(vec![Value::String("z".repeat(1000)); 10]);
+        assert!(approx_json_len(&big) >= 10_000);
+        let mut d = skaidb_types::Document::new();
+        d.insert("k", Value::Bytes(vec![0u8; 3000]));
+        assert!(approx_json_len(&Value::Document(d)) >= 4000);
     }
 }

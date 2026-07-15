@@ -58,6 +58,11 @@ Key facts an agent must know:
 - **The REST gateway is stateless**: `USE db` does not persist between
   calls. Pass `{"sql": ..., "db": "mydb"}` per request, or qualify names
   (`mydb.orders`). Binary-protocol sessions do keep `USE` state.
+- **REST is bounded**: request bodies over 64 MiB → 413; a `/query` result
+  that would serialize past 64 MiB → an error suggesting `LIMIT` or the
+  binary protocol's streaming query (which has no such cap); sockets carry
+  30 s read / 60 s write timeouts, so a stalled client can't pin a handler.
+  Bulk transfers belong on the binary protocol.
 - **String literals use single quotes** (`'ada'`, escape by doubling:
   `'O''Brien'`). **Double quotes are identifiers** (`"weird name"`). Sending
   `"text"` where a string is expected is a common LLM error.
