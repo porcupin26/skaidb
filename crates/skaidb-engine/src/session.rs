@@ -247,6 +247,24 @@ mod tests {
         assert!(dt.as_millis() < 500, "50 indexed point lookups took {dt:?} — not using the index");
     }
 
+    /// Exotic search syntax must come back as a query error — `*:*` reached
+    /// a panicking path inside tantivy's grammar, unwound through a request
+    /// thread, and poisoned the node's auth lock (2026-07-15).
+    #[test]
+    fn hostile_search_syntax_errors_instead_of_panicking() {
+        let mut s = Session::open(tmp()).unwrap();
+        s.execute("CREATE TABLE t (PRIMARY KEY (id));").unwrap();
+        s.execute("CREATE SEARCH INDEX t_fts ON t (body);").unwrap();
+        s.execute("INSERT INTO t (id, body) VALUES (1, 'hello world');").unwrap();
+        for q in ["*:*", "field:", "[a TO", "\"unclosed"] {
+            let out = s.execute(&format!("SELECT id FROM t WHERE SEARCH('{q}')"));
+            assert!(out.is_err(), "hostile query {q:?} must error, not panic/succeed");
+        }
+        // The session (and its locks) survive to serve normal queries.
+        let ok = s.execute("SELECT id FROM t WHERE MATCH(body, 'hello')").unwrap();
+        assert_eq!(rows(ok).len(), 1);
+    }
+
     /// A leftmost PK-prefix equality (plus optional trailing range on the
     /// next PK column) must scan only that slice of the table — the slack
     /// thread-refresh shape (`channel = ?` on PK (channel, ts)) walked 252k

@@ -488,9 +488,20 @@ pub(crate) fn build_query(
                     parser.set_field_boost(rt.field, rt.boost);
                 }
             }
-            parser
-                .parse_query(text)
-                .map_err(|e| FtsError::Config(format!("invalid search query: {e}")))
+            // tantivy's query grammar has panicking paths on exotic inputs
+            // (`*:*` panicked a request thread and poisoned the node's auth
+            // lock, 2026-07-15). User input must never unwind past here —
+            // trap the panic and hand back a normal query error.
+            let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                parser.parse_query(text)
+            }));
+            match parsed {
+                Ok(result) => result
+                    .map_err(|e| FtsError::Config(format!("invalid search query: {e}"))),
+                Err(_) => Err(FtsError::Config(format!(
+                    "invalid search query: unsupported syntax: {text}"
+                ))),
+            }
         }
         SearchQuery::All(subs) => {
             let mut clauses = Vec::with_capacity(subs.len());
