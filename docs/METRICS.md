@@ -155,6 +155,8 @@ coordinator at scrape time.
 | `skaidb_cluster_hints_pending_peer` | gauge | `peer` | Hints buffered **per peer** — exact replication backlog for that node. |
 | `skaidb_memory_shedding_writes` | gauge | — | 1 while the node is shedding writes under memory pressure (rejecting new writes so it can drain instead of being OOM-killed). **Alert on sustained 1.** |
 | `skaidb_memory_used_bytes` / `skaidb_memory_limit_bytes` | gauge | — | Sampled memory usage vs. the node's limit (cgroup when set, else system RAM); shedding starts at 85% and clears at 70%. |
+| `skaidb_memory_anon_bytes` / `skaidb_memory_file_bytes` | gauge | — | Cgroup anon vs file split. The production memory-wedge signature is anon ratcheting up while file collapses toward zero — graph these together. |
+| `skaidb_alloc_allocated_bytes` / `skaidb_alloc_resident_bytes` / `skaidb_alloc_retained_bytes` | gauge | — | jemalloc live heap / resident pages / OS-unreturned address space. `resident − allocated` ≈ fragmentation + unpurged dirty pages: distinguishes "something holds memory" from "the allocator won't give it back". |
 | `skaidb_cluster_replication_lag_ms` | gauge | `peer` | Approx. ms between this node's HLC frontier and the latest write it has confirmed `peer` applied. |
 | `skaidb_cluster_peer_requests_total` | counter | — | Internode RPCs issued by the coordinator. |
 | `skaidb_cluster_peer_errors_total` | counter | — | Internode RPCs that errored or timed out. |
@@ -189,6 +191,10 @@ picture from a local read, and it is plain SQL:
 
 ```sql
 SELECT node, ts, mem_used_bytes, restarts, oom_kills FROM node_stats;
+-- memory-ramp composition (the anon-ratchet post-mortem columns):
+SELECT node, mem_anon_bytes, mem_file_bytes,
+       alloc_allocated_bytes, alloc_resident_bytes, alloc_retained_bytes
+FROM node_stats;
 ```
 
 The UI's stats **NODES** table reads this (falling back to live probes for

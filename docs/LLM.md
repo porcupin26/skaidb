@@ -182,6 +182,10 @@ CREATE INDEX [IF NOT EXISTS] i ON t (path [, path ...])   -- composite = leftmos
 --   a `path[]` component makes the index MULTIKEY: one entry per array
 --   element, so `col = 'x'` containment is an index probe (exact counts);
 --   planner requires equality through the [] column; max one [] per index
+--   append WITH (global = true) for a value-sharded GLOBAL index
+--   (v0.90 phase 1: write-path entries only, no reads yet — see
+--   docs/GLOBAL_INDEXES.md; local remains the default and the planner
+--   ignores global indexes until the routed read path lands)
 DROP INDEX [IF EXISTS] i
 CREATE VECTOR INDEX [IF NOT EXISTS] v ON t (path) DIM n [USING cosine|l2|dot]
 DROP VECTOR INDEX [IF EXISTS] v
@@ -455,6 +459,11 @@ the table on open. Distributed: scatter, merge by distance.
   own backfill in the background. `SHOW INDEXES` shows
   `secondary (building)` until that node's pages complete; the planner
   never uses a building index.
+- **Vector DDL acks at schema-apply too** (v0.90): CREATE VECTOR INDEX
+  with an explicit DIM (and rename-triggered vector rebuilds) queue a
+  paged backfill; `SHOW INDEXES` shows `local = building` and searches on
+  that index error "rebuilding — retry shortly" until the pages complete.
+  Only the DIM-inference form (no explicit DIM) still scans inline.
 - **Non-blocking FTS startup** (v0.81): a node opens and serves everything
   immediately; search-index catch-up/rebuild pages in the background.
   `MATCH` against a still-rebuilding index errors with "rebuilding after

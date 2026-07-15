@@ -31,13 +31,11 @@ fn register_alloc_stats() {
     skaidb_cluster::memguard::set_alloc_stats_hook(Box::new(|| {
         use tikv_jemalloc_ctl::{epoch, stats};
         epoch::advance().ok()?; // refresh the stats snapshot
-        let mb = |v: usize| v / (1024 * 1024);
-        Some(format!(
-            "jemalloc: allocated {} MB, resident {} MB, retained {} MB",
-            mb(stats::allocated::read().ok()?),
-            mb(stats::resident::read().ok()?),
-            mb(stats::retained::read().ok()?),
-        ))
+        Some(skaidb_cluster::memguard::AllocStats {
+            allocated: stats::allocated::read().ok()? as u64,
+            resident: stats::resident::read().ok()? as u64,
+            retained: stats::retained::read().ok()? as u64,
+        })
     }));
 }
 

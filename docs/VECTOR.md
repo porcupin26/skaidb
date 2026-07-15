@@ -32,6 +32,13 @@ DROP   VECTOR INDEX docs_emb
 its own shard. The index is maintained automatically on `INSERT`/`UPDATE`/
 `DELETE` (a replace soft-deletes the old vector and inserts the new one).
 
+The DDL acks at schema-apply; each node backfills existing rows in paged
+background work (like secondary indexes). While a node is backfilling,
+`SHOW INDEXES` reports `local = building` there, and searches against the
+index answer **"vector index is rebuilding — retry shortly"** rather than
+silently serving a partial graph. On a single-node/embedded database the
+backfill completes before the DDL returns.
+
 ## Searching (SQL)
 
 ```sql

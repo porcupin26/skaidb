@@ -21,6 +21,7 @@ pub use exec::{
     InventoryTable, InventoryTimeseries, InventoryVector, pk_point_key, pk_point_keys, TableStats,
     TsRollupInfo,
     DecodedMaint, MaintTask,
+    gidx_table, global_entry_delta, index_entry_key,
 };
 pub use skaidb_storage::{Codec, EngineOptions, DEFAULT_SEARCH_WRITER_HEAP};
 pub use namespace::DEFAULT_DATABASE;
@@ -2215,6 +2216,142 @@ mod tests {
         assert_eq!(rs.rows.len(), 1, "EXPLAIN DELETE must not delete");
         // Nested EXPLAIN is rejected at parse time.
         assert!(db.execute("EXPLAIN EXPLAIN SELECT * FROM e").is_err());
+    }
+
+    /// GLOBAL index entry plumbing (phase 1, docs/GLOBAL_INDEXES.md): row
+    /// mutations keep the internal `__gidx__` entry table in exact lockstep —
+    /// puts add entries, value changes retract the old entry, deletes retract
+    /// everything. No reader exists yet; parity of the entry set is the
+    /// contract.
+    #[test]
+    fn global_index_entries_track_row_mutations() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE msgs (PRIMARY KEY (id))").unwrap();
+        db.execute("CREATE INDEX msgs_user ON msgs (sender) WITH (global = true)")
+            .unwrap();
+        // SHOW INDEXES reports the global class, healthy.
+        let rs = rows(db.execute("SHOW INDEXES").unwrap());
+        let row = rs
+            .rows
+            .iter()
+            .find(|r| r[0] == Value::String("msgs_user".into()))
+            .expect("global index listed");
+        assert_eq!(row[2], Value::String("global".into()));
+        assert_eq!(row[4], Value::String("ok".into()));
+
+        let entries = |db: &Database| -> Vec<(Vec<u8>, bool)> {
+            db.local_scan_versioned_page(&gidx_table("msgs_user"), None, 100)
+                .unwrap()
+                .into_iter()
+                .map(|(k, _, _, is_put)| (k, is_put))
+                .collect()
+        };
+
+        db.execute("INSERT INTO msgs (id, sender, body) VALUES (1, 'ala', 'x'), (2, 'bob', 'y'), (3, 'ala', 'z')")
+            .unwrap();
+        let live: Vec<_> = entries(&db).into_iter().filter(|(_, p)| *p).collect();
+        assert_eq!(live.len(), 3, "one entry per row");
+
+        // Changing the indexed value retracts the old entry and adds the new
+        // one; the row count stays 3.
+        db.execute("UPDATE msgs SET sender = 'cyd' WHERE id = 1").unwrap();
+        let now = entries(&db);
+        let live: Vec<_> = now.iter().filter(|(_, p)| *p).collect();
+        let dead: Vec<_> = now.iter().filter(|(_, p)| !*p).collect();
+        assert_eq!(live.len(), 3);
+        assert_eq!(dead.len(), 1, "old 'ala' entry tombstoned");
+
+        // Rewriting a row WITHOUT changing the indexed value adds nothing.
+        db.execute("UPDATE msgs SET body = 'w' WHERE id = 2").unwrap();
+        assert_eq!(entries(&db).iter().filter(|(_, p)| *p).count(), 3);
+
+        // Deleting a row retracts its entry.
+        db.execute("DELETE FROM msgs WHERE id = 3").unwrap();
+        assert_eq!(entries(&db).iter().filter(|(_, p)| *p).count(), 2);
+
+        // The entry table is internal: hidden from SHOW TABLES.
+        let ts = rows(db.execute("SHOW TABLES").unwrap());
+        assert!(
+            ts.rows.iter().all(|r| r[0] != Value::String("__gidx__msgs_user".to_string())),
+            "entry table hidden"
+        );
+
+        // The planner never picks a global index (no reader in phase 1).
+        let rs = rows(db.execute("EXPLAIN SELECT * FROM msgs WHERE sender = 'bob'").unwrap());
+        let access = rs
+            .rows
+            .iter()
+            .find(|r| r[0] == Value::String("access".into()))
+            .map(|r| format!("{:?}", r[1]))
+            .unwrap_or_default();
+        assert!(
+            access.contains("full table scan"),
+            "global index must not plan yet, got: {access}"
+        );
+
+        // DROP INDEX removes the entry table with it.
+        db.execute("DROP INDEX msgs_user").unwrap();
+        assert!(db.local_scan_versioned_page(&gidx_table("msgs_user"), None, 10).is_err());
+    }
+
+    /// Deferred vector backfill (cluster mode): CREATE VECTOR INDEX with an
+    /// explicit DIM acks at schema-apply with the index marked `building`;
+    /// searches error "retry shortly", SHOW INDEXES reports `building`, and
+    /// paging the backfill flips it to `ok` with the rows searchable.
+    #[test]
+    fn deferred_vector_backfill_reports_building() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.set_defer_backfills(true);
+        db.execute("CREATE TABLE docs (PRIMARY KEY (id))").unwrap();
+        for i in 0..20 {
+            db.execute(&format!(
+                "INSERT INTO docs (id, emb) VALUES ({i}, [{}.0, 1.0, 0.0])",
+                i % 7
+            ))
+            .unwrap();
+        }
+        db.execute("CREATE VECTOR INDEX docs_emb ON docs (emb) DIM 3").unwrap();
+
+        let local = |db: &mut Database| -> String {
+            let rs = rows(db.execute("SHOW INDEXES").unwrap());
+            let row = rs
+                .rows
+                .iter()
+                .find(|r| r[0] == Value::String("docs_emb".into()))
+                .expect("docs_emb listed");
+            match &row[4] {
+                Value::String(s) => s.clone(),
+                other => panic!("expected string local health, got {other:?}"),
+            }
+        };
+        assert_eq!(local(&mut db), "building");
+        let err = db
+            .vector_search("docs_emb", &[1.0, 1.0, 0.0], 3, &None)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("rebuilding"),
+            "building index must refuse searches, got: {err}"
+        );
+
+        // Drive the backfill in deliberately small pages, like the cluster
+        // worker does.
+        let mut cursor = None;
+        let mut pages = 0;
+        while let Some(next) = db.backfill_vector_page("docs_emb", cursor.take(), 8).unwrap() {
+            cursor = Some(next);
+            pages += 1;
+        }
+        assert!(pages >= 2, "20 rows at page size 8 must take several pages");
+        assert_eq!(local(&mut db), "ok");
+        let hits = db.vector_search("docs_emb", &[1.0, 1.0, 0.0], 3, &None).unwrap();
+        assert_eq!(hits.len(), 3);
+
+        // Writes landing after DDL but before/while paging are not lost:
+        // they maintained the live HNSW directly (id 100 was never seen by a
+        // page — insert it now and confirm it is searchable).
+        db.execute("INSERT INTO docs (id, emb) VALUES (100, [9.0, 9.0, 9.0])").unwrap();
+        let hits = db.vector_search("docs_emb", &[9.0, 9.0, 9.0], 1, &None).unwrap();
+        assert_eq!(hits.len(), 1);
     }
 
     /// ALTER VECTOR INDEX SET (ef = n): live recall/latency tuning;

@@ -792,6 +792,37 @@ impl Node {
                     }
                 }
             }
+            // Vector backfills: same paged drain (searches on the index answer
+            // "rebuilding — retry shortly" until the pages complete).
+            let pending = match node.local.write() {
+                Ok(mut db) => db.take_pending_vector_backfills(),
+                Err(_) => return,
+            };
+            for name in pending {
+                let mut cursor = None;
+                loop {
+                    let step = match node.local.write() {
+                        Ok(mut db) => db.backfill_vector_page(&name, cursor.take(), 2048),
+                        Err(_) => return,
+                    };
+                    match step {
+                        Ok(Some(next)) => {
+                            cursor = Some(next);
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Ok(None) => {
+                            skaidb_types::slog!(
+                                "skaidb: background vector backfill complete: {name}"
+                            );
+                            break;
+                        }
+                        Err(e) => {
+                            skaidb_types::slog!("skaidb: vector backfill failed on {name}: {e}");
+                            break;
+                        }
+                    }
+                }
+            }
             loop {
                 let jobs = match node.local.write() {
                     Ok(mut db) => db.background_flush_jobs(),
@@ -869,9 +900,11 @@ impl Node {
             // logged: both production wedges crept to the ceiling in silence.
             const RELEASE_EVERY: Duration = Duration::from_secs(10);
             const DISTRESS_EVERY: Duration = Duration::from_secs(60);
+            const RAMP_LOG_EVERY: Duration = Duration::from_secs(900);
             let mut last_release: Option<Instant> = None;
             let mut shed_since: Option<Instant> = None;
             let mut last_distress: Option<Instant> = None;
+            let mut last_ramp_log: Option<Instant> = None;
             while let Some(node) = mem_weak.upgrade() {
                 let pressure = node.mem.sample_pressure();
                 if pressure >= Pressure::Release
@@ -947,6 +980,25 @@ impl Node {
                         );
                     }
                     (false, None) => {}
+                }
+                // Ramp log: one composition line every 15 min while above
+                // half the limit. Both production wedges crept ~100 MB/h for
+                // many hours before the first pressure log; this writes the
+                // ramp's anon/file + allocated/resident/retained history so
+                // the post-mortem question — live memory or allocator
+                // retention? — is answerable from the log alone.
+                if limit > 0 && used > limit / 2 {
+                    if last_ramp_log.is_none_or(|t: Instant| t.elapsed() >= RAMP_LOG_EVERY) {
+                        last_ramp_log = Some(Instant::now());
+                        skaidb_types::slog!(
+                            "skaidb: memory ramp — {}/{} MB{}",
+                            used / (1024 * 1024),
+                            limit / (1024 * 1024),
+                            breakdown()
+                        );
+                    }
+                } else {
+                    last_ramp_log = None;
                 }
                 drop(node); // don't hold the node alive across the sleep
                 thread::sleep(crate::memguard::SAMPLE_INTERVAL);
@@ -4559,6 +4611,46 @@ impl Node {
     /// sum), with the local fsync overlapped on this thread; any remaining
     /// peers are replicated in the background (so e.g. CL=ONE returns after
     /// the local fsync without waiting for the peer round-trip).
+    /// The GLOBAL index declarations on `table` (from the local catalog —
+    /// identical on every node, DDL is broadcast).
+    fn global_indexes_of(&self, table: &str) -> EngineResult<Vec<(String, Vec<String>)>> {
+        Ok(self
+            .local
+            .read()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .global_indexes_of(table))
+    }
+
+    /// Companion writes for GLOBAL indexes: replicate each entry delta to the
+    /// ENTRY key's replica set (potentially different nodes than the row's),
+    /// at the same consistency as the row write, before the statement acks
+    /// (docs/GLOBAL_INDEXES.md). There is no cross-key atomicity: a crash
+    /// between the row write and these leaves a missing/orphan entry, both
+    /// self-healing (probe re-check now, repair leg in phase 3).
+    fn write_global_entries(
+        self: &Arc<Self>,
+        gidx: &[(String, Vec<String>)],
+        row_key: &[u8],
+        old: Option<&Document>,
+        new: Option<&Document>,
+        oc: Option<Consistency>,
+    ) -> EngineResult<()> {
+        for (name, paths) in gidx {
+            let entry_table = skaidb_engine::gidx_table(name);
+            let (dels, puts) = skaidb_engine::global_entry_delta(paths, row_key, old, new);
+            for k in dels {
+                let hlc = self.clock.now();
+                self.replicate(&entry_table, &k, WriteOp::Delete, hlc, oc)?;
+            }
+            let empty = Value::Document(Document::new()).encode();
+            for k in puts {
+                let hlc = self.clock.now();
+                self.replicate(&entry_table, &k, WriteOp::Put(empty.clone()), hlc, oc)?;
+            }
+        }
+        Ok(())
+    }
+
     fn replicate(
         self: &Arc<Self>,
         table: &str,
@@ -7098,15 +7190,38 @@ impl Cluster for Coordinator {
     }
 
     fn put(&mut self, table: &str, key: &[u8], doc: &Document) -> EngineResult<()> {
+        // Global-index companion writes need the OLD row to retract entries
+        // the new version no longer produces — one quorum point read, paid
+        // only by tables that declared a global index.
+        let gidx = self.node.global_indexes_of(table)?;
+        let old = if gidx.is_empty() {
+            None
+        } else {
+            self.node
+                .point_get(table, key, self.oc)?
+                .into_iter()
+                .map(|(_, d)| d)
+                .next()
+        };
         let hlc = self.node.clock.now();
         let bytes = Value::Document(doc.clone()).encode();
-        self.node.replicate(table, key, WriteOp::Put(bytes), hlc, self.oc)
+        self.node.replicate(table, key, WriteOp::Put(bytes), hlc, self.oc)?;
+        self.node
+            .write_global_entries(&gidx, key, old.as_ref(), Some(doc), self.oc)
     }
 
     fn put_batch(&mut self, table: &str, rows: &[(Vec<u8>, Document)]) -> EngineResult<()> {
         // A single row gets the per-row path (same cost, no grouping pass).
         if let [(key, doc)] = rows {
             return self.put(table, key, doc);
+        }
+        // Tables with global indexes take the per-row path: each row needs
+        // its old-version read and its own routed entry writes.
+        if !self.node.global_indexes_of(table)?.is_empty() {
+            for (key, doc) in rows {
+                self.put(table, key, doc)?;
+            }
+            return Ok(());
         }
         let batch: Vec<(Vec<u8>, Vec<u8>, Hlc)> = rows
             .iter()
@@ -7121,9 +7236,13 @@ impl Cluster for Coordinator {
         self.node.replicate_batch(table, batch, self.oc)
     }
 
-    fn delete(&mut self, table: &str, key: &[u8], _doc: &Document) -> EngineResult<()> {
+    fn delete(&mut self, table: &str, key: &[u8], doc: &Document) -> EngineResult<()> {
+        let gidx = self.node.global_indexes_of(table)?;
         let hlc = self.node.clock.now();
-        self.node.replicate(table, key, WriteOp::Delete, hlc, self.oc)
+        self.node.replicate(table, key, WriteOp::Delete, hlc, self.oc)?;
+        // `doc` is the matched (old) row: retract all its entries.
+        self.node
+            .write_global_entries(&gidx, key, Some(doc), None, self.oc)
     }
 }
 
@@ -7943,6 +8062,24 @@ mod tests {
                 .collect()
         };
 
+        // Vector DDL acks at schema-apply; each node's background worker
+        // pages the backfill (searches answer "rebuilding — retry shortly"
+        // meanwhile). Wait for every node to serve before asserting.
+        for node in [&na, &nb, &nc] {
+            for attempt in 0.. {
+                match node
+                    .local
+                    .read()
+                    .unwrap()
+                    .vector_search_local("docs_emb", &[1.0, 0.0, 0.0], 1)
+                {
+                    Ok(_) => break,
+                    Err(_) if attempt < 100 => thread::sleep(Duration::from_millis(50)),
+                    Err(e) => panic!("vector index never became ready: {e}"),
+                }
+            }
+        }
+
         // Distributed kNN coordinated by a different node: scatter to all
         // members' local HNSW, merge, re-read at quorum.
         assert_eq!(ids(nb.vector_search("docs_emb", &[1.0, 0.0, 0.0], 2, &None).unwrap()), vec![1, 4]);
@@ -8029,6 +8166,66 @@ mod tests {
             .collect();
         out.sort_unstable();
         out
+    }
+
+    /// GLOBAL index entry plumbing across the ring (phase 1): companion
+    /// writes route each entry to the ENTRY key's replica set. At rf=1 every
+    /// entry lives on exactly one node, so the per-node union having no
+    /// duplicates and exact total count proves routing (not broadcast), and
+    /// update/delete retract entries wherever they live.
+    #[test]
+    fn global_index_entries_route_by_value() {
+        let (a, b) = (free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b)];
+        let na = Node::new(Database::open(temp_dir("gia")).unwrap(), rf1("a", &a, &members));
+        let nb = Node::new(Database::open(temp_dir("gib")).unwrap(), rf1("b", &b, &members));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE msgs (PRIMARY KEY (id))").unwrap();
+        na.execute("CREATE INDEX msgs_sender ON msgs (sender) WITH (global = true)")
+            .unwrap();
+
+        for i in 0..40 {
+            na.execute(&format!(
+                "INSERT INTO msgs (id, sender) VALUES ({i}, 'user{}')",
+                i % 10
+            ))
+            .unwrap();
+        }
+
+        let entry_table = skaidb_engine::gidx_table("msgs_sender");
+        let live_entries = |n: &Arc<Node>| -> Vec<Vec<u8>> {
+            n.local
+                .read()
+                .unwrap()
+                .local_scan_versioned_page(&entry_table, None, 1000)
+                .unwrap()
+                .into_iter()
+                .filter(|(_, _, _, is_put)| *is_put)
+                .map(|(k, _, _, _)| k)
+                .collect()
+        };
+        let (ea, eb) = (live_entries(&na), live_entries(&nb));
+        assert_eq!(ea.len() + eb.len(), 40, "one entry per row across the ring");
+        assert!(!ea.is_empty() && !eb.is_empty(), "entries spread over both nodes");
+        let mut all: Vec<&Vec<u8>> = ea.iter().chain(eb.iter()).collect();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 40, "no entry stored on both nodes at rf=1");
+
+        // Value change: exactly one entry moves; total stays 40. Coordinate
+        // from the OTHER node to prove either side issues companion writes.
+        nb.execute("UPDATE msgs SET sender = 'moved' WHERE id = 0").unwrap();
+        assert_eq!(
+            live_entries(&na).len() + live_entries(&nb).len(),
+            40,
+            "update retracted the old entry and wrote the new one"
+        );
+
+        // Row delete retracts its entry wherever it lives.
+        nb.execute("DELETE FROM msgs WHERE id = 1").unwrap();
+        assert_eq!(live_entries(&na).len() + live_entries(&nb).len(), 39);
     }
 
     #[test]

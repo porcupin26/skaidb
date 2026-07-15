@@ -49,6 +49,12 @@ pub struct IndexDef {
     /// its own flag when its own backfill finishes.
     #[serde(default)]
     pub building: bool,
+    /// Global (value-sharded) index: entries live in an internal replicated
+    /// table placed on the ring by indexed value, maintained by the write
+    /// coordinator — there is no per-node index engine. Local indexes stay
+    /// the default. See docs/GLOBAL_INDEXES.md.
+    #[serde(default)]
+    pub global: bool,
 }
 
 /// A vector (HNSW) index declaration for approximate nearest-neighbor search

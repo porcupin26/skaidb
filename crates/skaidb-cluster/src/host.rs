@@ -60,6 +60,23 @@ pub struct HostStats {
     /// (why a node restarted, when the cause was memory).
     #[serde(default)]
     pub oom_kills: u64,
+    /// Cgroup anon vs file byte split (0 outside cgroup v2) — the ramp
+    /// signature of the production memory wedges was anon growing while
+    /// file collapsed toward zero.
+    #[serde(default)]
+    pub mem_anon_bytes: u64,
+    #[serde(default)]
+    pub mem_file_bytes: u64,
+    /// jemalloc live heap / resident pages / OS-unreturned address space
+    /// (0 without an allocator hook). `alloc_resident - alloc_allocated` ≈
+    /// fragmentation + unpurged dirty pages: the live-vs-allocator split the
+    /// OOM post-mortems lacked.
+    #[serde(default)]
+    pub alloc_allocated_bytes: u64,
+    #[serde(default)]
+    pub alloc_resident_bytes: u64,
+    #[serde(default)]
+    pub alloc_retained_bytes: u64,
     /// Whether an anti-entropy repair pass is currently running on this
     /// node. Peers defer their own pass while one runs anywhere — two
     /// concurrent passes (paced or not) were enough to dent write quorum.
@@ -108,6 +125,15 @@ pub fn sample(data_dir: &Path) -> HostStats {
     s.uptime_secs = process_uptime_secs().unwrap_or(0);
     s.restarts = read_runtime_counter(data_dir, "starts").saturating_sub(1);
     s.oom_kills = cgroup_oom_kills().unwrap_or(0);
+    if let Some((anon, file)) = crate::memguard::anon_file_breakdown() {
+        s.mem_anon_bytes = anon;
+        s.mem_file_bytes = file;
+    }
+    if let Some(a) = crate::memguard::alloc_numbers() {
+        s.alloc_allocated_bytes = a.allocated;
+        s.alloc_resident_bytes = a.resident;
+        s.alloc_retained_bytes = a.retained;
+    }
     if let Some((total, avail)) = fs_space(data_dir) {
         s.disk_total_bytes = total;
         s.disk_available_bytes = avail;

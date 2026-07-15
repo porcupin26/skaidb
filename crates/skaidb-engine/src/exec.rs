@@ -167,6 +167,16 @@ pub struct Database {
     /// A Session drains inline after DDL; a cluster node's background worker
     /// pages through them without monopolizing the write lock.
     pending_backfills: Vec<String>,
+    /// Vector indexes this node is currently backfilling in pages. Runtime
+    /// state, local by design (like a search index's `building`): searches
+    /// error with "rebuilding — retry shortly" and SHOW INDEXES reports
+    /// `building` while a name is in here. Writes landing meanwhile maintain
+    /// the live HNSW normally (idempotent overlap with the pages).
+    building_vectors: std::collections::HashSet<String>,
+    /// Vector backfills not yet driven — same drain contract as
+    /// `pending_backfills` (inline for a Session, background on a cluster
+    /// node).
+    pending_vector_backfills: Vec<String>,
     /// Cluster mode: leave pending backfills for the background worker
     /// instead of draining inline after each statement, so DDL acks at
     /// schema-apply (single-node/Session keeps run-to-completion DDL).
@@ -397,7 +407,10 @@ impl Database {
         }
 
         let mut indexes = HashMap::new();
-        for name in catalog.indexes.keys() {
+        for (name, def) in &catalog.indexes {
+            if def.global {
+                continue; // entries live in the __gidx table opened above
+            }
             let engine = StorageEngine::open_with_options(index_dir(&dir, name), opts)?;
             indexes.insert(name.clone(), engine);
         }
@@ -590,6 +603,8 @@ impl Database {
             search_rebuild_ms,
             applied_watermarks,
             pending_backfills: Vec::new(),
+            building_vectors: std::collections::HashSet::new(),
+            pending_vector_backfills: Vec::new(),
             pending_search_catchups: pending_search,
             defer_backfills: false,
             field_registry: std::sync::Mutex::new(HashMap::new()),
@@ -688,10 +703,37 @@ impl Database {
             self.catalog.vector_indexes.remove(name);
             self.vector_indexes.remove(name);
             self.vector_watermarks.remove(name);
+            self.building_vectors.remove(name);
+            self.pending_vector_backfills.retain(|n| n != name);
             let _ = std::fs::remove_file(vector_snapshot_path(&self.dir, name));
         }
         if Metric::parse(metric).is_none() {
             return Err(EngineError::Constraint(format!("unknown vector metric '{metric}'")));
+        }
+        // Explicit dimension: the graph can be sized without scanning a
+        // single row, so DDL acks with an empty index marked `building` and
+        // the backfill runs in pages afterwards — inline for a single-node
+        // Session, in the background worker on a cluster node (a schema-sync
+        // def replay always lands here, so a repair pass no longer streams a
+        // whole table inside its RPC). Only the dimension-INFERENCE form
+        // below still scans inline: it cannot know `dim` without looking at
+        // a row.
+        if let Some(d) = dim {
+            let def = VectorIndexDef {
+                table: table.to_string(),
+                path: path.to_string(),
+                metric: metric.to_ascii_lowercase(),
+                dim: d,
+                ef_search: preserved_ef,
+            };
+            self.vector_indexes.insert(name.to_string(), new_hnsw(&def));
+            self.vector_watermarks.insert(name.to_string(), Hlc::MIN);
+            self.catalog.vector_indexes.insert(name.to_string(), def);
+            self.building_vectors.insert(name.to_string());
+            self.pending_vector_backfills.push(name.to_string());
+            self.record_schema(key, hlc, false);
+            self.save_catalog()?;
+            return Ok(QueryOutput::Ddl);
         }
         // Stream the table: materializing every row as a Document tree
         // multiplied memory ~8x (a 3 KB float array becomes ~24 KB of Value
@@ -779,6 +821,8 @@ impl Database {
         }
         self.vector_indexes.remove(name);
         self.vector_watermarks.remove(name);
+        self.building_vectors.remove(name);
+        self.pending_vector_backfills.retain(|n| n != name);
         let _ = std::fs::remove_file(vector_snapshot_path(&self.dir, name));
         self.record_schema(key, hlc, true);
         self.save_catalog()?;
@@ -1048,6 +1092,7 @@ impl Database {
         k: usize,
         filter: &Option<Expr>,
     ) -> Result<Vec<(Vec<u8>, Document, f32)>> {
+        self.vector_index_ready(index)?;
         let hnsw = self
             .vector_indexes
             .get(index)
@@ -1105,11 +1150,25 @@ impl Database {
         query: &[f32],
         k: usize,
     ) -> Result<Vec<(Vec<u8>, f32)>> {
+        self.vector_index_ready(index)?;
         let hnsw = self
             .vector_indexes
             .get(index)
             .ok_or_else(|| EngineError::IndexNotFound(index.to_string()))?;
         Ok(hnsw.search(query, k, |_| true))
+    }
+
+    /// Refuse to search a vector index whose backfill is still paging — a
+    /// partial graph would silently return wrong neighbors (search indexes
+    /// error the same way while `building`).
+    fn vector_index_ready(&self, index: &str) -> Result<()> {
+        if self.building_vectors.contains(index) {
+            return Err(EngineError::Unsupported(format!(
+                "vector index '{}' is rebuilding — retry shortly",
+                namespace::split(index).1
+            )));
+        }
+        Ok(())
     }
 
     /// The table a vector index is defined on, if it exists locally.
@@ -2093,14 +2152,19 @@ impl Database {
     /// Whether any vector index has in-memory changes not yet snapshotted —
     /// the cheap read-gate for the periodic checkpoint tick.
     pub fn has_dirty_vector_indexes(&self) -> bool {
-        self.vector_indexes.values().any(|h| h.is_dirty())
+        self.vector_indexes
+            .iter()
+            .any(|(n, h)| h.is_dirty() && !self.building_vectors.contains(n))
     }
 
     pub fn save_vector_indexes(&mut self) {
+        // Skip indexes mid-backfill: their watermark is still advancing and a
+        // checkpoint would persist a partial graph as if complete; the final
+        // backfill page writes their snapshot.
         let names: Vec<String> = self
             .vector_indexes
             .iter()
-            .filter(|(_, h)| h.is_dirty())
+            .filter(|(n, h)| h.is_dirty() && !self.building_vectors.contains(*n))
             .map(|(n, _)| n.clone())
             .collect();
         for name in names {
@@ -2314,6 +2378,11 @@ impl Database {
                 self.run_index_backfill(&name)?;
             }
         }
+        if !self.defer_backfills && !self.pending_vector_backfills.is_empty() {
+            for name in self.take_pending_vector_backfills() {
+                self.run_vector_backfill(&name)?;
+            }
+        }
         Ok(out)
     }
 
@@ -2341,7 +2410,7 @@ impl Database {
             ),
             Statement::DropTable { name, if_exists } => self.drop_table(&name, if_exists),
             Statement::CreateIndex(ci) => {
-                self.create_index(&ci.name, &ci.table, &ci.paths, ci.if_not_exists)
+                self.create_index(&ci.name, &ci.table, &ci.paths, ci.if_not_exists, ci.global)
             }
             Statement::DropIndex { name, if_exists } => self.drop_index(&name, if_exists),
             Statement::CreateVectorIndex(ci) => {
@@ -2685,7 +2754,10 @@ impl Database {
             .catalog
             .tables
             .iter()
-            .filter(|(name, _)| namespace::belongs_to(name, current_db))
+            .filter(|(name, _)| {
+                namespace::belongs_to(name, current_db)
+                    && !namespace::split(name).1.starts_with("__gidx__")
+            })
             .map(|(name, def)| {
                 vec![
                     Value::String(namespace::split(name).1.to_string()),
@@ -2719,7 +2791,14 @@ impl Database {
                 Value::String(namespace::split(name).1.to_string()),
                 Value::String(namespace::split(&idx.table).1.to_string()),
                 Value::String(
-                    if idx.building { "secondary (building)" } else { "secondary" }.into(),
+                    if idx.global {
+                        "global"
+                    } else if idx.building {
+                        "secondary (building)"
+                    } else {
+                        "secondary"
+                    }
+                    .into(),
                 ),
                 Value::String(idx.paths.join(", ")),
                 Value::String(self.index_local_health(name, IndexClass::Secondary).into()),
@@ -2773,12 +2852,17 @@ impl Database {
     fn index_local_health(&self, name: &str, class: IndexClass) -> &'static str {
         match class {
             IndexClass::Secondary => match self.catalog.indexes.get(name) {
+                // Global entries are replicated table rows — there is no
+                // per-node local state to be missing.
+                Some(d) if d.global => "ok",
                 Some(d) if d.building => "building",
                 _ if self.indexes.contains_key(name) => "ok",
                 _ => "missing",
             },
             IndexClass::Vector => {
-                if self.vector_indexes.contains_key(name) {
+                if self.building_vectors.contains(name) {
+                    "building"
+                } else if self.vector_indexes.contains_key(name) {
                     "ok"
                 } else {
                     "missing"
@@ -3223,17 +3307,27 @@ impl Database {
             .unwrap_or_else(|e| e.into_inner())
             .remove(name);
         // Drop the table's indexes too, tombstoning each so the drop replicates.
-        let dropped: Vec<String> = self
+        let dropped: Vec<(String, bool)> = self
             .catalog
             .indexes
             .iter()
             .filter(|(_, idx)| idx.table == name)
-            .map(|(n, _)| n.clone())
+            .map(|(n, idx)| (n.clone(), idx.global))
             .collect();
-        for index_name in dropped {
+        for (index_name, global) in dropped {
             self.catalog.indexes.remove(&index_name);
             self.indexes.remove(&index_name);
             self.record_schema(format!("i:{index_name}"), hlc, true);
+            if global {
+                let gname = gidx_table(&index_name);
+                self.tables.remove(&gname);
+                self.catalog.tables.remove(&gname);
+                self.record_schema(format!("t:{gname}"), hlc, true);
+                let tdir = table_dir(&self.dir, &gname);
+                if tdir.exists() {
+                    std::fs::remove_dir_all(tdir)?;
+                }
+            }
             let idir = index_dir(&self.dir, &index_name);
             if idir.exists() {
                 std::fs::remove_dir_all(idir)?;
@@ -3286,6 +3380,7 @@ impl Database {
         table: &str,
         paths: &[String],
         if_not_exists: bool,
+        global: bool,
     ) -> Result<QueryOutput> {
         if !self.catalog.tables.contains_key(table) {
             return Err(EngineError::TableNotFound(table.to_string()));
@@ -3313,6 +3408,37 @@ impl Database {
                 "at most one multikey ([]) component per index".into(),
             ));
         }
+        if global {
+            // Global (value-sharded) index: entries live in an internal
+            // replicated table — created here on every node (DDL is
+            // broadcast/replayed), written by the coordinator routed by
+            // ENTRY key. No per-node index engine, no local backfill.
+            // Phase 1 (docs/GLOBAL_INDEXES.md): entries track writes from
+            // this moment on; reader + backfill come in phase 2.
+            let gname = gidx_table(name);
+            if !self.tables.contains_key(&gname) {
+                let engine =
+                    StorageEngine::open_with_options(table_dir(&self.dir, &gname), self.storage_opts)?;
+                self.tables.insert(gname.clone(), engine);
+            }
+            self.catalog.tables.entry(gname).or_insert(TableDef {
+                primary_key: vec!["k".into()],
+                ttl_ms: None,
+                memory: false,
+            });
+            self.catalog.indexes.insert(
+                name.to_string(),
+                IndexDef {
+                    table: table.to_string(),
+                    paths: paths.to_vec(),
+                    building: false,
+                    global: true,
+                },
+            );
+            self.record_schema(key, hlc, false);
+            self.save_catalog()?;
+            return Ok(QueryOutput::Ddl);
+        }
         // Schema-only: the index exists (empty, marked `building`) the
         // moment DDL acks; the backfill runs in pages afterwards — inline
         // for a single-node Session (`run_index_backfill`), in a background
@@ -3328,6 +3454,7 @@ impl Database {
                 table: table.to_string(),
                 paths: paths.to_vec(),
                 building: true,
+                global: false,
             },
         );
         self.record_schema(key, hlc, false);
@@ -3464,8 +3591,21 @@ impl Database {
         if !self.schema_advances(&key, hlc) {
             return Ok(QueryOutput::Ddl);
         }
-        if self.catalog.indexes.remove(name).is_none() && !if_exists {
+        let dropped = self.catalog.indexes.remove(name);
+        if dropped.is_none() && !if_exists {
             return Err(EngineError::IndexNotFound(name.to_string()));
+        }
+        if dropped.as_ref().is_some_and(|d| d.global) {
+            // Global index: the entries live in the internal replicated
+            // table, not a local index engine.
+            let gname = gidx_table(name);
+            self.tables.remove(&gname);
+            self.catalog.tables.remove(&gname);
+            self.record_schema(format!("t:{gname}"), hlc, true);
+            let tdir = table_dir(&self.dir, &gname);
+            if tdir.exists() {
+                std::fs::remove_dir_all(tdir)?;
+            }
         }
         self.indexes.remove(name);
         let idir = index_dir(&self.dir, name);
@@ -3644,7 +3784,11 @@ impl Database {
         Ok(())
     }
 
-    /// Rebuild an in-memory HNSW vector index from its table's current rows.
+    /// Wipe a vector index and queue its paged re-backfill (marked
+    /// `building`; searches error "retry shortly" until the pages complete).
+    /// Formerly streamed the whole table inline — minutes under the write
+    /// lock for a large table, the same class as the secondary-index inline
+    /// backfill this mirrors.
     fn rebuild_vector_index(&mut self, name: &str) -> Result<()> {
         let def = self
             .catalog
@@ -3652,34 +3796,96 @@ impl Database {
             .get(name)
             .ok_or_else(|| EngineError::IndexNotFound(name.to_string()))?
             .clone();
-        let mut hnsw = new_hnsw(&def);
-        let engine = self
-            .tables
-            .get(&def.table)
-            .ok_or_else(|| EngineError::TableNotFound(def.table.clone()))?;
-        // Stream (see create_vector_index): whole-table Document
-        // materialization OOM'd 4 GB nodes.
-        let mut watermark = Hlc::MIN;
-        for row in engine.scan_versioned_iter() {
-            let (row_key, bytes, hlc) = row?;
-            if hlc > watermark {
-                watermark = hlc;
-            }
-            if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
-                if let Some(v) = doc_vector(&doc, &def.path, def.dim) {
-                    hnsw.insert(row_key, v);
+        // Drop the stale snapshot now: a crash mid-backfill must trigger the
+        // open-time full rebuild, not a load of pre-rebuild contents.
+        let _ = std::fs::remove_file(vector_snapshot_path(&self.dir, name));
+        self.vector_indexes.insert(name.to_string(), new_hnsw(&def));
+        self.vector_watermarks.insert(name.to_string(), Hlc::MIN);
+        self.building_vectors.insert(name.to_string());
+        self.pending_vector_backfills.push(name.to_string());
+        Ok(())
+    }
+
+    /// One page of a vector-index backfill: read up to `limit` rows after
+    /// `cursor`, insert their vectors into the live HNSW, and return the next
+    /// cursor — `None` when complete (the index is then unmarked `building`
+    /// and snapshotted). Page-sized so a cluster node holds its write lock
+    /// for milliseconds at a time. Writes landing between pages maintain the
+    /// index normally; a page re-reading such a row re-inserts the same
+    /// latest version (idempotent).
+    pub fn backfill_vector_page(
+        &mut self,
+        name: &str,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        if !self.building_vectors.contains(name) {
+            return Ok(None); // dropped or superseded mid-backfill
+        }
+        let Some(def) = self.catalog.vector_indexes.get(name).cloned() else {
+            self.building_vectors.remove(name);
+            return Ok(None);
+        };
+        let rows = {
+            let Some(engine) = self.tables.get(&def.table) else {
+                self.building_vectors.remove(name);
+                return Ok(None);
+            };
+            engine.scan_versioned_page(cursor.as_deref(), limit)?
+        };
+        let done = rows.len() < limit;
+        let next = rows.last().map(|(k, _, _)| k.clone());
+        let mut watermark = self
+            .vector_watermarks
+            .get(name)
+            .copied()
+            .unwrap_or(Hlc::MIN);
+        if let Some(hnsw) = self.vector_indexes.get_mut(name) {
+            for (row_key, hlc, bytes) in rows {
+                if hlc > watermark {
+                    watermark = hlc;
+                }
+                let Some(bytes) = bytes else { continue }; // tombstone
+                if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
+                    if let Some(v) = doc_vector(&doc, &def.path, def.dim) {
+                        hnsw.insert(row_key, v);
+                    }
                 }
             }
         }
-        if let Err(e) = save_vector_snapshot(&vector_snapshot_path(&self.dir, name), &hnsw, watermark)
-        {
-            skaidb_types::slog!("skaidb: vector snapshot save failed for {name}: {e}");
-        } else {
-            hnsw.mark_clean();
-        }
         self.vector_watermarks.insert(name.to_string(), watermark);
-        self.vector_indexes.insert(name.to_string(), hnsw);
-        Ok(())
+        if done {
+            self.building_vectors.remove(name);
+            let path = vector_snapshot_path(&self.dir, name);
+            if let Some(hnsw) = self.vector_indexes.get_mut(name) {
+                match save_vector_snapshot(&path, hnsw, watermark) {
+                    Ok(()) => hnsw.mark_clean(),
+                    Err(e) => skaidb_types::slog!(
+                        "skaidb: vector snapshot save failed for {name}: {e}"
+                    ),
+                }
+            }
+            return Ok(None);
+        }
+        Ok(next)
+    }
+
+    /// Run a vector backfill to completion, inline. The single-node path
+    /// (Session, tests); cluster nodes page it in a background thread.
+    pub fn run_vector_backfill(&mut self, name: &str) -> Result<()> {
+        let mut cursor = None;
+        loop {
+            match self.backfill_vector_page(name, cursor, 2048)? {
+                Some(next) => cursor = Some(next),
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// Names of vector indexes whose backfill this node still owes. Same
+    /// drain contract as [`Database::take_pending_backfills`].
+    pub fn take_pending_vector_backfills(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_vector_backfills)
     }
 
     // ---- transactions (embedded, single-connection) ----
@@ -3977,7 +4183,7 @@ impl Database {
             .catalog
             .indexes
             .iter()
-            .filter(|(_, i)| i.table == table && !i.building)
+            .filter(|(_, i)| i.table == table && !i.building && !i.global)
         {
             let names = index_key_names(&idx.paths);
             // Same multikey gate as `plan_index`: with the [] component
@@ -4298,7 +4504,7 @@ impl Database {
             .catalog
             .indexes
             .iter()
-            .filter(|(_, i)| i.table == table && !i.building)
+            .filter(|(_, i)| i.table == table && !i.building && !i.global)
         {
             let names = index_key_names(&idx.paths);
             // A multikey index is usable only when every column through the
@@ -4382,6 +4588,70 @@ impl Database {
             .filter(|(_, idx)| idx.table == table)
             .map(|(name, idx)| (name.clone(), idx.paths.clone()))
             .collect()
+    }
+
+    /// The GLOBAL index declarations on `table` as `(index name, paths)`.
+    /// The write coordinator consults this to issue companion entry writes;
+    /// empty for tables without global indexes (the overwhelmingly common
+    /// case — one Vec::new, no reads).
+    pub fn global_indexes_of(&self, table: &str) -> Vec<(String, Vec<String>)> {
+        self.catalog
+            .indexes
+            .iter()
+            .filter(|(_, idx)| idx.table == table && idx.global)
+            .map(|(name, idx)| (name.clone(), idx.paths.clone()))
+            .collect()
+    }
+
+    /// Single-node maintenance of GLOBAL index entries on a row put: diff the
+    /// old row's entry keys against the new row's and apply put/delete to the
+    /// local `__gidx__` table. On a single node the local shard IS the whole
+    /// ring, so writing entries locally is exactly the coordinator's routed
+    /// companion write. Cluster coordinators do NOT use this — they route
+    /// each entry to its own replica set (`Node::write_global_entries`); the
+    /// replica APPLY path never touches global entries at all.
+    fn maintain_global_put(&mut self, table: &str, key: &[u8], new: &Document) -> Result<()> {
+        let gidx = self.global_indexes_of(table);
+        if gidx.is_empty() {
+            return Ok(());
+        }
+        let old = self
+            .tables
+            .get(table)
+            .and_then(|e| e.get(key).ok().flatten())
+            .and_then(|b| match Value::decode(&b) {
+                Ok(Value::Document(d)) => Some(d),
+                _ => None,
+            });
+        for (name, paths) in gidx {
+            let (dels, puts) = global_entry_delta(&paths, key, old.as_ref(), Some(new));
+            let Some(engine) = self.tables.get_mut(&gidx_table(&name)) else {
+                continue;
+            };
+            for k in dels {
+                engine.delete(&k)?;
+            }
+            for k in puts {
+                engine.put(&k, Value::encode_document(&Document::new()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Single-node maintenance of GLOBAL index entries on a row delete
+    /// (`old` is the row being removed). See [`Database::maintain_global_put`].
+    fn maintain_global_del(&mut self, table: &str, key: &[u8], old: &Document) -> Result<()> {
+        let gidx = self.global_indexes_of(table);
+        for (name, paths) in gidx {
+            let (dels, _) = global_entry_delta(&paths, key, Some(old), None);
+            let Some(engine) = self.tables.get_mut(&gidx_table(&name)) else {
+                continue;
+            };
+            for k in dels {
+                engine.delete(&k)?;
+            }
+        }
+        Ok(())
     }
 
     /// Remove the secondary-index entries of the row's PREVIOUS version
@@ -4581,6 +4851,9 @@ impl Database {
         }
         for (name, def) in &self.catalog.tables {
             let (db, bare) = namespace::split(name);
+            if bare.starts_with("__gidx__") {
+                continue; // implied by its global index's CREATE INDEX
+            }
             out.push((
                 db.to_string(),
                 format!(
@@ -4618,8 +4891,9 @@ impl Database {
             out.push((
                 db.to_string(),
                 format!(
-                    "CREATE INDEX IF NOT EXISTS {bare} ON {table} ({})",
-                    idx.paths.join(", ")
+                    "CREATE INDEX IF NOT EXISTS {bare} ON {table} ({}){}",
+                    idx.paths.join(", "),
+                    if idx.global { " WITH (global = true)" } else { "" }
                 ),
                 ver(&format!("i:{name}")),
             ));
@@ -4721,6 +4995,9 @@ impl Database {
         }
         for (name, def) in &self.catalog.tables {
             let (db, bare) = namespace::split(name);
+            if bare.starts_with("__gidx__") {
+                continue; // implied by its global index's CREATE INDEX
+            }
             out.push((
                 db.to_string(),
                 format!(
@@ -4752,8 +5029,9 @@ impl Database {
             out.push((
                 db.to_string(),
                 format!(
-                    "CREATE INDEX IF NOT EXISTS {bare} ON {table} ({})",
-                    idx.paths.join(", ")
+                    "CREATE INDEX IF NOT EXISTS {bare} ON {table} ({}){}",
+                    idx.paths.join(", "),
+                    if idx.global { " WITH (global = true)" } else { "" }
                 ),
             ));
         }
@@ -5019,6 +5297,7 @@ impl Database {
             .catalog
             .tables
             .iter()
+            .filter(|(name, _)| !namespace::split(name).1.starts_with("__gidx__"))
             .map(|(name, def)| {
                 vec![
                     Value::String(name.clone()),
@@ -5046,7 +5325,7 @@ impl Database {
             rows.push(vec![
                 Value::String(name.clone()),
                 Value::String(idx.table.clone()),
-                Value::String("secondary".into()),
+                Value::String(if idx.global { "global" } else { "secondary" }.into()),
                 Value::String(idx.paths.join(", ")),
                 Value::String(self.index_local_health(name, IndexClass::Secondary).into()),
             ]);
@@ -8117,6 +8396,7 @@ impl<'a> LocalCluster<'a> {
         }
         self.table_indexes(table);
         self.db.index_del_previous(table, key)?;
+        self.db.maintain_global_put(table, key, doc)?;
         let engine = self.db.table_engine_mut(table)?;
         let (hlc, commit) = engine.put_deferred(key, Value::encode_document(doc))?;
         self.pending
@@ -8251,6 +8531,7 @@ impl Cluster for LocalCluster<'_> {
             return Ok(());
         }
         self.table_indexes(table);
+        self.db.maintain_global_del(table, key, doc)?;
         let engine = self.db.table_engine_mut(table)?;
         let (hlc, commit) = engine.delete_deferred(key)?;
         self.pending
@@ -8915,7 +9196,45 @@ fn index_value_tuples(doc: &Document, paths: &[String]) -> Vec<Vec<Value>> {
 
 /// Index entry key: `[v1, .., vk, row_key]` encoded order-preservingly, so all
 /// entries sharing a leading value prefix share a byte prefix (composite-aware).
-fn index_entry_key(values: &[Value], row_key: &[u8]) -> Vec<u8> {
+/// The entry-key delta a row mutation implies for one GLOBAL index:
+/// `(deletes, puts)` — old entries no longer produced by the new document,
+/// and new entries the old one didn't have. Unchanged entries are untouched
+/// (no redundant replicated writes). `new = None` is a row delete.
+pub fn global_entry_delta(
+    paths: &[String],
+    row_key: &[u8],
+    old: Option<&Document>,
+    new: Option<&Document>,
+) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let keys = |doc: Option<&Document>| -> std::collections::HashSet<Vec<u8>> {
+        doc.map(|d| {
+            index_value_tuples(d, paths)
+                .iter()
+                .map(|values| index_entry_key(values, row_key))
+                .collect()
+        })
+        .unwrap_or_default()
+    };
+    let old_keys = keys(old);
+    let new_keys = keys(new);
+    let dels = old_keys.difference(&new_keys).cloned().collect();
+    let puts = new_keys.difference(&old_keys).cloned().collect();
+    (dels, puts)
+}
+
+/// The internal replicated table holding a GLOBAL index's entries:
+/// `<db>␟__gidx__<bare index name>` — same database as the index, hidden
+/// from SHOW TABLES and schema replay (the index DDL implies it). A plain
+/// `__gidx__` prefix rather than a `␟`-separated segment: in the default
+/// database names are unprefixed, and a leading `␟` segment would parse as
+/// a database. Entries are `index_entry_key(values, row_key) → empty
+/// document`, placed on the ring by entry key like any other row.
+pub fn gidx_table(index_name: &str) -> String {
+    let (db, bare) = namespace::split(index_name);
+    namespace::qualify(db, &format!("__gidx__{bare}"))
+}
+
+pub fn index_entry_key(values: &[Value], row_key: &[u8]) -> Vec<u8> {
     let mut elems = values.to_vec();
     elems.push(Value::Bytes(row_key.to_vec()));
     Value::Array(elems).encode_key()

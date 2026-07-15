@@ -53,6 +53,52 @@ pub struct SstEntry {
     pub value: VersionValue,
 }
 
+/// A borrowed view of an entry to write. [`SsTable::write_stream`] is generic
+/// over this so a memtable flush streams its (Arc-shared, still readable)
+/// entries straight into the block buffer without cloning every key and
+/// value first — the writer only ever reads bytes.
+pub trait EntryRef {
+    fn key(&self) -> &[u8];
+    fn hlc(&self) -> Hlc;
+    fn value(&self) -> &VersionValue;
+}
+
+impl EntryRef for SstEntry {
+    fn key(&self) -> &[u8] {
+        &self.key
+    }
+    fn hlc(&self) -> Hlc {
+        self.hlc
+    }
+    fn value(&self) -> &VersionValue {
+        &self.value
+    }
+}
+
+impl EntryRef for &SstEntry {
+    fn key(&self) -> &[u8] {
+        &self.key
+    }
+    fn hlc(&self) -> Hlc {
+        self.hlc
+    }
+    fn value(&self) -> &VersionValue {
+        &self.value
+    }
+}
+
+impl EntryRef for (&[u8], Hlc, &VersionValue) {
+    fn key(&self) -> &[u8] {
+        self.0
+    }
+    fn hlc(&self) -> Hlc {
+        self.1
+    }
+    fn value(&self) -> &VersionValue {
+        self.2
+    }
+}
+
 /// In-memory description of one on-disk compressed block.
 #[derive(Debug, Clone)]
 struct BlockMeta {
@@ -190,21 +236,16 @@ impl BlockCache {
 impl SsTable {
     /// Write `entries` (sorted by key, unique) to a new SSTable using `codec`.
     pub fn write(path: impl AsRef<Path>, entries: &[SstEntry], codec: Codec) -> Result<SsTable> {
-        SsTable::write_stream(
-            path,
-            entries.iter().cloned().map(Ok),
-            entries.len(),
-            codec,
-        )
+        SsTable::write_stream(path, entries.iter().map(Ok), entries.len(), codec)
     }
 
     /// Write a stream of entries (sorted by key, unique) to a new SSTable,
     /// compressing and writing each block as it fills — peak memory is one
     /// block plus the index, not the whole table. `expected_entries` sizes the
     /// Bloom filter; overestimating is safe (it only lowers the FP rate).
-    pub fn write_stream(
+    pub fn write_stream<E: EntryRef>(
         path: impl AsRef<Path>,
-        entries: impl Iterator<Item = Result<SstEntry>>,
+        entries: impl Iterator<Item = Result<E>>,
         expected_entries: usize,
         codec: Codec,
     ) -> Result<SsTable> {
@@ -260,11 +301,11 @@ impl SsTable {
         for entry in entries {
             let e = entry?;
             if first.is_none() {
-                first = Some(e.key.clone());
+                first = Some(e.key().to_vec());
             }
-            bloom.add(&e.key);
+            bloom.add(e.key());
             entry_count += 1;
-            if matches!(e.value, VersionValue::Delete) {
+            if matches!(e.value(), VersionValue::Delete) {
                 delete_count += 1;
             }
             encode_entry(&mut buf, &e);
@@ -737,11 +778,12 @@ fn peek_entry_key(buf: &[u8], start: usize) -> Result<(&[u8], usize)> {
     Ok((key, pos))
 }
 
-fn encode_entry(out: &mut Vec<u8>, e: &SstEntry) {
-    out.extend_from_slice(&(e.key.len() as u32).to_le_bytes());
-    out.extend_from_slice(&e.key);
-    out.extend_from_slice(&e.hlc.to_bytes());
-    match &e.value {
+fn encode_entry<E: EntryRef>(out: &mut Vec<u8>, e: &E) {
+    let key = e.key();
+    out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    out.extend_from_slice(key);
+    out.extend_from_slice(&e.hlc().to_bytes());
+    match e.value() {
         VersionValue::Put(val) => {
             out.push(OP_PUT);
             out.extend_from_slice(&(val.len() as u32).to_le_bytes());
@@ -756,11 +798,12 @@ fn encode_entry(out: &mut Vec<u8>, e: &SstEntry) {
 pub type SstStamp = (Vec<u8>, Hlc, bool);
 
 /// Encode one entry's stamp for the sidecar: `u32 keylen | key | hlc[12] | u8 op`.
-fn encode_stamp(out: &mut Vec<u8>, e: &SstEntry) {
-    out.extend_from_slice(&(e.key.len() as u32).to_le_bytes());
-    out.extend_from_slice(&e.key);
-    out.extend_from_slice(&e.hlc.to_bytes());
-    out.push(match e.value {
+fn encode_stamp<E: EntryRef>(out: &mut Vec<u8>, e: &E) {
+    let key = e.key();
+    out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    out.extend_from_slice(key);
+    out.extend_from_slice(&e.hlc().to_bytes());
+    out.push(match e.value() {
         VersionValue::Put(_) => OP_PUT,
         VersionValue::Delete => OP_DELETE,
     });

@@ -61,9 +61,11 @@ pub fn publish_tick(ctx: &Shared) -> Result<(), String> {
         .unwrap_or(0);
     let sql = format!(
         "INSERT INTO {TABLE} (node, ts, cpu_percent, cpus, load1, mem_total_bytes, \
-         mem_used_bytes, rss_bytes, disk_read_bps, disk_write_bps, disk_total_bytes, \
-         disk_available_bytes, uptime_secs, restarts, oom_kills, cpu_pressure_pct) VALUES \
-         ('{}', {ts_ms}, {:.2}, {}, {:.2}, {}, {}, {}, {:.0}, {:.0}, {}, {}, {}, {}, {}, {:.2})",
+         mem_used_bytes, rss_bytes, mem_anon_bytes, mem_file_bytes, alloc_allocated_bytes, \
+         alloc_resident_bytes, alloc_retained_bytes, disk_read_bps, disk_write_bps, \
+         disk_total_bytes, disk_available_bytes, uptime_secs, restarts, oom_kills, \
+         cpu_pressure_pct) VALUES \
+         ('{}', {ts_ms}, {:.2}, {}, {:.2}, {}, {}, {}, {}, {}, {}, {}, {}, {:.0}, {:.0}, {}, {}, {}, {}, {}, {:.2})",
         node.replace('\'', "''"),
         h.cpu_percent,
         h.cpus,
@@ -71,6 +73,11 @@ pub fn publish_tick(ctx: &Shared) -> Result<(), String> {
         h.mem_total_bytes,
         h.mem_used_bytes,
         h.rss_bytes,
+        h.mem_anon_bytes,
+        h.mem_file_bytes,
+        h.alloc_allocated_bytes,
+        h.alloc_resident_bytes,
+        h.alloc_retained_bytes,
         h.disk_read_bps,
         h.disk_write_bps,
         h.disk_total_bytes,
@@ -131,6 +138,11 @@ pub fn read_all(ctx: &Shared) -> Vec<(String, skaidb_cluster::host::HostStats, u
             uptime_secs: get("uptime_secs") as u64,
             restarts: get("restarts") as u64,
             oom_kills: get("oom_kills") as u64,
+            mem_anon_bytes: get("mem_anon_bytes") as u64,
+            mem_file_bytes: get("mem_file_bytes") as u64,
+            alloc_allocated_bytes: get("alloc_allocated_bytes") as u64,
+            alloc_resident_bytes: get("alloc_resident_bytes") as u64,
+            alloc_retained_bytes: get("alloc_retained_bytes") as u64,
             cpu_pressure_pct: get("cpu_pressure_pct"),
             stale_secs: age_secs,
             ..Default::default()

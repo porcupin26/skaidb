@@ -818,11 +818,31 @@ impl Parser {
                 paths.push(self.parse_index_path()?);
             }
             self.expect(&Token::RParen)?;
+            // `WITH (global = true)` selects the value-sharded (global)
+            // form; anything else here is a typo worth rejecting loudly.
+            let mut global = false;
+            for (key, value) in self.parse_with_options()? {
+                match (key.as_str(), value.as_str()) {
+                    ("global", "true") => global = true,
+                    ("global", "false") => global = false,
+                    ("global", other) => {
+                        return Err(ParseError::Other(format!(
+                            "global must be true or false, got '{other}'"
+                        )))
+                    }
+                    (other, _) => {
+                        return Err(ParseError::Other(format!(
+                            "unknown CREATE INDEX option '{other}' (supported: global)"
+                        )))
+                    }
+                }
+            }
             Ok(Statement::CreateIndex(CreateIndex {
                 name,
                 if_not_exists,
                 table,
                 paths,
+                global,
             }))
         } else if self.eat_ident_ci("database") {
             let if_not_exists = self.parse_if_not_exists()?;

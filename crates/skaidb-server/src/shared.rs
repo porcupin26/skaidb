@@ -587,6 +587,19 @@ pub fn collect_runtime_metrics(ctx: &Shared) {
         m.set("skaidb_memory_shedding_writes", u64::from(c.shedding_writes));
         m.set("skaidb_memory_used_bytes", c.memory_used_bytes);
         m.set("skaidb_memory_limit_bytes", c.memory_limit_bytes);
+        // Memory-ramp composition (the anon-ratchet post-mortem gauges):
+        // anon vs file from the cgroup, live-heap vs resident vs retained
+        // from the allocator. Scraped as time series so the next creep to
+        // the ceiling arrives with its history attached.
+        if let Some((anon, file)) = skaidb_cluster::memguard::anon_file_breakdown() {
+            m.set("skaidb_memory_anon_bytes", anon);
+            m.set("skaidb_memory_file_bytes", file);
+        }
+        if let Some(a) = skaidb_cluster::memguard::alloc_numbers() {
+            m.set("skaidb_alloc_allocated_bytes", a.allocated);
+            m.set("skaidb_alloc_resident_bytes", a.resident);
+            m.set("skaidb_alloc_retained_bytes", a.retained);
+        }
         m.set(
             &format!("skaidb_cluster_writes_total{{consistency=\"{}\"}}", c.write_consistency),
             c.writes_total,

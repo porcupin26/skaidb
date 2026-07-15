@@ -339,6 +339,10 @@ pub struct CreateIndex {
     pub if_not_exists: bool,
     pub table: String,
     pub paths: Vec<String>,
+    /// `WITH (global = true)`: entries are placed on the ring by indexed
+    /// value (an internal replicated table) instead of indexing each node's
+    /// local shard. See docs/GLOBAL_INDEXES.md.
+    pub global: bool,
 }
 
 /// `CREATE VECTOR INDEX [IF NOT EXISTS] name ON table (path) DIM n [USING metric]`.

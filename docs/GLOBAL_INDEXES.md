@@ -1,8 +1,29 @@
 # Global (value-sharded) secondary indexes — design
 
-Status: **design draft, pre-implementation** (2026-07-15). The last big
-architectural item on the list. This document is the agreed starting point
-for the implementation phases at the bottom; nothing here is built yet.
+Status: **phase 1 (entry plumbing) shipped** (2026-07-15, v0.90);
+phases 2–4 pending. Phase-1 notes:
+
+- Syntax landed: `CREATE INDEX i ON t (cols) WITH (global = true)`;
+  `IndexDef.global` (serde-default false). SHOW INDEXES reports kind
+  `global`, local health `ok` (entries are replicated rows — no per-node
+  state to be missing).
+- Entry table name is `<db>␟__gidx__<bare>` — a plain `__gidx__` prefix
+  rather than the `␟`-separated segment drafted below, because default-db
+  names are unprefixed and a leading `␟` segment would parse as a database
+  name. Hidden from SHOW TABLES and schema replay (the index DDL implies
+  it; replay emits the `WITH (global = true)` clause).
+- Coordinator companion writes ship at the row write's consistency, after
+  the row write, before the ack. The old row is fetched with one quorum
+  point read (only on tables that declared a global index); multi-row
+  INSERTs on such tables take the per-row path. `DELETE` reuses the
+  already-matched row — no extra read. Single-node (Session) writes
+  maintain entries directly in the local entry table (the local shard IS
+  the whole ring there); the replica APPLY path never touches entries.
+- Unchanged entries produce no writes (old/new entry-key set difference,
+  `global_entry_delta`).
+- The planner **excludes** global indexes (no reader until phase 2), and
+  backfill of pre-existing rows is also phase 2 — a phase-1 global index
+  covers writes from creation onward.
 
 ## Problem
 

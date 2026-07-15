@@ -90,21 +90,19 @@ chunked-streaming REST rows, CAST syntax, batched executemany wire op,
 distributed sorted top-k for QUORUM ordered reads, humanized EXPLAIN
 names) lives in git history. Still open:
 
-- [ ] **[cluster] Global (value-sharded) secondary indexes** (large,
-  **design agreed** — see [GLOBAL_INDEXES.md](GLOBAL_INDEXES.md)) — the
-  index is an internal replicated table keyed by (values ‖ pk); equality
-  probes route to the value's replica set; write-path companion writes at
-  the row's consistency; ranges stay on the scatter path in v1. Four
-  implementation phases in the design doc; start with phase 1 (entry
-  plumbing).
+- [ ] **[cluster] Global (value-sharded) secondary indexes** (large —
+  see [GLOBAL_INDEXES.md](GLOBAL_INDEXES.md)) — **phase 1 (entry
+  plumbing) shipped in v0.90**: `WITH (global = true)` DDL, `__gidx__`
+  entry table, coordinator companion writes at the row's consistency,
+  single-node parity, planner exclusion. Next: **phase 2** — routed
+  equality-probe read path + planner pick + EXPLAIN
+  `global-index probe (routed)` + backfill of pre-existing rows; then
+  phase 3 (repair leg / orphan GC) and phase 4 (bench at RF<members,
+  prod rollout behind the flag).
 - [ ] **[cluster] Distributed / multi-key transactions** (deferred, large)
   — cluster mode autocommits per statement (`BEGIN/COMMIT/ROLLBACK`
   rejected); no 2PC/coordinator exists. agencik designs around it with
   idempotent PK overwrites.
-- [ ] **[fts] Per-vector-index `building` flag** (nit) — the SHOW INDEXES
-  `local` column reports vector indexes only as ok/missing; a rebuild in
-  progress has no per-index flag to surface (search and secondary have
-  one).
 
 ## Performance
 
@@ -118,13 +116,17 @@ lives in [BENCHMARKS.md](BENCHMARKS.md#performance-engineering-notes).)
   guardrails + v0.87.0's chunked row streaming removed the known multi-GB
   live-buffer sources, but "at the ceiling, shed writes only" remains the
   policy — there is still no active reclaim (flush + FTS commit exist;
-  jemalloc purge does not). Note: an explicit `arena.<all>.purge` needs
-  `tikv_jemalloc_ctl::raw` which is `unsafe`, and the workspace FORBIDS
-  unsafe — adding it means an explicit lint carve-out for the server crate
-  (deliberate decision required). Background-thread decay purging is
-  compiled in and on, so the ratchet observed is either live memory or
-  fragmentation, not simple retention: instrument first (the stats hook
-  logs allocated/resident/retained at pressure) before reaching for purge.
+  jemalloc purge does not). **Instrumentation shipped in v0.90**: anon/file
+  + jemalloc allocated/resident/retained now flow as `node_stats` columns,
+  `/metrics` gauges (`skaidb_memory_anon_bytes`, `skaidb_alloc_*_bytes`),
+  and a 15-min "memory ramp" log line whenever usage exceeds half the
+  limit — the next creep arrives with its live-vs-allocator history
+  attached. NEXT: watch skai2's ramp for a few days; if
+  `resident − allocated` dominates, the fix is allocator purge — an
+  explicit `arena.<all>.purge` needs `tikv_jemalloc_ctl::raw` which is
+  `unsafe`, and the workspace FORBIDS unsafe, so that is a deliberate
+  lint-carve-out decision. If `allocated` itself ratchets, hunt the holder
+  (FTS writer heaps, hint buffers, vector graphs are the candidates).
   Watch `oom_kills` in `node_stats` after every deploy day.
 
 - [ ] **[perf] Repair digests: incremental digests (endgame)** —
@@ -153,10 +155,6 @@ lives in [BENCHMARKS.md](BENCHMARKS.md#performance-engineering-notes).)
   `ORDER BY <indexed>` without `LIMIT` still materializes the index in
   order first; a lazy merge would stream it. (With `LIMIT` the top-k
   path already avoids the sort.)
-- [ ] **[perf] Memtable flush without clones** — flush streams entries
-  but still clones each key/value even though the memtable is dropped
-  right after; a consuming iterator would halve the transient flush
-  spike. Background path only.
 - [ ] **[perf] Per-statement replica/peer snapshot** — `replicas_for`
   builds a fresh `Vec` per row in batch replication and peer addresses
   clone per fan-out site. Measured class: a few small allocations next

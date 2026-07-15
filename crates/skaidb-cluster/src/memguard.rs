@@ -46,22 +46,48 @@ pub enum Pressure {
     Shed,
 }
 
-/// Process-wide allocator introspection hook ("allocated X MB, resident Y MB,
-/// retained Z MB" from jemalloc). Lives here rather than on a `Node` because
-/// the allocator is program-global and the hook is registered once by the
-/// binary that chose it; library consumers without one simply never set it.
-/// Diagnostic, not cosmetic: distinguishing live heap from allocator-retained
-/// pages is exactly what the production OOM post-mortems lacked.
-static ALLOC_STATS_HOOK: OnceLock<Box<dyn Fn() -> Option<String> + Send + Sync>> = OnceLock::new();
+/// Allocator introspection numbers (jemalloc), in bytes. `allocated` is live
+/// application heap; `resident` is what the allocator's pages actually pin in
+/// RAM; `retained` is address space freed by the app but not yet returned to
+/// the OS. `resident - allocated` ≈ fragmentation + not-yet-purged dirty
+/// pages — the split that decides whether a node ratcheting to its cgroup
+/// ceiling is *live memory* (find the holder) or *allocator behavior*
+/// (purge/decay tuning), which is exactly what the production OOM
+/// post-mortems could not tell.
+#[derive(Debug, Clone, Copy)]
+pub struct AllocStats {
+    pub allocated: u64,
+    pub resident: u64,
+    pub retained: u64,
+}
+
+/// Process-wide allocator introspection hook. Lives here rather than on a
+/// `Node` because the allocator is program-global and the hook is registered
+/// once by the binary that chose it; library consumers without one simply
+/// never set it.
+static ALLOC_STATS_HOOK: OnceLock<Box<dyn Fn() -> Option<AllocStats> + Send + Sync>> =
+    OnceLock::new();
 
 /// Register the allocator stats hook (first caller wins).
-pub fn set_alloc_stats_hook(hook: Box<dyn Fn() -> Option<String> + Send + Sync>) {
+pub fn set_alloc_stats_hook(hook: Box<dyn Fn() -> Option<AllocStats> + Send + Sync>) {
     let _ = ALLOC_STATS_HOOK.set(hook);
+}
+
+/// The current allocator numbers; `None` without a hook.
+pub fn alloc_numbers() -> Option<AllocStats> {
+    ALLOC_STATS_HOOK.get().and_then(|h| h())
 }
 
 /// A one-line allocator summary for pressure logs; `None` without a hook.
 pub fn alloc_stats() -> Option<String> {
-    ALLOC_STATS_HOOK.get().and_then(|h| h())
+    let a = alloc_numbers()?;
+    let mb = |v: u64| v / (1024 * 1024);
+    Some(format!(
+        "jemalloc: allocated {} MB, resident {} MB, retained {} MB",
+        mb(a.allocated),
+        mb(a.resident),
+        mb(a.retained),
+    ))
 }
 
 /// The cgroup's anon vs file byte split, for pressure diagnostics ("is this

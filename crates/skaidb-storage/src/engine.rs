@@ -877,13 +877,11 @@ impl Engine {
     /// Build the SSTable for a flush job. Pure I/O over an immutable
     /// memtable — call WITHOUT holding the engine lock.
     pub fn build_flush(job: &FlushJob) -> Result<SsTable> {
-        let entries = job.mem.iter_latest_lazy().map(|(key, hlc, value)| {
-            Ok(SstEntry {
-                key: key.to_vec(),
-                hlc,
-                value: value.clone(),
-            })
-        });
+        // Borrowed entries: the writer copies bytes straight from the
+        // (Arc-shared, still readable) memtable into its block buffer — no
+        // per-entry key/value clone, which used to double the memtable's
+        // footprint for the duration of the build.
+        let entries = job.mem.iter_latest_lazy().map(Ok);
         SsTable::write_stream(&job.path, entries, job.mem.version_count(), job.codec)
     }
 
