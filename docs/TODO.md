@@ -127,16 +127,24 @@ lives in [BENCHMARKS.md](BENCHMARKS.md#performance-engineering-notes).)
   logs allocated/resident/retained at pressure) before reaching for purge.
   Watch `oom_kills` in `node_stats` after every deploy day.
 
-- [ ] **[perf] Incremental repair digests** — v0.88's digest gate already
-  skips the full paged compare for converged (table, peer) pairs (one
-  4096-bucket XOR-digest exchange instead of paging every key across the
-  wire and merge-joining), but each side still recomputes its digest with
-  a sequential scan per pass — scan IO remains O(table). Maintaining the
-  digests incrementally on the write path would make a converged pass
-  nearly free. **Design constraint:** an incremental digest that misses
-  even one write site produces FALSE CONVERGENCE (repair skips real
-  divergence forever) — it needs a complete write-site audit plus a
-  periodic scan-rebuild self-check before it can be trusted.
+- [ ] **[perf] Repair digests: make the gated pass actually fast** —
+  v0.88's digest gate removes the full-table wire transfer and merge-join
+  for converged (table, peer) pairs, but a measured prod pass still runs
+  >240 s: the digest scan itself remains O(table) per (table, peer), and
+  it uses `local_scan_versioned_page`, which **decompresses row values the
+  digest never reads** (only key ‖ hlc ‖ is_put matter) — the same brotli
+  burn as before. In cost order:
+  1. **Value-free stamp scan** — an engine page variant returning
+     `(key, hlc, is_put)` without touching value blocks; removes the
+     decompression entirely from digest computation.
+  2. **Per-pass digest reuse** — on full-copy clusters the pair-ownership
+     filter passes every row for every peer, so one scan per table serves
+     all peers (requester-side cache; responder-side short-TTL cache).
+  3. **Incremental digests** (the endgame — converged pass nearly free).
+     Design constraint: a digest that misses even one write site produces
+     FALSE CONVERGENCE (repair skips real divergence forever) — needs a
+     complete write-site audit plus a periodic scan-rebuild self-check.
+  Keep `anti_entropy_interval_secs = 3600` until at least (1)+(2) land.
 - [ ] **[perf] Vector index memory: quantization + mmap** — persistence
   itself already exists (snapshot + watermark-delta replay at open; saved
   at create/rebuild/graceful shutdown, and since v0.88 checkpointed every
