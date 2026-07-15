@@ -83,6 +83,8 @@ fn select_from(table: &str) -> Select {
         order_by: Vec::new(),
         limit: None,
         offset: None,
+        limit_param: None,
+        offset_param: None,
     }
 }
 

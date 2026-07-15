@@ -5941,6 +5941,11 @@ impl Node {
         ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
         let mut out = Vec::new();
         for (key, score) in ranked {
+            // Meter the per-hit materialization: an unbounded gather (a
+            // grouped fallback with `k = None` over a large match set) must
+            // hit the scan budget instead of tying the coordinator up for
+            // the whole statement timeout (2026-07-15 incident).
+            skaidb_engine::scan_meter::tick(1)?;
             let rows = filter_rows(filter, self.point_get(table, &key, None)?)?;
             if let Some((_, mut doc)) = rows.into_iter().next() {
                 for (col, h) in &highlighters {

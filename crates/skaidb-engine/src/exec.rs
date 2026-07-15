@@ -1891,8 +1891,11 @@ impl Database {
             })
             .collect::<Result<Vec<_>>>()?;
         // The index only knows keys; re-read each hit's row (authoritative)
-        // to apply the residual filter and return the document.
+        // to apply the residual filter and return the document. Metered: an
+        // unbounded gather (`k = None`, the grouped-fallback shape) must die
+        // at the scan budget, not run for the whole statement timeout.
         let resolve = |key: &[u8]| -> Result<Option<Document>> {
+            crate::scan_meter::tick(1)?;
             match table_engine.get(key)? {
                 Some(bytes) => match Value::decode(&bytes) {
                     Ok(Value::Document(mut doc)) if matches_filter(filter, &doc)? => {
@@ -6182,10 +6185,23 @@ fn run_insert(ins: Insert, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
 }
 
 fn run_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> {
+    check_bound_counts(sel)?;
     // The scan meter is context-free by design; re-add the context here where
     // the statement is in scope, so "scan budget exceeded" names the table
     // and filter columns and the fix (which index to add) is mechanical.
     enrich_scan_budget(run_select_impl(sel, cluster), &sel.from, &sel.filter)
+}
+
+/// A `LIMIT ?`/`OFFSET ?` position surviving to execution means the statement
+/// went through the one-shot path instead of prepare/execute — same contract
+/// as an unbound `?` in an expression.
+fn check_bound_counts(sel: &Select) -> Result<()> {
+    if sel.limit_param.is_some() || sel.offset_param.is_some() {
+        return Err(EngineError::Type(
+            "unbound parameter (`?`) in LIMIT/OFFSET".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Append the table and filter columns to a scan-budget error.
@@ -6796,6 +6812,7 @@ fn search_query_from_func(name: &str, args: &[Expr]) -> Result<SearchQuery> {
 /// path; with no ORDER BY every matching row comes back (order unspecified,
 /// scores 0.0).
 fn run_search_select(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSet> {
+    check_bound_counts(sel)?;
     if !sel.joins.is_empty() || !sel.set_ops.is_empty() {
         return Err(EngineError::Unsupported(
             "MATCH()/SEARCH() cannot be combined with JOIN or UNION".into(),
@@ -6851,7 +6868,21 @@ fn run_search_select(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSe
                 .collect();
             return select_aggregate(sel, docs, true);
         }
-        let hits = cluster.search(&sel.from, &query, None, &residual, &[])?;
+        // The exact-row fallback materializes EVERY match; on a large match
+        // set the (metered) gather dies at the scan budget instead of tying
+        // the coordinator up for the whole statement timeout (2026-07-15
+        // incident). Point the error at the search-side fix — the generic
+        // "add a covering index" advice does not apply here.
+        let hits = cluster
+            .search(&sel.from, &query, None, &residual, &[])
+            .map_err(|e| match e {
+                EngineError::ResourceLimit(msg) => EngineError::ResourceLimit(format!(
+                    "{msg} [grouped search fallback: declare the GROUP BY column as a \
+                     keyword fast field (WITH ('<col>.type' = 'keyword') + REBUILD \
+                     SEARCH INDEX) so it answers index-side, or narrow the match set]"
+                )),
+                other => other,
+            })?;
         let docs: Vec<Document> = hits.into_iter().map(|(_, doc, _)| doc).collect();
         return select_aggregate(sel, docs, true);
     }

@@ -409,6 +409,47 @@ mod tests {
         assert!(err.to_string().contains("scan budget"), "{err}");
     }
 
+    /// A grouped search on a non-fast-field column takes the exact-row
+    /// fallback; on a large match set that gather must die at the scan
+    /// budget with search-specific guidance — it must NOT silently run to
+    /// the statement timeout (the 2026-07-15 coordinator tie-up). Small
+    /// match sets keep answering correctly.
+    #[test]
+    fn grouped_search_fallback_is_budget_bounded() {
+        let mut opts = skaidb_storage::EngineOptions {
+            scan_row_budget: 50,
+            ..Default::default()
+        };
+        opts.statement_timeout_secs = 0;
+        let mut s = Session::open_with_options(tmp(), opts).unwrap();
+        s.execute("CREATE TABLE msgs (PRIMARY KEY (id));").unwrap();
+        // `text` is analyzed; `user` is NOT on the index at all.
+        s.execute("CREATE SEARCH INDEX msgs_fts ON msgs (text);").unwrap();
+        for i in 0..300 {
+            s.execute(&format!(
+                "INSERT INTO msgs (id, text, \"user\") VALUES ({i}, 'hello world {i}', 'u{}');",
+                i % 3
+            ))
+            .unwrap();
+        }
+        // 300 matches >> budget 50: the fallback gather errors fast with the
+        // fix in the message instead of materializing everything.
+        let err = s
+            .execute("SELECT \"user\", count(*) FROM msgs WHERE MATCH(text, 'hello') GROUP BY \"user\";")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("scan budget"), "{err}");
+        assert!(err.contains("keyword fast field"), "{err}");
+        // A narrow match set stays under budget and answers row-side.
+        let got = rows(
+            s.execute(
+                "SELECT \"user\", count(*) FROM msgs WHERE MATCH(text, '7') GROUP BY \"user\";",
+            )
+            .unwrap(),
+        );
+        assert!(!got.is_empty());
+    }
+
     /// `SELECT 1` must work in ANY session database: name resolution used to
     /// qualify the FROM-less sentinel into `db.<nothing>`, so the liveness
     /// probe failed with `table "" does not exist` everywhere except the

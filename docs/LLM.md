@@ -152,10 +152,11 @@ Key facts an agent must know:
   everywhere else), `SUM`, `AVG`, `MIN`, `MAX`; time-series only: `RATE`,
   `INCREASE`, `DELTA`, `FIRST`, `LAST`.
 - **Bind parameters**: `?` in prepared `SELECT/INSERT/UPDATE/DELETE`
-  (binary protocol / drivers). Values bind as **typed** values, so `?` can
-  carry an array or nested document (e.g. Python `list`/`dict`) that has no
-  SQL literal form — including `WHERE id IN (?)` bound to an array. Not on the
-  one-shot REST path.
+  (binary protocol / drivers), including `LIMIT ? OFFSET ?` (non-negative
+  integer) and `NEAREST`'s query/k. Values bind as **typed** values, so `?`
+  can carry an array or nested document (e.g. Python `list`/`dict`) that has
+  no SQL literal form — including `WHERE id IN (?)` bound to an array. Not on
+  the one-shot REST path.
 
 **Not in the language**: subqueries, CTEs, window functions, `FULL OUTER
 JOIN`, `INTERSECT`/`EXCEPT`, `ADD/DROP COLUMN` (schema-less), `ORDER BY

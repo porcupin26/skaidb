@@ -414,6 +414,12 @@ pub struct Select {
     pub order_by: Vec<OrderKey>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+    /// `LIMIT ?` — the bind-parameter position when the limit is a
+    /// placeholder. `bind` substitutes the bound value into `limit` and
+    /// clears this; one surviving to execution is an unbound-parameter error.
+    pub limit_param: Option<u16>,
+    /// `OFFSET ?`, same contract as [`Select::limit_param`].
+    pub offset_param: Option<u16>,
 }
 
 /// The `TOP k BY <expr> [ASC|DESC]` clause of a `GROUP BY`.

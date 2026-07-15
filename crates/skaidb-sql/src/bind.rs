@@ -16,6 +16,8 @@ pub enum BindError {
     Arity { expected: usize, got: usize },
     #[error("statement kind cannot be prepared")]
     Unpreparable,
+    #[error("{0}")]
+    Value(String),
 }
 
 /// The number of bind parameters (`?`) in a statement. `None` marks a
@@ -29,6 +31,12 @@ pub fn param_count(stmt: &Statement) -> Option<usize> {
             n = n.max(*i as usize + 1);
         }
     });
+    // `LIMIT ?` / `OFFSET ?` positions live outside the expression tree.
+    if let Statement::Select(s) = stmt {
+        for p in [s.limit_param, s.offset_param].into_iter().flatten() {
+            n = n.max(p as usize + 1);
+        }
+    }
     counted.then_some(n)
 }
 
@@ -49,6 +57,25 @@ pub fn bind(stmt: &Statement, params: &[Value]) -> Result<Statement, BindError> 
             *e = Expr::Literal(params[*i as usize].clone());
         }
     });
+    // `LIMIT ?` / `OFFSET ?`: the bound value must be a non-negative integer;
+    // it lands in the plain `limit`/`offset` count, and the param slot clears.
+    if let Statement::Select(s) = &mut bound {
+        let as_count = |what: &str, v: &Value| -> Result<u64, BindError> {
+            match v {
+                Value::Int(n) if *n >= 0 => Ok(*n as u64),
+                other => Err(BindError::Value(format!(
+                    "{what} parameter must be a non-negative integer, got {:?}",
+                    other.type_of()
+                ))),
+            }
+        };
+        if let Some(i) = s.limit_param.take() {
+            s.limit = Some(as_count("LIMIT", &params[i as usize])?);
+        }
+        if let Some(i) = s.offset_param.take() {
+            s.offset = Some(as_count("OFFSET", &params[i as usize])?);
+        }
+    }
     Ok(bound)
 }
 
@@ -358,5 +385,39 @@ mod tests {
         let stmt = parse("SELECT v FROM t WHERE id = 1").unwrap();
         assert_eq!(param_count(&stmt), Some(0));
         assert_eq!(bind(&stmt, &[]).unwrap(), stmt);
+    }
+
+    /// `LIMIT ?` / `OFFSET ?` are bindable positions: counted, substituted
+    /// into plain counts, and type-checked.
+    #[test]
+    fn bind_limit_and_offset_params() {
+        let stmt = parse("SELECT v FROM t WHERE a = ? ORDER BY v LIMIT ? OFFSET ?").unwrap();
+        assert_eq!(param_count(&stmt), Some(3));
+        let bound = bind(
+            &stmt,
+            &[Value::String("x".into()), Value::Int(10), Value::Int(20)],
+        )
+        .unwrap();
+        let Statement::Select(s) = &bound else { panic!() };
+        assert_eq!(s.limit, Some(10));
+        assert_eq!(s.offset, Some(20));
+        assert_eq!(s.limit_param, None);
+        assert_eq!(s.offset_param, None);
+
+        // Wrong type / negative → a bind error, not silent nonsense.
+        let stmt = parse("SELECT v FROM t LIMIT ?").unwrap();
+        assert_eq!(param_count(&stmt), Some(1));
+        assert!(matches!(
+            bind(&stmt, &[Value::String("10".into())]),
+            Err(BindError::Value(_))
+        ));
+        assert!(matches!(
+            bind(&stmt, &[Value::Int(-1)]),
+            Err(BindError::Value(_))
+        ));
+        // A literal LIMIT still parses as a plain count.
+        let stmt = parse("SELECT v FROM t LIMIT 5").unwrap();
+        let Statement::Select(s) = &stmt else { panic!() };
+        assert_eq!((s.limit, s.limit_param), (Some(5), None));
     }
 }

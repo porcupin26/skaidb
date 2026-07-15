@@ -168,6 +168,33 @@ prepared-statement work in phase 1.
   enriched at the `run_select` statement boundary (the meter stays
   context-free): `… [table emails, filter column(s): sender, date]`.
 
+**Round 2 (agencik re-probe of v0.83.0, 2026-07-15)** — new items from the
+rewritten wishlist:
+
+- [x] **[fts] E-1 (P1): grouped-search fallback is scan-budget bounded** —
+  the exact-row gather (embedded `search_with_index` resolve + the cluster
+  coordinator's per-hit materialization) now ticks the scan meter, so a
+  non-fast-field `GROUP BY` under a search predicate dies at the budget in
+  ms with search-specific guidance ("declare the GROUP BY column as a
+  keyword fast field … + REBUILD") instead of tying the coordinator for the
+  full statement timeout. A hard fail-fast error was rejected: declared
+  text-column group-bys legitimately fall back and answer correctly on
+  small match sets (documented behavior, tested).
+- [x] **[sql] E-2 (P1): `?` in `LIMIT`/`OFFSET`** — bindable positions
+  (`limit_param`/`offset_param` on `Select`, substituted by `bind` with a
+  non-negative-integer type check); an unbound one reaching execution errors
+  like any unbound `?`. `NEAREST`'s query/k already bound.
+- [ ] **[planner] E-3 (P2): LIMIT-aware index choice** — most-equality-pins
+  ranking picks `(account,_tombstone,is_archived)` over the order-serving
+  `(account,date)` for `ORDER BY date DESC LIMIT 1` → whole-account sort
+  (timeout at 150k rows). Prefer the order-serving index for small LIMITs.
+- [ ] **[fts] C-1 (P1): schema-registered search index missing on a node** —
+  `.6` listed `slack_messages_fts` in SHOW INDEXES but had no local tantivy
+  index → intermittent per-coordinator search failures. Asks: (a) a node
+  discovering a schema-registered search index it lacks should build it
+  (like secondary backfill); (b) SHOW INDEXES should expose per-node
+  presence/health. (Operational rebuild broadcast issued 2026-07-15.)
+
 **Phase 6 — deferred, large architecture** (already on the lists below)
 
 - [ ] **[cluster] Global value-sharded secondary indexes** (C-1) — indexes

@@ -998,19 +998,38 @@ impl Parser {
         }
         query.set_ops = set_ops;
 
-        // Whole-query ORDER BY / LIMIT / OFFSET.
+        // Whole-query ORDER BY / LIMIT / OFFSET. Each count is a literal or a
+        // `?` bind parameter (numbered in order of appearance, like any other
+        // placeholder position).
         query.order_by = self.parse_order_by()?;
-        query.limit = if self.eat_keyword(Keyword::Limit) {
-            Some(self.expect_u64()?)
-        } else {
-            None
-        };
-        query.offset = if self.eat_keyword(Keyword::Offset) {
-            Some(self.expect_u64()?)
-        } else {
-            None
-        };
+        if self.eat_keyword(Keyword::Limit) {
+            match self.parse_count_or_param()? {
+                Ok(n) => query.limit = Some(n),
+                Err(idx) => query.limit_param = Some(idx),
+            }
+        }
+        if self.eat_keyword(Keyword::Offset) {
+            match self.parse_count_or_param()? {
+                Ok(n) => query.offset = Some(n),
+                Err(idx) => query.offset_param = Some(idx),
+            }
+        }
         Ok(query)
+    }
+
+    /// A non-negative integer count or a `?` placeholder: `Ok(Ok(n))` for a
+    /// literal, `Ok(Err(param_index))` for a placeholder.
+    #[allow(clippy::result_large_err)]
+    fn parse_count_or_param(&mut self) -> Result<std::result::Result<u64, u16>, ParseError> {
+        if self.eat(&Token::Question) {
+            let idx = self.params;
+            self.params = self
+                .params
+                .checked_add(1)
+                .ok_or_else(|| ParseError::Other("too many bind parameters".into()))?;
+            return Ok(Err(idx));
+        }
+        Ok(Ok(self.expect_u64()?))
     }
 
     /// One `SELECT` body: `SELECT [DISTINCT] items FROM t [joins] [WHERE]
@@ -1061,6 +1080,8 @@ impl Parser {
                 order_by: Vec::new(),
                 limit: None,
                 offset: None,
+                limit_param: None,
+                offset_param: None,
             });
         }
         self.expect_keyword(Keyword::From)?;
@@ -1143,6 +1164,8 @@ impl Parser {
             order_by: Vec::new(),
             limit: None,
             offset: None,
+            limit_param: None,
+            offset_param: None,
         })
     }
 

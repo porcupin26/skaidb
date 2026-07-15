@@ -223,6 +223,30 @@ mod tests {
         assert_eq!(rs.rows, vec![vec![Value::String("ada".into())]]);
     }
 
+    /// `LIMIT ? OFFSET ?` binds end-to-end; an unbound one (one-shot path)
+    /// errors instead of executing.
+    #[test]
+    fn limit_offset_params_end_to_end() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        for i in 0..10 {
+            db.execute(&format!("INSERT INTO t (id) VALUES ({i})")).unwrap();
+        }
+        let stmt = skaidb_sql::parse("SELECT id FROM t ORDER BY id LIMIT ? OFFSET ?").unwrap();
+        let bound = skaidb_sql::bind(&stmt, &[Value::Int(3), Value::Int(4)]).unwrap();
+        let rs = rows(db.execute_statement(bound).unwrap());
+        assert_eq!(
+            rs.rows,
+            vec![vec![Value::Int(4)], vec![Value::Int(5)], vec![Value::Int(6)]]
+        );
+        // Unbound `LIMIT ?` through the one-shot path is a clean error.
+        let err = db
+            .execute("SELECT id FROM t LIMIT ?")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unbound parameter"), "{err}");
+    }
+
     #[test]
     fn const_select_and_to_timestamp_end_to_end() {
         let mut db = Database::open(tempdir()).unwrap();
