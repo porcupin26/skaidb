@@ -240,7 +240,8 @@ SHOW GRANTS [FOR r]
 
 -- Introspection (no privilege needed; names only, no data)
 SHOW TABLES        -- (table, primary_key)
-SHOW INDEXES       -- (index, table, kind, columns)
+SHOW INDEXES       -- (index, table, kind, columns, local) — local is THIS
+                   -- node's live state: ok / building / missing
 DESCRIBE t         -- (column, key, indexes): one row per PK/indexed column of
 DESC t             -- table t (DESC is an alias). Catalog-only, no privilege.
 DESCRIBE t FULL [SAMPLE n | EXACT]

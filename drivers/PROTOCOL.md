@@ -212,8 +212,9 @@ A statement containing `?` placeholders can be parsed **once** and executed
 many times with different bindings — skipping the per-request SQL parse and
 giving a typed, injection-safe parameter path. Prepared ids are scoped to the
 connection that created them: they are invalid on any other connection, and
-gone when the connection closes. Only `SELECT`/`INSERT`/`UPDATE`/`DELETE` can
-be prepared; DDL and session statements are refused with `Error`.
+gone when the connection closes. Only `SELECT`/`INSERT`/`UPDATE`/`DELETE` —
+and `EXPLAIN` of any of those (servers ≥ 0.86.0) — can be prepared; DDL and
+session statements are refused with `Error`.
 
 `OP_PREPARE` — parse and cache; answered with `Prepared`:
 ```
@@ -240,9 +241,26 @@ u8  = 4                       # OP_CLOSE
 u32 statement id (LE)
 ```
 
-An old server (< 0.17.0) answers opcodes 2–4 with `Error("unknown opcode")` —
+`OP_EXECUTE_BATCH` (servers ≥ 0.87.0) — run a prepared statement once per
+parameter row in a single round-trip (the `executemany` wire form); answered
+with `Mutation` carrying the **total** affected count:
+```
+u8  = 7                       # OP_EXECUTE_BATCH
+u8  consistency               # as in OP_QUERY
+u32 statement id (LE)
+u32 nrows (LE)
+nrows × [ u16 nparams (LE) + nparams × [ u32 len (LE) + value bytes ] ]
+```
+Each row binds and executes exactly like a separate `OP_EXECUTE` (per-row
+autocommit, per-row arity check). On the first failing row the reply is an
+`Error` naming the row index and how many rows applied before it — earlier
+rows stay applied, matching the loop the driver would otherwise run. The
+whole request must fit one frame (§2, 64 MiB).
+
+An old server answers unknown opcodes with `Error("… unknown opcode")` —
 drivers can feature-detect by preparing once and falling back to client-side
-interpolation (§5).
+interpolation (§5), and fall back from `OP_EXECUTE_BATCH` to a per-row
+`OP_EXECUTE` loop the same way.
 
 ---
 
@@ -318,9 +336,13 @@ scripts), the server also speaks HTTP/1.1:
 - `POST /query` with the SQL as the body (raw text) or JSON `{"sql": "..."}`.
 - Auth: HTTP **Basic** (`Authorization: Basic base64(user:pass)`) when the
   server requires auth.
-- One request per connection (`Connection: close`).
+- One request per connection (`Connection: close`); request bodies are capped
+  at 64 MiB (HTTP 413 past it), and sockets carry 30 s read / 60 s write
+  timeouts (servers ≥ 0.83.1).
 - Response JSON:
-  - rows: `{"columns": [...], "rows": [[...], ...]}` (values as JSON)
+  - rows: `{"columns": [...], "rows": [[...], ...]}` (values as JSON) —
+    servers ≥ 0.87.0 send row results with `Transfer-Encoding: chunked`
+    (no size cap; any HTTP client reassembles transparently)
   - mutation: `{"affected": N}`
   - ddl: `{"ok": true}`
   - error: `{"error": "..."}` (HTTP 400)

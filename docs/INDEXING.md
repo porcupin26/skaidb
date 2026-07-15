@@ -25,7 +25,8 @@ by contract.
 
 ```sql
 CREATE INDEX IF NOT EXISTS i_mail_star ON mail (account, _tombstone, is_starred);
-SHOW INDEXES;          -- name, table, type, paths (multikey paths keep their [])
+SHOW INDEXES;          -- name, table, type, paths (multikey keep their []),
+                       -- and `local`: THIS node's live state (ok/building/missing)
 DROP INDEX IF EXISTS i_mail_star;
 ```
 
@@ -51,6 +52,13 @@ DROP INDEX IF EXISTS i_mail_star;
 - **Selectivity ranking.** Among usable indexes, the one consuming the most
   equality columns (then a range) wins — a two-equality probe beats a
   sibling index that pins one column and spans half the table.
+- **A fully pinned primary key is a point-read set.** Every PK column
+  pinned by `=` or a literal `IN` list (bound array parameters included)
+  resolves to exact candidate keys — one bloom-gated point read each
+  (cross product on composite keys, ≤ 1000), never a scan; `EXPLAIN`
+  shows `point-read set`. On a cluster the keys route to their replica
+  sets, and `ORDER BY <indexed> LIMIT k` at QUORUM takes a distributed
+  sorted top-k (see CLUSTERING.md) instead of gathering the match set.
 - **ORDER BY + LIMIT prefers a sorted walk.** An index whose next-unpinned
   column matches the `ORDER BY` column serves the sort directly and stops at
   the limit (`(account, date)` for `WHERE account = ? ORDER BY date DESC

@@ -498,5 +498,28 @@ SCRAM on the binary endpoint and HTTP Basic on REST, plus RBAC; see the
   is pushed into the gather: sources are paged in lockstep and a row is emitted
   once every still-active replica has scanned past it, so the scan stops after
   the first `n` rows are sealed instead of materialising the whole table.
+- **A PK pinned by `=`/`IN` is a point-read set.** When every primary-key
+  column is pinned by an equality or a literal `IN` list (bound array
+  parameters included), the coordinator resolves the exact candidate keys
+  (≤ 1000; composite keys cross-multiply) and routes each to its replica
+  set — the "fetch these N ids" shape never scatters a filter.
+- **`ORDER BY <indexed> LIMIT k` at QUORUM is a distributed sorted top-k**
+  (single exact sort key, `k ≤ 1000`): every member returns its local
+  index-ordered top candidates (4× overfetched to absorb per-shard
+  staleness in the sort column and boundary ties), the bounded union is
+  re-read at quorum, and the executor re-sorts — ~`members × 4k` row reads
+  instead of gathering the whole match set. Conservative by construction:
+  if any member is unreachable or cannot walk in order, or fewer matches
+  than `k` resolve, the exact full gather answers instead; every returned
+  row is quorum-fresh. (At consistency `ONE` on a full-copy cluster the
+  ordered read serves entirely from the local replica's index walk.)
+- **Schema repair converges index definitions, not just names.** Every
+  repair pass exchanges the full catalog as stamped idempotent DDL; a
+  replayed `CREATE … IF NOT EXISTS` whose schema stamp advances **replaces**
+  a differing search/vector index definition and rebuilds it — a node that
+  missed the DDL that widened an index while down no longer keeps the stale,
+  narrower definition forever. `SHOW INDEXES`' `local` column
+  (`ok`/`building`/`missing`) exposes each node's live index state for
+  cross-ring comparison.
 
 See [RESHARDING.md](RESHARDING.md) for the deeper design and the current edges.
