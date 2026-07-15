@@ -106,6 +106,7 @@ class _StubConn(skaidb.Connection):
 
         self._lock = threading.Lock()
         self.closed = False
+        self._broken = False
         self._prepared = {}
         self.sent = []
         self._replies = []
@@ -189,6 +190,98 @@ class PreparedFraming(unittest.TestCase):
         # value interpolated into the text.
         self.assertEqual(len(conn.sent), 2)
         self.assertEqual(conn.sent[1][0], skaidb._OP_QUERY)
+
+
+class Endpoints(unittest.TestCase):
+    def test_parse_endpoint(self):
+        self.assertEqual(skaidb._parse_endpoint("h", 7000), ("h", 7000))
+        self.assertEqual(skaidb._parse_endpoint("h:7005", 7000), ("h", 7005))
+        self.assertEqual(skaidb._parse_endpoint(" h.x:1 ", 7000), ("h.x", 1))
+
+    def test_resolve_endpoints(self):
+        self.assertEqual(skaidb._resolve_endpoints("h", 7000, None), [("h", 7000)])
+        got = skaidb._resolve_endpoints("h", 7000, ["a", "b:2"])
+        self.assertEqual(sorted(got), [("a", 7000), ("b", 2)])
+
+
+class _FakeConn:
+    """Stand-in connection for pool tests: no socket, controllable health."""
+
+    def __init__(self):
+        self.closed = False
+        self.broken = False
+
+    def is_usable(self):
+        return not self.closed and not self.broken
+
+    def close(self):
+        self.closed = True
+
+
+class Pool(unittest.TestCase):
+    def _pool(self):
+        # Patch connect() so the pool mints _FakeConns instead of dialing.
+        self._made = []
+
+        def fake_connect(**kwargs):
+            c = _FakeConn()
+            self._made.append(c)
+            return c
+
+        p = skaidb.ConnectionPool(maxsize=2)
+        p._orig_connect = skaidb.connect
+        skaidb.connect = fake_connect
+        self.addCleanup(setattr, skaidb, "connect", p._orig_connect)
+        return p
+
+    def test_checkout_checkin_reuse(self):
+        p = self._pool()
+        c1 = p.getconn()
+        p.putconn(c1)
+        c2 = p.getconn()
+        self.assertIs(c1, c2)  # reused, not a fresh dial
+        self.assertEqual(len(self._made), 1)
+
+    def test_broken_connection_discarded_on_checkin(self):
+        p = self._pool()
+        c1 = p.getconn()
+        c1.broken = True
+        p.putconn(c1)
+        self.assertTrue(c1.closed)  # not retained
+        c2 = p.getconn()
+        self.assertIsNot(c1, c2)  # a fresh one was dialed
+
+    def test_maxsize_caps_idle(self):
+        p = self._pool()  # maxsize=2
+        conns = [p.getconn() for _ in range(3)]
+        for c in conns:
+            p.putconn(c)
+        self.assertEqual(len(p._idle), 2)  # third was closed, not pooled
+        self.assertTrue(conns[2].closed)
+
+    def test_context_manager_returns_and_discards(self):
+        p = self._pool()
+        with p.connection() as c:
+            self.assertTrue(c.is_usable())
+        self.assertEqual(len(p._idle), 1)  # returned on clean exit
+
+        with self.assertRaises(RuntimeError):
+            with p.connection() as c:  # reuses the idle conn from above
+                c.broken = True  # broke mid-use
+                raise RuntimeError("boom")
+        # The checked-out conn was broken, so it was closed rather than
+        # returned — the pool is left with no idle connections.
+        self.assertEqual(len(p._idle), 0)
+        self.assertTrue(c.closed)
+
+    def test_close_drains_idle(self):
+        p = self._pool()
+        c = p.getconn()
+        p.putconn(c)
+        p.close()
+        self.assertTrue(c.closed)
+        with self.assertRaises(skaidb.ProgrammingError):
+            p.getconn()
 
 
 if __name__ == "__main__":

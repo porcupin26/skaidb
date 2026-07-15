@@ -44,6 +44,41 @@ conn.close()
   and `description` all behave per PEP 249.
 - Connections and cursors are context managers (`with skaidb.connect(...) as c:`).
 
+### Connecting: database, seeds, timeouts
+
+```python
+# Land the session in a database (runs USE as part of connecting):
+conn = skaidb.connect(host="db1", database="app")
+
+# Multi-seed failover: endpoints are tried in randomized order until one
+# connects (skaidb is leaderless — any seed serves any request):
+conn = skaidb.connect(seeds=["db1", "db2:7000", "db3"], database="app")
+
+# Separate dial vs read timeouts (a read timeout can sit above the server's
+# statement timeout without also slowing dial failures):
+conn = skaidb.connect(host="db1", connect_timeout=2, read_timeout=120)
+```
+
+`conn.is_usable()` is a cheap (no round-trip) check that a connection has not
+been left out of sync by a transport error; `conn.ping()` does a real
+round-trip liveness check; `conn.reconnect()` re-dials (failing over across
+seeds) and re-authenticates.
+
+### Connection pool
+
+Thread-safe, with the same keyword arguments as `connect()` (so pooled
+connections inherit multi-seed failover and `database=`). Broken connections
+are discarded on checkin and replaced transparently.
+
+```python
+pool = skaidb.pool(seeds=["db1", "db2", "db3"], database="app", maxsize=8)
+
+with pool.connection() as conn:          # checked out, returned on exit
+    conn.execute("SELECT ... WHERE id IN (?)", ([1, 2, 3],))
+
+pool.close()                             # closes idle connections
+```
+
 ### Consistency
 
 skaidb is leaderless with tunable consistency. Default is `QUORUM`:

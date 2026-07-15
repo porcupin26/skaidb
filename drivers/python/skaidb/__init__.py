@@ -25,15 +25,19 @@ import datetime as _dt
 import decimal
 import hashlib
 import hmac
+import random
 import socket
 import struct
 import threading
 import uuid
-from typing import Any, Iterable, Optional, Sequence
+from contextlib import contextmanager
+from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 __all__ = [
     "connect",
     "Connection",
+    "ConnectionPool",
+    "pool",
     "Cursor",
     "Error",
     "DatabaseError",
@@ -422,21 +426,102 @@ class Connection:
     _nonce_counter = 0
     _nonce_lock = threading.Lock()
 
-    def __init__(self, host, port, user, password, consistency, timeout):
+    def __init__(
+        self,
+        endpoints,
+        user,
+        password,
+        consistency,
+        connect_timeout,
+        read_timeout,
+        database=None,
+    ):
         self._consistency = Consistency.resolve(consistency)
         self._lock = threading.Lock()
         self.closed = False
+        # Set once a transport error leaves the socket out of sync; a pool
+        # checks `is_usable()` and discards the connection instead of reusing it.
+        self._broken = False
         # sql text -> (prepared_id, nparams) for this connection. Ids are
-        # per-connection slot indices assigned by the server.
+        # per-connection slot indices assigned by the server, so the cache is
+        # cleared whenever the underlying socket is (re)dialed.
         self._prepared: "dict[str, tuple[int, int]]" = {}
+        self._endpoints: List[Tuple[str, int]] = list(endpoints)
+        self._user = user
+        self._password = password
+        self._connect_timeout = connect_timeout
+        self._read_timeout = read_timeout
+        self._database = database
+        self._sock = None
+        self._file = None
+        self._open()
+
+    def _open(self) -> None:
+        """Dial the endpoints in order until one connects and authenticates,
+        then `USE` the database if one was requested. Raises
+        ``OperationalError`` if no endpoint is reachable."""
+        errors = []
+        for host, port in self._endpoints:
+            try:
+                sock = socket.create_connection(
+                    (host, port), timeout=self._connect_timeout
+                )
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.settimeout(self._read_timeout)
+                self._sock = sock
+                self._file = sock.makefile("rb")
+                self._handshake(self._user, self._password)
+            except (OSError, OperationalError) as e:
+                errors.append(f"{host}:{port}: {e}")
+                self._drop_socket()
+                continue
+            # Connected + authenticated: a fresh socket has no prepared
+            # statements and is not broken.
+            self._broken = False
+            self._prepared.clear()
+            if self._database is not None:
+                self._use_database(self._database)
+            return
+        raise OperationalError("could not connect to any endpoint (" + "; ".join(errors) + ")")
+
+    def _drop_socket(self) -> None:
+        for closer in (self._file, self._sock):
+            try:
+                if closer is not None:
+                    closer.close()
+            except OSError:
+                pass
+        self._file = None
+        self._sock = None
+
+    def _use_database(self, db: str) -> None:
+        ident = '"' + db.replace('"', '""') + '"'
+        self._query("USE " + ident, self._consistency)
+
+    def reconnect(self) -> None:
+        """Re-dial (failing over across endpoints) and re-authenticate,
+        discarding any per-connection prepared statements. A pool calls this to
+        recover a broken connection."""
+        if self.closed:
+            raise ProgrammingError("connection is closed")
+        self._drop_socket()
+        self._open()
+
+    def is_usable(self) -> bool:
+        """True if the connection can still be used — not closed and not left
+        out of sync by a mid-query transport error. Cheap (no round-trip)."""
+        return not self.closed and not self._broken
+
+    def ping(self) -> bool:
+        """Round-trip liveness check; returns False (and marks the connection
+        broken) on any transport failure."""
+        if not self.is_usable():
+            return False
         try:
-            self._sock = socket.create_connection((host, port), timeout=timeout)
-            self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            self._sock.settimeout(timeout)
-            self._file = self._sock.makefile("rb")
-            self._handshake(user, password)
-        except OSError as e:
-            raise OperationalError(f"connect failed: {e}") from e
+            self._query("SHOW DATABASES", self._consistency)
+            return True
+        except (OperationalError, ProgrammingError, InterfaceError):
+            return False
 
     # -- framing --
     def _write_frame(self, payload: bytes) -> None:
@@ -520,8 +605,12 @@ class Connection:
                 self._write_frame(req)
                 return _Reader(self._read_frame())
         except OperationalError:
+            # A framing-level error (e.g. server closed the socket) leaves the
+            # connection unusable; mark it so pools recycle it.
+            self._broken = True
             raise
         except OSError as e:  # mid-query socket error: dead peer, timeout, ...
+            self._broken = True
             raise OperationalError(f"query transport failed: {e}") from e
 
     # -- one-shot query (OP_QUERY) --
@@ -616,10 +705,7 @@ class Connection:
     def close(self) -> None:
         if not self.closed:
             self.closed = True
-            try:
-                self._file.close()
-            finally:
-                self._sock.close()
+            self._drop_socket()
 
     def __enter__(self) -> "Connection":
         return self
@@ -722,7 +808,30 @@ class Cursor:
         self.close()
 
 
-# ---- module entry point ---------------------------------------------------
+# ---- endpoints / module entry point ---------------------------------------
+
+
+def _parse_endpoint(spec: str, default_port: int) -> Tuple[str, int]:
+    """`"host"` or `"host:port"` -> `(host, port)`. The port after the last
+    colon wins (bracketless), so bare IPv4/hostnames keep the default port."""
+    spec = spec.strip()
+    host, sep, port = spec.rpartition(":")
+    if sep and port.isdigit():
+        return (host, int(port))
+    return (spec, default_port)
+
+
+def _resolve_endpoints(host, port, seeds) -> List[Tuple[str, int]]:
+    if seeds:
+        eps = [_parse_endpoint(s, port) for s in seeds]
+    else:
+        eps = [(host, port)]
+    # Shuffle so a fleet of clients spreads its initial connections across the
+    # seed list rather than hammering the first one. Leaderless: any seed
+    # serves any request.
+    eps = list(eps)
+    random.shuffle(eps)
+    return eps
 
 
 def connect(
@@ -732,6 +841,107 @@ def connect(
     password: str = "",
     consistency: "int | str" = Consistency.QUORUM,
     timeout: Optional[float] = 10.0,
+    database: Optional[str] = None,
+    seeds: Optional[Sequence[str]] = None,
+    connect_timeout: Optional[float] = None,
+    read_timeout: Optional[float] = None,
 ) -> Connection:
-    """Open a connection to a skaidb node and run the SCRAM handshake."""
-    return Connection(host, port, user, password, consistency, timeout)
+    """Open a connection to skaidb and run the SCRAM handshake.
+
+    ``seeds`` is an optional list of ``"host"`` / ``"host:port"`` endpoints
+    tried (in randomized order) until one connects — skaidb is leaderless, so
+    any seed serves any request. ``database`` issues ``USE <database>`` as part
+    of connecting, so the session starts in the right database. ``timeout`` is
+    the default for both dial and reads; ``connect_timeout`` / ``read_timeout``
+    override each independently (a read timeout can then sit above the server's
+    statement timeout without also slowing dial failures).
+    """
+    endpoints = _resolve_endpoints(host, port, seeds)
+    ct = connect_timeout if connect_timeout is not None else timeout
+    rt = read_timeout if read_timeout is not None else timeout
+    return Connection(endpoints, user, password, consistency, ct, rt, database)
+
+
+# ---- connection pool ------------------------------------------------------
+
+
+class ConnectionPool:
+    """A thread-safe pool of skaidb connections.
+
+    Hands out connections from an idle set (creating new ones up to
+    ``maxsize`` retained idle) and validates them cheaply on checkout/checkin,
+    discarding any left broken by a transport error. All keyword arguments
+    accepted by :func:`connect` (``seeds``, ``database``, timeouts, auth, …)
+    pass straight through, so pooled connections inherit multi-seed failover.
+
+    Typical use::
+
+        pool = skaidb.pool(seeds=["h1", "h2", "h3"], database="app", maxsize=8)
+        with pool.connection() as conn:
+            conn.execute("SELECT ...")
+    """
+
+    def __init__(self, maxsize: int = 10, **connect_kwargs: Any):
+        if maxsize < 1:
+            raise ValueError("maxsize must be >= 1")
+        self._maxsize = maxsize
+        self._kwargs = connect_kwargs
+        self._idle: List[Connection] = []
+        self._lock = threading.Lock()
+        self.closed = False
+
+    def getconn(self) -> Connection:
+        """Check out a usable connection, reusing an idle one when possible."""
+        while True:
+            with self._lock:
+                if self.closed:
+                    raise ProgrammingError("pool is closed")
+                conn = self._idle.pop() if self._idle else None
+            if conn is None:
+                return connect(**self._kwargs)
+            if conn.is_usable():
+                return conn
+            conn.close()  # discard a stale idle connection, then loop
+
+    def putconn(self, conn: Connection) -> None:
+        """Return a connection to the pool, or close it if it is broken or the
+        pool is full."""
+        with self._lock:
+            if not self.closed and conn.is_usable() and len(self._idle) < self._maxsize:
+                self._idle.append(conn)
+                return
+        conn.close()
+
+    @contextmanager
+    def connection(self):
+        """Context manager: check out a connection and return it on exit
+        (closing it instead if a transport error broke it)."""
+        conn = self.getconn()
+        try:
+            yield conn
+        finally:
+            if conn.is_usable():
+                self.putconn(conn)
+            else:
+                conn.close()
+
+    def close(self) -> None:
+        """Close the pool and every idle connection. Checked-out connections
+        close when they are returned."""
+        with self._lock:
+            self.closed = True
+            idle, self._idle = self._idle, []
+        for conn in idle:
+            conn.close()
+
+    def __enter__(self) -> "ConnectionPool":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+def pool(maxsize: int = 10, **connect_kwargs: Any) -> ConnectionPool:
+    """Create a :class:`ConnectionPool`. Accepts every :func:`connect`
+    keyword (``seeds``, ``database``, timeouts, auth, …)."""
+    return ConnectionPool(maxsize=maxsize, **connect_kwargs)

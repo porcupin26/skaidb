@@ -89,37 +89,31 @@ against `main`. Sequenced by priority × dependency. Phases 2/3/5 are
 independent tracks; only batched `executemany` (P2) depends on the Python
 prepared-statement work in phase 1.
 
-**Phase 1 — P0 unblockers (native adoption)**
+**Phase 1 — P0 unblockers (native adoption)** ✅ shipped
 
-- [ ] **[driver] Python prepared statements** — the server, wire protocol,
-  and Rust driver already implement `OP_PREPARE`/`OP_EXECUTE` with typed
-  `Array`/`Document` value frames; the Python driver still interpolates
-  params client-side and raises `cannot bind value of type list/dict`
-  (`drivers/python/skaidb/__init__.py:210`). Add a value **encoder**
-  (list→Array, dict→Document, mirroring the existing decoder), implement
-  `prepare()` + `OP_EXECUTE`, handle `RESP_PREPARED`, route
-  `Cursor.execute` through it so `?` carries typed arrays/documents.
-  Removes the REST-vs-binary split transport.
-- [ ] **[sql] `IN` / `NOT IN`** — absent on `main` (`parse_comparison` has
-  only `= != < <= > >=` + `IS NULL`). Add as a postfix in
-  `parse_comparison` via a contextual ident; new `Expr::InList`; eval arm
-  reuses the array-membership logic. Pairs with a bound array param
-  (`col IN (?)`). Highest-value language add.
+- [x] **[driver] Python prepared statements** — typed value encoder
+  (list→Array, dict→Document), `OP_PREPARE`/`OP_EXECUTE`/`OP_CLOSE`, per-conn
+  prepared cache, `RESP_PREPARED` handling, unpreparable-kind fallback to text
+  binding; `Cursor.execute` routes params through it. Removes the REST-vs-binary
+  split transport.
+- [x] **[sql] `IN` / `NOT IN`** — `Expr::InList`, contextual-ident parse,
+  three-valued eval with array-element flattening (bound array param) and
+  multikey containment, cluster filter-pushdown codec. Still a residual filter
+  (no index/PK pushdown yet — see the IN/OR pushdown follow-up below).
 
-**Phase 2 — P1 Python driver ergonomics** (all in `drivers/python`)
+**Phase 2 — P1 Python driver ergonomics** (all in `drivers/python`) ✅ shipped
 
-- [ ] **[driver] `connect(database=…)`** — run `USE <db>` in the handshake
-  so pooled connections land in the app db.
-- [ ] **[driver] Multi-seed + failover + pool** — seed list (or `/status`
-  peer discovery), reconnect-on-failure, thread-safe pool helper; mirror
-  the Rust driver's `connect_many`/`add_endpoints`.
-- [ ] **[driver] Split connect/read timeout; wrap mid-query errors** — one
-  `timeout` covers both today; mid-query `socket.timeout` propagates raw
-  instead of as `OperationalError`. Add `connect_timeout`/`read_timeout`,
-  wrap all transport errors, expose an is-usable/ping check for pools.
-- [ ] **[driver] Batched `executemany`** (depends on prepared statements) —
-  prepare-once + execute-many over the wire, not the current N-round-trip
-  Python loop.
+- [x] **[driver] `connect(database=…)`** — issues `USE <db>` as part of
+  connecting, so the session starts in the app database.
+- [x] **[driver] Multi-seed + failover + pool** — `seeds=[…]` tried in
+  randomized order until one connects; `reconnect()` fails over; thread-safe
+  `ConnectionPool` / `skaidb.pool(…)` discards broken connections on checkin.
+- [x] **[driver] Split connect/read timeout; wrap mid-query errors** —
+  `connect_timeout`/`read_timeout` split; all mid-query transport errors wrap
+  as `OperationalError`; `is_usable()` (cheap) + `ping()` (round-trip) for pools.
+- [x] **[driver] Batched `executemany`** — the per-connection prepared cache
+  makes `executemany` prepare once and reuse the id across rows (no re-parse).
+  A single-round-trip batched wire path remains an optional future optimization.
 
 **Phase 3 — P1 SQL grammar** (grouped to amortize the new-`Expr`-variant
 match fan-out; use contextual idents, not reserved keywords)
