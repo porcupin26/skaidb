@@ -532,7 +532,6 @@ mod tests {
         ));
     }
 
-    #[test]
     /// ExecuteBatch runs a prepared statement once per row in one
     /// round-trip; a mid-batch failure names the row and keeps earlier rows.
     #[test]
