@@ -3779,6 +3779,68 @@ impl Database {
             };
             return Ok((rows, true));
         }
+        // Primary-key prefix range: a leftmost run of PK columns pinned by
+        // equality (plus one optional trailing range on the next PK column)
+        // bounds the scan to that key range of the table itself — the table
+        // IS the primary index, ordered by its encoded key. `WHERE channel
+        // = ?` on PK (channel, ts) reads one channel's slice, not 252k rows
+        // into the scan budget (the slack thread-refresh shape, 2026-07-15).
+        // Rows come back in PK order; the caller re-sorts, so `sorted` is
+        // claimed only when no explicit ORDER BY was requested.
+        {
+            let pk = self.table_def(table)?.primary_key.clone();
+            let constraints = column_constraints(filter);
+            let get =
+                |col: &str| constraints.iter().find(|(c, _)| c == col).map(|(_, c)| c);
+            let mut prefix: Vec<Value> = Vec::new();
+            while prefix.len() < pk.len() {
+                match get(&pk[prefix.len()]).and_then(|c| c.eq.clone()) {
+                    Some(v) => prefix.push(v),
+                    None => break,
+                }
+            }
+            // Full-PK equality is the point-read fast path above; a partial
+            // prefix (or a prefix plus trailing range) is ours.
+            if !prefix.is_empty() && prefix.len() < pk.len() {
+                let trailing = get(&pk[prefix.len()])
+                    .filter(|c| c.eq.is_none() && (c.lo.is_some() || c.hi.is_some()));
+                let (start, end) = match trailing {
+                    Some(c) => {
+                        let start = match &c.lo {
+                            Some(v) => Some(index_prefix_n(&push(&prefix, v))),
+                            None => Some(index_prefix_n(&prefix)),
+                        };
+                        let end = match &c.hi {
+                            Some(v) => index_upper_bound_n(&push(&prefix, v)),
+                            None => index_upper_bound_n(&prefix),
+                        };
+                        (start, end)
+                    }
+                    None => (
+                        Some(index_prefix_n(&prefix)),
+                        index_upper_bound_n(&prefix),
+                    ),
+                };
+                let engine = self
+                    .tables
+                    .get(table)
+                    .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+                let mut out = Vec::new();
+                for (key, bytes) in engine.scan_range(start.as_deref(), end.as_deref())? {
+                    crate::scan_meter::tick(1)?;
+                    if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
+                        if matches_filter(filter, &doc)? {
+                            out.push((key, doc));
+                            if order.is_none() && fetch_limit.is_some_and(|l| out.len() >= l)
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+                return Ok((out, order.is_none()));
+            }
+        }
         let order2 = order.map(|(c, d, _)| (c, d));
         let Some((index_name, start, end, sorted, reverse)) =
             self.plan_index(table, filter, order2, fetch_limit)

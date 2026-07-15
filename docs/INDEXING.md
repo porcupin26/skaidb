@@ -12,7 +12,7 @@ LLM-facing reference).
 
 | Type | Create | Answers | Notes |
 |------|--------|---------|-------|
-| Primary key | `CREATE TABLE t (PRIMARY KEY (a [, b ...]))` | point reads, prefix scans | the table IS the index; composite keys sort left-to-right |
+| Primary key | `CREATE TABLE t (PRIMARY KEY (a [, b ...]))` | point reads, **prefix-equality slices** (+ one trailing range) | the table IS the index; `WHERE a = ?` on PK `(a, b)` scans only that slice |
 | Secondary | `CREATE INDEX i ON t (a, b, ...)` | equality/range filters, index-served `ORDER BY`, index-only counts | composite = leftmost-prefix; see planner section |
 | Multikey | `CREATE INDEX i ON t (a, tags[])` | array **element** equality (`tags = 'x'` containment), exact index-only counts | one `[]` component per index; entry per element |
 | Vector | `CREATE VECTOR INDEX v ON t (emb) DIM n [USING cosine\|l2\|dot]` | `NEAREST` k-NN | HNSW; snapshotted for fast restarts |

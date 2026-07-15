@@ -247,6 +247,45 @@ mod tests {
         assert!(dt.as_millis() < 500, "50 indexed point lookups took {dt:?} — not using the index");
     }
 
+    /// A leftmost PK-prefix equality (plus optional trailing range on the
+    /// next PK column) must scan only that slice of the table — the slack
+    /// thread-refresh shape (`channel = ?` on PK (channel, ts)) walked 252k
+    /// rows into the scan budget instead of one channel (2026-07-15).
+    #[test]
+    fn pk_prefix_equality_scans_only_the_slice() {
+        let mut opts = skaidb_storage::EngineOptions {
+            scan_row_budget: 500,
+            ..Default::default()
+        };
+        opts.statement_timeout_secs = 0;
+        let mut s = Session::open_with_options(tmp(), opts).unwrap();
+        s.execute("CREATE TABLE msgs (PRIMARY KEY (channel, ts));").unwrap();
+        // 2,000 rows across 10 channels; any whole-table walk dies at 500.
+        for i in 0..2000 {
+            s.execute(&format!(
+                "INSERT INTO msgs (channel, ts, reply_count) VALUES ('c{:02}', 't{:06}', {});",
+                i % 10,
+                i,
+                i % 5
+            ))
+            .unwrap();
+        }
+        // Prefix equality: reads one channel's 200 rows, well under budget.
+        let got = rows(
+            s.execute("SELECT ts FROM msgs WHERE channel = 'c03' AND reply_count > 0 ORDER BY ts DESC LIMIT 5;")
+                .unwrap(),
+        );
+        assert_eq!(got.len(), 5);
+        // Prefix + trailing range on the next PK column: narrower still.
+        let got = rows(
+            s.execute(
+                "SELECT ts FROM msgs WHERE channel = 'c03' AND ts >= 't001500' ORDER BY ts DESC LIMIT 50;",
+            )
+            .unwrap(),
+        );
+        assert_eq!(got.len(), 50);
+    }
+
     /// Multikey (`[]`) indexes: one entry per array element makes element
     /// equality an index probe. Counts are exact — entry keys embed the row
     /// key, so a duplicate element in one array collapses to one entry —
