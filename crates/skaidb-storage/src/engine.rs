@@ -160,8 +160,8 @@ pub struct FlushJob {
 }
 
 /// A background compaction work order: inputs are pinned by path and
-/// re-opened read-only by the builder; `epoch` detects concurrent table-set
-/// changes (the install is discarded on mismatch).
+/// re-opened read-only by the builder; the install validates them by path
+/// (a vanished input means an overlapping compaction already ran).
 #[derive(Debug)]
 pub struct CompactJob {
     pub inputs: Vec<PathBuf>,
@@ -169,7 +169,6 @@ pub struct CompactJob {
     pub deepest: bool,
     pub codec: Codec,
     pub expire_before: Option<u64>,
-    pub epoch: u64,
 }
 
 /// A single-node, single-keyspace LSM storage engine.
@@ -182,8 +181,6 @@ pub struct Engine {
     frozen: Vec<FrozenMem>,
     /// Next WAL segment number for a freeze.
     next_wal_seq: u64,
-    /// Bumped on every l0/levels mutation; stale compaction installs abort.
-    table_epoch: u64,
     clock: HlcClock,
     /// Row time-to-live in ms (`Some` = expiring table). A row is invisible
     /// once its stamp's physical age exceeds this; compaction drops it. A
@@ -323,7 +320,6 @@ impl Engine {
             maint_watermark: Hlc::MAX,
             frozen: Vec::new(),
             next_wal_seq: 1,
-            table_epoch: 0,
         })
     }
 
@@ -823,7 +819,6 @@ impl Engine {
     /// watermark gates segment deletion exactly as it gated truncation.
     pub fn install_flush(&mut self, job: FlushJob, sst: SsTable) -> Result<()> {
         self.l0.insert(0, sst);
-        self.table_epoch += 1;
         self.persist_manifest()?;
         if let Some(idx) = self.frozen.iter().position(|f| f.wal_seq == job.wal_seq) {
             let f = self.frozen.remove(idx);
@@ -871,7 +866,6 @@ impl Engine {
                 deepest,
                 codec: self.codec_for(deepest),
                 expire_before,
-                epoch: self.table_epoch,
             });
         }
         for level in 0..self.levels.len() {
@@ -891,7 +885,6 @@ impl Engine {
                 deepest,
                 codec: self.codec_for(deepest),
                 expire_before,
-                epoch: self.table_epoch,
             });
         }
         None
@@ -915,42 +908,56 @@ impl Engine {
     /// state. Retired inputs are deleted only after the manifest points at
     /// the replacement (the ordering that ended the manifest tears).
     pub fn install_compact(&mut self, job: CompactJob, new_run: SsTable) -> Result<bool> {
-        if job.epoch != self.table_epoch {
+        let is_input = |t: &SsTable| job.inputs.iter().any(|p| p == t.path());
+        // Path-based validity, NOT a global epoch: a flush landing during the
+        // build adds a NEW L0 table that is not among these inputs, so the
+        // compaction is still valid — only clobber it if one of its OWN
+        // inputs vanished (an overlapping compaction already consumed it).
+        // The global-epoch check invalidated on every concurrent flush,
+        // discarding the freshly built SSTable and re-planning the same
+        // merge — a build/discard loop that burned ~20 MB/s of disk on the
+        // write-coordinating nodes (.3/.6, 2026-07-15). The wasted output
+        // was the entire load.
+        let inputs_present = job.inputs.iter().all(|p| {
+            self.l0.iter().any(|t| t.path() == p)
+                || self.levels.iter().any(|t| t.path() == p)
+        });
+        if !inputs_present {
             let _ = std::fs::remove_file(&job.output);
             return Ok(false);
         }
-        let is_l0_merge = self
-            .l0
-            .first()
-            .is_some_and(|t| job.inputs.iter().any(|p| p == t.path()));
+        // The output level: one deeper than the shallowest level the inputs
+        // touched. An L0 merge (any L0 input) produces an L1 run; an Ln
+        // cascade produces Ln+1.
+        let l0_input = self.l0.iter().any(is_input);
+        let removed_levels: Vec<usize> = self
+            .levels
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| is_input(t))
+            .map(|(i, _)| i)
+            .collect();
+        let target = if l0_input {
+            1
+        } else {
+            removed_levels.first().copied().unwrap_or(0) + 1
+        };
         self.compactions += 1;
         self.compaction_bytes += new_run.disk_len();
-        if is_l0_merge {
-            self.l0.clear();
-            if self.levels.is_empty() {
-                self.levels.push(new_run);
-            } else {
-                self.levels[0] = new_run;
-            }
-        } else {
-            // A level-cascade step: the first input names the source level.
-            let Some(level) = self
-                .levels
-                .iter()
-                .position(|t| Some(t.path()) == job.inputs.first().map(PathBuf::as_path))
-            else {
-                let _ = std::fs::remove_file(&job.output);
-                return Ok(false);
-            };
-            if level + 1 < self.levels.len() {
-                self.levels[level + 1] = new_run;
-                self.levels.remove(level);
-            } else {
-                self.levels.push(new_run);
-                self.levels.remove(level);
-            }
+        // Remove exactly the input tables (keep any flushed-since L0 table).
+        self.l0.retain(|t| !is_input(t));
+        // Remove input levels high-index-first so earlier indices stay valid.
+        for &i in removed_levels.iter().rev() {
+            self.levels.remove(i);
         }
-        self.table_epoch += 1;
+        // Place the output at `target` (levels index target-1), replacing an
+        // existing run there or extending the ladder.
+        let idx = target - 1;
+        if idx < self.levels.len() {
+            self.levels.insert(idx, new_run);
+        } else {
+            self.levels.push(new_run);
+        }
         self.persist_manifest()?;
         for p in &job.inputs {
             let _ = std::fs::remove_file(p);
@@ -1063,7 +1070,6 @@ impl Engine {
         }
         self.mem = Memtable::new();
         self.frozen.clear();
-        self.table_epoch += 1;
         self.wal.truncate()?;
         let _ = self.wal.drop_segments_through(self.next_wal_seq);
         self.read_cache = ReadCache::new(self.opts.read_cache_capacity);
@@ -1255,8 +1261,6 @@ impl Engine {
             retired.extend(old_paths);
             level += 1;
         }
-
-        self.table_epoch += 1;
         self.persist_manifest()?;
         remove_files(&retired);
         Ok(())
@@ -1591,6 +1595,41 @@ mod tests {
         e.put(b"k", b"new".to_vec()).unwrap();
         assert_eq!(e.get(b"k").unwrap(), Some(b"new".to_vec()));
         assert_eq!(e.get_as_of(b"k", snap).unwrap(), Some(b"old".to_vec()));
+    }
+
+    #[test]
+    fn compaction_install_survives_a_concurrent_flush() {
+        // A flush landing between take_compact_job and install_compact adds a
+        // new L0 table. The compaction must still install (its own inputs are
+        // untouched) AND the flushed table must survive — the global-epoch
+        // discard re-planned the merge forever, a ~20 MB/s disk loop
+        // (2026-07-15).
+        let mut e = Engine::open_with_options(tempdir(), small_opts()).unwrap();
+        // Build up several L0 tables to trigger a compaction.
+        for i in 0..60u32 {
+            e.put(format!("k{i:03}").as_bytes(), vec![i as u8; 64]).unwrap();
+            if i % 6 == 5 {
+                e.freeze().unwrap();
+                let j = e.take_flush_job().unwrap();
+                let sst = Engine::build_flush(&j).unwrap();
+                e.install_flush(j, sst).unwrap();
+            }
+        }
+        let job = e.take_compact_job().expect("l0 over trigger");
+        let built = Engine::build_compact(&job).unwrap();
+        // Concurrent flush: a brand-new key freezes + installs as a fresh L0
+        // table WHILE the compaction output is in hand.
+        e.put(b"concurrent", b"kept".to_vec()).unwrap();
+        e.freeze().unwrap();
+        let fj = e.take_flush_job().unwrap();
+        let fsst = Engine::build_flush(&fj).unwrap();
+        e.install_flush(fj, fsst).unwrap();
+        // The compaction installs (not discarded) despite the epoch bump.
+        assert!(e.install_compact(job, built).unwrap(), "compaction must install");
+        // Both the compacted data AND the concurrently flushed row survive.
+        assert_eq!(e.get(b"k000").unwrap(), Some(vec![0u8; 64]));
+        assert_eq!(e.get(b"k059").unwrap(), Some(vec![59u8; 64]));
+        assert_eq!(e.get(b"concurrent").unwrap(), Some(b"kept".to_vec()));
     }
 
     #[test]
