@@ -84,11 +84,12 @@ Key facts an agent must know:
   Three-valued logic: `NULL` comparisons are unknown.
 - **Scalar functions**: `now()` (statement start, timestamp),
   `time_bucket(step, ts)` (floor to bucket: `time_bucket(5m, ts)`).
-- **PK-prefix slices**: a leftmost equality run on composite primary-key
-  columns (plus one trailing range on the next PK column) scans only that
-  key slice of the table — `WHERE channel = ?` on PK `(channel, ts)` reads
-  one channel, and `AND ts >= ?` narrows it further. No secondary index
-  needed for shapes the primary key already orders.
+- **PK point reads & prefix slices**: a full composite-PK equality
+  (`channel = ? AND ts = ?` on PK `(channel, ts)`) is a single bloom-gated
+  point read — even for an absent key (no full-table scan). A leftmost
+  equality *prefix* (plus one trailing range on the next PK column) scans
+  only that key slice — `WHERE channel = ?` reads one channel, `AND ts >= ?`
+  narrows it. No secondary index needed for shapes the primary key orders.
 - **ORDER BY**: a multi-key `ORDER BY` whose leading key is indexed walks the
   index bounded by LIMIT plus the leading-key tie group, then re-sorts by the
   full clause — exact, without gathering every matching row. When a strictly

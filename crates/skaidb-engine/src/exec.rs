@@ -3767,7 +3767,14 @@ impl Database {
                 .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
             let rows = match engine.get(&key)? {
                 Some(bytes) => match Value::decode(&bytes) {
-                    Ok(Value::Document(doc)) => vec![(key, doc)],
+                    // Re-check the full filter: pk_point_key keys off the PK
+                    // equalities but a residual constraint on a non-PK column
+                    // could still exclude the row (the caller does not filter
+                    // a point-read result).
+                    Ok(Value::Document(doc)) if matches_filter(filter, &doc)? => {
+                        vec![(key, doc)]
+                    }
+                    Ok(Value::Document(_)) => Vec::new(),
                     Ok(_) => {
                         return Err(EngineError::Constraint(
                             "stored row is not a document".into(),
@@ -7179,26 +7186,33 @@ fn run_delete(del: Delete, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
 /// be built exactly as the engine builds it for inserts: the order-preserving
 /// encoding of a one-element array holding the value.
 pub fn pk_point_key(pk: &[String], filter: &Option<Expr>) -> Option<Vec<u8>> {
-    if pk.len() != 1 {
+    if pk.is_empty() {
         return None;
     }
-    let Some(Expr::Binary {
-        op: BinaryOp::Eq,
-        left,
-        right,
-    }) = filter
-    else {
-        return None;
-    };
-    let col = &pk[0];
-    let value = match (left.as_ref(), right.as_ref()) {
-        (Expr::Column(c), Expr::Literal(v)) | (Expr::Literal(v), Expr::Column(c)) if c == col => v,
-        _ => return None,
-    };
-    if value.is_null() {
-        return None;
+    // Every PK column must be equality-pinned by the filter to a non-null
+    // literal — then the row key is exact and this is a point read. A
+    // composite PK (channel, ts) with both pinned qualifies; a missing key
+    // returns "not found" in one bloom-gated lookup instead of a full table
+    // scan (LIMIT 1 masked this for present keys — it stopped early — but a
+    // missing key walked the whole table into the scan budget, 2026-07-15).
+    let constraints = column_constraints(filter);
+    let mut values = Vec::with_capacity(pk.len());
+    for col in pk {
+        let c = constraints.iter().find(|(name, _)| name == col).map(|(_, c)| c)?;
+        // Exactly an equality on this column — a range (lo/hi) is not a point.
+        if c.lo.is_some() || c.hi.is_some() {
+            return None;
+        }
+        let v = c.eq.as_ref()?;
+        if v.is_null() {
+            return None;
+        }
+        values.push(v.clone());
     }
-    Some(Value::Array(vec![value.clone()]).encode_key())
+    // A residual constraint on a non-PK column is fine: both callers
+    // re-filter the point-read result (gather_rows_planned and the
+    // cluster's matching_rows via filter_rows).
+    Some(Value::Array(values).encode_key())
 }
 
 /// The embedded, single-node implementation of [`Cluster`].

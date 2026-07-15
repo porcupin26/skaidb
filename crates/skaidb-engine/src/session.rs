@@ -265,6 +265,51 @@ mod tests {
         assert_eq!(rows(ok).len(), 1);
     }
 
+    /// A full composite-PK equality must be a point read — even when the
+    /// key is ABSENT. LIMIT 1 masked this for present keys (the scan stopped
+    /// early); a missing key walked the whole table into the scan budget
+    /// (slack dedup probes, 2026-07-15).
+    #[test]
+    fn composite_pk_equality_is_a_point_read_even_when_absent() {
+        let mut opts = skaidb_storage::EngineOptions {
+            scan_row_budget: 500,
+            ..Default::default()
+        };
+        opts.statement_timeout_secs = 0;
+        let mut s = Session::open_with_options(tmp(), opts).unwrap();
+        s.execute("CREATE TABLE msgs (PRIMARY KEY (channel, ts));").unwrap();
+        for i in 0..2000 {
+            s.execute(&format!(
+                "INSERT INTO msgs (channel, ts, body) VALUES ('c{:02}', 't{:06}', 'x');",
+                i % 10,
+                i
+            ))
+            .unwrap();
+        }
+        // Present key: one row.
+        let got = rows(
+            s.execute("SELECT body FROM msgs WHERE channel = 'c03' AND ts = 't000123' LIMIT 1;")
+                .unwrap(),
+        );
+        assert_eq!(got.len(), 1);
+        // Absent key: zero rows, NOT a scan-budget death (this walked 2000
+        // rows past the 500-row budget before the fix).
+        let got = rows(
+            s.execute("SELECT body FROM msgs WHERE channel = 'c03' AND ts = 't999999' LIMIT 1;")
+                .unwrap(),
+        );
+        assert_eq!(got.len(), 0);
+        // A residual on a non-PK column must still be applied to the
+        // point-read row (the caller re-filters).
+        let got = rows(
+            s.execute(
+                "SELECT body FROM msgs WHERE channel = 'c03' AND ts = 't000123' AND body = 'nope';",
+            )
+            .unwrap(),
+        );
+        assert_eq!(got.len(), 0);
+    }
+
     /// A leftmost PK-prefix equality (plus optional trailing range on the
     /// next PK column) must scan only that slice of the table — the slack
     /// thread-refresh shape (`channel = ?` on PK (channel, ts)) walked 252k
