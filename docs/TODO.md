@@ -92,7 +92,7 @@ names) lives in git history. Still open:
 
 - [ ] **[cluster] Global (value-sharded) secondary indexes** (large —
   see [GLOBAL_INDEXES.md](GLOBAL_INDEXES.md)) — **phase 1 (entry
-  plumbing) shipped in v0.90**: `WITH (global = true)` DDL, `__gidx__`
+  plumbing) shipped in v0.89**: `WITH (global = true)` DDL, `__gidx__`
   entry table, coordinator companion writes at the row's consistency,
   single-node parity, planner exclusion. Next: **phase 2** — routed
   equality-probe read path + planner pick + EXPLAIN
@@ -116,7 +116,7 @@ lives in [BENCHMARKS.md](BENCHMARKS.md#performance-engineering-notes).)
   guardrails + v0.87.0's chunked row streaming removed the known multi-GB
   live-buffer sources, but "at the ceiling, shed writes only" remains the
   policy — there is still no active reclaim (flush + FTS commit exist;
-  jemalloc purge does not). **Instrumentation shipped in v0.90**: anon/file
+  jemalloc purge does not). **Instrumentation shipped in v0.89**: anon/file
   + jemalloc allocated/resident/retained now flow as `node_stats` columns,
   `/metrics` gauges (`skaidb_memory_anon_bytes`, `skaidb_alloc_*_bytes`),
   and a 15-min "memory ramp" log line whenever usage exceeds half the
@@ -132,16 +132,16 @@ lives in [BENCHMARKS.md](BENCHMARKS.md#performance-engineering-notes).)
 - [ ] **[perf] Repair digests: incremental digests (endgame)** —
   speedups (1) value-free stamp scan (stamps sidecar `<sst>.stamps`, old
   files fall back) and (2) versioned digest cache (keyed on
-  `(schema stamp, write_seq)`, full-copy clusters) landed in v0.89: a
+  `(schema stamp, write_seq)`, full-copy clusters) landed in v0.88.1: a
   converged pass now costs one stamp scan per *changed* table, zero for
   idle ones. Remaining endgame: **incremental digests** — maintain the
   bucket XOR at write time so even changed tables skip the scan.
   Design constraint: a digest that misses even one write site produces
   FALSE CONVERGENCE (repair skips real divergence forever) — needs a
   complete write-site audit plus a periodic scan-rebuild self-check.
-  Note: pre-v0.89 SSTables have no sidecar until compaction rewrites
+  Note: pre-v0.88.1 SSTables have no sidecar until compaction rewrites
   them (fallback decompresses values); the digest cache hides this for
-  idle tables. **Measure a prod pass post-v0.89, then consider
+  idle tables. **Measure a prod pass post-v0.88.1, then consider
   re-tightening `anti_entropy_interval_secs` from 3600.**
 - [ ] **[perf] Vector index memory: quantization + mmap** — persistence
   itself already exists (snapshot + watermark-delta replay at open; saved

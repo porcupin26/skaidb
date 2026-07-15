@@ -183,7 +183,7 @@ CREATE INDEX [IF NOT EXISTS] i ON t (path [, path ...])   -- composite = leftmos
 --   element, so `col = 'x'` containment is an index probe (exact counts);
 --   planner requires equality through the [] column; max one [] per index
 --   append WITH (global = true) for a value-sharded GLOBAL index
---   (v0.90 phase 1: write-path entries only, no reads yet — see
+--   (v0.89 phase 1: write-path entries only, no reads yet — see
 --   docs/GLOBAL_INDEXES.md; local remains the default and the planner
 --   ignores global indexes until the routed read path lands)
 DROP INDEX [IF EXISTS] i
@@ -459,7 +459,7 @@ the table on open. Distributed: scatter, merge by distance.
   own backfill in the background. `SHOW INDEXES` shows
   `secondary (building)` until that node's pages complete; the planner
   never uses a building index.
-- **Vector DDL acks at schema-apply too** (v0.90): CREATE VECTOR INDEX
+- **Vector DDL acks at schema-apply too** (v0.89): CREATE VECTOR INDEX
   with an explicit DIM (and rename-triggered vector rebuilds) queue a
   paged backfill; `SHOW INDEXES` shows `local = building` and searches on
   that index error "rebuilding — retry shortly" until the pages complete.

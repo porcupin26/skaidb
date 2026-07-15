@@ -1,6 +1,6 @@
 # Global (value-sharded) secondary indexes — design
 
-Status: **phase 1 (entry plumbing) shipped** (2026-07-15, v0.90);
+Status: **phase 1 (entry plumbing) shipped** (2026-07-15, v0.89);
 phases 2–4 pending. Phase-1 notes:
 
 - Syntax landed: `CREATE INDEX i ON t (cols) WITH (global = true)`;
