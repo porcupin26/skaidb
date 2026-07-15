@@ -203,6 +203,17 @@ SHOW GRANTS [FOR r]
 -- Introspection (no privilege needed; names only, no data)
 SHOW TABLES        -- (table, primary_key)
 SHOW INDEXES       -- (index, table, kind, columns)
+DESCRIBE t         -- (column, key, indexes): one row per PK/indexed column of
+DESC t             -- table t (DESC is an alias). Catalog-only, no privilege.
+DESCRIBE t FULL [SAMPLE n | EXACT]
+                   -- also reads rows to surface EVERY field with its type:
+                   -- (column, type, key, indexes). SAMPLE n = first n rows in
+                   -- PK order (default 1000). EXACT = scan all rows, cached in
+                   -- a RAM field registry keyed by the table's write stamp:
+                   -- repeats are O(fields) until the table changes; always
+                   -- exact (TTL tables: never cached). Reads data -> needs
+                   -- SELECT; local shard on a cluster (complete when RF >=
+                   -- members).
 SHOW STATUS        -- (metric, value): disk/memtable/wal/cache/compactions,
                    -- per-table table.<db>.<table>.*, per-index search.<name>.*
 SHOW DATABASES

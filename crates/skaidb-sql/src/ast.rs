@@ -110,6 +110,23 @@ pub enum Statement {
     ShowIndexes,
     /// `SHOW STATUS` — storage/runtime statistics for the current database.
     ShowStatus,
+    /// `DESCRIBE <table> [FULL [SAMPLE n | EXACT]]` (or `DESC …`) — the
+    /// table's structure. Without `FULL` it is catalog-only: one row per column
+    /// that is part of the primary key or an index, answered from the catalog
+    /// with no data access. `FULL` additionally samples rows to surface
+    /// **every** field (schema-less, so otherwise-invisible non-key fields)
+    /// with its inferred type; `SAMPLE n` caps the rows scanned (default
+    /// otherwise), while `EXACT` scans all rows and caches the result in RAM,
+    /// revalidated against the table's write stamp on each call.
+    Describe {
+        table: String,
+        /// `FULL` — sample rows to include non-key/non-indexed fields + types.
+        full: bool,
+        /// `SAMPLE n` (only with `FULL`) — max rows to scan; `None` = default.
+        sample: Option<usize>,
+        /// `EXACT` (only with `FULL`) — scan all rows; RAM-cached by write stamp.
+        exact: bool,
+    },
     /// `SHOW DATABASES` — list the databases in this data directory.
     ///
     /// The four database statements below operate across databases, so a single
@@ -209,6 +226,7 @@ impl Statement {
             Statement::Update(u) => f(&mut u.table),
             Statement::Delete(d) => f(&mut d.table),
             Statement::Select(s) => s.for_each_table_mut(&mut f),
+            Statement::Describe { table, .. } => f(table),
             Statement::Explain { statement } => statement.for_each_table_mut(f),
             _ => {}
         }

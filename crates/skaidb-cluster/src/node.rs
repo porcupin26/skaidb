@@ -4318,8 +4318,8 @@ impl Node {
         // Read-only catalog/stat introspection: the catalog is identical on every
         // node (DDL is broadcast), so answer from the local engine, filtered to
         // the current database, without fan-out — under a shared lock, so it
-        // never queues behind (or blocks) writers. SUGGEST reads the local
-        // shard's term dictionary the same way (complete when RF >= members;
+        // never queues behind (or blocks) writers. SUGGEST and `DESCRIBE … FULL`
+        // read the local shard's rows the same way (complete when RF >= members;
         // per-shard otherwise).
         if matches!(
             stmt,
@@ -4328,6 +4328,7 @@ impl Node {
                 | Statement::ShowStatus
                 | Statement::ShowDatabases
                 | Statement::ShowGrants { .. }
+                | Statement::Describe { .. }
                 | Statement::Suggest { .. }
         ) {
             return self

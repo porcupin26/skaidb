@@ -181,6 +181,14 @@ pub struct Engine {
     frozen: Vec<FrozenMem>,
     /// Next WAL segment number for a freeze.
     next_wal_seq: u64,
+    /// Monotonic count of mutations applied this process lifetime (every
+    /// `append_buffered`, plus `retain` rewrites). NOT persisted and NOT
+    /// advanced by WAL replay at open — it is a session-local change stamp:
+    /// two reads of [`Engine::write_seq`] bracketing an operation return the
+    /// same value iff the data could not have changed in between. Used to
+    /// validate RAM-only caches derived from a scan (`DESCRIBE … FULL EXACT`'s
+    /// field registry), which reset with the process too.
+    write_seq: u64,
     clock: HlcClock,
     /// Row time-to-live in ms (`Some` = expiring table). A row is invisible
     /// once its stamp's physical age exceeds this; compaction drops it. A
@@ -320,6 +328,7 @@ impl Engine {
             maint_watermark: Hlc::MAX,
             frozen: Vec::new(),
             next_wal_seq: 1,
+            write_seq: 0,
         })
     }
 
@@ -335,6 +344,7 @@ impl Engine {
         };
         let commit = self.wal.append_op(hlc, key, wal_value)?;
         self.mem.insert(key.to_vec(), hlc, value);
+        self.write_seq += 1;
         // Every write supersedes any cached SSTable result for this key. This is
         // what keeps the read cache correct across flush/compaction.
         self.read_cache.invalidate(key);
@@ -411,6 +421,18 @@ impl Engine {
     /// releasing the write lock.
     pub fn wal_sync_handle(&self) -> std::sync::Arc<WalSync> {
         self.wal.sync_handle()
+    }
+
+    /// Session-local change stamp: unchanged between two reads iff no mutation
+    /// was applied in between (see the field doc). Resets to 0 at open.
+    pub fn write_seq(&self) -> u64 {
+        self.write_seq
+    }
+
+    /// Whether a row TTL is set — visibility then changes with wall time even
+    /// without writes, so scan-derived caches must not be trusted.
+    pub fn has_ttl(&self) -> bool {
+        self.ttl_ms.is_some()
     }
 
     /// Set (or clear) the row TTL. Applied to all read paths immediately;
@@ -1083,6 +1105,7 @@ impl Engine {
         self.wal.truncate()?;
         let _ = self.wal.drop_segments_through(self.next_wal_seq);
         self.read_cache = ReadCache::new(self.opts.read_cache_capacity);
+        self.write_seq += 1; // data changed without an append — stamp it
         self.persist_manifest()?;
         remove_files(&old_paths);
         Ok(dropped)

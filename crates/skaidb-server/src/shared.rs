@@ -1020,6 +1020,10 @@ fn required_privilege(stmt: &Statement) -> Option<(Privilege, Object)> {
         // Suggestions read the index's term dictionary — a read, gated
         // like SELECT (the dictionary derives from table rows).
         Statement::Suggest { .. } => (Privilege::Select, Object::Global),
+        // `DESCRIBE … FULL` samples table rows to surface every field, so it
+        // reads data — gate it like SELECT. Plain DESCRIBE is catalog-only and
+        // needs no privilege (in the introspection group below).
+        Statement::Describe { full: true, .. } => (Privilege::Select, Object::Global),
         Statement::AlterTable(a) => (Privilege::Create, Object::Table(a.name.clone())),
         // Transaction control affects writes; gate it like a global write.
         Statement::Begin | Statement::Commit | Statement::Rollback => {
@@ -1031,6 +1035,7 @@ fn required_privilege(stmt: &Statement) -> Option<(Privilege, Object)> {
         Statement::ShowTables
         | Statement::ShowIndexes
         | Statement::ShowStatus
+        | Statement::Describe { full: false, .. }
         | Statement::ShowDatabases => return None,
         // Multi-database statements are an embedded-CLI concept; the clustered
         // engine rejects them, but gate the mutating ones as global writes.

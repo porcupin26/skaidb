@@ -164,6 +164,37 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   privilege, so a monitoring/tooling agent can enumerate the schema without
   `/query` data access. In cluster mode they answer from the local catalog (the
   schema is identical on every node).
+- **`DESCRIBE <table>`** (alias **`DESC <table>`**) is one table's structure as
+  `(column, key, indexes)` rows — one per column that is part of the primary key
+  or an index. `key` is `primary key` (with a `(n/m)` position for a composite
+  key); `indexes` lists the covering indexes as `name (kind)` (`secondary`,
+  `secondary, building`, `vector`, `search`), and a MULTIKEY `[]` suffix is
+  stripped from the column name. Rows come out primary-key columns first (in key
+  order), then the remaining indexed columns alphabetically. Like the `SHOW`
+  pair it is read-only, needs no privilege, and answers from the local catalog —
+  no data is read. **The store is schema-less, so a column that is neither part
+  of the key nor indexed is not in the catalog and does not appear here.** An
+  unknown table is an error. Accepts a `db.table` qualifier.
+  - **`DESCRIBE <table> FULL [SAMPLE n | EXACT]`** additionally reads the data
+    to surface **every** field — the schema-less fields the catalog can't know.
+    It returns `(column, type, key, indexes)`: the added `type` is the set of
+    value types seen for that field, joined by ` | ` (a field can hold several
+    types). Because it reads rows, `FULL` requires the `SELECT` privilege (plain
+    `DESCRIBE` does not) and, on a cluster, reads the local shard (complete when
+    RF ≥ members). Time-series tables report catalog columns only (blank types).
+    - Default/**`SAMPLE n`**: reads the first `n` rows in primary-key order
+      (default `1000`), streamed so it reads at most `n` rows and never
+      materializes the table — a field that appears only in rows outside the
+      sample is not seen; widen `SAMPLE` to trade cost for completeness.
+    - **`EXACT`**: scans all rows (streamed — memory stays bounded regardless
+      of table size) and caches the field map in a RAM **field registry**,
+      stamped with the table's write sequence. Repeated `EXACT`s on an
+      unchanged table answer from RAM in O(fields); any write, delete, or
+      reclaim to the table invalidates the stamp so the next call rescans —
+      results are always exact, including fields *disappearing* when their last
+      row is deleted. The registry is process-local (a restart clears it; the
+      first `EXACT` after rebuilds) and is skipped for TTL tables, whose row
+      visibility decays without writes — `EXACT` on those rescans every call.
 - **Admin statements** (`SHOW CLUSTER`/`SHOW CONFIG`/`SET CONFIG`/
   `SHOW SLOW QUERIES`/`REPAIR CLUSTER`/`RECLAIM`/`ALTER CLUSTER`) are the
   SQL spellings of the HTTP `/admin/*` control plane — identical handler,

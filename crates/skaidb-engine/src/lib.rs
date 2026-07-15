@@ -2019,6 +2019,145 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// DESCRIBE <table>: primary-key columns first (in key order, with `(n/m)`
+    /// position), then indexed columns alphabetically, each listing its
+    /// covering indexes; MULTIKEY `[]` is stripped from the column name.
+    #[test]
+    fn describe_lists_key_and_index_columns() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE ev (PRIMARY KEY (channel, ts))").unwrap();
+        db.execute("CREATE INDEX ev_actor ON ev (actor)").unwrap();
+        db.execute("CREATE INDEX ev_labels ON ev (labels[])").unwrap();
+        db.execute("CREATE SEARCH INDEX ev_body ON ev (body)").unwrap();
+        db.execute("CREATE VECTOR INDEX ev_emb ON ev (emb) DIM 3").unwrap();
+
+        let rs = rows(db.execute("DESCRIBE ev").unwrap());
+        let cell = |v: &Value| match v {
+            Value::String(x) => x.clone(),
+            other => panic!("non-string cell: {other:?}"),
+        };
+        let got: Vec<(String, String, String)> = rs
+            .rows
+            .iter()
+            .map(|r| (cell(&r[0]), cell(&r[1]), cell(&r[2])))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("channel".into(), "primary key (1/2)".into(), String::new()),
+                ("ts".into(), "primary key (2/2)".into(), String::new()),
+                ("actor".into(), String::new(), "ev_actor (secondary)".into()),
+                ("body".into(), String::new(), "ev_body (search)".into()),
+                ("emb".into(), String::new(), "ev_emb (vector)".into()),
+                ("labels".into(), String::new(), "ev_labels (secondary)".into()),
+            ]
+        );
+
+        // A single-column PK reads as a bare "primary key" (no position), and
+        // `DESC` is an accepted alias for `DESCRIBE`.
+        db.execute("CREATE TABLE k (PRIMARY KEY (id))").unwrap();
+        let rs = rows(db.execute("DESC k").unwrap());
+        assert_eq!(
+            rs.rows,
+            vec![vec![
+                Value::String("id".into()),
+                Value::String("primary key".into()),
+                Value::String(String::new()),
+            ]]
+        );
+
+        // Unknown table is an error, not empty output.
+        assert!(db.execute("DESCRIBE nope").is_err());
+    }
+
+    /// DESCRIBE <table> FULL samples rows to surface every field (not just
+    /// key/indexed ones) with its inferred type, merged with the catalog view.
+    #[test]
+    fn describe_full_samples_all_fields() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        db.execute("CREATE INDEX t_email ON t (email)").unwrap();
+        // `note` is neither key nor indexed — invisible to plain DESCRIBE.
+        db.execute("INSERT INTO t (id, email, age, note) VALUES (1, 'a@x', 30, 'hi')")
+            .unwrap();
+        db.execute("INSERT INTO t (id, email, age) VALUES (2, 'b@x', 41)").unwrap();
+
+        // Plain DESCRIBE shows only key + indexed columns (no `note`, no type).
+        let plain = rows(db.execute("DESCRIBE t").unwrap());
+        let plain_cols: Vec<String> = plain
+            .rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::String(s) => s.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(plain_cols, vec!["id", "email"]);
+
+        // FULL adds a `type` column and every sampled field, including `note`.
+        let full = rows(db.execute("DESCRIBE t FULL").unwrap());
+        assert_eq!(full.columns, vec!["column", "type", "key", "indexes"]);
+        let cell = |v: &Value| match v {
+            Value::String(x) => x.clone(),
+            other => panic!("non-string cell: {other:?}"),
+        };
+        let got: Vec<(String, String, String, String)> = full
+            .rows
+            .iter()
+            .map(|r| (cell(&r[0]), cell(&r[1]), cell(&r[2]), cell(&r[3])))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("id".into(), "int".into(), "primary key".into(), String::new()),
+                ("age".into(), "int".into(), String::new(), String::new()),
+                ("email".into(), "string".into(), String::new(), "t_email (secondary)".into()),
+                ("note".into(), "string".into(), String::new(), String::new()),
+            ]
+        );
+    }
+
+    /// DESCRIBE <table> FULL EXACT scans everything and serves repeats from
+    /// the RAM field registry, invalidated by the table's write stamp: a
+    /// field added (or removed) by later writes shows up (or disappears) on
+    /// the next call — no restart, no manual refresh.
+    #[test]
+    fn describe_full_exact_tracks_writes() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        db.execute("INSERT INTO t (id, a) VALUES (1, 'x')").unwrap();
+
+        let cols = |rs: &ResultSet| -> Vec<String> {
+            rs.rows
+                .iter()
+                .map(|r| match &r[0] {
+                    Value::String(s) => s.clone(),
+                    _ => unreachable!(),
+                })
+                .collect()
+        };
+        // First EXACT scans and caches.
+        let rs = rows(db.execute("DESCRIBE t FULL EXACT").unwrap());
+        assert_eq!(cols(&rs), vec!["id", "a"]);
+        // Cache hit: same result without a write in between.
+        let rs = rows(db.execute("DESCRIBE t FULL EXACT").unwrap());
+        assert_eq!(cols(&rs), vec!["id", "a"]);
+        // A write bumps the stamp — the next EXACT rescans and sees `b`.
+        db.execute("INSERT INTO t (id, b) VALUES (2, 7)").unwrap();
+        let rs = rows(db.execute("DESCRIBE t FULL EXACT").unwrap());
+        assert_eq!(cols(&rs), vec!["id", "a", "b"]);
+        // Deleting the only row holding `b` removes it again (exact, not
+        // adds-only): the delete bumps the stamp, the rescan no longer sees it.
+        db.execute("DELETE FROM t WHERE id = 2").unwrap();
+        let rs = rows(db.execute("DESCRIBE t FULL EXACT").unwrap());
+        assert_eq!(cols(&rs), vec!["id", "a"]);
+        // DROP + recreate under the same name must not serve the old cache.
+        db.execute("DROP TABLE t").unwrap();
+        db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        let rs = rows(db.execute("DESCRIBE t FULL EXACT").unwrap());
+        assert_eq!(cols(&rs), vec!["id"]);
+    }
+
     /// GROUP BY ... TOP k BY <expr> [ASC|DESC]: per-group top-k rows —
     /// each group returns its k best rows instead of one aggregated row;
     /// ranks by score() under a search predicate.

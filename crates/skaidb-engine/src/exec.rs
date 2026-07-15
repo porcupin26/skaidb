@@ -45,6 +45,12 @@ pub type IndexScanRange = (String, Option<Vec<u8>>, Option<Vec<u8>>);
 
 /// `(key, document)` rows — the engine's standard row-gather result.
 type KeyedRows = Vec<(Vec<u8>, Document)>;
+/// `DESCRIBE`'s catalog half: the primary-key columns (in key order) and, per
+/// column, the descriptors of the indexes covering it.
+type DescribeCatalog = (Vec<String>, BTreeMap<String, Vec<String>>);
+/// `DESCRIBE … FULL`'s data half: field name → the set of value-type tags
+/// seen for it (schema-less, so one field can hold several types).
+type FieldTypes = BTreeMap<String, BTreeSet<&'static str>>;
 /// Gathered rows plus whether they are already in the requested `ORDER BY` order.
 type OrderedRows = (KeyedRows, bool);
 /// A chosen index access path: `(index_name, start_key, end_key, sorted)` where
@@ -166,6 +172,14 @@ pub struct Database {
     /// layer's WAL-truncation gate. Absent entry = table has never had a
     /// deferred write (sync path or no consumers).
     applied_watermarks: HashMap<String, Hlc>,
+    /// RAM-only cache for `DESCRIBE … FULL EXACT`: per table, the field→types
+    /// map from a full scan, stamped with the storage engine's `write_seq` at
+    /// scan time. Valid while the stamp still matches (every mutation bumps
+    /// the seq); never persisted — both the cache and the seq reset with the
+    /// process, so they can never disagree across a restart. Tables no one
+    /// DESCRIBEs pay nothing. `Mutex` because DESCRIBE runs on the shared-lock
+    /// read path (`&self`); size is bounded by fields × type tags, tiny.
+    field_registry: std::sync::Mutex<HashMap<String, (u64, FieldTypes)>>,
 }
 
 /// A search index plus its NRT refresh state: writes apply immediately but
@@ -569,6 +583,7 @@ impl Database {
             pending_backfills: Vec::new(),
             pending_search_catchups: pending_search,
             defer_backfills: false,
+            field_registry: std::sync::Mutex::new(HashMap::new()),
         };
         // Re-arm the storage truncation gates, then replay any deferred
         // maintenance the crash interrupted (WAL replay above re-populated
@@ -2102,6 +2117,11 @@ impl Database {
             Statement::ShowTables => Ok(QueryOutput::Rows(self.show_tables())),
             Statement::ShowIndexes => Ok(QueryOutput::Rows(self.show_indexes())),
             Statement::ShowStatus => Ok(QueryOutput::Rows(self.show_status())),
+            Statement::Describe { ref table, full, sample, exact } => Ok(QueryOutput::Rows(if full {
+                self.describe_full(table, sample, exact)?
+            } else {
+                self.describe(table)?
+            })),
             Statement::ShowGrants { role } => {
                 Ok(QueryOutput::Rows(self.show_grants(role.as_deref())))
             }
@@ -2198,6 +2218,11 @@ impl Database {
             Statement::ShowTables => Ok(QueryOutput::Rows(self.show_tables())),
             Statement::ShowIndexes => Ok(QueryOutput::Rows(self.show_indexes())),
             Statement::ShowStatus => Ok(QueryOutput::Rows(self.show_status())),
+            Statement::Describe { ref table, full, sample, exact } => Ok(QueryOutput::Rows(if full {
+                self.describe_full(table, sample, exact)?
+            } else {
+                self.describe(table)?
+            })),
             Statement::CreateUser(cu) => self.create_user(
                 &cu.name,
                 cu.password.as_deref(),
@@ -2329,6 +2354,7 @@ impl Database {
             Statement::Select(_)
             | Statement::Suggest { .. }
             | Statement::ExplainScore { .. }
+            | Statement::Describe { .. }
             | Statement::Explain { .. } => {
                 namespace::resolve_statement(&mut stmt, current_db);
                 self.execute_read_statement(stmt)
@@ -2985,6 +3011,12 @@ impl Database {
         }
         self.tables.remove(name);
         self.catalog.tables.remove(name);
+        // A recreated table's engine restarts its write_seq at 0, which could
+        // collide with a stamp cached for this incarnation — purge, don't trust.
+        self.field_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name);
         // Drop the table's indexes too, tombstoning each so the drop replicates.
         let dropped: Vec<String> = self
             .catalog
@@ -3268,6 +3300,13 @@ impl Database {
         }
         self.tables
             .insert(new.to_string(), StorageEngine::open_with_options(new_dir, self.storage_opts)?);
+        // The reopened engine restarts write_seq at 0: purge both names' field
+        // registry so a stale stamp can't validate against the fresh counter.
+        {
+            let mut reg = self.field_registry.lock().unwrap_or_else(|e| e.into_inner());
+            reg.remove(old);
+            reg.remove(new);
+        }
 
         let def = self.catalog.tables.remove(old).expect("table present");
         self.catalog.tables.insert(new.to_string(), def);
@@ -4780,6 +4819,225 @@ impl Database {
         }
     }
 
+    /// The catalog half of `DESCRIBE`: a table's primary-key columns (in key
+    /// order) and, per column, the indexes that cover it (`name (kind)`).
+    /// Handles ordinary tables and a time-series table's implicit
+    /// `(series key…, ts)` key. Errors if the table is unknown. Shared by
+    /// [`Database::describe`] and [`Database::describe_full`].
+    fn describe_catalog(&self, table: &str) -> Result<DescribeCatalog> {
+        let pk: Vec<String> = if let Some(def) = self.catalog.tables.get(table) {
+            def.primary_key.clone()
+        } else if let Some(ts) = self.catalog.timeseries.get(table) {
+            let mut k = ts.series_key.clone();
+            k.push("ts".to_string());
+            k
+        } else {
+            return Err(EngineError::TableNotFound(table.to_string()));
+        };
+
+        // A MULTIKEY index path carries a trailing `[]`; the column it covers
+        // is the path without it (matching how the engine strips it).
+        let column_of = |p: &str| p.strip_suffix("[]").unwrap_or(p).to_string();
+
+        // column -> covering-index descriptors, keyed sorted so non-PK columns
+        // come out alphabetically.
+        let mut idx_of: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (name, idx) in &self.catalog.indexes {
+            if idx.table != table {
+                continue;
+            }
+            let kind = if idx.building { "secondary, building" } else { "secondary" };
+            let label = format!("{} ({kind})", namespace::split(name).1);
+            for p in &idx.paths {
+                idx_of.entry(column_of(p)).or_default().push(label.clone());
+            }
+        }
+        for (name, v) in &self.catalog.vector_indexes {
+            if v.table != table {
+                continue;
+            }
+            idx_of
+                .entry(column_of(&v.path))
+                .or_default()
+                .push(format!("{} (vector)", namespace::split(name).1));
+        }
+        for (name, s) in &self.catalog.search_indexes {
+            if s.table != table {
+                continue;
+            }
+            let label = format!("{} (search)", namespace::split(name).1);
+            for p in &s.paths {
+                idx_of.entry(column_of(p)).or_default().push(label.clone());
+            }
+        }
+        Ok((pk, idx_of))
+    }
+
+    /// The `key` cell for column `col` given the primary key `pk`: `primary
+    /// key` for a single-column key, `primary key (n/m)` for a composite one,
+    /// empty for a non-key column.
+    fn describe_key_cell(pk: &[String], col: &str) -> String {
+        match pk.iter().position(|c| c == col) {
+            Some(_) if pk.len() == 1 => "primary key".to_string(),
+            Some(i) => format!("primary key ({}/{})", i + 1, pk.len()),
+            None => String::new(),
+        }
+    }
+
+    /// `DESCRIBE <table>`: the table's structural catalog as a
+    /// `column | key | indexes` table — one row per column that participates
+    /// in the primary key or an index. Rows are ordered primary-key columns
+    /// first (in key order), then the remaining indexed columns alphabetically.
+    /// The store is schema-less, so fields that are neither part of the key nor
+    /// indexed are not in the catalog and do not appear — use
+    /// [`Database::describe_full`] (`DESCRIBE … FULL`) to sample the data for
+    /// the complete field set. `table` is the internal (database-resolved)
+    /// name; errors if unknown.
+    pub fn describe(&self, table: &str) -> Result<ResultSet> {
+        let (pk, idx_of) = self.describe_catalog(table)?;
+        let pk_set: HashSet<&String> = pk.iter().collect();
+        let mut order = pk.clone();
+        order.extend(idx_of.keys().filter(|c| !pk_set.contains(*c)).cloned());
+
+        let rows = order
+            .iter()
+            .map(|col| {
+                let indexes = idx_of.get(col).map(|v| v.join(", ")).unwrap_or_default();
+                vec![
+                    Value::String(col.clone()),
+                    Value::String(Self::describe_key_cell(&pk, col)),
+                    Value::String(indexes),
+                ]
+            })
+            .collect();
+        Ok(ResultSet {
+            columns: vec!["column".into(), "key".into(), "indexes".into()],
+            rows,
+        })
+    }
+
+    /// The scan half of `DESCRIBE … FULL`: fold the first `limit` rows'
+    /// top-level fields into the set of types seen per field. Streaming k-way
+    /// merge in key order — we keep only field names + type tags, never the
+    /// rows, so even an unbounded scan stays bounded in memory.
+    fn scan_field_types(engine: &StorageEngine, limit: usize) -> Result<FieldTypes> {
+        let mut types = FieldTypes::new();
+        for item in engine.scan_iter().take(limit) {
+            let (_, bytes) = item?;
+            // Best-effort: skip a row that fails to decode rather than
+            // failing the whole DESCRIBE over one corrupt value.
+            if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
+                for (field, v) in &doc.0 {
+                    types
+                        .entry(field.clone())
+                        .or_default()
+                        .insert(value_type_label(v));
+                }
+            }
+        }
+        Ok(types)
+    }
+
+    /// `DESCRIBE … FULL EXACT`'s data half: the complete field→types map from
+    /// a full scan, served from the RAM registry when the table's `write_seq`
+    /// still matches the stamp the cached scan ran at (callers hold at least
+    /// the shared database lock, and every mutation path holds it exclusively,
+    /// so the seq cannot move mid-scan). A TTL table is never cached: row
+    /// visibility there decays with wall time, without any write to bump the
+    /// seq. The registry resets with the process — the first EXACT after a
+    /// restart rescans.
+    fn exact_field_types(&self, table: &str) -> Result<FieldTypes> {
+        let Some(engine) = self.tables.get(table) else {
+            return Ok(FieldTypes::new()); // time-series: no row store
+        };
+        let seq = engine.write_seq();
+        let cacheable = !engine.has_ttl();
+        if cacheable {
+            let reg = self.field_registry.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((stamp, cached)) = reg.get(table) {
+                if *stamp == seq {
+                    return Ok(cached.clone());
+                }
+            }
+        }
+        let types = Self::scan_field_types(engine, usize::MAX)?;
+        if cacheable {
+            self.field_registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(table.to_string(), (seq, types.clone()));
+        }
+        Ok(types)
+    }
+
+    /// `DESCRIBE <table> FULL [SAMPLE n | EXACT]`: the catalog view plus
+    /// **every field** discovered in the data — a `column | type | key |
+    /// indexes` table. `type` is the set of value types seen for that field,
+    /// joined by ` | ` (schema-less: one field can hold several types).
+    ///
+    /// Sampling (`SAMPLE n`, default [`DESCRIBE_FULL_DEFAULT_SAMPLE`]) reads
+    /// the first `n` rows in primary-key order; a field set only in rows
+    /// outside the sample is not seen. `EXACT` scans all rows and caches the
+    /// result in the RAM field registry, revalidated against the table's write
+    /// stamp — repeated EXACTs on an unchanged table are O(fields), and any
+    /// write triggers a rescan on the next call. Non-key/non-indexed columns
+    /// absent from the data show a blank type. On a cluster this reads the
+    /// local shard (complete when RF ≥ members). Time-series tables report
+    /// catalog columns only (blank types), as their values live outside the
+    /// row store.
+    pub fn describe_full(
+        &self,
+        table: &str,
+        sample: Option<usize>,
+        exact: bool,
+    ) -> Result<ResultSet> {
+        let (pk, idx_of) = self.describe_catalog(table)?;
+        let types = if exact {
+            self.exact_field_types(table)?
+        } else {
+            let limit = sample.unwrap_or(DESCRIBE_FULL_DEFAULT_SAMPLE);
+            match self.tables.get(table) {
+                Some(engine) => Self::scan_field_types(engine, limit)?,
+                None => FieldTypes::new(), // time-series: no row store
+            }
+        };
+
+        // Column universe: primary-key columns first (key order), then every
+        // indexed-or-sampled column, alphabetically.
+        let pk_set: HashSet<&String> = pk.iter().collect();
+        let mut rest: BTreeSet<String> = BTreeSet::new();
+        rest.extend(idx_of.keys().cloned());
+        rest.extend(types.keys().cloned());
+        let mut order = pk.clone();
+        order.extend(rest.into_iter().filter(|c| !pk_set.contains(c)));
+
+        let rows = order
+            .iter()
+            .map(|col| {
+                let ty = types
+                    .get(col)
+                    .map(|s| s.iter().copied().collect::<Vec<_>>().join(" | "))
+                    .unwrap_or_default();
+                let indexes = idx_of.get(col).map(|v| v.join(", ")).unwrap_or_default();
+                vec![
+                    Value::String(col.clone()),
+                    Value::String(ty),
+                    Value::String(Self::describe_key_cell(&pk, col)),
+                    Value::String(indexes),
+                ]
+            })
+            .collect();
+        Ok(ResultSet {
+            columns: vec![
+                "column".into(),
+                "type".into(),
+                "key".into(),
+                "indexes".into(),
+            ],
+            rows,
+        })
+    }
+
     /// `SHOW STATUS`: storage and runtime statistics as a `metric | value`
     /// table, plus a per-table live-key/tombstone/disk breakdown.
     pub fn show_status(&self) -> ResultSet {
@@ -5814,6 +6072,7 @@ pub fn statement_is_read_only(stmt: &Statement) -> bool {
             | Statement::Suggest { .. }
             | Statement::ExplainScore { .. }
             | Statement::Explain { .. }
+            | Statement::Describe { .. }
             | Statement::ShowTables
             | Statement::ShowIndexes
             | Statement::ShowStatus
@@ -7179,6 +7438,30 @@ fn run_delete(del: Delete, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
         cluster.delete(&del.table, &key, &doc)?;
     }
     Ok(QueryOutput::Mutation { affected })
+}
+
+/// Default number of rows `DESCRIBE … FULL` samples when no `SAMPLE n` is
+/// given: enough to surface the common field set cheaply, bounded so a large
+/// table is not scanned in full. Streaming, so the scan stops after this many
+/// rows.
+pub const DESCRIBE_FULL_DEFAULT_SAMPLE: usize = 1000;
+
+/// The lowercase type tag of a [`Value`], for `DESCRIBE … FULL`'s `type`
+/// column (schema-less, so a field's type is discovered from the data).
+fn value_type_label(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Int(_) => "int",
+        Value::Float(_) => "float",
+        Value::Decimal(_) => "decimal",
+        Value::String(_) => "string",
+        Value::Bytes(_) => "bytes",
+        Value::Uuid(_) => "uuid",
+        Value::Timestamp(_) => "timestamp",
+        Value::Array(_) => "array",
+        Value::Document(_) => "document",
+    }
 }
 
 /// When the entire filter is `pk = <literal>` on a single-column primary key,

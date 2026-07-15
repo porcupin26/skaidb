@@ -332,6 +332,32 @@ impl Parser {
                 limit,
             });
         }
+        // `DESCRIBE <table>` / `DESC <table>` — a table's structural catalog
+        // (primary key + indexes, per column). DESCRIBE is contextual (not a
+        // reserved word); DESC reuses the ORDER-BY keyword at statement
+        // position, which is unambiguous — a statement never otherwise begins
+        // with a bare DESC.
+        if self.peek_ident_ci("describe") || matches!(self.peek(), Token::Keyword(Keyword::Desc)) {
+            self.advance();
+            let table = self.parse_table_name()?;
+            // `FULL` (contextual) also samples rows for the full field set;
+            // `SAMPLE n` caps the scan, `EXACT` scans everything (RAM-cached).
+            let full = self.eat_ident_ci("full");
+            let exact = full && self.eat_ident_ci("exact");
+            let sample = if full && !exact && self.eat_ident_ci("sample") {
+                match self.advance() {
+                    Token::Int(n) if n > 0 => Some(n as usize),
+                    other => {
+                        return Err(ParseError::Other(format!(
+                            "DESCRIBE … SAMPLE expects a positive integer, found {other:?}"
+                        )))
+                    }
+                }
+            } else {
+                None
+            };
+            return Ok(Statement::Describe { table, full, sample, exact });
+        }
         match self.peek() {
             Token::Keyword(Keyword::Select) => self.parse_select().map(Statement::Select),
             Token::Keyword(Keyword::Insert) => self.parse_insert().map(Statement::Insert),
@@ -1899,6 +1925,28 @@ mod tests {
             Statement::UseDatabase {
                 name: "database".into()
             }
+        );
+    }
+
+    #[test]
+    fn parse_describe() {
+        let d = |table: &str, full: bool, sample: Option<usize>, exact: bool| {
+            Statement::Describe { table: table.into(), full, sample, exact }
+        };
+        assert_eq!(parse("DESCRIBE orders").unwrap(), d("orders", false, None, false));
+        // `DESC` is accepted as an alias, and a db-qualified table works.
+        assert_eq!(parse("DESC shop.orders").unwrap(), d("shop.orders", false, None, false));
+        // Case-insensitive contextual keyword.
+        assert_eq!(parse("describe orders").unwrap(), d("orders", false, None, false));
+        // FULL, FULL SAMPLE n, and FULL EXACT.
+        assert_eq!(parse("DESCRIBE orders FULL").unwrap(), d("orders", true, None, false));
+        assert_eq!(
+            parse("desc orders full sample 50").unwrap(),
+            d("orders", true, Some(50), false)
+        );
+        assert_eq!(
+            parse("DESCRIBE orders FULL EXACT").unwrap(),
+            d("orders", true, None, true)
         );
     }
 
