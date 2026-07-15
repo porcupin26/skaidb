@@ -96,10 +96,11 @@ SHOW INDEXES
 SHOW STATUS
 SHOW DATABASES
 
--- Admin control plane (network server only; needs ADMIN on *)
+-- Admin control plane (network server only; reads need MONITOR on *,
+-- mutations need ADMIN on *; ADMIN implies MONITOR)
 SHOW CLUSTER                                  -- ring, members, epoch, liveness
 SHOW CONFIG [LIKE '<pattern>']                -- flattened keys, secrets masked
-SET  CONFIG <section.field> = <literal>       -- live-mutable keys apply instantly
+SET  CONFIG <section.field> = <literal>       -- live-mutable keys apply instantly (ADMIN)
 SHOW SLOW QUERIES [LIMIT <n>]                 -- masked slow-query sample
 REPAIR CLUSTER                                -- one anti-entropy pass
 RECLAIM                                       -- drop unowned keys/series
@@ -201,7 +202,8 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
 - **Admin statements** (`SHOW CLUSTER`/`SHOW CONFIG`/`SET CONFIG`/
   `SHOW SLOW QUERIES`/`REPAIR CLUSTER`/`RECLAIM`/`ALTER CLUSTER`) are the
   SQL spellings of the HTTP `/admin/*` control plane — identical handler,
-  RBAC (`ADMIN` on `*`), and audit; results come back as `(key, value)`
+  RBAC (reads: `MONITOR` on `*`; mutations: `ADMIN` on `*`), and audit;
+  results come back as `(key, value)`
   rows (LIKE uses `%`/`_`). They execute on the **network server** — the
   embedded `--local` engine rejects them. `SET CONSISTENCY` is
   per-connection session state on binary-protocol sessions (it overrides
@@ -273,8 +275,20 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   distributed transaction coordinator is future work). DDL is not transactional.
 
 - **Access control.** `<privilege>` is one of `SELECT`, `INSERT`, `UPDATE`,
-  `DELETE`, `CREATE`, `DROP`, `GRANT`, `ADMIN` (`ADMIN` on `*` = superuser;
-  `ADMIN` on a table implies every privilege on it). A **user** authenticates
+  `DELETE`, `CREATE`, `DROP`, `GRANT`, `MONITOR`, `ADMIN` (`ADMIN` on `*` =
+  superuser; `ADMIN` on a table implies every privilege on it). `MONITOR`
+  (granted `ON *`) opens the **read-only** control plane — `SHOW CLUSTER`,
+  `SHOW CONFIG` (secrets stay masked), `SHOW SLOW QUERIES`, and the matching
+  read-only HTTP admin endpoints — so an application role can report cluster
+  health and its effective config without an admin credential; it never
+  authorizes a mutation (`SET CONFIG`, repair, membership stay `ADMIN`).
+  **Index DDL is table-scoped:** `CREATE INDEX` needs `CREATE` on the target
+  table, and `DROP INDEX` / `REBUILD`/`ALTER` of an index need that same
+  `CREATE` on the index's **owning table** — an index is derived data, so a
+  role that can create its own indexes can also drop or retune them (no
+  `DROP on Global` needed; `DROP TABLE` still requires `DROP`). Dropping a
+  nonexistent index needs no privilege (`IF EXISTS` stays an idempotent
+  no-op; index existence is already free via `SHOW INDEXES`). A **user** authenticates
   (SCRAM on the binary protocol, HTTP Basic on REST) and acts as its
   own-named role; `GRANT ROLE r TO u` adds inherited roles. A grant
   `ON DATABASE db` covers every table in that database (checked against the

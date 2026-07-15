@@ -144,22 +144,22 @@ prepared-statement work in phase 1.
   privilege, so any authenticated role can `SELECT 1` as a liveness probe.
   `SELECT *` and trailing clauses still require a table.
 
-**Phase 5 — P1/P2 localized ops/RBAC tweaks** (`crates/skaidb-server`,
-`skaidb-auth`, engine)
+**Phase 5 — P1/P2 localized ops/RBAC tweaks** ✅ shipped
 
-- [ ] **[ops] `DROP INDEX` table-scoped like `CREATE`** (P1) — `CreateIndex`
-  is `(Create, Table)` but `DropIndex` is `(Drop, Global)`, so an app role
-  can create indexes it can never drop. `DROP INDEX` carries only the index
-  name, so scoping needs an index→table catalog resolution in
-  `required_privilege` (or a narrower per-`Index` privilege).
-- [ ] **[ops] Read-only introspection grant** (P2) — `SHOW CLUSTER` /
-  `SHOW CONFIG` are `(Admin, Global)`; split the read-only members to a
-  lesser gate (relax the `admin::handle` re-check in lockstep). Precedent:
-  the redacted low-privilege topology read in `rest.rs`.
-- [ ] **[ops] Scan-budget error names the column** (P2) — enrich the
-  `scan budget exceeded (N rows examined)` message at the catch site (where
-  the parsed statement + catalog are in scope), not inside the
-  context-free thread-local meter.
+- [x] **[ops] Index DDL table-scoped** (P1) — `DROP INDEX` (and vector/search
+  drops, `REBUILD`/`ALTER`) now require `Create` on the index's **owning
+  table**, resolved through the catalog at check time — a role that creates
+  its own indexes can drop/retune them. Unknown index → no privilege
+  (`IF EXISTS` bootstrap stays an idempotent no-op; existence is already free
+  via `SHOW INDEXES`).
+- [x] **[ops] `MONITOR` privilege** (P2) — new grantable privilege
+  (`GRANT MONITOR ON *`): read-only control plane (`SHOW CLUSTER`,
+  `SHOW CONFIG` — secrets masked, `SHOW SLOW QUERIES`, read-only HTTP admin)
+  without an admin credential; mutations stay `ADMIN`, and `ADMIN` implies
+  `MONITOR`. The `admin::handle` re-check relaxed in lockstep.
+- [x] **[ops] Scan-budget error names table + filter columns** (P2) —
+  enriched at the `run_select` statement boundary (the meter stays
+  context-free): `… [table emails, filter column(s): sender, date]`.
 
 **Phase 6 — deferred, large architecture** (already on the lists below)
 

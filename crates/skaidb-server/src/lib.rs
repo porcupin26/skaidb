@@ -1490,10 +1490,8 @@ mod tests {
         assert!(Client::connect_with(addr, "bob", "correct-horse").is_err());
     }
 
-    #[test]
-    fn rbac_enforced_per_statement() {
-        use crate::shared::{execute, execute_as};
-        let ctx: Shared = Arc::new(Context {
+    fn rbac_test_ctx() -> Shared {
+        Arc::new(Context {
             backend: Backend::Local(Box::new(RwLock::new(Database::open(temp_dir()).unwrap()))),
             metrics: Metrics::new(),
             audit: RwLock::new(quiet_audit()),
@@ -1504,7 +1502,90 @@ mod tests {
             slow_log: crate::slowlog::SlowLog::new(),
             config: RwLock::new(Config::default()),
             config_path: None,
-        });
+        })
+    }
+
+    /// An app role that can CREATE its own indexes can also DROP/replace them
+    /// (index DDL scoped to the owning table); other roles stay denied.
+    #[test]
+    fn index_ddl_scoped_to_owning_table() {
+        use crate::shared::{execute, execute_as};
+        let ctx = rbac_test_ctx();
+        assert_eq!(
+            execute(&ctx, "CREATE TABLE t (PRIMARY KEY (id))"),
+            Response::Ddl
+        );
+        assert_eq!(execute(&ctx, "CREATE ROLE app"), Response::Ddl);
+        assert_eq!(
+            execute(&ctx, "GRANT CREATE ON DATABASE default TO app"),
+            Response::Ddl
+        );
+        // The app can create its own index...
+        assert_eq!(
+            execute_as(&ctx, "app", "CREATE INDEX i_probe ON t (name)"),
+            Response::Ddl
+        );
+        // ...and — the C-5 fix — drop it again (previously `permission
+        // denied: Drop on Global`, making index DDL append-only for apps).
+        assert_eq!(execute_as(&ctx, "app", "DROP INDEX i_probe"), Response::Ddl);
+        // Idempotent bootstrap: IF EXISTS on a nonexistent index stays a
+        // permissionless no-op instead of a spurious denial.
+        assert_eq!(
+            execute_as(&ctx, "app", "DROP INDEX IF EXISTS i_probe"),
+            Response::Ddl
+        );
+        // A role without Create on the owning table is still denied.
+        assert_eq!(execute(&ctx, "CREATE ROLE reader"), Response::Ddl);
+        assert_eq!(execute(&ctx, "GRANT SELECT ON t TO reader"), Response::Ddl);
+        assert_eq!(
+            execute(&ctx, "CREATE INDEX i_admin ON t (name)"),
+            Response::Ddl
+        );
+        match execute_as(&ctx, "reader", "DROP INDEX i_admin") {
+            Response::Error(m) => assert!(m.contains("permission denied"), "got: {m}"),
+            other => panic!("expected denial, got {other:?}"),
+        }
+    }
+
+    /// `GRANT MONITOR ON *` opens read-only control-plane introspection
+    /// (SHOW CONFIG / SHOW CLUSTER / SHOW SLOW QUERIES) without Admin; the
+    /// mutating control plane stays Admin-only.
+    #[test]
+    fn monitor_grants_read_only_introspection() {
+        use crate::shared::{execute, execute_as};
+        let ctx = rbac_test_ctx();
+        assert_eq!(execute(&ctx, "CREATE ROLE watcher"), Response::Ddl);
+        assert_eq!(
+            execute(&ctx, "GRANT MONITOR ON * TO watcher"),
+            Response::Ddl
+        );
+        // Read-only introspection is allowed (never a permission error)...
+        for sql in ["SHOW CONFIG", "SHOW CLUSTER", "SHOW SLOW QUERIES"] {
+            if let Response::Error(m) = execute_as(&ctx, "watcher", sql) {
+                assert!(!m.contains("permission denied"), "{sql}: {m}");
+            }
+        }
+        // ...but mutation still requires Admin.
+        match execute_as(
+            &ctx,
+            "watcher",
+            "SET CONFIG storage.scan_row_budget = 1000",
+        ) {
+            Response::Error(m) => assert!(m.contains("permission denied"), "got: {m}"),
+            other => panic!("expected denial, got {other:?}"),
+        }
+        // A role without the grant stays locked out of introspection.
+        assert_eq!(execute(&ctx, "CREATE ROLE plain"), Response::Ddl);
+        match execute_as(&ctx, "plain", "SHOW CONFIG") {
+            Response::Error(m) => assert!(m.contains("permission denied"), "got: {m}"),
+            other => panic!("expected denial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rbac_enforced_per_statement() {
+        use crate::shared::{execute, execute_as};
+        let ctx: Shared = rbac_test_ctx();
 
         // Superuser sets up the table, the role, and its grant — via SQL.
         assert_eq!(

@@ -1975,6 +1975,23 @@ impl Database {
     /// One node's full schema-and-storage inventory: every table (regular,
     /// timeseries, memory), secondary/vector/search index, with definition
     /// details and this node's usage numbers. Table/index counts use the
+    /// The table owning the index named by the user-typed reference `index`
+    /// under `current_db` (secondary, vector, or search index), returned as a
+    /// user-facing table reference (`table`, or `db.table` when foreign to
+    /// `current_db`). `None` if no such index exists. Used by the server's
+    /// permission layer to scope index DDL to the owning table.
+    pub fn index_owner_table(&self, index: &str, current_db: &str) -> Option<String> {
+        let internal = crate::namespace::qualify(current_db, index);
+        let table = self
+            .catalog
+            .indexes
+            .get(&internal)
+            .map(|d| &d.table)
+            .or_else(|| self.catalog.vector_indexes.get(&internal).map(|d| &d.table))
+            .or_else(|| self.catalog.search_indexes.get(&internal).map(|d| &d.table))?;
+        Some(crate::namespace::display_name(table, current_db))
+    }
+
     /// O(files) approximate stats; disk sizes are exact. Names are
     /// namespaced (`db\u{1f}table`) — callers split for display.
     pub fn inventory(&self) -> Inventory {
@@ -6125,6 +6142,79 @@ fn run_insert(ins: Insert, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
 }
 
 fn run_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> {
+    // The scan meter is context-free by design; re-add the context here where
+    // the statement is in scope, so "scan budget exceeded" names the table
+    // and filter columns and the fix (which index to add) is mechanical.
+    enrich_scan_budget(run_select_impl(sel, cluster), &sel.from, &sel.filter)
+}
+
+/// Append the table and filter columns to a scan-budget error.
+fn enrich_scan_budget<T>(
+    r: Result<T>,
+    table: &str,
+    filter: &Option<Expr>,
+) -> Result<T> {
+    match r {
+        Err(EngineError::ResourceLimit(msg)) if msg.starts_with("scan budget exceeded") => {
+            // Internal names carry the namespace separator; show `db.table`.
+            let table = table.replace('\u{1f}', ".");
+            let mut cols: Vec<String> = Vec::new();
+            if let Some(f) = filter {
+                collect_filter_columns(f, &mut cols);
+            }
+            let detail = if cols.is_empty() {
+                format!(" [table {table}]")
+            } else {
+                format!(" [table {table}, filter column(s): {}]", cols.join(", "))
+            };
+            Err(EngineError::ResourceLimit(format!("{msg}{detail}")))
+        }
+        other => other,
+    }
+}
+
+/// Column paths referenced anywhere in a filter, in first-seen order.
+fn collect_filter_columns(e: &Expr, out: &mut Vec<String>) {
+    if let Expr::Column(c) = e {
+        if !out.iter().any(|x| x == c) {
+            out.push(c.clone());
+        }
+    }
+    match e {
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => collect_filter_columns(expr, out),
+        Expr::Binary { left, right, .. } => {
+            collect_filter_columns(left, out);
+            collect_filter_columns(right, out);
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_filter_columns(expr, out);
+            for item in list {
+                collect_filter_columns(item, out);
+            }
+        }
+        Expr::Between { expr, lo, hi, .. } => {
+            collect_filter_columns(expr, out);
+            collect_filter_columns(lo, out);
+            collect_filter_columns(hi, out);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            collect_filter_columns(expr, out);
+            collect_filter_columns(pattern, out);
+        }
+        Expr::Func { args, .. } => {
+            for a in args {
+                collect_filter_columns(a, out);
+            }
+        }
+        Expr::Aggregate {
+            arg: AggArg::Expr(inner),
+            ..
+        } => collect_filter_columns(inner, out),
+        Expr::Aggregate { .. } | Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) => {}
+    }
+}
+
+fn run_select_impl(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> {
     // `SELECT <expr>` without FROM: constant projection over one empty row —
     // the cheap liveness probe (`SELECT 1`) and expression calculator. Shared
     // by the embedded and clustered paths since both funnel through here.

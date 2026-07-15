@@ -17,6 +17,11 @@ pub enum Privilege {
     Create,
     Drop,
     Grant,
+    /// Read-only control-plane introspection (`SHOW CLUSTER`, `SHOW CONFIG`,
+    /// `SHOW SLOW QUERIES`, and the matching read-only HTTP admin endpoints):
+    /// lets an application role report cluster health and its effective
+    /// config without an admin credential. Never authorizes a mutation.
+    Monitor,
     /// Full control (superuser when held on [`Object::Global`]).
     Admin,
 }
@@ -50,6 +55,7 @@ pub fn privilege_name(p: Privilege) -> &'static str {
         Privilege::Create => "create",
         Privilege::Drop => "drop",
         Privilege::Grant => "grant",
+        Privilege::Monitor => "monitor",
         Privilege::Admin => "admin",
     }
 }
@@ -64,6 +70,7 @@ pub fn privilege_from_name(s: &str) -> Option<Privilege> {
         "create" => Privilege::Create,
         "drop" => Privilege::Drop,
         "grant" => Privilege::Grant,
+        "monitor" => Privilege::Monitor,
         "admin" => Privilege::Admin,
         _ => return None,
     })

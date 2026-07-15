@@ -88,10 +88,31 @@ fn field(body: &str, key: &str) -> Option<String> {
 
 /// Run `cmd` for `role`. Returns `(http_status, json)`.
 pub fn handle(ctx: &Shared, role: &str, cmd: AdminCmd) -> (u16, Json) {
-    // Every admin op (including status) requires cluster-wide Admin.
-    if !ctx.allowed(role, Privilege::Admin, &Object::Global) {
+    // Read-only introspection (status, slow queries, config reads — secrets
+    // masked) needs only cluster-wide Monitor, so an application role can
+    // report on its deployment; everything that mutates requires Admin.
+    // Admin implies Monitor.
+    let read_only = matches!(
+        cmd,
+        AdminCmd::Status | AdminCmd::Slow | AdminCmd::ConfigShow | AdminCmd::ConfigGet(_)
+    );
+    let (needed, ok) = if read_only {
+        (
+            Privilege::Monitor,
+            ctx.allowed(role, Privilege::Monitor, &Object::Global),
+        )
+    } else {
+        (
+            Privilege::Admin,
+            ctx.allowed(role, Privilege::Admin, &Object::Global),
+        )
+    };
+    if !ok {
         ctx.metrics.incr_authz_denied();
-        return (403, json!({ "error": "permission denied: Admin on Global" }));
+        return (
+            403,
+            json!({ "error": format!("permission denied: {needed:?} on Global") }),
+        );
     }
 
     // Slow-query sample is available in both standalone and cluster mode.

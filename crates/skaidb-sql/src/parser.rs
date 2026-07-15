@@ -497,9 +497,12 @@ impl Parser {
             Token::Keyword(Keyword::Drop) => "drop",
             Token::Keyword(Keyword::Grant) => "grant",
             Token::Keyword(Keyword::Admin) => "admin",
+            // Contextual (not a reserved keyword): read-only control-plane
+            // introspection.
+            Token::Ident(s) if s.eq_ignore_ascii_case("monitor") => "monitor",
             other => {
                 return Err(ParseError::Other(format!(
-                    "expected a privilege (SELECT/INSERT/UPDATE/DELETE/CREATE/DROP/GRANT/ADMIN), found {other:?}"
+                    "expected a privilege (SELECT/INSERT/UPDATE/DELETE/CREATE/DROP/GRANT/MONITOR/ADMIN), found {other:?}"
                 )))
             }
         };

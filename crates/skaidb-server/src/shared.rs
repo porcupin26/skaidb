@@ -43,6 +43,22 @@ impl Backend {
         }
     }
 
+    /// The user-facing reference of the table owning index `index` under
+    /// `current_db` (secondary, vector, or search), or `None` if no such
+    /// index exists. Lets the permission layer scope index DDL to the owning
+    /// table instead of gating it globally.
+    pub fn index_owner_table(&self, index: &str, current_db: &str) -> Option<String> {
+        match self {
+            Backend::Local(db) => db
+                .read()
+                .ok()
+                .and_then(|db| db.index_owner_table(index, current_db)),
+            Backend::Cluster(node) => node
+                .with_local_read(|db| db.index_owner_table(index, current_db))
+                .flatten(),
+        }
+    }
+
     /// This node's schema/storage inventory (`None` if the engine lock is
     /// poisoned). Serves `GET /ui/inventory`.
     pub fn inventory(&self) -> Option<skaidb_engine::Inventory> {
@@ -659,7 +675,14 @@ pub fn execute_session_statement_as(
         Some(Statement::ShowGrants { role: Some(r) }) if r == role
     );
     if !self_inspection {
-        if let Some((privilege, object)) = parsed.as_ref().ok().and_then(required_privilege) {
+        // Index DDL scopes to the index's owning table, resolved against the
+        // session database (names here are still user-typed, pre-resolution).
+        let index_owner = |name: &str| ctx.backend.index_owner_table(name, current_db);
+        if let Some((privilege, object)) = parsed
+            .as_ref()
+            .ok()
+            .and_then(|stmt| required_privilege(stmt, &index_owner))
+        {
             let ok = match &object {
                 Object::Table(t) => ctx.allowed_on_table(role, privilege, t, current_db),
                 _ => ctx.allowed(role, privilege, &object),
@@ -979,7 +1002,10 @@ fn slow_query_rows(payload: &Json, limit: Option<u64>) -> Response {
     }
 }
 
-fn required_privilege(stmt: &Statement) -> Option<(Privilege, Object)> {
+fn required_privilege(
+    stmt: &Statement,
+    index_owner: &dyn Fn(&str) -> Option<String>,
+) -> Option<(Privilege, Object)> {
     Some(match stmt {
         // A FROM-less select (`SELECT 1`) projects constants over no table —
         // nothing to protect, so any authenticated role may use it as a
@@ -992,7 +1018,7 @@ fn required_privilege(stmt: &Statement) -> Option<(Privilege, Object)> {
         }
         // The plan describes what the wrapped statement would touch — gate
         // exactly as the wrapped statement itself is gated.
-        Statement::Explain { statement } => return required_privilege(statement),
+        Statement::Explain { statement } => return required_privilege(statement, index_owner),
         Statement::Insert(i) => (Privilege::Insert, Object::Table(i.table.clone())),
         Statement::Update(u) => (Privilege::Update, Object::Table(u.table.clone())),
         Statement::Delete(d) => (Privilege::Delete, Object::Table(d.table.clone())),
@@ -1013,14 +1039,22 @@ fn required_privilege(stmt: &Statement) -> Option<(Privilege, Object)> {
         Statement::CreateVectorIndex(ci) => (Privilege::Create, Object::Table(ci.table.clone())),
         Statement::CreateSearchIndex(ci) => (Privilege::Create, Object::Table(ci.table.clone())),
         Statement::DropTable { name, .. } => (Privilege::Drop, Object::Table(name.clone())),
-        Statement::DropIndex { .. } => (Privilege::Drop, Object::Global),
-        Statement::DropVectorIndex { .. } => (Privilege::Drop, Object::Global),
-        Statement::DropSearchIndex { .. } => (Privilege::Drop, Object::Global),
-        // A rebuild rewrites index data, so gate it like index creation;
-        // ALTER changes index options the same way.
-        Statement::RebuildSearchIndex { .. } => (Privilege::Create, Object::Global),
-        Statement::AlterSearchIndex { .. } => (Privilege::Create, Object::Global),
-        Statement::AlterVectorIndex { .. } => (Privilege::Create, Object::Global),
+        // Index lifecycle (drop/rebuild/alter) is governed by the same
+        // `Create` privilege on the owning table that created the index: an
+        // index is derived data — dropping it loses no rows — so a role that
+        // can create its own indexes can also remove or retune them (no more
+        // append-only index DDL for app roles). An unknown index needs no
+        // privilege: execution answers "does not exist" (or no-ops under
+        // IF EXISTS), and index existence is already free via SHOW INDEXES.
+        Statement::DropIndex { name, .. }
+        | Statement::DropVectorIndex { name, .. }
+        | Statement::DropSearchIndex { name, .. }
+        | Statement::RebuildSearchIndex { name }
+        | Statement::AlterSearchIndex { name, .. }
+        | Statement::AlterVectorIndex { name, .. } => match index_owner(name) {
+            Some(table) => (Privilege::Create, Object::Table(table)),
+            None => return None,
+        },
         // Suggestions read the index's term dictionary — a read, gated
         // like SELECT (the dictionary derives from table rows).
         Statement::Suggest { .. } => (Privilege::Select, Object::Global),
@@ -1058,12 +1092,16 @@ fn required_privilege(stmt: &Statement) -> Option<(Privilege, Object)> {
         | Statement::GrantRole { .. }
         | Statement::RevokeRole { .. }
         | Statement::ShowGrants { .. } => (Privilege::Grant, Object::Global),
-        // The SQL spellings of the admin control plane; `admin::handle`
-        // re-checks, this arm makes the standard denial path fire first.
+        // Read-only control-plane introspection: cluster health, effective
+        // config (secrets already masked), slow queries. Gated on the
+        // `Monitor` privilege so an application role can report on its own
+        // deployment without an admin credential; Admin implies it.
         Statement::ShowCluster
         | Statement::ShowConfig { .. }
-        | Statement::SetConfig { .. }
-        | Statement::ShowSlowQueries { .. }
+        | Statement::ShowSlowQueries { .. } => (Privilege::Monitor, Object::Global),
+        // The mutating admin control plane; `admin::handle` re-checks, this
+        // arm makes the standard denial path fire first.
+        Statement::SetConfig { .. }
         | Statement::RepairCluster
         | Statement::Reclaim
         | Statement::AlterCluster { .. } => (Privilege::Admin, Object::Global),

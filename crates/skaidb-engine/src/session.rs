@@ -409,6 +409,34 @@ mod tests {
         assert!(err.to_string().contains("scan budget"), "{err}");
     }
 
+    /// The scan-budget error names the table and the filter columns, so the
+    /// fix (which index to add) is mechanical. Context is attached at the
+    /// statement boundary; the meter itself stays context-free.
+    #[test]
+    fn scan_budget_error_names_table_and_columns() {
+        let mut opts = skaidb_storage::EngineOptions {
+            scan_row_budget: 100,
+            ..Default::default()
+        };
+        opts.statement_timeout_secs = 0;
+        let mut s = Session::open_with_options(tmp(), opts).unwrap();
+        s.execute("CREATE TABLE emails (PRIMARY KEY (id));").unwrap();
+        for i in 0..500 {
+            s.execute(&format!(
+                "INSERT INTO emails (id, sender, date) VALUES ('k{i:05}', 's{i}', {i});"
+            ))
+            .unwrap();
+        }
+        let err = s
+            .execute("SELECT id FROM emails WHERE sender = 'nobody' AND date > 5;")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("scan budget exceeded"), "{msg}");
+        assert!(msg.contains("table emails"), "{msg}");
+        assert!(msg.contains("sender"), "{msg}");
+        assert!(msg.contains("date"), "{msg}");
+    }
+
     /// A filter matching nothing under ORDER BY .. LIMIT walks the whole
     /// index range; the scan budget must turn that into an error instead of
     /// unbounded work (the categorizer-poll shape that OOM-looped

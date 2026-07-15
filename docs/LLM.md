@@ -245,9 +245,9 @@ SHOW STATUS        -- (metric, value): disk/memtable/wal/cache/compactions,
                    -- per-table table.<db>.<table>.*, per-index search.<name>.*
 SHOW DATABASES
 
--- Admin statements (SQL spellings of the HTTP admin surface; need ADMIN
--- on * and share its RBAC + audit path — a SQL-only client is fully
--- self-sufficient)
+-- Admin statements (SQL spellings of the HTTP admin surface; reads need
+-- MONITOR on *, mutations need ADMIN on * (ADMIN implies MONITOR); share
+-- its RBAC + audit path — a SQL-only client is fully self-sufficient)
 SHOW CLUSTER                        -- ring/peers/liveness as (key, value) rows
 SHOW CONFIG [LIKE 'pat%']           -- full config flattened to dotted keys, masked
 SET CONFIG section.key = literal    -- live-mutable keys apply instantly
@@ -269,11 +269,15 @@ SET CONSISTENCY ONE | QUORUM | ALL
 ```
 
 **RBAC**: privileges are `SELECT INSERT UPDATE DELETE CREATE DROP GRANT
-ADMIN`. `ADMIN ON *` = superuser; a database grant covers its tables; a
-user acts as its own-named role and inherits granted roles. Management
-statements need `GRANT`; `SHOW GRANTS FOR <own role>` is always allowed.
+MONITOR ADMIN`. `ADMIN ON *` = superuser; a database grant covers its
+tables; a user acts as its own-named role and inherits granted roles.
+Management statements need `GRANT`; `SHOW GRANTS FOR <own role>` is always
+allowed. `MONITOR ON *` = read-only control plane (SHOW CLUSTER/CONFIG/
+SLOW QUERIES + read-only admin HTTP), never mutations. **Index DDL is
+table-scoped**: CREATE/DROP/REBUILD/ALTER of an index need `CREATE` on the
+owning table — a role that creates its indexes can drop them.
 `remote_write` needs `INSERT` and `/api/v1/query*` need `SELECT` on the
-`metrics` table. Admin HTTP endpoints need `ADMIN` on `*`.
+`metrics` table. Mutating admin HTTP endpoints need `ADMIN` on `*`.
 
 **Indexing**: predicates on indexed columns (`=`, ranges, AND-combined) and
 matching `ORDER BY` accelerate; everything else scans with identical
