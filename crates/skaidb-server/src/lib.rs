@@ -294,9 +294,21 @@ pub fn run(
     // The tick makes writes searchable within refresh_ms + the tick period.
     {
         let ctx = ctx.clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            ctx.backend.search_refresh_tick();
+        std::thread::spawn(move || {
+            // Vector snapshots checkpoint on a slow cadence riding the same
+            // thread: a crash then replays minutes of writes, not everything
+            // since the last graceful shutdown.
+            const VECTOR_CHECKPOINT_EVERY: std::time::Duration =
+                std::time::Duration::from_secs(600);
+            let mut last_ckpt = std::time::Instant::now();
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                ctx.backend.search_refresh_tick();
+                if last_ckpt.elapsed() >= VECTOR_CHECKPOINT_EVERY {
+                    last_ckpt = std::time::Instant::now();
+                    ctx.backend.vector_checkpoint_tick();
+                }
+            }
         });
     }
 

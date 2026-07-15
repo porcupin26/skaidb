@@ -2939,12 +2939,84 @@ impl Node {
     /// Reconcile one table with one peer by merge-joining paged key-ordered
     /// scans of both sides: pull remote-newer rows (for keys we replicate),
     /// push local-newer rows (for keys the peer replicates), page by page.
+    /// Number of repair-digest buckets (fits one small frame: 4096 × 8 B).
+    const REPAIR_DIGEST_BUCKETS: usize = 4096;
+
+    /// The per-bucket repair digest for `(self, peer)` over `table`: rows
+    /// whose replica set involves either side contribute
+    /// `fnv1a(key ‖ hlc ‖ is_put)` XORed into the bucket keyed by the top 12
+    /// bits of `fnv1a(key)`. Computed fresh from the live data each pass —
+    /// it can never go stale, so equal digests are safe to trust (an
+    /// incrementally-maintained digest would risk false convergence if any
+    /// write site missed an update; see TODO). One sequential page walk,
+    /// paced like the repair scan.
+    pub(crate) fn repair_digest(&self, table: &str, peer: &NodeId) -> EngineResult<Vec<u64>> {
+        let mut buckets = vec![0u64; Self::REPAIR_DIGEST_BUCKETS];
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let rows = self
+                .local
+                .read()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+                .local_scan_versioned_page(table, after.as_deref(), REPAIR_PAGE_ROWS)?;
+            let Some((last_key, _, _, _)) = rows.last() else { break };
+            after = Some(last_key.clone());
+            for (key, _, hlc, is_put) in &rows {
+                let owners = self.replicas_for(key);
+                if !(owners.contains(&self.id) || owners.contains(peer)) {
+                    continue; // neither side is responsible: reclaim territory
+                }
+                let mut fp_input = Vec::with_capacity(key.len() + 13);
+                fp_input.extend_from_slice(key);
+                fp_input.extend_from_slice(&hlc.to_bytes());
+                fp_input.push(u8::from(*is_put));
+                let bucket = (fnv1a(key) >> 52) as usize & (Self::REPAIR_DIGEST_BUCKETS - 1);
+                buckets[bucket] ^= fnv1a(&fp_input);
+            }
+            if rows.len() < REPAIR_PAGE_ROWS {
+                break;
+            }
+            thread::sleep(REPAIR_PAGE_PAUSE);
+        }
+        Ok(buckets)
+    }
+
+    /// Digest gate for one (table, peer): `true` when both sides' digests
+    /// match — the pair is converged and the full paged compare can be
+    /// skipped. Any failure (old peer, busy engine) means "don't know":
+    /// the caller proceeds with the full compare, so the gate can only ever
+    /// save work, never skip real divergence.
+    fn repair_digests_match(&self, table: &str, pid: &NodeId, addr: &str) -> bool {
+        let Ok(local) = self.repair_digest(table, pid) else {
+            return false;
+        };
+        let resp = self.pool.call(
+            addr,
+            &Request::RepairDigest {
+                table: table.to_string(),
+                requester: self.id.0.clone(),
+            },
+        );
+        match resp {
+            Ok(Response::Digest { buckets }) => buckets == local,
+            _ => false,
+        }
+    }
+
     fn repair_table_with(
         &self,
         table: &str,
         pid: &NodeId,
         addr: &str,
     ) -> Result<usize, RepairPeerError> {
+        // Converged pair? One digest exchange instead of paging the whole
+        // table across the wire and merge-joining every key — the steady
+        // state of a healthy cluster, and the reason the anti-entropy
+        // interval had to be detuned to 1 h in production (the back-to-back
+        // full-compare passes were a continuous ScanPage firehose).
+        if self.repair_digests_match(table, pid, addr) {
+            return Ok(0);
+        }
         let mut repaired = 0usize;
         let mut local: PageCursor = PageCursor::new();
         let mut remote: PageCursor = PageCursor::new();
@@ -3808,6 +3880,14 @@ impl Node {
                 }
                 None => Response::Err("busy: engine write-locked, retry".into()),
             },
+            Request::RepairDigest { table, requester } => {
+                // The requester's id plays the "peer" role so both sides
+                // apply the identical pair-ownership row filter.
+                match self.repair_digest(&table, &NodeId(requester)) {
+                    Ok(buckets) => Response::Digest { buckets },
+                    Err(e) => Response::Err(e.to_string()),
+                }
+            }
             Request::TsAppend { table, rows } => match self.local_read_bounded() {
                 Some(db) => match db.ts_append(&table, &rows) {
                     Ok(_) => Response::Ack,
@@ -4886,6 +4966,21 @@ impl Node {
     /// See [`Node::table_primary_key`].
     pub fn search_index_fields(&self, table: &str) -> Option<Vec<(String, String)>> {
         self.local.read().ok()?.search_index_fields(table)
+    }
+
+    /// Checkpoint dirty vector-index snapshots (see the server tick): bounds
+    /// crash-recovery replay to writes since the last checkpoint. Read-gated.
+    pub fn vector_checkpoint_tick(&self) {
+        let dirty = self
+            .local
+            .read()
+            .ok()
+            .is_some_and(|d| d.has_dirty_vector_indexes());
+        if dirty {
+            if let Ok(mut d) = self.local.write() {
+                d.save_vector_indexes();
+            }
+        }
     }
 
     /// One background NRT tick over the local shard's search indexes (the
@@ -7305,6 +7400,56 @@ mod tests {
         nc.execute("DELETE FROM t WHERE id = 2").unwrap();
         let rs = rows(na.execute("SELECT id FROM t ORDER BY id").unwrap());
         assert_eq!(rs.rows, vec![vec![Value::Int(1)], vec![Value::Int(3)]]);
+    }
+
+    /// Repair digests: equal on a converged pair (so the full compare is
+    /// skipped), sensitive to a single divergent row, and repair still
+    /// converges the divergence — the gate can only save work, never skip
+    /// real differences.
+    #[test]
+    fn repair_digest_gates_converged_tables() {
+        let (a, b) = (free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b)];
+        let na = Node::new(
+            Database::open(temp_dir("dga")).unwrap(),
+            cfg("a", &a, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("dgb")).unwrap(),
+            cfg("b", &b, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        for i in 0..500 {
+            na.execute(&format!("INSERT INTO t (id, v) VALUES ({i}, 'v{i}')"))
+                .unwrap();
+        }
+        // Fully replicated: digests agree in both directions.
+        let ab = na.repair_digest("t", &NodeId("b".into())).unwrap();
+        let ba = nb.repair_digest("t", &NodeId("a".into())).unwrap();
+        assert_eq!(ab, ba, "converged pair must produce equal digests");
+        assert!(ab.iter().any(|&x| x != 0), "digest is not degenerate");
+
+        // Diverge ONE row on A only (bypassing replication).
+        let hlc = na.clock.now();
+        na.apply_batch_local(
+            "t",
+            &[(b"\x02zzz-local-only".to_vec(), vec![7u8; 4], hlc, true)],
+        )
+        .unwrap();
+        let ab2 = na.repair_digest("t", &NodeId("b".into())).unwrap();
+        assert_ne!(ab2, ba, "a single divergent row must change the digest");
+        // Exactly one bucket differs.
+        let diffs = ab2.iter().zip(&ba).filter(|(x, y)| x != y).count();
+        assert_eq!(diffs, 1);
+
+        // Repair converges it (digest gate correctly does NOT skip).
+        na.repair().unwrap();
+        let ab3 = na.repair_digest("t", &NodeId("b".into())).unwrap();
+        let ba3 = nb.repair_digest("t", &NodeId("a".into())).unwrap();
+        assert_eq!(ab3, ba3, "repair restores digest equality");
     }
 
     /// QUORUM `ORDER BY <indexed> LIMIT k` takes the distributed sorted

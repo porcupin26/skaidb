@@ -217,6 +217,29 @@ impl Backend {
         }
     }
 
+    /// Checkpoint dirty vector-index snapshots, so a crash replays only the
+    /// writes since the last checkpoint instead of everything since the last
+    /// graceful shutdown (a kill -9 recovery previously re-inserted every
+    /// vector written since the prior clean stop — 182k-vector tables make
+    /// that minutes of open-time). Read-gated: the common nothing-dirty case
+    /// never takes the write lock. Interval pacing lives at the caller.
+    pub fn vector_checkpoint_tick(&self) {
+        match self {
+            Backend::Local(db) => {
+                let dirty = db
+                    .read()
+                    .ok()
+                    .is_some_and(|d| d.has_dirty_vector_indexes());
+                if dirty {
+                    if let Ok(mut d) = db.write() {
+                        d.save_vector_indexes();
+                    }
+                }
+            }
+            Backend::Cluster(node) => node.vector_checkpoint_tick(),
+        }
+    }
+
     /// One background NRT tick: commit search indexes with pending writes
     /// whose refresh interval elapsed, so an idle table's last writes become
     /// searchable within `refresh_ms` with no follow-up traffic. Gated on a

@@ -90,10 +90,13 @@ chunked-streaming REST rows, CAST syntax, batched executemany wire op,
 distributed sorted top-k for QUORUM ordered reads, humanized EXPLAIN
 names) lives in git history. Still open:
 
-- [ ] **[cluster] Global (value-sharded) secondary indexes** (deferred,
-  large) — indexes are local per node, so a non-PK indexed read scatters
-  to every member; a value-sharded index would route to the value's
-  owners. Rearchitects index maintenance, routing, ring, internode proto.
+- [ ] **[cluster] Global (value-sharded) secondary indexes** (large,
+  **design agreed** — see [GLOBAL_INDEXES.md](GLOBAL_INDEXES.md)) — the
+  index is an internal replicated table keyed by (values ‖ pk); equality
+  probes route to the value's replica set; write-path companion writes at
+  the row's consistency; ranges stay on the scatter path in v1. Four
+  implementation phases in the design doc; start with phase 1 (entry
+  plumbing).
 - [ ] **[cluster] Distributed / multi-key transactions** (deferred, large)
   — cluster mode autocommits per statement (`BEGIN/COMMIT/ROLLBACK`
   rejected); no 2PC/coordinator exists. agencik designs around it with
@@ -108,23 +111,40 @@ names) lives in git history. Still open:
 (The audit record — what already holds, measured dead ends, methodology —
 lives in [BENCHMARKS.md](BENCHMARKS.md#performance-engineering-notes).)
 
-- [ ] **[perf] REST streaming results** — the gateway now bounds request
-  bodies and materialized `/query` results at 64 MiB with socket timeouts
-  (v0.83.1, after a multi-GB response serialization pinned a production node
-  at its cgroup ceiling for hours — stalled client, no write timeout, whole
-  JSON held live). The cap is a guardrail; chunked/streamed REST responses
-  would lift it properly. Binary-protocol `QueryStream` already streams.
-  Note: jemalloc background purge was ruled out as the culprit — the
-  `background_threads` build feature enables time-based decay purging; the
-  wedged memory was live serialization buffers, not retained pages.
+- [ ] **[perf] Active memory release at the cgroup ceiling (skai2 #8)** —
+  three production wedges in five days (2026-07-11/13/15): RSS ratchets to
+  the 4 GB cgroup limit and stays there, starving file cache into an IO
+  storm; with swap now off the failure mode is an OOM-kill. v0.83.1's REST
+  guardrails + v0.87.0's chunked row streaming removed the known multi-GB
+  live-buffer sources, but "at the ceiling, shed writes only" remains the
+  policy — there is still no active reclaim (flush + FTS commit exist;
+  jemalloc purge does not). Note: an explicit `arena.<all>.purge` needs
+  `tikv_jemalloc_ctl::raw` which is `unsafe`, and the workspace FORBIDS
+  unsafe — adding it means an explicit lint carve-out for the server crate
+  (deliberate decision required). Background-thread decay purging is
+  compiled in and on, so the ratchet observed is either live memory or
+  fragmentation, not simple retention: instrument first (the stats hook
+  logs allocated/resident/retained at pressure) before reaching for purge.
+  Watch `oom_kills` in `node_stats` after every deploy day.
 
-- [ ] **[perf] Merkle-tree anti-entropy** — paged repair compares every
-  key each pass; a Merkle tree per table would make repair cost
-  proportional to divergence, not table size.
-- [ ] **[perf] Vector index persistence** — HNSW graphs are in-memory
-  and rebuilt from the table on open (slow for large sets). Persist
-  per-segment graphs alongside the LSM (snapshot + mmap), quantized
-  vectors in RAM.
+- [ ] **[perf] Incremental repair digests** — v0.88's digest gate already
+  skips the full paged compare for converged (table, peer) pairs (one
+  4096-bucket XOR-digest exchange instead of paging every key across the
+  wire and merge-joining), but each side still recomputes its digest with
+  a sequential scan per pass — scan IO remains O(table). Maintaining the
+  digests incrementally on the write path would make a converged pass
+  nearly free. **Design constraint:** an incremental digest that misses
+  even one write site produces FALSE CONVERGENCE (repair skips real
+  divergence forever) — it needs a complete write-site audit plus a
+  periodic scan-rebuild self-check before it can be trusted.
+- [ ] **[perf] Vector index memory: quantization + mmap** — persistence
+  itself already exists (snapshot + watermark-delta replay at open; saved
+  at create/rebuild/graceful shutdown, and since v0.88 checkpointed every
+  10 min so a crash replays minutes, not everything since the last clean
+  stop). What remains from the original idea: full-precision f32 vectors
+  live in RAM and in the snapshot (182k × dim × 4 B for the gmail set) —
+  quantize the in-RAM copy, and mmap the (possibly per-segment) snapshot
+  instead of a full deserialize, when vector memory becomes the constraint.
 - [ ] **[perf] Lazy index-order merge for unbounded `ORDER BY`** —
   `ORDER BY <indexed>` without `LIMIT` still materializes the index in
   order first; a lazy merge would stream it. (With `LIMIT` the top-k

@@ -2075,6 +2075,12 @@ impl Database {
     /// Persist every vector index whose graph changed since its last
     /// snapshot. Called on graceful shutdown (and after builds), so the next
     /// start reloads in seconds instead of rebuilding for tens of minutes.
+    /// Whether any vector index has in-memory changes not yet snapshotted —
+    /// the cheap read-gate for the periodic checkpoint tick.
+    pub fn has_dirty_vector_indexes(&self) -> bool {
+        self.vector_indexes.values().any(|h| h.is_dirty())
+    }
+
     pub fn save_vector_indexes(&mut self) {
         let names: Vec<String> = self
             .vector_indexes

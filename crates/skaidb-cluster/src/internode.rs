@@ -113,6 +113,18 @@ pub enum Request {
         start: Option<Vec<u8>>,
         end: Option<Vec<u8>>,
     },
+    /// The responder's per-bucket repair digest for `table`, computed over
+    /// rows relevant to the (requester, responder) pair: 4096 buckets, each
+    /// an XOR accumulator of per-row fingerprints `hash(key ‖ hlc ‖ is_put)`
+    /// over the latest version of every key. Equal digests on both sides
+    /// mean the pair is converged for this table and the full paged compare
+    /// can be skipped (the anti-entropy firehose reducer).
+    RepairDigest {
+        table: String,
+        /// The asking node's id, so the responder applies the same
+        /// pair-ownership row filter the requester used.
+        requester: String,
+    },
     /// This shard's top-`fetch` candidate keys for `ORDER BY col [DESC]`
     /// under `filter`, served only when a local index walks in that order
     /// (answered with [`Response::Keys`]; an empty-handed node that cannot
@@ -258,6 +270,10 @@ pub enum Response {
     Keys {
         keys: Vec<Vec<u8>>,
     },
+    /// Reply to [`Request::RepairDigest`]: the 4096 bucket accumulators.
+    Digest {
+        buckets: Vec<u64>,
+    },
     /// `(key, distance)` hits from a [`Request::VectorSearch`], nearest-first.
     VectorHits {
         hits: Vec<(Vec<u8>, f32)>,
@@ -366,6 +382,7 @@ const REQ_SEARCHSORTED: u8 = 27;
 const REQ_SEARCHEXPLAIN: u8 = 28;
 const REQ_HOSTSTATS: u8 = 29;
 const REQ_SORTEDSCAN: u8 = 30;
+const REQ_REPAIRDIGEST: u8 = 31;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
@@ -384,6 +401,7 @@ const RES_SAGG: u8 = 13;
 const RES_SORTEDROWS: u8 = 14;
 const RES_EXPLAIN: u8 = 15;
 const RES_HOSTSTATS: u8 = 16;
+const RES_DIGEST: u8 = 17;
 
 impl Request {
     pub fn encode(&self) -> Vec<u8> {
@@ -524,6 +542,11 @@ impl Request {
                 put_str(o, col);
                 o.push(u8::from(*desc));
                 o.extend_from_slice(&fetch.to_le_bytes());
+            }
+            Request::RepairDigest { table, requester } => {
+                o.push(REQ_REPAIRDIGEST);
+                put_str(o, table);
+                put_str(o, requester);
             }
             Request::VectorSearch { index, query, k } => {
                 o.push(REQ_VECTOR);
@@ -732,6 +755,10 @@ impl Request {
                     fetch: c.u32()?,
                 }
             }
+            REQ_REPAIRDIGEST => Request::RepairDigest {
+                table: c.string()?,
+                requester: c.string()?,
+            },
             REQ_VECTOR => {
                 let index = c.string()?;
                 let n = c.u32()? as usize;
@@ -854,6 +881,13 @@ impl Response {
                 o.extend_from_slice(&(keys.len() as u32).to_le_bytes());
                 for k in keys {
                     put_bytes(o, k);
+                }
+            }
+            Response::Digest { buckets } => {
+                o.push(RES_DIGEST);
+                o.extend_from_slice(&(buckets.len() as u32).to_le_bytes());
+                for b in buckets {
+                    o.extend_from_slice(&b.to_le_bytes());
                 }
             }
             Response::VectorHits { hits } => {
@@ -1002,6 +1036,14 @@ impl Response {
                     keys.push(c.bytes()?);
                 }
                 Response::Keys { keys }
+            }
+            RES_DIGEST => {
+                let n = c.u32()? as usize;
+                let mut buckets = Vec::with_capacity(n.min(1 << 16));
+                for _ in 0..n {
+                    buckets.push(c.u64()?);
+                }
+                Response::Digest { buckets }
             }
             RES_VHITS => {
                 let n = c.u32()? as usize;

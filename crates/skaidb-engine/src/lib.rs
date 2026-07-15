@@ -338,6 +338,25 @@ mod tests {
         }
     }
 
+    /// The vector-checkpoint dirty gate: writes dirty the graph, a save
+    /// cleans it, and the next write dirties it again — the periodic
+    /// checkpoint tick's read-gate contract.
+    #[test]
+    fn vector_dirty_gate_tracks_writes_and_saves() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE d (PRIMARY KEY (id))").unwrap();
+        db.execute("INSERT INTO d (id, v) VALUES (1, [1.0, 0.0])").unwrap();
+        db.execute("CREATE VECTOR INDEX d_v ON d (v) DIM 2").unwrap();
+        // create saves a fresh snapshot — clean right after.
+        assert!(!db.has_dirty_vector_indexes());
+        db.execute("INSERT INTO d (id, v) VALUES (2, [0.0, 1.0])").unwrap();
+        assert!(db.has_dirty_vector_indexes());
+        db.save_vector_indexes();
+        assert!(!db.has_dirty_vector_indexes());
+        db.execute("DELETE FROM d WHERE id = 1").unwrap();
+        assert!(db.has_dirty_vector_indexes());
+    }
+
     /// Shared fixture: a TS table with two hosts sampling `value` every 15 s
     /// for two minutes (values rise 1/s), plus a `temp` field on host a.
     fn ts_fixture(db: &mut Database) {

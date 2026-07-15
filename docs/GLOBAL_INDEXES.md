@@ -1,0 +1,118 @@
+# Global (value-sharded) secondary indexes — design
+
+Status: **design draft, pre-implementation** (2026-07-15). The last big
+architectural item on the list. This document is the agreed starting point
+for the implementation phases at the bottom; nothing here is built yet.
+
+## Problem
+
+Secondary indexes are **local per node**: each node indexes only its own
+shard. A non-PK indexed read therefore scatters `IndexScan` to every member,
+unions candidate keys, and quorum re-reads them — every indexed equality
+probe pays a full-cluster fan-out (`node.rs::index_candidate_keys`). On the
+production 3-node/RF=3 cluster the fan-out is masked (every node has all
+data), but on any RF < members deployment the cost scales with cluster size,
+and even at RF=full each probe touches every member.
+
+## Target
+
+An index whose **entries are placed on the ring by indexed value**, so an
+equality probe routes to the value's replica set only — one replica-set
+round-trip, like a PK point read.
+
+## Data model: the index is a table
+
+A global index is an **internal row table** `__gidx␟<index-name>` whose rows
+are:
+
+```
+key   = encode_key([indexed value(s)..., primary-key values...])
+value = (empty)
+```
+
+The PK tail makes entries unique per row and lets a probe enumerate
+candidate PKs by scanning the `[values...]` prefix range. Because it *is* a
+table, it inherits every existing mechanism unchanged: ring placement +
+replication + hints (`replicas_for` on the entry key), LWW via HLC,
+anti-entropy repair (including the new digest gate), backup, resharding.
+No new storage or repair machinery.
+
+## Write path
+
+On a row put/delete the coordinator computes old→new entry deltas (the old
+version is already read on the apply path for idempotency — same cost
+class) and issues companion writes to the index table:
+
+- delete of old entry (tombstone), put of new entry — routed by the *entry*
+  keys, i.e. potentially to different nodes than the row.
+- **Consistency choice (recommended):** companion writes ship at the same
+  consistency as the row write, *before* the ack. Cost: one extra
+  replicated write per indexed column touched. Benefit: read-your-writes
+  parity with today's local indexes.
+- There is no cross-key atomicity (no distributed txn). A crash between row
+  ack and entry write leaves a **missing or orphan entry**; both are
+  self-healing:
+  - orphan entry → the probe's candidate re-read finds the row absent or
+    non-matching and drops it (the existing residual re-check);
+  - missing entry → invisible to index reads until repair; bounded by the
+    anti-entropy interval. Phase 3 adds an entry-table repair leg that
+    regenerates entries from rows (the row table is the source of truth).
+
+## Read path
+
+Equality probe `WHERE col = v` on a global index:
+
+1. `start/end = prefix range of encode_key([v])` in the entry table.
+2. Route to `replicas_for(prefix)` — **the one replica set owning that
+   value** (hash placement keeps a single value's entries on one set).
+3. Read the entry range at the statement's consistency, extract PKs.
+4. `resolve_candidates` (existing): quorum point-reads of the candidate
+   rows, residual filter re-check.
+
+**Scope limit:** value *ranges* (`col > v`) do not route under hash
+placement — they stay on the local-index scatter path (or a future
+order-preserving placement mode). v1 targets equality/`IN` probes — the
+dedup and candidate-fetch shapes that dominate agencik's workload.
+
+Multikey (`[]`) columns: one entry per array element (same expansion the
+local multikey index does), equality-pinned probes only.
+
+## DDL, backfill, compat
+
+- Syntax: `CREATE INDEX i ON t (cols) WITH (global = true)` — local stays
+  the default. Catalog: `IndexDef.global: bool` (serde-default false, so
+  old catalogs deserialize).
+- Backfill: scan the table paged (existing backfill pattern, `building`
+  flag, SHOW INDEXES `local` column applies) writing entries through the
+  normal replicated write path.
+- Mixed versions: entries replicate as ordinary table rows, so old peers
+  store them fine; only the *planner* use is version-gated. Feature-flag
+  the read path until the fleet is upgraded.
+
+## Phases
+
+1. **Entry plumbing** — internal-table naming, entry key codec,
+   write-path companion writes behind `global = true`, no reader yet.
+   Tests: entry create/delete parity with row mutations, crash-window
+   orphan tolerated by re-check.
+2. **Read path** — prefix-range probe + `resolve_candidates` integration,
+   planner picks a global index for equality probes, EXPLAIN says
+   `global-index probe (routed)`. 3-node harness test: probe touches one
+   replica set (assert via internode call counts).
+3. **Hardening** — repair leg regenerating entries from rows (scan rows,
+   diff against entry table, fix), orphan GC, delete-tombstone compaction
+   interplay, backfill resumability.
+4. **Prove it** — bench the 250k-row `slack_messages` `"user"` probe on the
+   bench fleet at RF<members (where the win is real), then prod rollout
+   behind the flag.
+
+## Open questions (resolve during phase 1)
+
+- Composite global indexes: probe requires the full value tuple (leftmost
+  prefixes do not route under hashing) — accept, or hash only the first
+  column and range-scan the rest within the set?
+- Index-only answers (covered counts) — entries carry no row data; a count
+  over entries double-counts unrepaired divergence. Defer; counts keep the
+  candidate-resolve path.
+- Entry-table TTL interplay if the base table has `WITH (ttl)` — entries
+  must expire with their rows (stamp entries with the row HLC).
