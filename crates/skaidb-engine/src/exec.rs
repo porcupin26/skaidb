@@ -1513,6 +1513,14 @@ impl Database {
                     let pk = self.table_primary_key(&sel.from)?;
                     if pk_point_key(&pk, &sel.filter).is_some() {
                         push("access", "point read (primary-key equality)".into());
+                    } else if let Some(keys) = pk_point_keys(&pk, &sel.filter) {
+                        push(
+                            "access",
+                            format!(
+                                "point-read set (primary-key =/IN, {} keys)",
+                                keys.len()
+                            ),
+                        );
                     } else if let Some((idx, start, end)) =
                         self.plan_index_scan(&sel.from, &sel.filter)
                     {
@@ -3841,6 +3849,38 @@ impl Database {
                 None => Vec::new(),
             };
             return Ok((rows, true));
+        }
+        // Fast path: every PK column pinned by `=` or a literal `IN` list —
+        // a bounded set of bloom-gated point reads (the "fetch these N ids"
+        // shape) instead of a table scan into the scan budget.
+        if let Some(keys) = pk_point_keys(&self.table_def(table)?.primary_key, filter) {
+            let engine = self
+                .tables
+                .get(table)
+                .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+            let mut rows = Vec::new();
+            for key in keys {
+                crate::scan_meter::tick(1)?;
+                let Some(bytes) = engine.get(&key)? else { continue };
+                match Value::decode(&bytes) {
+                    // Re-check the full filter: the key set covers the PK
+                    // pins, but residual predicates (other columns, NOT IN
+                    // exclusions) can still drop a fetched row.
+                    Ok(Value::Document(doc)) if matches_filter(filter, &doc)? => {
+                        rows.push((key, doc));
+                    }
+                    Ok(Value::Document(_)) => {}
+                    Ok(_) => {
+                        return Err(EngineError::Constraint(
+                            "stored row is not a document".into(),
+                        ))
+                    }
+                    Err(e) => return Err(EngineError::Constraint(format!("corrupt row: {e}"))),
+                }
+            }
+            // Keys were generated in ascending PK order; claim sorted only
+            // when the caller asked for no particular order.
+            return Ok((rows, order.is_none()));
         }
         // Primary-key prefix range: a leftmost run of PK columns pinned by
         // equality (plus one optional trailing range on the next PK column)
@@ -7638,6 +7678,132 @@ pub fn pk_point_key(pk: &[String], filter: &Option<Expr>) -> Option<Vec<u8>> {
     // re-filter the point-read result (gather_rows_planned and the
     // cluster's matching_rows via filter_rows).
     Some(Value::Array(values).encode_key())
+}
+
+/// Cap on the candidate-key set [`pk_point_keys`] will expand: past this,
+/// a bounded scan plans better than thousands of bloom-gated point reads.
+pub const PK_IN_MAX_KEYS: usize = 1000;
+
+/// Multi-key generalization of [`pk_point_key`]: every PK column pinned
+/// (AND-reachable) by a non-null literal equality **or a non-negated `IN`
+/// list of literals** yields the exact candidate key set — the "fetch these
+/// N ids" shape becomes N point reads instead of a table scan. A literal
+/// array element is flattened exactly as evaluation flattens it, so the
+/// bound-parameter form (`id IN (?)` with `?` = `[1, 2, 3]`) qualifies.
+/// `None` when a PK column is unpinned, a list element is not a literal, or
+/// the composite cross product exceeds [`PK_IN_MAX_KEYS`]. The set is a
+/// per-column superset (a doubly-constrained column keeps its smallest pin),
+/// sound because every caller re-checks the full filter against the rows.
+pub fn pk_point_keys(pk: &[String], filter: &Option<Expr>) -> Option<Vec<Vec<u8>>> {
+    if pk.is_empty() {
+        return None;
+    }
+    let expr = filter.as_ref()?;
+    let mut per_col: Vec<Vec<Value>> = Vec::with_capacity(pk.len());
+    for col in pk {
+        let cands = pk_column_candidates(expr, col)?;
+        if cands.is_empty() {
+            // Pinned to an empty set (e.g. `IN (NULL)`): matches nothing.
+            return Some(Vec::new());
+        }
+        per_col.push(cands);
+    }
+    let mut total = 1usize;
+    for c in &per_col {
+        total = total.checked_mul(c.len())?;
+        if total > PK_IN_MAX_KEYS {
+            return None;
+        }
+    }
+    // Cross product over the composite columns; the BTreeSet dedups repeated
+    // list values and yields keys in ascending (primary-key) order.
+    let mut keys = std::collections::BTreeSet::new();
+    let mut idx = vec![0usize; per_col.len()];
+    loop {
+        let values: Vec<Value> = idx
+            .iter()
+            .zip(&per_col)
+            .map(|(&i, c)| c[i].clone())
+            .collect();
+        keys.insert(Value::Array(values).encode_key());
+        let mut d = per_col.len();
+        loop {
+            if d == 0 {
+                return Some(keys.into_iter().collect());
+            }
+            d -= 1;
+            idx[d] += 1;
+            if idx[d] < per_col[d].len() {
+                break;
+            }
+            idx[d] = 0;
+        }
+    }
+}
+
+/// The AND-reachable literal candidate set pinning `col`: from `col = lit`
+/// (either side) or `col IN (literals)`. When several pins constrain the same
+/// column, the smallest set wins (any single pin is a superset of their
+/// intersection). `None` if no usable pin exists.
+fn pk_column_candidates(expr: &Expr, col: &str) -> Option<Vec<Value>> {
+    fn consider(best: &mut Option<Vec<Value>>, vals: Vec<Value>) {
+        match best {
+            Some(b) if b.len() <= vals.len() => {}
+            _ => *best = Some(vals),
+        }
+    }
+    fn collect(expr: &Expr, col: &str, best: &mut Option<Vec<Value>>) {
+        match expr {
+            Expr::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => {
+                collect(left, col, best);
+                collect(right, col, best);
+            }
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                left,
+                right,
+            } => {
+                let v = match (left.as_ref(), right.as_ref()) {
+                    (Expr::Column(c), Expr::Literal(v)) if c == col && !v.is_null() => v,
+                    (Expr::Literal(v), Expr::Column(c)) if c == col && !v.is_null() => v,
+                    _ => return,
+                };
+                consider(best, vec![v.clone()]);
+            }
+            Expr::InList {
+                expr: e,
+                list,
+                negated: false,
+            } => {
+                let Expr::Column(c) = e.as_ref() else { return };
+                if c != col {
+                    return;
+                }
+                let mut vals = Vec::new();
+                for item in list {
+                    match item {
+                        // A literal array is the bound-parameter form
+                        // (`id IN (?)`); flatten like evaluation does.
+                        Expr::Literal(Value::Array(elems)) => {
+                            vals.extend(elems.iter().filter(|v| !v.is_null()).cloned())
+                        }
+                        Expr::Literal(v) if !v.is_null() => vals.push(v.clone()),
+                        Expr::Literal(_) => {} // NULL element matches nothing
+                        _ => return, // non-literal element: pin unusable
+                    }
+                }
+                consider(best, vals);
+            }
+            _ => {}
+        }
+    }
+    let mut best = None;
+    collect(expr, col, &mut best);
+    best
 }
 
 /// The embedded, single-node implementation of [`Cluster`].

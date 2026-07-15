@@ -351,12 +351,15 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   with `?` = `[1, 2, 3]` tests membership in that set (the "fetch these N
   ids" pattern). When the left side is an array column, `IN` matches if the
   array holds any listed value, mirroring the `=` containment rule above.
-  > **Performance note:** `IN`/`NOT IN` currently evaluate as a residual
-  > row filter — they are *not* yet pushed to a primary-key/index probe, so
-  > `col IN (…)` scans the candidate range and a large unindexed scan can
-  > trip `scan budget exceeded`. Prefer it on primary-key point sets that
-  > stay within the scan budget, or pair with a narrowing indexed predicate,
-  > until multi-probe pushdown lands.
+  > **Performance:** when **every primary-key column** is pinned by `=` or a
+  > literal `IN` list (bound array parameters included), the query resolves
+  > as a **point-read set** — one bloom-gated point read per candidate key
+  > (cross product on composite keys, capped at 1000 keys), routed to each
+  > key's replica set on a cluster; `EXPLAIN` shows `point-read set`. Other
+  > `IN` shapes (non-PK columns, `NOT IN`, non-literal elements) evaluate as
+  > a residual row filter over the scanned range and can trip
+  > `scan budget exceeded` on large unindexed scans — pair those with a
+  > narrowing indexed predicate.
 - **`BETWEEN`** — `x BETWEEN lo AND hi` is the inclusive range
   `x >= lo AND x <= hi` (three-valued: a `NULL` operand or bound makes the
   undecided side unknown); `NOT BETWEEN` negates it. A `col BETWEEN lo AND hi`

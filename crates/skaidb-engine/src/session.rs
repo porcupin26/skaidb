@@ -409,6 +409,111 @@ mod tests {
         assert!(err.to_string().contains("scan budget"), "{err}");
     }
 
+    /// `pk IN (...)` resolves to point reads, not a scan: with a scan budget
+    /// far below the table size, the fetch-these-N-ids shape must still
+    /// answer (a scan would trip the budget), including through a bound
+    /// array parameter and on a composite key, and EXPLAIN must say so.
+    #[test]
+    fn pk_in_list_is_point_reads_not_a_scan() {
+        let mut opts = skaidb_storage::EngineOptions {
+            scan_row_budget: 50,
+            ..Default::default()
+        };
+        opts.statement_timeout_secs = 0;
+        let mut s = Session::open_with_options(tmp(), opts).unwrap();
+        s.execute("CREATE TABLE users (PRIMARY KEY (id));").unwrap();
+        for i in 0..500 {
+            s.execute(&format!("INSERT INTO users (id, grp) VALUES ({i}, {});", i % 7))
+                .unwrap();
+        }
+        // Literal IN list: 3 point reads, well under the 50-row budget.
+        let got = rows(
+            s.execute("SELECT id FROM users WHERE id IN (7, 300, 499) ORDER BY id;")
+                .unwrap(),
+        );
+        assert_eq!(
+            got,
+            vec![
+                vec![skaidb_types::Value::Int(7)],
+                vec![skaidb_types::Value::Int(300)],
+                vec![skaidb_types::Value::Int(499)],
+            ]
+        );
+        // Array element in the list — the exact shape a bound parameter
+        // (`id IN (?)` with ? = [..]) takes after `bind` — incl. a miss.
+        let got = rows(
+            s.execute("SELECT id FROM users WHERE id IN ([2, 9999, 444]) ORDER BY id;")
+                .unwrap(),
+        );
+        assert_eq!(
+            got,
+            vec![
+                vec![skaidb_types::Value::Int(2)],
+                vec![skaidb_types::Value::Int(444)],
+            ]
+        );
+        // Residual predicates still apply on the fetched rows.
+        let got = rows(
+            s.execute("SELECT id FROM users WHERE id IN (7, 300, 499) AND grp = 0;")
+                .unwrap(),
+        );
+        assert_eq!(got, vec![vec![skaidb_types::Value::Int(7)]]); // 7 % 7 == 0
+
+        // The plan is visible: EXPLAIN names the point-read set.
+        let plan = rows(
+            s.execute("EXPLAIN SELECT id FROM users WHERE id IN (7, 300, 499);")
+                .unwrap(),
+        );
+        let all = format!("{plan:?}");
+        assert!(all.contains("point-read set"), "{all}");
+
+        // NOT IN cannot use the key set (it excludes) — it scans and trips
+        // the budget, proving the fast path is what answered above.
+        let err = s
+            .execute("SELECT id FROM users WHERE id NOT IN (1, 2);")
+            .unwrap_err();
+        assert!(err.to_string().contains("scan budget"), "{err}");
+    }
+
+    /// Composite key: `a = .. AND b IN (..)` expands the cross product.
+    #[test]
+    fn composite_pk_in_list_point_reads() {
+        let mut opts = skaidb_storage::EngineOptions {
+            scan_row_budget: 50,
+            ..Default::default()
+        };
+        opts.statement_timeout_secs = 0;
+        let mut s = Session::open_with_options(tmp(), opts).unwrap();
+        s.execute("CREATE TABLE msgs (PRIMARY KEY (chan, seq));").unwrap();
+        for c in ["a", "b"] {
+            for i in 0..300 {
+                s.execute(&format!(
+                    "INSERT INTO msgs (chan, seq, body) VALUES ('{c}', {i}, 'm{i}');"
+                ))
+                .unwrap();
+            }
+        }
+        let got = rows(
+            s.execute("SELECT seq FROM msgs WHERE chan = 'a' AND seq IN (5, 250) ORDER BY seq;")
+                .unwrap(),
+        );
+        assert_eq!(
+            got,
+            vec![
+                vec![skaidb_types::Value::Int(5)],
+                vec![skaidb_types::Value::Int(250)],
+            ]
+        );
+        // Both columns via IN: 2×2 cross product, still point reads.
+        let got = rows(
+            s.execute(
+                "SELECT chan, seq FROM msgs WHERE chan IN ('a', 'b') AND seq IN (0, 299) ORDER BY chan, seq;",
+            )
+            .unwrap(),
+        );
+        assert_eq!(got.len(), 4);
+    }
+
     /// The scan-budget error names the table and the filter columns, so the
     /// fix (which index to add) is mechanical. Context is attached at the
     /// statement boundary; the meter itself stays context-free.

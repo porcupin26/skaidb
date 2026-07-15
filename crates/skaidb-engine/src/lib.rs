@@ -18,7 +18,7 @@ pub use error::EngineError;
 pub use exec::{
     filter_rows, filter_search_query, matches_filter, run, statement_is_read_only, Cluster,
     Database, DbStats, IndexScanRange, Inventory, InventoryIndex, InventorySearch,
-    InventoryTable, InventoryTimeseries, InventoryVector, pk_point_key, TableStats,
+    InventoryTable, InventoryTimeseries, InventoryVector, pk_point_key, pk_point_keys, TableStats,
     TsRollupInfo,
     DecodedMaint, MaintTask,
 };

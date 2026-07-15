@@ -103,9 +103,11 @@ Key facts an agent must know:
   errors). An array-valued element is flattened, so `WHERE id IN (?)` bound
   to `[1,2,3]` tests membership in that set — the "fetch these N ids"
   pattern, and the native replacement for the old `$in`→OR-chain. Array
-  columns match by containment (like `=`). Currently a residual filter (no
-  index/PK pushdown yet), so a large unindexed `IN` scan can hit the scan
-  budget.
+  columns match by containment (like `=`). **PK-pinned `IN` is a point-read
+  set**: every PK column pinned by `=`/literal-`IN` → one point read per
+  candidate key (≤1000; composite keys cross-multiply), replica-routed on a
+  cluster (EXPLAIN: `point-read set`). Non-PK / `NOT IN` shapes stay a
+  residual filter and can hit the scan budget on large unindexed scans.
 - **Scalar functions**: `now()` (statement start, timestamp),
   `time_bucket(step, ts)` (floor to bucket: `time_bucket(5m, ts)`),
   `to_timestamp(v)` (epoch-ms number or ISO-8601 string → timestamp;

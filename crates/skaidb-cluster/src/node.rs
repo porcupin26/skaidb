@@ -21,7 +21,8 @@ use std::time::{Duration, Instant};
 use std::thread;
 
 use skaidb_engine::{
-    filter_rows, namespace, pk_point_key, run, Cluster, Database, DbStats, DecodedMaint,
+    filter_rows, namespace, pk_point_key, pk_point_keys, run, Cluster, Database, DbStats,
+    DecodedMaint,
     EngineError, IndexScanRange, MaintTask, QueryOutput, SessionEffect, DEFAULT_DATABASE,
 };
 use skaidb_sql::ast::{Expr, Statement};
@@ -4298,6 +4299,11 @@ impl Node {
                     let pk = db.table_primary_key(&sel.from).unwrap_or_default();
                     if pk_point_key(&pk, &sel.filter).is_some() {
                         "point read routed to the key's replica set".to_string()
+                    } else if let Some(keys) = pk_point_keys(&pk, &sel.filter) {
+                        format!(
+                            "point-read set ({} keys) routed to each key's replica set",
+                            keys.len()
+                        )
                     } else if rf >= members {
                         "every member holds all data — served without fan-out".to_string()
                     } else {
@@ -6753,6 +6759,17 @@ impl Cluster for Coordinator {
             let rows = self.node.point_get(table, &key, self.oc)?;
             return filter_rows(filter, rows);
         }
+        // Every PK column pinned by `=` or a literal `IN` list: a bounded
+        // candidate set resolved exactly like index candidates (per-key
+        // quorum point reads, or one merged pass when broad) — the "fetch
+        // these N ids" shape routes to the keys' replica sets instead of
+        // scattering a filter to every member.
+        if let Some(keys) = pk_point_keys(&pk, filter) {
+            let set: std::collections::BTreeMap<Vec<u8>, ()> =
+                keys.into_iter().map(|k| (k, ())).collect();
+            let rows = self.node.resolve_candidates(table, set, self.oc)?;
+            return filter_rows(filter, rows);
+        }
         // Indexed non-PK predicate: push the index scan to every node to gather
         // candidate keys, then re-read each at quorum — far less data than
         // shipping every node's whole shard.
@@ -6796,7 +6813,9 @@ impl Cluster for Coordinator {
         // statement timeouts (2026-07-13).
         if let (Some(f), None, Some(lim)) = (filter, order, fetch_limit) {
             let pk = self.primary_key(table)?;
-            if pk_point_key(&pk, filter).is_some() {
+            // `=` and `=`/`IN` point-read shapes both resolve a bounded key
+            // set — reuse the unordered fast path and truncate.
+            if pk_point_key(&pk, filter).is_some() || pk_point_keys(&pk, filter).is_some() {
                 let mut rows = self.matching_rows(table, filter)?;
                 rows.truncate(lim);
                 return Ok((rows, false));

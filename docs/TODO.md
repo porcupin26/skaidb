@@ -98,8 +98,15 @@ prepared-statement work in phase 1.
   split transport.
 - [x] **[sql] `IN` / `NOT IN`** — `Expr::InList`, contextual-ident parse,
   three-valued eval with array-element flattening (bound array param) and
-  multikey containment, cluster filter-pushdown codec. Still a residual filter
-  (no index/PK pushdown yet — see the IN/OR pushdown follow-up below).
+  multikey containment, cluster filter-pushdown codec.
+- [x] **[sql] PK `IN` point-read pushdown** (v0.84.0) — every PK column pinned
+  by `=`/literal-`IN` resolves as a point-read set (`pk_point_keys`: cross
+  product on composite keys, ≤1000, dedup, ascending): bloom-gated gets on a
+  single node, `resolve_candidates` (per-key quorum reads / merged pass) on a
+  cluster; ordered+LIMIT path included; EXPLAIN shows `point-read set`.
+  Remaining slice: `IN` multi-probe on **secondary-index** columns (today
+  those shapes stay residual over the scanned/indexed range), and OR-of-PK-
+  equality folding into the same key-set path.
 
 **Phase 2 — P1 Python driver ergonomics** (all in `drivers/python`) ✅ shipped
 
