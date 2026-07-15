@@ -127,24 +127,20 @@ lives in [BENCHMARKS.md](BENCHMARKS.md#performance-engineering-notes).)
   logs allocated/resident/retained at pressure) before reaching for purge.
   Watch `oom_kills` in `node_stats` after every deploy day.
 
-- [ ] **[perf] Repair digests: make the gated pass actually fast** —
-  v0.88's digest gate removes the full-table wire transfer and merge-join
-  for converged (table, peer) pairs, but a measured prod pass still runs
-  >240 s: the digest scan itself remains O(table) per (table, peer), and
-  it uses `local_scan_versioned_page`, which **decompresses row values the
-  digest never reads** (only key ‖ hlc ‖ is_put matter) — the same brotli
-  burn as before. In cost order:
-  1. **Value-free stamp scan** — an engine page variant returning
-     `(key, hlc, is_put)` without touching value blocks; removes the
-     decompression entirely from digest computation.
-  2. **Per-pass digest reuse** — on full-copy clusters the pair-ownership
-     filter passes every row for every peer, so one scan per table serves
-     all peers (requester-side cache; responder-side short-TTL cache).
-  3. **Incremental digests** (the endgame — converged pass nearly free).
-     Design constraint: a digest that misses even one write site produces
-     FALSE CONVERGENCE (repair skips real divergence forever) — needs a
-     complete write-site audit plus a periodic scan-rebuild self-check.
-  Keep `anti_entropy_interval_secs = 3600` until at least (1)+(2) land.
+- [ ] **[perf] Repair digests: incremental digests (endgame)** —
+  speedups (1) value-free stamp scan (stamps sidecar `<sst>.stamps`, old
+  files fall back) and (2) versioned digest cache (keyed on
+  `(schema stamp, write_seq)`, full-copy clusters) landed in v0.89: a
+  converged pass now costs one stamp scan per *changed* table, zero for
+  idle ones. Remaining endgame: **incremental digests** — maintain the
+  bucket XOR at write time so even changed tables skip the scan.
+  Design constraint: a digest that misses even one write site produces
+  FALSE CONVERGENCE (repair skips real divergence forever) — needs a
+  complete write-site audit plus a periodic scan-rebuild self-check.
+  Note: pre-v0.89 SSTables have no sidecar until compaction rewrites
+  them (fallback decompresses values); the digest cache hides this for
+  idle tables. **Measure a prod pass post-v0.89, then consider
+  re-tightening `anti_entropy_interval_secs` from 3600.**
 - [ ] **[perf] Vector index memory: quantization + mmap** — persistence
   itself already exists (snapshot + watermark-delta replay at open; saved
   at create/rebuild/graceful shutdown, and since v0.88 checkpointed every

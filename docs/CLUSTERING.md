@@ -308,6 +308,21 @@ quorum while this node was momentarily behind) converges **on its own**, with no
 operator action. Passes are staggered per-node so the cluster doesn't repair in
 lockstep.
 
+**Digest-gated passes.** A repair pass first exchanges a compact XOR digest
+(4096 buckets over `key ‖ hlc ‖ op`, ~32 KB) per (table, peer) pair; equal
+digests prove the pair converged and skip the full paged compare, so a
+steady-state pass ships digests instead of tables. Digest computation itself
+is cheap: it scans **value-free stamps** — each SSTable carries a
+`<file>.stamps` sidecar holding just `(key, hlc, op)` per entry, so no row
+value is even decompressed (tables written before the sidecar existed fall
+back to data blocks until compaction rewrites them). On full-copy clusters
+(replication factor ≥ member count) each node also **caches its digest per
+table**, keyed on a `(schema stamp, write-sequence)` version, so an idle
+table's digest is served from memory — a fully converged pass touches no
+table data at all. The cache can never mask divergence: any write bumps the
+version on the node that has it, forcing a fresh digest — and therefore a
+mismatch — on at least one side of the pair.
+
 **Automatic catch-up on (re)join.** When a node starts and finds peers, it runs a
 catch-up pass in the background as soon as a peer is reachable — the same repair
 (schema + data) — so a node that was down converges on its own without an

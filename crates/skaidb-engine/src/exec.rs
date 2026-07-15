@@ -2075,6 +2075,21 @@ impl Database {
     /// Persist every vector index whose graph changed since its last
     /// snapshot. Called on graceful shutdown (and after builds), so the next
     /// start reloads in seconds instead of rebuilding for tens of minutes.
+    /// A cheap identity+mutation version for `table`, for caches that must
+    /// invalidate on ANY data change: the table's schema stamp (changes on
+    /// drop+recreate, so a fresh table can never collide with a cached
+    /// predecessor) plus the storage engine's write sequence (bumped on
+    /// every append and on non-append data changes). `None` if unknown.
+    pub fn table_repair_version(&self, table: &str) -> Option<(Hlc, u64)> {
+        let schema = self
+            .catalog
+            .schema_versions
+            .get(&format!("t:{table}"))
+            .map(|v| v.hlc())
+            .unwrap_or(Hlc::MIN);
+        Some((schema, self.tables.get(table)?.write_seq()))
+    }
+
     /// Whether any vector index has in-memory changes not yet snapshotted —
     /// the cheap read-gate for the periodic checkpoint tick.
     pub fn has_dirty_vector_indexes(&self) -> bool {
@@ -5513,6 +5528,23 @@ impl Database {
                 None => (key, Vec::new(), hlc, false),
             })
             .collect())
+    }
+
+    /// Value-free [`Database::local_scan_versioned_page`]: one bounded page of
+    /// `(key, hlc, is_put)` stamps in key order. Anti-entropy digests hash
+    /// exactly these three fields, and the storage layer serves them from the
+    /// stamps sidecar — a whole-table digest pass never decompresses values.
+    pub fn local_scan_stamps_page(
+        &self,
+        table: &str,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Hlc, bool)>> {
+        let engine = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+        Ok(engine.scan_stamps_page(after, limit)?)
     }
 
     /// **Filter pushdown**: the primary keys of this node's rows whose latest

@@ -12,6 +12,15 @@
 //! - index:  `u64 nblocks | (u32 keylen | first_key | u64 offset | u32 comp | u32 uncomp)*`
 //! - bloom:  the bytes of [`Bloom::encode`]
 //! - footer: `u64 index_off | u64 bloom_off | u64 entry_count | u64 codec | u64 magic`
+//!
+//! Each table also gets a best-effort **stamps sidecar** (`<file>.stamps`):
+//! the same entries minus their values (`u32 keylen | key | hlc[12] | u8 op`),
+//! in stamp blocks compressed with the table's codec and aligned 1:1 with the
+//! data blocks so the shared block index seeks both. Anti-entropy digests scan
+//! `(key, hlc, op)` for whole tables; the sidecar answers that without
+//! decompressing a single value byte. Sidecars are optional — a missing or
+//! invalid one (old files, torn write) falls back to decoding data blocks.
+//! Layout: `[sblock0][sblock1]...[(u32 comp | u32 uncomp)*][u64 nblocks][u64 magic]`.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
@@ -28,6 +37,7 @@ use crate::hlc::Hlc;
 use crate::memtable::VersionValue;
 
 const MAGIC: u64 = 0x736b_6169_6462_5354; // "skaidbST"
+const STAMPS_MAGIC: u64 = 0x736b_6169_6462_5350; // "skaidbSP"
 const FOOTER_LEN: u64 = 40;
 const OP_PUT: u8 = 0;
 const OP_DELETE: u8 = 1;
@@ -75,6 +85,63 @@ pub struct SsTable {
     /// and would only churn it. Populated lazily; immutable files can't go
     /// stale.
     block_cache: BlockCache,
+    /// Value-free stamps sidecar, when present and consistent with `blocks`.
+    /// `None` (old files, failed sidecar write) is always safe — stamp scans
+    /// fall back to decoding data blocks.
+    stamps: Option<StampsIndex>,
+}
+
+/// The sidecar path for an SSTable file: `<file>.stamps` (extension appended,
+/// so it can never collide with another table's data file).
+pub fn stamps_path(path: &Path) -> PathBuf {
+    let mut os = path.as_os_str().to_os_string();
+    os.push(".stamps");
+    PathBuf::from(os)
+}
+
+/// An opened, validated stamps sidecar (see the module docs for the layout).
+#[derive(Debug)]
+struct StampsIndex {
+    file: File,
+    /// `(offset, comp_len, uncomp_len)` per stamp block, aligned 1:1 with the
+    /// table's data-block index.
+    blocks: Vec<(u64, u32, u32)>,
+}
+
+/// Open and validate `<main_path>.stamps` against the table's block index.
+/// Any inconsistency (missing file, torn write, block-count mismatch) yields
+/// `None` — callers fall back to data blocks.
+fn load_stamps(main_path: &Path, data_blocks: &[BlockMeta]) -> Option<StampsIndex> {
+    let file = File::open(stamps_path(main_path)).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len < 16 {
+        return None;
+    }
+    let mut foot = [0u8; 16];
+    read_exact_at(&file, &mut foot, len - 16).ok()?;
+    let n = u64::from_le_bytes(foot[0..8].try_into().unwrap()) as usize;
+    let magic = u64::from_le_bytes(foot[8..16].try_into().unwrap());
+    if magic != STAMPS_MAGIC || n != data_blocks.len() {
+        return None;
+    }
+    let table_len = (n as u64).checked_mul(8)?;
+    let table_off = len.checked_sub(16 + table_len)?;
+    let mut table = vec![0u8; table_len as usize];
+    read_exact_at(&file, &mut table, table_off).ok()?;
+    let mut blocks = Vec::with_capacity(n);
+    let mut offset = 0u64;
+    for i in 0..n {
+        let comp = u32::from_le_bytes(table[i * 8..i * 8 + 4].try_into().unwrap());
+        let uncomp = u32::from_le_bytes(table[i * 8 + 4..i * 8 + 8].try_into().unwrap());
+        blocks.push((offset, comp, uncomp));
+        offset += comp as u64;
+    }
+    // The concatenated stamp blocks must exactly fill the space before the
+    // length table — anything else is a torn or foreign file.
+    if offset != table_off {
+        return None;
+    }
+    Some(StampsIndex { file, blocks })
 }
 
 /// A small per-table cache of decompressed blocks (see [`SsTable::block_cache`]).
@@ -150,25 +217,46 @@ impl SsTable {
         let mut entry_count: u64 = 0;
         let mut delete_count: u64 = 0;
 
+        // Best-effort stamps sidecar, streamed in lockstep with the data
+        // blocks (see the module docs). Any sidecar I/O error just drops it —
+        // the data file alone is always sufficient.
+        let mut stamps_writer = File::create(stamps_path(&path)).map(BufWriter::new).ok();
+        let mut stamps_table: Vec<u8> = Vec::new();
+
         // Group entries into uncompressed blocks of ~BLOCK_TARGET bytes; seal,
         // compress and write each block as soon as it fills.
         let mut buf = Vec::with_capacity(BLOCK_TARGET + BLOCK_TARGET / 4);
+        let mut stamp_buf = Vec::new();
         let mut first: Option<Vec<u8>> = None;
-        let mut seal =
-            |buf: &mut Vec<u8>, first: &mut Option<Vec<u8>>, writer: &mut BufWriter<File>|
-             -> Result<BlockMeta> {
-                let comp = compress(codec, buf);
-                writer.write_all(&comp)?;
-                let meta = BlockMeta {
-                    first_key: first.take().unwrap(),
-                    offset,
-                    comp_len: comp.len() as u32,
-                    uncomp_len: buf.len() as u32,
-                };
-                offset += comp.len() as u64;
-                buf.clear();
-                Ok(meta)
+        let mut seal = |buf: &mut Vec<u8>,
+                        stamp_buf: &mut Vec<u8>,
+                        first: &mut Option<Vec<u8>>,
+                        writer: &mut BufWriter<File>,
+                        stamps_writer: &mut Option<BufWriter<File>>,
+                        stamps_table: &mut Vec<u8>|
+         -> Result<BlockMeta> {
+            let comp = compress(codec, buf);
+            writer.write_all(&comp)?;
+            let meta = BlockMeta {
+                first_key: first.take().unwrap(),
+                offset,
+                comp_len: comp.len() as u32,
+                uncomp_len: buf.len() as u32,
             };
+            offset += comp.len() as u64;
+            buf.clear();
+            if let Some(sw) = stamps_writer.as_mut() {
+                let scomp = compress(codec, stamp_buf);
+                if sw.write_all(&scomp).is_ok() {
+                    stamps_table.extend_from_slice(&(scomp.len() as u32).to_le_bytes());
+                    stamps_table.extend_from_slice(&(stamp_buf.len() as u32).to_le_bytes());
+                } else {
+                    *stamps_writer = None;
+                }
+            }
+            stamp_buf.clear();
+            Ok(meta)
+        };
         for entry in entries {
             let e = entry?;
             if first.is_none() {
@@ -180,12 +268,27 @@ impl SsTable {
                 delete_count += 1;
             }
             encode_entry(&mut buf, &e);
+            encode_stamp(&mut stamp_buf, &e);
             if buf.len() >= BLOCK_TARGET {
-                blocks.push(seal(&mut buf, &mut first, &mut writer)?);
+                blocks.push(seal(
+                    &mut buf,
+                    &mut stamp_buf,
+                    &mut first,
+                    &mut writer,
+                    &mut stamps_writer,
+                    &mut stamps_table,
+                )?);
             }
         }
         if !buf.is_empty() {
-            blocks.push(seal(&mut buf, &mut first, &mut writer)?);
+            blocks.push(seal(
+                &mut buf,
+                &mut stamp_buf,
+                &mut first,
+                &mut writer,
+                &mut stamps_writer,
+                &mut stamps_table,
+            )?);
         }
 
         // Index block.
@@ -220,6 +323,34 @@ impl SsTable {
         drop(file);
         let file = File::open(&path)?;
 
+        // Seal the stamps sidecar: length table + footer, then re-open it
+        // through the same validating loader `open` uses. Best-effort — a
+        // failure here only loses the fast path.
+        let stamps = match stamps_writer {
+            Some(mut sw) => {
+                let sealed = (|| -> std::io::Result<()> {
+                    sw.write_all(&stamps_table)?;
+                    sw.write_all(&(blocks.len() as u64).to_le_bytes())?;
+                    sw.write_all(&STAMPS_MAGIC.to_le_bytes())?;
+                    let f = sw.into_inner().map_err(|e| {
+                        std::io::Error::from(e.error().kind())
+                    })?;
+                    f.sync_all()
+                })();
+                match sealed {
+                    Ok(()) => load_stamps(&path, &blocks),
+                    Err(_) => {
+                        let _ = std::fs::remove_file(stamps_path(&path));
+                        None
+                    }
+                }
+            }
+            None => {
+                let _ = std::fs::remove_file(stamps_path(&path));
+                None
+            }
+        };
+
         let version_counts = std::sync::OnceLock::new();
         let _ = version_counts.set((entry_count - delete_count, delete_count));
         Ok(SsTable {
@@ -232,6 +363,7 @@ impl SsTable {
             disk_len,
             version_counts,
             block_cache: BlockCache::default(),
+            stamps,
         })
     }
 
@@ -268,6 +400,7 @@ impl SsTable {
         read_exact_at(&file, &mut bloom_buf, bloom_off)?;
         let bloom = Bloom::decode(&bloom_buf).ok_or_else(|| corrupt("bad bloom block"))?;
 
+        let stamps = load_stamps(&path, &blocks);
         Ok(SsTable {
             file,
             path,
@@ -278,6 +411,7 @@ impl SsTable {
             version_counts: std::sync::OnceLock::new(),
             disk_len: file_len,
             block_cache: BlockCache::default(),
+            stamps,
         })
     }
 
@@ -439,6 +573,99 @@ impl SsTable {
         self.block_cache.insert(meta.offset, Arc::clone(&block));
         Ok(block)
     }
+
+    /// Stream `(key, hlc, is_put)` in key order without decoding values,
+    /// starting at the first block that can hold `start` (like
+    /// [`SsTable::iter_from`], stamps before `start` within that block are
+    /// still yielded — callers filter to their exact bound). Served from the
+    /// stamps sidecar when present (no value byte is even decompressed);
+    /// tables without one decode data blocks but skip the value copies.
+    pub fn stamps_iter_from(&self, start: Option<&[u8]>) -> StampsIter<'_> {
+        let first = match start {
+            Some(s) => self
+                .blocks
+                .partition_point(|b| b.first_key.as_slice() <= s)
+                .saturating_sub(1),
+            None => 0,
+        };
+        StampsIter {
+            table: self,
+            next_block: first,
+            block: Vec::new(),
+            pos: 0,
+        }
+    }
+
+    /// Read and decompress stamp block `i` from the sidecar.
+    fn read_stamp_block(&self, i: usize) -> Result<Vec<u8>> {
+        let stamps = self.stamps.as_ref().expect("sidecar present");
+        let (offset, comp_len, uncomp_len) = stamps.blocks[i];
+        let mut comp = vec![0u8; comp_len as usize];
+        read_exact_at(&stamps.file, &mut comp, offset)?;
+        decompress(self.codec, &comp, uncomp_len as usize)
+    }
+}
+
+/// Streaming iterator over one SSTable's `(key, hlc, is_put)` stamps in key
+/// order — the value-free counterpart of [`SsTableIter`]. Holds at most one
+/// decompressed block at a time; reads the stamps sidecar when the table has
+/// one, else falls back to data blocks (decompressing values it then skips).
+#[derive(Debug)]
+pub struct StampsIter<'a> {
+    table: &'a SsTable,
+    /// Index of the next block to load.
+    next_block: usize,
+    /// Currently loaded (decompressed) block, empty until first load.
+    block: Vec<u8>,
+    /// Decode position within `block`.
+    pos: usize,
+}
+
+impl Iterator for StampsIter<'_> {
+    type Item = Result<SstStamp>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let sidecar = self.table.stamps.is_some();
+        while self.pos >= self.block.len() {
+            let i = self.next_block;
+            if i >= self.table.blocks.len() {
+                return None;
+            }
+            self.next_block += 1;
+            self.pos = 0;
+            let block = if sidecar {
+                self.table.read_stamp_block(i)
+            } else {
+                self.table.read_block(&self.table.blocks[i])
+            };
+            match block {
+                Ok(block) => self.block = block,
+                Err(e) => {
+                    // Poison the iterator so a caller that keeps polling stops.
+                    self.next_block = self.table.blocks.len();
+                    self.block = Vec::new();
+                    return Some(Err(e));
+                }
+            }
+        }
+        let decoded = if sidecar {
+            decode_stamp(&self.block, self.pos)
+        } else {
+            decode_entry_stamp(&self.block, self.pos)
+        };
+        match decoded {
+            Ok((stamp, next)) => {
+                self.pos = next;
+                Some(Ok(stamp))
+            }
+            Err(e) => {
+                self.next_block = self.table.blocks.len();
+                self.block = Vec::new();
+                self.pos = 0;
+                Some(Err(e))
+            }
+        }
+    }
 }
 
 /// Streaming iterator over one SSTable's entries in key order. Holds at most
@@ -522,6 +749,69 @@ fn encode_entry(out: &mut Vec<u8>, e: &SstEntry) {
         }
         VersionValue::Delete => out.push(OP_DELETE),
     }
+}
+
+/// A value-free entry: `(key, hlc, is_put)` — everything an anti-entropy
+/// digest needs.
+pub type SstStamp = (Vec<u8>, Hlc, bool);
+
+/// Encode one entry's stamp for the sidecar: `u32 keylen | key | hlc[12] | u8 op`.
+fn encode_stamp(out: &mut Vec<u8>, e: &SstEntry) {
+    out.extend_from_slice(&(e.key.len() as u32).to_le_bytes());
+    out.extend_from_slice(&e.key);
+    out.extend_from_slice(&e.hlc.to_bytes());
+    out.push(match e.value {
+        VersionValue::Put(_) => OP_PUT,
+        VersionValue::Delete => OP_DELETE,
+    });
+}
+
+/// Decode one stamp from a sidecar stamp block.
+fn decode_stamp(buf: &[u8], start: usize) -> Result<(SstStamp, usize)> {
+    let mut pos = start;
+    let key_len = read_u32(buf, &mut pos)? as usize;
+    let key = take(buf, &mut pos, key_len)?.to_vec();
+    let hlc_bytes: [u8; 12] = take(buf, &mut pos, 12)?
+        .try_into()
+        .map_err(|_| corrupt("bad hlc"))?;
+    let hlc = Hlc::from_bytes(hlc_bytes);
+    let op = *take(buf, &mut pos, 1)?
+        .first()
+        .ok_or_else(|| corrupt("missing op"))?;
+    let is_put = match op {
+        OP_PUT => true,
+        OP_DELETE => false,
+        _ => return Err(corrupt("unknown op")),
+    };
+    Ok(((key, hlc, is_put), pos))
+}
+
+/// Decode one *data-block* entry as a stamp, skipping the value bytes without
+/// copying them — the fallback path for tables with no sidecar.
+fn decode_entry_stamp(buf: &[u8], start: usize) -> Result<(SstStamp, usize)> {
+    let mut pos = start;
+    let key_len = read_u32(buf, &mut pos)? as usize;
+    let key = take(buf, &mut pos, key_len)?.to_vec();
+    let hlc_bytes: [u8; 12] = take(buf, &mut pos, 12)?
+        .try_into()
+        .map_err(|_| corrupt("bad hlc"))?;
+    let hlc = Hlc::from_bytes(hlc_bytes);
+    let op = *take(buf, &mut pos, 1)?
+        .first()
+        .ok_or_else(|| corrupt("missing op"))?;
+    let is_put = match op {
+        OP_PUT => {
+            let val_len = read_u32(buf, &mut pos)? as usize;
+            pos = pos
+                .checked_add(val_len)
+                .filter(|end| *end <= buf.len())
+                .ok_or_else(|| corrupt("unexpected end"))?;
+            true
+        }
+        OP_DELETE => false,
+        _ => return Err(corrupt("unknown op")),
+    };
+    Ok(((key, hlc, is_put), pos))
 }
 
 fn decode_entry(buf: &[u8], start: usize) -> Result<(SstEntry, usize)> {
@@ -666,6 +956,80 @@ mod tests {
         );
         assert_eq!(sst.entries().unwrap(), entries);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn stamps_sidecar_matches_entries_and_falls_back() {
+        for codec in [Codec::None, Codec::Lz4, Codec::Brotli] {
+            let path = tmp();
+            let mut entries: Vec<SstEntry> = (0..2000)
+                .map(|i| put(&format!("key{i:05}"), i as u64 + 1, &format!("value-{i}")))
+                .collect();
+            entries[7].value = VersionValue::Delete;
+            entries[1500].value = VersionValue::Delete;
+            let sst = SsTable::write(&path, &entries, codec).unwrap();
+            assert!(sst.stamps.is_some(), "sidecar written ({codec:?})");
+            assert!(stamps_path(&path).exists());
+            let expect: Vec<SstStamp> = entries
+                .iter()
+                .map(|e| {
+                    (
+                        e.key.clone(),
+                        e.hlc,
+                        matches!(e.value, VersionValue::Put(_)),
+                    )
+                })
+                .collect();
+            let via_sidecar: Vec<SstStamp> = sst
+                .stamps_iter_from(None)
+                .collect::<Result<_>>()
+                .unwrap();
+            assert_eq!(via_sidecar, expect, "sidecar scan ({codec:?})");
+            // Seeked start behaves like iter_from: begins in the right block.
+            let from: Vec<SstStamp> = sst
+                .stamps_iter_from(Some(b"key01500"))
+                .filter(|r| r.as_ref().is_ok_and(|(k, _, _)| k.as_slice() > b"key01500".as_slice()))
+                .collect::<Result<_>>()
+                .unwrap();
+            assert_eq!(from, expect[1501..], "seeked sidecar scan ({codec:?})");
+
+            // Old-file fallback: delete the sidecar, reopen — identical scan
+            // straight off the data blocks.
+            std::fs::remove_file(stamps_path(&path)).unwrap();
+            let sst = SsTable::open(&path).unwrap();
+            assert!(sst.stamps.is_none());
+            let via_fallback: Vec<SstStamp> = sst
+                .stamps_iter_from(None)
+                .collect::<Result<_>>()
+                .unwrap();
+            assert_eq!(via_fallback, expect, "fallback scan ({codec:?})");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn torn_stamps_sidecar_is_ignored() {
+        let path = tmp();
+        let entries: Vec<SstEntry> = (0..500)
+            .map(|i| put(&format!("k{i:04}"), i as u64 + 1, "v"))
+            .collect();
+        SsTable::write(&path, &entries, Codec::Lz4).unwrap();
+        // Truncate the sidecar mid-file (simulates a crash between the data
+        // fsync and the sidecar fsync).
+        let sp = stamps_path(&path);
+        let len = std::fs::metadata(&sp).unwrap().len();
+        let f = std::fs::OpenOptions::new().write(true).open(&sp).unwrap();
+        f.set_len(len / 2).unwrap();
+        drop(f);
+        let sst = SsTable::open(&path).unwrap();
+        assert!(sst.stamps.is_none(), "torn sidecar rejected");
+        let stamps: Vec<SstStamp> = sst
+            .stamps_iter_from(None)
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(stamps.len(), 500, "fallback still serves stamps");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&sp);
     }
 
     #[test]

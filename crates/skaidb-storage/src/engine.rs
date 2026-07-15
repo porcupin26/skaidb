@@ -626,6 +626,59 @@ impl Engine {
             .collect()
     }
 
+    /// Value-free [`Engine::scan_versioned_page`]: one bounded page of
+    /// `(key, hlc, is_put)` stamps, tombstones included, in key order. SSTable
+    /// sources read the stamps sidecar where present, so a whole-table pass
+    /// (anti-entropy digests) never decompresses value bytes — the dominant
+    /// cost of the versioned page scan on wide rows.
+    pub fn scan_stamps_page(
+        &self,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Hlc, bool)>> {
+        let mut sources: Vec<MergeSource<'_>> = Vec::with_capacity(1 + self.sstable_count());
+        // Memtable pages carry their (in-RAM) values; the merge needs a
+        // uniform item type, so map them to value-free markers. See
+        // scan_versioned_page for the page-cap argument.
+        let strip = |(k, hlc, v): (Vec<u8>, Hlc, VersionValue)| {
+            let marker = match v {
+                VersionValue::Put(_) => VersionValue::Put(Vec::new()),
+                VersionValue::Delete => VersionValue::Delete,
+            };
+            Ok((k, hlc, marker))
+        };
+        sources.push(Box::new(
+            self.mem.range_latest_page(after, limit).into_iter().map(strip),
+        ));
+        for f in self.frozen.iter().rev() {
+            sources.push(Box::new(
+                f.mem.range_latest_page(after, limit).into_iter().map(strip),
+            ));
+        }
+        for sst in self.sstables_newest_first() {
+            sources.push(Box::new(sst.stamps_iter_from(after).map(|r| {
+                r.map(|(k, hlc, is_put)| {
+                    let marker = if is_put {
+                        VersionValue::Put(Vec::new())
+                    } else {
+                        VersionValue::Delete
+                    };
+                    (k, hlc, marker)
+                })
+            })));
+        }
+        KWayMerge::new(sources)
+            .filter(|item| match (item, after) {
+                (Ok((k, _, _)), Some(a)) => k.as_slice() > a,
+                _ => true,
+            })
+            .take(limit)
+            .map(|item| {
+                item.map(|(k, hlc, v)| (k, hlc, matches!(v, VersionValue::Put(_))))
+            })
+            .collect()
+    }
+
     /// Scan only the live keys that start with `prefix`, in key order. Used by
     /// secondary indexes, whose entries are prefixed by the indexed value.
     /// Delegates to [`Engine::scan_range`], so cost is proportional to the
@@ -863,7 +916,7 @@ impl Engine {
         if let Some(f) = self.frozen.iter_mut().find(|f| f.wal_seq == job.wal_seq) {
             f.building = false;
         }
-        let _ = std::fs::remove_file(&job.path);
+        remove_files(std::slice::from_ref(&job.path));
     }
 
     /// One background compaction step as a work order, if a trigger is met:
@@ -955,7 +1008,7 @@ impl Engine {
                 || self.levels.iter().any(|t| t.path() == p)
         });
         if !inputs_present {
-            let _ = std::fs::remove_file(&job.output);
+            remove_files(std::slice::from_ref(&job.output));
             return Ok(false);
         }
         // The output level: one deeper than the shallowest level the inputs
@@ -991,9 +1044,7 @@ impl Engine {
             self.levels.push(new_run);
         }
         self.persist_manifest()?;
-        for p in &job.inputs {
-            let _ = std::fs::remove_file(p);
-        }
+        remove_files(&job.inputs);
         Ok(true)
     }
 
@@ -1462,6 +1513,7 @@ fn collect_paths(l0: &[SsTable], l1: Option<&SsTable>) -> Vec<PathBuf> {
 fn remove_files(paths: &[PathBuf]) {
     for p in paths {
         let _ = std::fs::remove_file(p);
+        let _ = std::fs::remove_file(crate::sstable::stamps_path(p));
     }
 }
 
@@ -1870,6 +1922,56 @@ mod tests {
         e.flush().unwrap();
         assert_eq!(e.get(b"d000").unwrap(), None);
         assert!(!e.scan().unwrap().iter().any(|(k, _)| k == b"d000"));
+    }
+
+    #[test]
+    fn stamps_page_matches_versioned_page() {
+        // Data spread across memtable + several SSTables (small_opts flushes
+        // and compacts aggressively), with deletes in both regions.
+        let dir = tempdir();
+        let mut e = Engine::open_with_options(&dir, small_opts()).unwrap();
+        for i in 0..200u32 {
+            e.put(format!("s{i:04}").as_bytes(), vec![7u8; 60]).unwrap();
+        }
+        e.delete(b"s0003").unwrap();
+        e.flush().unwrap();
+        for i in 200..230u32 {
+            e.put(format!("s{i:04}").as_bytes(), vec![7u8; 60]).unwrap();
+        }
+        e.delete(b"s0210").unwrap(); // memtable tombstone
+
+        let mut after: Option<Vec<u8>> = None;
+        let mut stamps = Vec::new();
+        loop {
+            let page = e.scan_stamps_page(after.as_deref(), 64).unwrap();
+            let Some((k, _, _)) = page.last() else { break };
+            after = Some(k.clone());
+            let n = page.len();
+            stamps.extend(page);
+            if n < 64 {
+                break;
+            }
+        }
+        let expect: Vec<(Vec<u8>, Hlc, bool)> = e
+            .scan_versioned_with_tombstones()
+            .unwrap()
+            .into_iter()
+            .map(|(k, hlc, v)| (k, hlc, v.is_some()))
+            .collect();
+        assert_eq!(stamps, expect);
+        assert!(stamps.iter().any(|(_, _, p)| !p), "tombstones included");
+
+        // Compaction removed input files' sidecars along with the files: no
+        // orphaned .stamps in the sst dir.
+        let sst_dir = dir.join("sst");
+        for entry in std::fs::read_dir(&sst_dir).unwrap() {
+            let p = entry.unwrap().path();
+            if p.extension().is_some_and(|x| x == "stamps") {
+                let mut main = p.clone();
+                main.set_extension(""); // strips ".stamps", leaving "<n>.sst"
+                assert!(main.exists(), "orphaned sidecar {p:?}");
+            }
+        }
     }
 
     impl Engine {

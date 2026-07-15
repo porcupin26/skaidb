@@ -184,6 +184,15 @@ pub struct Node {
     /// loop or an admin REPAIR). Served to peers in HostStats so they defer
     /// their own pass — concurrent passes dent write quorum.
     repairing: AtomicBool,
+    /// Repair-digest cache keyed by table: `(table version, digest)`, where
+    /// the version is (schema stamp, write_seq) — see
+    /// `Database::table_repair_version`. Only consulted on full-copy
+    /// clusters (the pair-ownership filter is peer-independent there). A
+    /// hit means the table's data has not changed since the digest was
+    /// computed, so serving it can never mask real divergence: any real
+    /// change bumps write_seq on the node that has it, forcing a fresh
+    /// digest (and a mismatch) on at least one side of the pair.
+    repair_digests: Mutex<HashMap<String, CachedDigest>>,
     /// Physical-time (ms) high-water mark of data writes this node has
     /// *coordinated*. Replication lag for a peer is `watermark − acked[peer]`
     /// (both track data writes). Unlike the HLC frontier (`clock.peek()`), this advances
@@ -349,6 +358,9 @@ const SORTED_TOPK_MAX: usize = 1000;
 
 /// Rows keyed by their storage key (the gather result shape).
 type KeyedRows = Vec<(Vec<u8>, Document)>;
+/// A cached repair digest: the table version it was computed at (see
+/// `Database::table_repair_version`) plus the digest buckets.
+type CachedDigest = ((Hlc, u64), Vec<u64>);
 
 /// Journal-ack applier queue bound: past this, write acks block until the
 /// applier drains — sustained-overload backpressure, not per-burst shedding.
@@ -627,6 +639,7 @@ impl Node {
             maint_tx: Mutex::new(maint_tx),
             maint_pending: AtomicUsize::new(0),
             repairing: AtomicBool::new(false),
+            repair_digests: Mutex::new(HashMap::new()),
             write_watermark: AtomicU64::new(0),
             membership_lock: Mutex::new(()),
             bg,
@@ -2951,6 +2964,29 @@ impl Node {
     /// write site missed an update; see TODO). One sequential page walk,
     /// paced like the repair scan.
     pub(crate) fn repair_digest(&self, table: &str, peer: &NodeId) -> EngineResult<Vec<u64>> {
+        // Full-copy clusters: the pair-ownership filter passes every row for
+        // every peer, so digests are peer-independent — serve from the
+        // versioned cache when the table has not changed. Idle converged
+        // tables then cost NOTHING per pass (no scan at all), for the
+        // requester and the responder alike.
+        let full_copy = self.cfg.replication_factor >= self.member_count();
+        let version = if full_copy {
+            let v = self
+                .local
+                .read()
+                .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+                .table_repair_version(table);
+            if let (Some(v), Ok(cache)) = (v, self.repair_digests.lock()) {
+                if let Some((cv, digest)) = cache.get(table) {
+                    if *cv == v {
+                        return Ok(digest.clone());
+                    }
+                }
+            }
+            v
+        } else {
+            None
+        };
         let mut buckets = vec![0u64; Self::REPAIR_DIGEST_BUCKETS];
         let mut after: Option<Vec<u8>> = None;
         loop {
@@ -2958,10 +2994,10 @@ impl Node {
                 .local
                 .read()
                 .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
-                .local_scan_versioned_page(table, after.as_deref(), REPAIR_PAGE_ROWS)?;
-            let Some((last_key, _, _, _)) = rows.last() else { break };
+                .local_scan_stamps_page(table, after.as_deref(), REPAIR_PAGE_ROWS)?;
+            let Some((last_key, _, _)) = rows.last() else { break };
             after = Some(last_key.clone());
-            for (key, _, hlc, is_put) in &rows {
+            for (key, hlc, is_put) in &rows {
                 let owners = self.replicas_for(key);
                 if !(owners.contains(&self.id) || owners.contains(peer)) {
                     continue; // neither side is responsible: reclaim territory
@@ -2977,6 +3013,12 @@ impl Node {
                 break;
             }
             thread::sleep(REPAIR_PAGE_PAUSE);
+        }
+        // Cache under the PRE-SCAN version: a write racing the scan makes the
+        // stored version stale relative to the data, which only causes an
+        // extra recompute next time — never a stale hit.
+        if let (Some(v), Ok(mut cache)) = (version, self.repair_digests.lock()) {
+            cache.insert(table.to_string(), (v, buckets.clone()));
         }
         Ok(buckets)
     }
@@ -7450,6 +7492,18 @@ mod tests {
         let ab3 = na.repair_digest("t", &NodeId("b".into())).unwrap();
         let ba3 = nb.repair_digest("t", &NodeId("a".into())).unwrap();
         assert_eq!(ab3, ba3, "repair restores digest equality");
+
+        // The versioned cache: an unchanged table serves the digest without
+        // a scan (same result), and ANY write invalidates it.
+        let cached = na.repair_digest("t", &NodeId("b".into())).unwrap();
+        assert_eq!(cached, ab3);
+        assert!(
+            na.repair_digests.lock().unwrap().contains_key("t"),
+            "digest cached after compute"
+        );
+        na.execute("INSERT INTO t (id, v) VALUES (9001, 'post')").unwrap();
+        let after_write = na.repair_digest("t", &NodeId("b".into())).unwrap();
+        assert_ne!(after_write, cached, "a write invalidates the cached digest");
     }
 
     /// QUORUM `ORDER BY <indexed> LIMIT k` takes the distributed sorted
@@ -8933,12 +8987,12 @@ mod tests {
         }
 
         let repaired = na.repair().unwrap();
-        // The async startup catch-up can win the race and reconcile the 40
-        // injected rows before this explicit pass runs; the 10 newer-version
-        // rows are all that is then left for repair() to move. Convergence —
-        // the assertions below — is the real contract; the count only proves
-        // the pass did *something* on whichever side of the race it landed.
-        assert!(repaired >= 10, "expected ≥10 rows repaired, got {repaired}");
+        // The async startup catch-up races this explicit pass and can
+        // reconcile any prefix of the injected rows first — including all of
+        // them, in which case the digest gate correctly makes repair() a
+        // no-op (repaired == 0). No count is race-proof; convergence — the
+        // assertions below — is the real contract of paged repair.
+        let _ = repaired;
 
         // Both nodes now agree: 40 rows, ids 0..9 at the newer b version.
         for node in [&na, &nb] {
