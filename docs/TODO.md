@@ -184,10 +184,18 @@ rewritten wishlist:
   (`limit_param`/`offset_param` on `Select`, substituted by `bind` with a
   non-negative-integer type check); an unbound one reaching execution errors
   like any unbound `?`. `NEAREST`'s query/k already bound.
-- [ ] **[planner] E-3 (P2): LIMIT-aware index choice** — most-equality-pins
-  ranking picks `(account,_tombstone,is_archived)` over the order-serving
-  `(account,date)` for `ORDER BY date DESC LIMIT 1` → whole-account sort
-  (timeout at 150k rows). Prefer the order-serving index for small LIMITs.
+- [ ] **[cluster] E-3 (P2, rescoped): distributed sorted top-k for QUORUM
+  ordered reads** — diagnosis (2026-07-15): the *local* planner already
+  prefers the order-serving walk under ORDER BY + LIMIT (since the
+  9a9194b selective-range probe; verified empirically), and at consistency
+  ONE on a full-copy cluster the ordered read serves locally with early
+  stop. The timeout shape reproduces only at **QUORUM**, whose ordered
+  path gathers every match (no order-aware early stop — a per-member
+  sorted-candidates scatter + bounded quorum re-read would fix it).
+  Workaround (agencik's adapter already does this): send sorted+limited
+  cursors at consistency ONE. EXPLAIN now plans with ORDER BY/LIMIT and
+  reports `index-ordered walk … early-stop at LIMIT` instead of the
+  misleading order-blind equality plan.
 - [ ] **[fts] C-1 (P1): search-index catalog/live divergence** — production
   `.6` served errors while SHOW INDEXES listed the index. Root cause was a
   **stale catalog def** (covered only `text`; fresh def covers

@@ -1544,16 +1544,36 @@ impl Database {
                                 keys.len()
                             ),
                         );
-                    } else if let Some((idx, start, end)) =
-                        self.plan_index_scan(&sel.from, &sel.filter)
-                    {
+                    } else if let Some((idx, start, end, sorted, reverse)) = {
+                        // Plan with the same ORDER BY / LIMIT inputs execution
+                        // uses — the previous order-blind plan here reported an
+                        // equality index for queries that actually take the
+                        // sorted walk, sending users chasing the wrong index.
+                        let order2 = sel.order_by.first().and_then(|k| match &k.expr {
+                            Expr::Column(c) => Some((c.as_str(), k.descending)),
+                            _ => None,
+                        });
+                        let lim = sel.limit.map(|n| n as usize);
+                        self.plan_index(&sel.from, &sel.filter, order2, lim)
+                    } {
                         let bounds = match (start.is_some(), end.is_some()) {
                             (true, true) => "bounded range",
                             (true, false) => "lower-bounded range",
                             (false, true) => "upper-bounded range",
                             (false, false) => "full index",
                         };
-                        push("access", format!("index scan via '{idx}' ({bounds})"));
+                        if sorted {
+                            push(
+                                "access",
+                                format!(
+                                    "index-ordered walk via '{idx}' ({bounds}, {}, \
+                                     early-stop at LIMIT)",
+                                    if reverse { "DESC tail-walk" } else { "ASC" }
+                                ),
+                            );
+                        } else {
+                            push("access", format!("index scan via '{idx}' ({bounds})"));
+                        }
                     } else {
                         push("access", "full table scan (streaming k-way merge)".into());
                     }
