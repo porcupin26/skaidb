@@ -4924,6 +4924,17 @@ impl Node {
     fn drive_gidx_backfill(self: &Arc<Self>, index: &str) {
         let (base_table, paths) = {
             let Ok(db) = self.local.read() else { return };
+            // A queued re-drive (repair resumability) whose predecessor
+            // already finished — or a concurrent drive on another node that
+            // won — has nothing left to do. Without this check every
+            // re-queue replayed the whole backfill.
+            if !db
+                .all_global_indexes()
+                .iter()
+                .any(|(n, building)| n == index && *building)
+            {
+                return;
+            }
             let Some((t, p)) = db.gidx_def(index) else {
                 return; // dropped before the backfill started
             };
@@ -4940,6 +4951,7 @@ impl Node {
                 .map(|(id, _)| id.clone())
                 .unwrap_or_else(|| self.id.clone());
             let mut cursor: Option<Vec<u8>> = None;
+            let mut batch: Vec<(Vec<u8>, Vec<u8>, Hlc)> = Vec::new();
             loop {
                 let page = match &member {
                     None => match self.local.read() {
@@ -4982,18 +4994,24 @@ impl Node {
                     let (_, puts) =
                         skaidb_engine::global_entry_delta(&paths, &key, None, Some(&doc));
                     for ekey in puts {
-                        let hlc = self.clock.now();
-                        if let Err(e) = self.replicate(
-                            &entry_table,
-                            &ekey,
-                            WriteOp::Put(empty.clone()),
-                            hlc,
-                            Some(Consistency::Quorum),
-                        ) {
-                            skaidb_types::slog!(
-                                "skaidb: global-index backfill write failed on {index}: {e}"
-                            );
-                        }
+                        batch.push((ekey, empty.clone(), self.clock.now()));
+                    }
+                }
+                // One grouped ApplyBatch per destination per page instead of
+                // one replicated write (fsync + RTT) per entry — the
+                // per-entry form took ~15 ms/entry on small nodes, turning a
+                // 250k-row backfill into an hour (found by the phase-4
+                // bench). replicate_batch groups by placement, which is
+                // entry-prefix-aware.
+                if !batch.is_empty() {
+                    if let Err(e) = self.replicate_batch(
+                        &entry_table,
+                        std::mem::take(&mut batch),
+                        Some(Consistency::Quorum),
+                    ) {
+                        skaidb_types::slog!(
+                            "skaidb: global-index backfill batch failed on {index}: {e}"
+                        );
                     }
                 }
                 if done {
