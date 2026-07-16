@@ -141,8 +141,13 @@ lives in [BENCHMARKS.md](BENCHMARKS.md#performance-engineering-notes).)
   complete write-site audit plus a periodic scan-rebuild self-check.
   Note: pre-v0.88.1 SSTables have no sidecar until compaction rewrites
   them (fallback decompresses values); the digest cache hides this for
-  idle tables. **Measure a prod pass post-v0.88.1, then consider
-  re-tightening `anti_entropy_interval_secs` from 3600.**
+  idle tables. **Measured on prod after the v0.89.0 roll (2026-07-16):
+  62 s cold / 60 s warm (was >240 s on v0.88.0).** The warm floor is the
+  live-ingest tables (every write bumps write_seq → rescan) still on
+  sidecar-less pre-v0.89 SSTables, plus inter-pair pacing sleeps — expect
+  it to drop as compaction rewrites files. Re-measure in a few days, then
+  re-tighten `anti_entropy_interval_secs` (3600 → 900 is safe at a 60 s
+  pass; the 2026-07-10 lesson only forbids interval < pass time).
 - [ ] **[perf] Vector index memory: quantization + mmap** — persistence
   itself already exists (snapshot + watermark-delta replay at open; saved
   at create/rebuild/graceful shutdown, and since v0.88 checkpointed every
