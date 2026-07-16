@@ -161,8 +161,14 @@ pub(crate) fn run_ts_select(
 
     // Rebuild documents: one per (series, ts), fields merged across streams,
     // ordered series-then-time so `rate()` sees per-series runs in order.
+    // Every sample charges the statement's scan budget — the raw gather
+    // materializes at the coordinator (like any row gather), and an
+    // unbounded `SELECT * FROM <ts>` over a large range must fail with the
+    // budget error, not grow until the OOM killer arrives. Aggregations
+    // took the bounded partials path above and never get here.
     let mut merged: BTreeMap<(Vec<u8>, i64), Document> = BTreeMap::new();
     for (labels, samples) in gathered {
+        crate::scan_meter::tick(samples.len())?;
         let field = labels
             .iter()
             .find(|(k, _)| k == FIELD_LABEL)

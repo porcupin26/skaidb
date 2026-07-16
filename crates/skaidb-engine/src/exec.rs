@@ -1703,7 +1703,7 @@ impl Database {
                         } else {
                             push("access", format!("index scan via '{idx}' ({bounds})"));
                         }
-                    } else if let Some((idx, _, _)) =
+                    } else if let Some((idx, _)) =
                         self.plan_global_probe(&sel.from, &sel.filter)
                     {
                         push(
@@ -2421,7 +2421,14 @@ impl Database {
             ),
             Statement::DropTable { name, if_exists } => self.drop_table(&name, if_exists),
             Statement::CreateIndex(ci) => {
-                self.create_index(&ci.name, &ci.table, &ci.paths, ci.if_not_exists, ci.global)
+                self.create_index(
+                    &ci.name,
+                    &ci.table,
+                    &ci.paths,
+                    ci.if_not_exists,
+                    ci.global,
+                    ci.ready,
+                )
             }
             Statement::DropIndex { name, if_exists } => self.drop_index(&name, if_exists),
             Statement::CreateVectorIndex(ci) => {
@@ -3392,6 +3399,7 @@ impl Database {
         paths: &[String],
         if_not_exists: bool,
         global: bool,
+        ready: bool,
     ) -> Result<QueryOutput> {
         if !self.catalog.tables.contains_key(table) {
             return Err(EngineError::TableNotFound(table.to_string()));
@@ -3403,6 +3411,16 @@ impl Database {
         }
         if self.catalog.indexes.contains_key(name) {
             if if_not_exists {
+                // Schema replay of a READY global index: a node stuck
+                // `building` (down during the readiness broadcast) converges
+                // here instead of never routing probes.
+                if global && ready {
+                    if let Some(def) = self.catalog.indexes.get_mut(name) {
+                        if def.global && def.building {
+                            def.building = false;
+                        }
+                    }
+                }
                 self.record_schema(key, hlc, false);
                 self.save_catalog()?;
                 return Ok(QueryOutput::Ddl);
@@ -3442,7 +3460,11 @@ impl Database {
                 IndexDef {
                     table: table.to_string(),
                     paths: paths.to_vec(),
-                    building: true,
+                    // A ready-marked replay (rejoin/bootstrap import of an
+                    // index whose backfill completed long ago) starts
+                    // serving immediately; entry data converges via the
+                    // entry table's own anti-entropy.
+                    building: !ready,
                     global: true,
                 },
             );
@@ -3453,7 +3475,7 @@ impl Database {
             // coordinator drives a replicated backfill across every member's
             // shard and broadcasts readiness — this engine-side apply does
             // nothing more.
-            if !self.defer_backfills {
+            if !ready && !self.defer_backfills {
                 self.run_gidx_backfill(name)?;
             }
             return Ok(QueryOutput::Ddl);
@@ -4917,7 +4939,11 @@ impl Database {
                 format!(
                     "CREATE INDEX IF NOT EXISTS {bare} ON {table} ({}){}",
                     idx.paths.join(", "),
-                    if idx.global { " WITH (global = true)" } else { "" }
+                    match (idx.global, idx.building) {
+                        (true, false) => " WITH (global = true, ready = true)",
+                        (true, true) => " WITH (global = true)",
+                        _ => "",
+                    }
                 ),
                 ver(&format!("i:{name}")),
             ));
@@ -5055,7 +5081,11 @@ impl Database {
                 format!(
                     "CREATE INDEX IF NOT EXISTS {bare} ON {table} ({}){}",
                     idx.paths.join(", "),
-                    if idx.global { " WITH (global = true)" } else { "" }
+                    match (idx.global, idx.building) {
+                        (true, false) => " WITH (global = true, ready = true)",
+                        (true, true) => " WITH (global = true)",
+                        _ => "",
+                    }
                 ),
             ));
         }
@@ -5875,16 +5905,18 @@ impl Database {
 
     /// Plan a routed GLOBAL-index probe for `filter`: the first ready
     /// (non-building) global index on `table` whose EVERY column is pinned
-    /// by an equality in the filter, as `(index name, entry range start,
-    /// end)`. Full-tuple equality only — leftmost prefixes and ranges do not
-    /// route under hash placement and keep the scatter paths. Consulted by
-    /// the cluster coordinator after PK and local-index plans decline.
+    /// by an equality or a literal `IN` list, as `(index name, entry
+    /// ranges)` — one `[start, end)` range per value tuple (`IN` lists
+    /// cross-multiply, capped at [`GIDX_PROBE_RANGES`]). Partial prefixes
+    /// and value ranges do not route under hash placement and keep the
+    /// scatter paths. Consulted by the cluster coordinator after PK and
+    /// local-index plans decline.
     pub fn plan_global_probe(
         &self,
         table: &str,
         filter: &Option<Expr>,
-    ) -> Option<(String, Vec<u8>, Vec<u8>)> {
-        let constraints = column_constraints(filter);
+    ) -> Option<(String, Vec<ProbeRange>)> {
+        let expr = filter.as_ref()?;
         for (name, idx) in self
             .catalog
             .indexes
@@ -5892,23 +5924,72 @@ impl Database {
             .filter(|(_, i)| i.table == table && i.global && !i.building)
         {
             let cols = index_key_names(&idx.paths);
-            let values: Vec<Value> = cols
-                .iter()
-                .filter_map(|c| {
-                    constraints
-                        .iter()
-                        .find(|(col, _)| col == c)
-                        .and_then(|(_, con)| con.eq.clone())
-                })
-                .collect();
-            if values.len() != cols.len() {
+            // Per-column candidate sets: `col = lit` or `col IN (lits)` —
+            // the same pins the PK point-read set accepts.
+            let mut per_col: Vec<Vec<Value>> = Vec::with_capacity(cols.len());
+            for col in &cols {
+                match pk_column_candidates(expr, col) {
+                    Some(c) if !c.is_empty() => per_col.push(c),
+                    // Pinned to an empty set (`IN (NULL)`): matches nothing.
+                    Some(_) => return Some((name.clone(), Vec::new())),
+                    None => {
+                        per_col.clear();
+                        break;
+                    }
+                }
+            }
+            if per_col.len() != cols.len() {
                 continue; // not fully pinned: this index cannot route
             }
-            if let Some((start, end)) = gidx_probe_bounds(&values) {
-                return Some((name.clone(), start, end));
+            let mut total = 1usize;
+            for c in &per_col {
+                total = total.checked_mul(c.len())?;
+                if total > GIDX_PROBE_RANGES {
+                    return None; // too many tuples: scatter beats N range RTTs
+                }
             }
+            // Cross product over the composite columns → one probe range per
+            // value tuple.
+            let mut ranges = Vec::with_capacity(total);
+            let mut idx_v = vec![0usize; per_col.len()];
+            'outer: loop {
+                let values: Vec<Value> = idx_v
+                    .iter()
+                    .zip(&per_col)
+                    .map(|(&i, c)| c[i].clone())
+                    .collect();
+                if let Some(bounds) = gidx_probe_bounds(&values) {
+                    ranges.push(bounds);
+                }
+                let mut d = per_col.len();
+                loop {
+                    if d == 0 {
+                        break 'outer;
+                    }
+                    d -= 1;
+                    idx_v[d] += 1;
+                    if idx_v[d] < per_col[d].len() {
+                        break;
+                    }
+                    idx_v[d] = 0;
+                }
+            }
+            ranges.sort();
+            ranges.dedup();
+            return Some((name.clone(), ranges));
         }
         None
+    }
+
+    /// Every GLOBAL index as `(name, building)` — the repair pass's
+    /// maintenance worklist.
+    pub fn all_global_indexes(&self) -> Vec<(String, bool)> {
+        self.catalog
+            .indexes
+            .iter()
+            .filter(|(_, d)| d.global)
+            .map(|(n, d)| (n.clone(), d.building))
+            .collect()
     }
 
     /// A GLOBAL index's `(base table, paths)`, if it exists and is global.
@@ -5921,10 +6002,17 @@ impl Database {
     }
 
     /// Flip a GLOBAL index out of `building` (the backfill driver finished).
+    /// Advances the index's schema stamp: schema sync then replays the
+    /// definition as `WITH (global = true, ready = true)` past nodes whose
+    /// stamp predates readiness — a node that missed the broadcast (down at
+    /// the time, or freshly bootstrapped) converges on its next repair
+    /// instead of never routing probes.
     pub fn finish_global_backfill(&mut self, name: &str) {
         if let Some(def) = self.catalog.indexes.get_mut(name) {
             if def.global && def.building {
                 def.building = false;
+                let hlc = self.ddl_stamp();
+                self.record_schema(format!("i:{name}"), hlc, false);
                 let _ = self.save_catalog();
             }
         }
@@ -5974,6 +6062,117 @@ impl Database {
             return Ok(None);
         }
         Ok(next)
+    }
+
+    /// One page of GLOBAL-index **orphan GC**: walk up to `limit` live
+    /// entries of the index after `cursor` and delete every entry whose row
+    /// no longer exists or no longer produces it (the write-crash-window
+    /// leftovers; until collected they only waste probe re-checks, never
+    /// correctness). Verification is per-entry local point reads
+    /// (bloom-gated), so this is only sound where the rows are guaranteed
+    /// local — full-copy clusters and single nodes; the caller gates that.
+    /// Returns `(next cursor, entries removed)`.
+    pub fn gidx_gc_page(
+        &mut self,
+        index: &str,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Result<(Option<Vec<u8>>, usize)> {
+        let Some((base_table, paths)) = self.gidx_def(index) else {
+            return Ok((None, 0));
+        };
+        let gname = gidx_table(index);
+        let entries = {
+            let Some(engine) = self.tables.get(&gname) else {
+                return Ok((None, 0));
+            };
+            engine.scan_versioned_page(cursor.as_deref(), limit)?
+        };
+        let done = entries.len() < limit;
+        let next = entries.last().map(|(k, _, _)| k.clone());
+        let mut orphans: Vec<Vec<u8>> = Vec::new();
+        for (ekey, _hlc, value) in &entries {
+            if value.is_none() {
+                continue; // already a tombstone
+            }
+            let Some(row_key) = gidx_entry_row_key(ekey) else {
+                orphans.push(ekey.clone()); // malformed (pre-phase-2 codec)
+                continue;
+            };
+            let row = self
+                .tables
+                .get(&base_table)
+                .and_then(|e| e.get(row_key).ok().flatten());
+            let produced = row
+                .and_then(|bytes| match Value::decode(&bytes) {
+                    Ok(Value::Document(doc)) => Some(doc),
+                    _ => None,
+                })
+                .is_some_and(|doc| {
+                    index_value_tuples(&doc, &paths)
+                        .iter()
+                        .any(|values| gidx_entry_key(values, row_key) == *ekey)
+                });
+            if !produced {
+                orphans.push(ekey.clone());
+            }
+        }
+        let removed = orphans.len();
+        if let Some(engine) = self.tables.get_mut(&gname) {
+            for ekey in orphans {
+                engine.delete(&ekey)?;
+            }
+        }
+        Ok(((!done).then_some(next).flatten(), removed))
+    }
+
+    /// One page of GLOBAL-index **missing-entry healing**: walk up to
+    /// `limit` live rows of the base table after `cursor` and write any
+    /// entry the row should have but the entry table lacks (the other side
+    /// of the crash window — and unlike orphans, a missing entry silently
+    /// hides its row from probes). Same locality requirement as
+    /// [`Database::gidx_gc_page`]. Returns `(next cursor, entries added)`.
+    pub fn gidx_heal_page(
+        &mut self,
+        index: &str,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Result<(Option<Vec<u8>>, usize)> {
+        let Some((base_table, paths)) = self.gidx_def(index) else {
+            return Ok((None, 0));
+        };
+        let gname = gidx_table(index);
+        let rows = {
+            let Some(engine) = self.tables.get(&base_table) else {
+                return Ok((None, 0));
+            };
+            engine.scan_versioned_page(cursor.as_deref(), limit)?
+        };
+        let done = rows.len() < limit;
+        let next = rows.last().map(|(k, _, _)| k.clone());
+        let mut missing: Vec<Vec<u8>> = Vec::new();
+        for (row_key, _hlc, value) in &rows {
+            let Some(bytes) = value else { continue }; // tombstone
+            let Ok(Value::Document(doc)) = Value::decode(bytes) else {
+                continue;
+            };
+            let Some(engine) = self.tables.get(&gname) else {
+                return Ok((None, 0));
+            };
+            for values in index_value_tuples(&doc, &paths) {
+                let ekey = gidx_entry_key(&values, row_key);
+                if engine.get(&ekey)?.is_none() {
+                    missing.push(ekey);
+                }
+            }
+        }
+        let added = missing.len();
+        if let Some(engine) = self.tables.get_mut(&gname) {
+            for ekey in missing {
+                engine.put(&ekey, Value::encode_document(&Document::new()))?;
+            }
+        }
+        Ok(((!done).then_some(next).flatten(), added))
     }
 
     /// Run a single-node GLOBAL-index backfill to completion, inline.
@@ -9438,6 +9637,15 @@ pub fn gidx_probe_bounds(values: &[Value]) -> Option<(Vec<u8>, Vec<u8>)> {
 pub fn is_gidx_table(table: &str) -> bool {
     namespace::split(table).1.starts_with("__gidx__")
 }
+
+/// One GLOBAL-index probe range: the `[start, end)` entry keys of a single
+/// pinned value tuple.
+pub type ProbeRange = (Vec<u8>, Vec<u8>);
+
+/// Max value tuples (probe ranges) one GLOBAL-index probe may expand to —
+/// each range costs a replica-set round-trip; past this the scatter paths
+/// win.
+pub const GIDX_PROBE_RANGES: usize = 100;
 
 /// The internal replicated table holding a GLOBAL index's entries:
 /// `<db>␟__gidx__<bare index name>` — same database as the index, hidden

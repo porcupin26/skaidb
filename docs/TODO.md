@@ -38,9 +38,17 @@ git history.
 
 ## Time-series
 
-- [ ] **[ts] Streamed TS results** — TS SELECT materializes before the
-  (streamable) wire; large raw range dumps should stream end-to-end like
-  row-table `QueryStream`.
+- [ ] **[ts] Streamed TS results** — raw range dumps now charge the
+  statement **scan budget** (v0.91): an unbounded `SELECT *` over a big
+  range fails with the budget error instead of materializing until OOM
+  (aggregations take the bounded partials path and are unaffected), and
+  both wire surfaces already chunk-stream row results. TRUE end-to-end
+  streaming remains an architecture item: `QueryOutput::Rows` and the
+  wire `Response::Rows` are materialized enums (~50 consumers) — needs a
+  lazy-rows variant threaded engine → node → server, plus a streaming
+  gather (per-series k-way field merge over owned samples). Do it when a
+  real >250k-sample raw-dump consumer exists; the budget error names the
+  workaround (narrow the range / aggregate).
 - [ ] **[ts] Label postings index** — regex matchers shipped
   (scan-based, fine at moderate cardinality); a postings index remains
   the perf unlock for high-cardinality matching.
@@ -91,15 +99,15 @@ distributed sorted top-k for QUORUM ordered reads, humanized EXPLAIN
 names) lives in git history. Still open:
 
 - [ ] **[cluster] Global (value-sharded) secondary indexes** (see
-  [GLOBAL_INDEXES.md](GLOBAL_INDEXES.md)) — **phases 1+2 shipped**
-  (entry plumbing v0.89; v0.90: prefix-placed self-describing entry
-  keys, routed equality probe at statement consistency with scatter
-  fallback, EXPLAIN texts, coordinator-driven replicated backfill +
-  `GidxReady` broadcast, single-node inline backfill). Remaining:
-  **phase 3** — repair leg regenerating entries from rows, orphan GC,
-  `building`-flag convergence for nodes that miss the ready broadcast,
-  IN-list probes (multi-tuple), backfill resumability; **phase 4** —
-  bench the 250k-row probe on the fleet at RF<members, prod rollout.
+  [GLOBAL_INDEXES.md](GLOBAL_INDEXES.md)) — **phases 1+2+3 shipped**
+  (v0.89 entry plumbing; v0.90 routed probe + backfill; v0.91
+  hardening: full-copy repair verify leg [heal missing entries / GC
+  orphans], ready-stamped `building` convergence, backfill re-drive on
+  repair, IN-list multi-tuple probes). Remaining: **phase 4** — bench
+  the 250k-row probe on the fleet at RF<members, prod rollout; and the
+  deferred RF<members verify leg (needs a batched cross-node stamp
+  exchange; orphans are harmless meanwhile, missing entries bounded by
+  the write crash window).
 - [ ] **[cluster] Distributed / multi-key transactions** (deferred, large)
   — cluster mode autocommits per statement (`BEGIN/COMMIT/ROLLBACK`
   rejected); no 2PC/coordinator exists. agencik designs around it with

@@ -94,6 +94,12 @@ stored as its own compressed stream. Full grammar and semantics:
   applied by the coordinator (peers answer the equality-matched
   superset). A fresh datasource with no ingest sees empty
   results, not errors. Datasource setup recipes: [GRAFANA.md](GRAFANA.md).
+- **Raw dumps are scan-metered** (v0.91): a raw `SELECT` over a
+  time-series table charges each gathered sample against the statement's
+  scan budget, exactly like row-table gathers — an unbounded dump over a
+  huge range fails with the budget error instead of materializing until
+  the coordinator OOMs. Narrow the time range or aggregate (aggregations
+  push down as bounded per-bucket partials and are unaffected).
 - **Rollups / downsampling** (v0.27.0): `CREATE ROLLUP r30m ON cpu BUCKET
   30m RETENTION 90d` — per-bucket partials (`<field>_{count,sum,min,max,
   first,last}`) maintained automatically at window flush and queryable as a

@@ -343,6 +343,12 @@ pub struct CreateIndex {
     /// value (an internal replicated table) instead of indexing each node's
     /// local shard. See docs/GLOBAL_INDEXES.md.
     pub global: bool,
+    /// Internal (schema-replay only): `WITH (global = true, ready = true)`
+    /// marks a global index whose cluster-wide backfill already completed,
+    /// so a node importing the definition (rejoin catch-up, fresh
+    /// bootstrap) starts routing probes instead of waiting for a readiness
+    /// broadcast it can no longer receive.
+    pub ready: bool,
 }
 
 /// `CREATE VECTOR INDEX [IF NOT EXISTS] name ON table (path) DIM n [USING metric]`.

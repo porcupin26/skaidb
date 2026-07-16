@@ -821,13 +821,18 @@ impl Parser {
             // `WITH (global = true)` selects the value-sharded (global)
             // form; anything else here is a typo worth rejecting loudly.
             let mut global = false;
+            let mut ready = false;
             for (key, value) in self.parse_with_options()? {
                 match (key.as_str(), value.as_str()) {
                     ("global", "true") => global = true,
                     ("global", "false") => global = false,
-                    ("global", other) => {
+                    // Internal, emitted by schema replay: the global index's
+                    // backfill already completed cluster-wide.
+                    ("ready", "true") => ready = true,
+                    ("ready", "false") => ready = false,
+                    ("global" | "ready", other) => {
                         return Err(ParseError::Other(format!(
-                            "global must be true or false, got '{other}'"
+                            "{key} must be true or false, got '{other}'"
                         )))
                     }
                     (other, _) => {
@@ -843,6 +848,7 @@ impl Parser {
                 table,
                 paths,
                 global,
+                ready,
             }))
         } else if self.eat_ident_ci("database") {
             let if_not_exists = self.parse_if_not_exists()?;

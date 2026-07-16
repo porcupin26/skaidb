@@ -1,8 +1,33 @@
 # Global (value-sharded) secondary indexes — design
 
-Status: **phases 1+2 shipped** (entry plumbing v0.89; routed read path +
-backfill v0.90). Phases 3 (repair leg / orphan GC) and 4 (RF<members
-bench + prod rollout) pending. Phase-2 notes:
+Status: **phases 1+2+3 shipped** (entry plumbing v0.89; routed read path +
+backfill v0.90; hardening v0.91). Phase 4 (RF<members bench + prod
+rollout) pending. Phase-3 notes:
+
+- **Repair verify leg** (`gidx_repair`, part of every repair pass): on
+  full-copy clusters, paged two-direction verification of entries against
+  rows — *heals missing entries* (a missing entry silently hides its row
+  from probes; the correctness direction) and *GCs orphans* (harmless,
+  pure waste). Fixes apply locally; the entry table's own anti-entropy
+  spreads them. At RF < members verification needs cross-node reads —
+  deferred (orphans stay harmless; missing entries stay bounded by the
+  write crash window).
+- **`building` convergence**: readiness advances the index's schema
+  stamp, and schema replay emits `WITH (global = true, ready = true)` —
+  a node that missed the `GidxReady` broadcast (down at the time, or
+  freshly bootstrapped) converges on its next schema sync instead of
+  never routing probes. `ready` is an internal DDL option.
+- **Backfill resumability**: a repair pass that finds a global index
+  still `building` re-queues the drive on that node; duplicate drives
+  are idempotent LWW upserts and readiness is stamped, so whichever
+  drive finishes first wins.
+- **`IN`-list probes**: every index column pinned by `=`/literal `IN`
+  expands to one probe range per value tuple (cross product, capped at
+  100 ranges — past that the scatter paths win), each routed to its own
+  value's replica set, candidates unioned into one resolve. A pin to an
+  empty set answers empty without touching the ring.
+
+Phase-2 notes:
 
 - **Entry keys are self-describing for placement**:
   `u16 BE prefix_len ‖ values_prefix ‖ row_key`. Every ring lookup with

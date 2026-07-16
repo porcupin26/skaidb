@@ -2345,6 +2345,163 @@ mod tests {
         assert!(db.plan_global_probe("msgs", &parse_filter("sender = 'user3'")).is_some());
     }
 
+    /// A raw time-series range dump charges the statement scan budget like
+    /// any row gather — an unbounded `SELECT *` over a big range fails with
+    /// the budget error instead of materializing until OOM. Aggregations
+    /// (bounded partials) stay unmetered.
+    #[test]
+    fn ts_raw_dump_respects_scan_budget() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TIMESERIES TABLE m (SERIES KEY (host))").unwrap();
+        for i in 0..300 {
+            db.execute(&format!(
+                "INSERT INTO m (host, ts, value) VALUES ('h1', {}, {i})",
+                1_000_000 + i * 1000
+            ))
+            .unwrap();
+        }
+        // Under budget: served.
+        let _armed = scan_meter::arm(1_000, None);
+        let rs = rows(db.execute("SELECT * FROM m").unwrap());
+        assert_eq!(rs.rows.len(), 300);
+        drop(_armed);
+        // Over budget: the clean metering error, not an unbounded gather.
+        let _armed = scan_meter::arm(100, None);
+        let err = db.execute("SELECT * FROM m").unwrap_err();
+        assert!(
+            err.to_string().contains("scan budget"),
+            "expected budget error, got: {err}"
+        );
+        drop(_armed);
+        // Aggregations take the partials path: unaffected by a small budget.
+        let _armed = scan_meter::arm(100, None);
+        let rs = rows(
+            db.execute("SELECT time_bucket(1h, ts) AS t, avg(value) FROM m GROUP BY t").unwrap(),
+        );
+        assert!(!rs.rows.is_empty());
+    }
+
+    /// GLOBAL index phase 3: the repair verify pages fix both crash-window
+    /// directions — a missing entry (hides its row from probes) is healed
+    /// from the row, an orphan entry (row gone / value changed) is GC'd —
+    /// and a `ready = true` schema replay converges a stuck `building` flag.
+    #[test]
+    fn global_index_verify_heals_and_gcs() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE msgs (PRIMARY KEY (id))").unwrap();
+        for i in 0..20 {
+            db.execute(&format!(
+                "INSERT INTO msgs (id, sender) VALUES ({i}, 'user{}')",
+                i % 4
+            ))
+            .unwrap();
+        }
+        db.execute("CREATE INDEX msgs_sender ON msgs (sender) WITH (global = true)")
+            .unwrap();
+        let gname = gidx_table("msgs_sender");
+        let live = |db: &Database| -> Vec<Vec<u8>> {
+            db.local_scan_versioned_page(&gname, None, 100)
+                .unwrap()
+                .into_iter()
+                .filter(|(_, _, _, p)| *p)
+                .map(|(k, _, _, _)| k)
+                .collect()
+        };
+        assert_eq!(live(&db).len(), 20);
+
+        // Manufacture the crash window: delete one entry behind the index's
+        // back, and plant an orphan for a row that never existed.
+        let victim = live(&db)[7].clone();
+        let orphan = gidx_entry_key(
+            &[Value::String("ghost".into())],
+            &Value::Array(vec![Value::Int(999)]).encode_key(),
+        );
+        let stamp = skaidb_storage::Hlc::new(u64::MAX / 2, 0);
+        db.apply_delete(&gname, &victim, stamp).unwrap();
+        db.apply_put(
+            &gname,
+            &orphan,
+            Value::encode_document(&skaidb_types::Document::new()),
+            stamp,
+        )
+        .unwrap();
+        assert_eq!(live(&db).len(), 20, "19 real + 1 orphan");
+
+        // Heal pass restores the missing entry…
+        let mut cursor = None;
+        let mut added = 0;
+        loop {
+            let (next, n) = db.gidx_heal_page("msgs_sender", cursor.take(), 8).unwrap();
+            added += n;
+            match next {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(added, 1, "exactly the deleted entry healed");
+        assert!(live(&db).contains(&victim));
+
+        // …and the GC pass removes the orphan.
+        let mut cursor = None;
+        let mut removed = 0;
+        loop {
+            let (next, n) = db.gidx_gc_page("msgs_sender", cursor.take(), 8).unwrap();
+            removed += n;
+            match next {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(removed, 1, "exactly the orphan collected");
+        assert_eq!(live(&db).len(), 20);
+        assert!(!live(&db).contains(&orphan));
+    }
+
+    /// A `WITH (global = true, ready = true)` schema replay (what a node
+    /// whose backfill completed emits) converges a peer stuck `building`.
+    #[test]
+    fn global_index_ready_replay_converges_building() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.set_defer_backfills(true); // cluster mode: DDL leaves building=true
+        db.execute("CREATE TABLE msgs (PRIMARY KEY (id))").unwrap();
+        db.execute("INSERT INTO msgs (id, sender) VALUES (1, 'ala')").unwrap();
+        db.execute("CREATE INDEX msgs_sender ON msgs (sender) WITH (global = true)")
+            .unwrap();
+        assert!(
+            db.plan_global_probe("msgs", &parse_filter("sender = 'ala'")).is_none(),
+            "building index must not route"
+        );
+        // The ready-marked replay (newer stamp) flips it.
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS msgs_sender ON msgs (sender) WITH (global = true, ready = true)",
+        )
+        .unwrap();
+        assert!(
+            db.plan_global_probe("msgs", &parse_filter("sender = 'ala'")).is_some(),
+            "ready replay converges building"
+        );
+    }
+
+    /// IN-list probes: every index column pinned by `=`/literal `IN` plans
+    /// one probe range per value tuple; over-wide and empty pins degrade
+    /// correctly.
+    #[test]
+    fn global_index_in_list_probe_plans_ranges() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE msgs (PRIMARY KEY (id))").unwrap();
+        db.execute("CREATE INDEX msgs_sender ON msgs (sender) WITH (global = true)")
+            .unwrap();
+        let plan = |cond: &str| db.plan_global_probe("msgs", &parse_filter(cond));
+        assert_eq!(plan("sender = 'a'").unwrap().1.len(), 1);
+        assert_eq!(plan("sender IN ('a', 'b', 'c')").unwrap().1.len(), 3);
+        assert_eq!(
+            plan("sender IN ('a', 'a', 'b')").unwrap().1.len(),
+            2,
+            "duplicate list values dedup"
+        );
+        assert!(plan("sender > 'a'").is_none(), "ranges do not route");
+    }
+
     /// Deferred vector backfill (cluster mode): CREATE VECTOR INDEX with an
     /// explicit DIM acks at schema-apply with the index marked `building`;
     /// searches error "retry shortly", SHOW INDEXES reports `building`, and

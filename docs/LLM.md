@@ -397,6 +397,11 @@ WHERE ts >= now() - 6h GROUP BY t;
   summed across the group (PromQL `sum(rate(...))` semantics); `first/last`
   take the earliest/latest value. GROUP BY/ORDER BY may reference output
   aliases (`GROUP BY t`).
+- **Raw dumps are scan-metered** (v0.91): a raw `SELECT` (no aggregation)
+  charges each gathered sample against the statement scan budget like any
+  row gather — a huge unbounded range dump errors cleanly instead of
+  materializing until OOM. Narrow the range or aggregate (per-bucket
+  partials are bounded and unaffected).
 - **Rollups**: `CREATE ROLLUP r30m ON cpu BUCKET 30m RETENTION 90d` stores
   `f_count/f_sum/f_min/f_max/f_first/f_last` per bucket, auto-maintained on
   flush AND on repair backfill. Aggregate queries on the source
