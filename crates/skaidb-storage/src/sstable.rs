@@ -191,9 +191,21 @@ fn load_stamps(main_path: &Path, data_blocks: &[BlockMeta]) -> Option<StampsInde
 }
 
 /// A small per-table cache of decompressed blocks (see [`SsTable::block_cache`]).
-#[derive(Debug, Default)]
+/// Sharded like [`crate::cache::ReadCache`] so concurrent point reads against
+/// one hot table don't serialize on a single mutex — a table with many
+/// concurrent readers used to funnel every hit *and* every miss-then-insert
+/// through one lock regardless of which (unrelated) blocks they touched.
+#[derive(Debug)]
 struct BlockCache {
-    inner: Mutex<BlockCacheInner>,
+    shards: [Mutex<BlockCacheInner>; BLOCK_CACHE_SHARDS],
+}
+
+impl Default for BlockCache {
+    fn default() -> Self {
+        BlockCache {
+            shards: std::array::from_fn(|_| Mutex::new(BlockCacheInner::default())),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -202,13 +214,29 @@ struct BlockCacheInner {
     fifo: VecDeque<u64>,
 }
 
-/// Blocks retained per table: 32 × ~4 KiB ≈ 128 KiB, allocated only for
-/// tables that actually serve point reads.
-const BLOCK_CACHE_BLOCKS: usize = 32;
+/// Blocks retained per table, split across [`BLOCK_CACHE_SHARDS`]: 64 total ×
+/// ~4 KiB ≈ 256 KiB, allocated only for tables that actually serve point
+/// reads.
+const BLOCK_CACHE_BLOCKS: usize = 64;
+/// Shard count for the block cache. Smaller than `ReadCache`'s 64 — this
+/// cache's total budget is far smaller (blocks, not point-read results), so
+/// shards need enough capacity each (16 blocks here) to hold a useful working
+/// set rather than trading hit rate for lock parallelism that a single small
+/// table rarely has enough concurrent-but-independent readers to need.
+const BLOCK_CACHE_SHARDS: usize = 4;
 
 impl BlockCache {
+    /// A block's shard: offsets from a sequential scan land in adjacent file
+    /// positions, so a plain modulo would put a scan's cached blocks all in
+    /// one shard — multiply-shift first to decorrelate, same idea as
+    /// `ReadCache`'s FNV hash over the key bytes.
+    fn shard(&self, offset: u64) -> &Mutex<BlockCacheInner> {
+        let h = offset.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        &self.shards[(h % self.shards.len() as u64) as usize]
+    }
+
     fn get(&self, offset: u64) -> Option<Arc<Vec<u8>>> {
-        self.inner
+        self.shard(offset)
             .lock()
             .expect("block cache")
             .map
@@ -217,12 +245,13 @@ impl BlockCache {
     }
 
     fn insert(&self, offset: u64, block: Arc<Vec<u8>>) {
-        let mut guard = self.inner.lock().expect("block cache");
+        let mut guard = self.shard(offset).lock().expect("block cache");
         let inner = &mut *guard;
         if inner.map.insert(offset, block).is_none() {
             inner.fifo.push_back(offset);
         }
-        while inner.map.len() > BLOCK_CACHE_BLOCKS {
+        let per_shard = BLOCK_CACHE_BLOCKS / BLOCK_CACHE_SHARDS;
+        while inner.map.len() > per_shard {
             match inner.fifo.pop_front() {
                 Some(old) => {
                     inner.map.remove(&old);
@@ -926,6 +955,41 @@ fn corrupt(detail: &'static str) -> StorageError {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// The sharded block cache behaves like one logical cache: a miss then
+    /// insert is visible on the next `get` regardless of which shard the
+    /// offset lands in, distinct offsets don't collide, and the total live
+    /// entry count across all shards never exceeds `BLOCK_CACHE_BLOCKS`
+    /// (proving eviction is per-shard-capacity, not a single global cap that
+    /// sharding would have silently multiplied).
+    #[test]
+    fn block_cache_shards_are_one_logical_cache() {
+        let cache = BlockCache::default();
+        for off in 0..500u64 {
+            assert!(cache.get(off).is_none(), "unpopulated offset must miss");
+            let block = Arc::new(vec![off as u8; 4]);
+            cache.insert(off, block.clone());
+            assert_eq!(cache.get(off), Some(block), "insert then get must hit");
+        }
+        let live: usize = cache
+            .shards
+            .iter()
+            .map(|s| s.lock().unwrap().map.len())
+            .sum();
+        assert!(
+            live <= BLOCK_CACHE_BLOCKS,
+            "total live entries ({live}) must stay within the shared budget"
+        );
+        // Every shard actually received traffic — offsets 0..500 with the
+        // multiply-shift hash must not collapse onto one shard (that would
+        // defeat the whole point of sharding).
+        let nonempty = cache
+            .shards
+            .iter()
+            .filter(|s| !s.lock().unwrap().map.is_empty())
+            .count();
+        assert_eq!(nonempty, BLOCK_CACHE_SHARDS, "every shard should see traffic");
+    }
 
     fn tmp() -> PathBuf {
         static C: AtomicU64 = AtomicU64::new(0);

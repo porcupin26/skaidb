@@ -13,7 +13,7 @@
 //! compaction preserve the latest stored value, so untouched entries stay valid.
 //!
 //! Eviction is FIFO with a fixed capacity; the cache is `Send + Sync` and
-//! **sharded** — keys hash to one of up to 16 independently locked shards, so
+//! **sharded** — keys hash to one of up to 64 independently locked shards, so
 //! concurrent readers don't serialize on a single mutex.
 
 use std::collections::{HashMap, VecDeque};
@@ -37,8 +37,10 @@ pub struct CacheStats {
 }
 
 /// Upper bound on lock shards; small caches use fewer so the total entry
-/// bound stays exact.
-const MAX_SHARDS: usize = 16;
+/// bound stays exact. Widened from 16 (PG's buffer-mapping table uses 128
+/// partitions for the same reason — this cache's total budget is far larger
+/// than the block cache's, so more shards cost little per-shard capacity).
+const MAX_SHARDS: usize = 64;
 
 #[derive(Debug)]
 pub struct ReadCache {
@@ -233,5 +235,58 @@ mod tests {
         let c = ReadCache::new(0);
         c.insert(b"a", put(1));
         assert!(c.get(b"a").is_none());
+    }
+
+    /// Not a correctness test — a throughput probe for shard-count A/B
+    /// (`MAX_SHARDS`), isolating the cache's own lock from everything else
+    /// on the read path (memtable check, key formatting, engine dispatch)
+    /// that a full-Engine benchmark can't help but include. `#[ignore]`d so
+    /// normal `cargo test` runs stay fast; invoke explicitly:
+    /// `cargo test --release -p skaidb-storage -- --ignored --nocapture
+    /// read_cache_contention_probe`.
+    #[test]
+    #[ignore]
+    fn read_cache_contention_probe() {
+        let hot_keys: usize = std::env::var("HOT_KEYS").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+        let threads: usize = std::env::var("THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+        let ops: usize = std::env::var("OPS").ok().and_then(|s| s.parse().ok()).unwrap_or(2_000_000);
+
+        let cache = std::sync::Arc::new(ReadCache::new(16_384));
+        let keys: Vec<Vec<u8>> = (0..hot_keys).map(|i| format!("key{i:08}").into_bytes()).collect();
+        for k in &keys {
+            cache.insert(k, put(1));
+        }
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(threads));
+        let start = std::time::Instant::now();
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let cache = cache.clone();
+                let keys = keys.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let mut x: u64 = 0x9E37_79B9 ^ (t as u64);
+                    barrier.wait();
+                    for _ in 0..ops {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        let k = &keys[(x as usize) % keys.len()];
+                        std::hint::black_box(cache.get(k));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let elapsed = start.elapsed();
+        let total = (threads * ops) as f64;
+        eprintln!(
+            "MAX_SHARDS={MAX_SHARDS} threads={threads} hot_keys={hot_keys} ops={ops} \
+             total={total:.0} elapsed={:.3}s throughput={:.0} ops/s",
+            elapsed.as_secs_f64(),
+            total / elapsed.as_secs_f64(),
+        );
     }
 }
