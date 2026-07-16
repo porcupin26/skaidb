@@ -23,8 +23,18 @@ git history.
 - [ ] **[fts] Phase-9 residue**: the 24 h mixed ingest+query soak
   (deferred on request); disk-full-mid-merge injection (needs a
   fault-injecting filesystem — torn-dir injection shipped and found a
-  real bug); re-run the ES A/B campaign to publish post-guard,
-  post-`MATCH_CROSS`/`BOOSTED` numbers in BENCHMARKS.md.
+  real bug).
+- [ ] **[fts] Restore the Wikipedia-corpus ES A/B** — the 2026-07-16
+  BENCHMARKS.md re-run used a 100k-doc synthetic corpus (`fts_corpus.py`
+  needs a `simplewiki-*-pages-articles.xml.bz2` dump not staged on the
+  fleet and not re-downloaded this pass) instead of the original
+  280,595-doc Simple English Wikipedia corpus. Numbers are directionally
+  consistent (skaidb still leads ingest + 3/4 query classes, parity
+  94.2%/99.6%) but not a clean apples-to-apples re-verification. Stage
+  the dump on the fleet (or find a stable download mirror) and re-run at
+  the original scale; also re-run the cluster leg (3-node ingest/scatter
+  latency/kill-rejoin) and the sharded-scatter kill/reshard resilience
+  demos, neither re-verified this pass either.
 - [ ] **[fts] Global BM25 statistics mode** — per-shard stats today (like
   ES across shards); an optional global-stats mode if result-set parity
   tests ever care.

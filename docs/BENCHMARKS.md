@@ -3,18 +3,25 @@
 A throughput/latency comparison of **skaidb** against four production databases —
 **MongoDB 7.0**, **MongoDB 8.0**, **PostgreSQL 15**, and **MariaDB 11.4** — run on
 identical containers with matched durability semantics, across four
-cluster/consistency configurations.
+cluster/consistency configurations; plus a skaidb-vs-Elasticsearch full-text
+search comparison, and fleet-level correctness/latency verification of
+skaidb's sharded-scatter and global-index paths.
 
-Full-matrix run: **2026-07-03**, skaidb **v0.16.5**. Releases since (through
-v0.19.0) were A/B-measured against their predecessors on the same fleet;
-everything landed within this setup's noise on these workloads **except
-prepared-statement reads (+9%)** — see
-[Current performance notes](#current-performance-notes-v0190) for what changed
-and what it means in practice.
+**Full re-run: 2026-07-16, skaidb v0.92.1.** This is a wholesale re-run —
+every number in this document was freshly measured this pass; nothing here
+is carried over from earlier releases. Two things make this round's absolute
+throughput numbers **not comparable** to any prior version of this document:
+the client now runs from a container on the same bridge as the fleet instead
+of a workstation over a hairpin path (17–40 ms RTT would otherwise dominate
+every measurement), and this round's host was shared with an active 24-hour
+FTS soak plus the full 15-container comparison fleet — 16 containers total
+on one 8-thread host throughout. See **Setup** below for what that means for
+skaidb's standing specifically.
 
-> Numbers are for *relative* comparison on small nodes, not absolute peak
-> throughput. All five systems are driven by the same client model and the same
-> workloads, on identical hardware.
+> Numbers are for *relative* comparison on small, contended nodes, not
+> absolute peak throughput. Within one round, all systems are driven by the
+> same client model and workloads on identical hardware, so the *relative*
+> standings are trustworthy even when absolute figures move between rounds.
 
 ## Setup
 
@@ -22,9 +29,13 @@ and what it means in practice.
 **i7-8550U** (4 cores / 8 threads, 1.8 GHz) with 8 GB RAM.
 
 **Nodes.** Every database runs as its own set of identical unprivileged LXC
-containers — each **1 vCPU / 512 MB RAM / 4 GB disk**, Debian 12 — bridged on one
-VLAN. A 3-node configuration is three such containers; a 2-node configuration is
-two.
+containers — each **1 vCPU / 512 MB RAM / 4 GB disk**, Debian 12, bridged on
+one VLAN. A 3-node configuration is three such containers; a 2-node
+configuration is two.
+
+**Client runs inside the VLAN**, on a dedicated container, not the
+workstation — workstation→VLAN RTT measured 17–40 ms this round, which would
+swamp the sub-10ms latencies under test.
 
 **Durability is matched across systems.** In each config a write is acknowledged
 to the client only after the same number of nodes have made it durable:
@@ -38,12 +49,7 @@ to the client only after the same number of nodes have made it durable:
 
 ¹ MariaDB semi-sync acknowledges after the **first** replica responds and has no
 "wait for N replicas" knob, so true all-3 durability isn't expressible; its C3
-row is the same semi-sync mode as C4 (≈ 2-of-3) and is marked `*`.
-
-**Client.** A multithreaded load generator holds one persistent, pre-authenticated
-connection per thread (skaidb over its binary protocol via the Rust driver;
-MongoDB via `pymongo`; PostgreSQL via `psycopg2`; MariaDB via `pymysql`). Each op
-is its own committed/acked operation.
+row is the same semi-sync mode as C4 (≈ 2-of-3), a single measurement marked `*`.
 
 **Workloads** (throughput in **ops/sec**, higher is better):
 
@@ -52,307 +58,120 @@ is its own committed/acked operation.
 - `read 16c` — 16 connections, point read by primary key over a 1,000-row table
 - `mixed 16c` — 16 connections, 50/50 read/write
 
+**skaidb's standing dropped sharply from every previous version of this
+document** — from leading reads and being competitive on writes, to trailing
+every system on every workload this round. This was investigated before
+publishing, not waved away:
+
+- **A real, fixed bug**: the fleet's reference skaidb config predated the
+  `anti_entropy_interval_secs=3600` pin and ran on the 60-second default —
+  the same back-to-back-repair-pass pattern documented as a production
+  incident (see CLUSTERING.md). Fixed and the **entire skaidb matrix
+  re-run**; numbers barely moved (read 16c: 960→984 ops/s), so this was not
+  the dominant cause — but it was a genuine methodology bug and the fix
+  stands.
+- **Ruled out**: per-operation reconnection (the client holds one persistent
+  connection per thread for the whole run — confirmed in `bench.rs`), and
+  write shedding (0 errors on every leg, every config).
+- **The latency shape** (p50 ≈ 1 ms, p99 10–35 ms) matches scheduling-jitter
+  tail latency on an oversubscribed host, not a uniform engine slowdown — a
+  fast median says the storage path itself isn't the bottleneck.
+- **Not fully root-caused.** The leading hypothesis: skaidb's
+  leaderless/quorum coordination issues more internode round-trips per
+  operation than PostgreSQL's simpler primary-writes-locally model, making
+  it more sensitive to host-level scheduling jitter at this row count, where
+  coordination overhead dominates raw storage work. This is inconsistent
+  with production skai-cluster telemetry (sub-50 ms p99 on equivalent shapes
+  at far higher load) — **treat this round's skaidb C1–C4 numbers as
+  contention-dominated, not representative of isolated-host or production
+  performance; re-run on a dedicated host before drawing product
+  conclusions.**
+
 ## C1 — 2 nodes, writes wait for **both**
 
 | Workload | skaidb | MongoDB 7 | MongoDB 8 | PostgreSQL | MariaDB |
 |----------|-------:|----------:|----------:|-----------:|--------:|
-| write 1c  |   149 |   105 |   139 | **216** | 153 |
-| write 16c | 1,369 |   897 |   849 | **1,924** | 979 |
-| read 16c  | **3,064** | 2,503 | 2,231 | 2,605 | 2,449 |
-| mixed 16c | 1,848 | 1,196 | 1,145 | **2,175** | 1,464 |
+| write 1c  |    299 |    215 |    244 | **565** |    314 |
+| write 16c |    635 |    951 |  1,091 | **2,100** |  1,189 |
+| read 16c  |    975 |  1,942 |  1,846 | **3,709** |  2,082 |
+| mixed 16c |    791 |  1,287 |  1,450 | **2,606** |  1,580 |
 
 ## C2 — 2 nodes, writes wait for the **primary only** (async replication)
 
 | Workload | skaidb | MongoDB 7 | MongoDB 8 | PostgreSQL | MariaDB |
 |----------|-------:|----------:|----------:|-----------:|--------:|
-| write 1c  |   141 |   239 |   216 | **261** | 150 |
-| write 16c | 1,348 | 1,725 | 1,275 | **2,270** | 1,071 |
-| read 16c  | **3,234** | 2,418 | 2,131 | 2,714 | 2,058 |
-| mixed 16c | 1,809 | 1,965 | 1,554 | **2,249** | 1,514 |
+| write 1c  |    325 |    666 |    536 | **788** |    327 |
+| write 16c |    621 |  1,436 |  1,561 | **3,022** |  1,097 |
+| read 16c  |  1,053 |  1,776 |  1,878 | **4,441** |  2,205 |
+| mixed 16c |    790 |  1,383 |  1,556 | **3,460** |  1,541 |
 
 ## C3 — 3 nodes, writes wait for **all 3**
 
 | Workload | skaidb | MongoDB 7 | MongoDB 8 | PostgreSQL | MariaDB* |
 |----------|-------:|----------:|----------:|-----------:|---------:|
-| write 1c  |   149 |   120 |   120 | **184** | 147* |
-| write 16c | 1,290 |   802 |   696 | **1,357** | 915* |
-| read 16c  | 2,486 | 2,408 | 2,393 | **2,664** | 2,601* |
-| mixed 16c | 1,734 | 1,136 |   904 | **1,770** | 1,410* |
+| write 1c  |    237 |    260 |    235 | **499** |    292* |
+| write 16c |    584 |  1,063 |    983 | **2,128** |    954* |
+| read 16c  |    989 |  1,893 |  1,836 | **4,164** |  2,173* |
+| mixed 16c |    775 |  1,427 |  1,438 | **3,135** |  1,476* |
 
-`*` MariaDB acks after 1 replica (see note ¹), so its C3 ≈ 2-of-3, not all-3.
+`*` MariaDB's C3 is the identical physical config as C4 (see note ¹) — a
+single measurement, not an independent second run.
 
 ## C4 — 3 nodes, writes wait for **2 of 3** (quorum)
 
 | Workload | skaidb | MongoDB 7 | MongoDB 8 | PostgreSQL | MariaDB |
 |----------|-------:|----------:|----------:|-----------:|--------:|
-| write 1c  |   149 |   127 |   138 | **183** | 134 |
-| write 16c | 1,328 |   886 |   791 | **1,684** | 886 |
-| read 16c  | **3,000** | 2,256 | 2,255 | 1,958 | 2,066 |
-| mixed 16c | 1,856 | 1,201 | 1,098 | **1,999** | 1,364 |
+| write 1c  |    234 |    219 |    265 | **574** |    292 |
+| write 16c |    585 |    952 |  1,026 | **2,447** |    954 |
+| read 16c  |    984 |  1,822 |  1,691 | **4,409** |  2,173 |
+| mixed 16c |    733 |  1,238 |  1,310 | **3,071** |  1,476 |
 
-## skaidb: reads and writes on **all nodes** (leaderless)
+**PostgreSQL wins every cell this round.** Its commit path sits at the
+network-latency floor and its replication is a lightweight streaming-WAL
+protocol; combined with the host contention discussed above, it pulled
+further ahead of every leaderless/multi-round-trip system (skaidb, MongoDB)
+than in prior isolated-host runs. Take this as this-round's relative
+standing under contention, not a durable architectural verdict — see Setup.
 
-skaidb is leaderless — every node accepts both reads and writes and coordinates
-the quorum itself. Inserting a row through each of the three nodes and reading
-each back from a *different* node returns consistent results, and a full scan
-from any node sees all writes.
+Two real methodology bugs were caught and fixed **during** this round rather
+than silently producing wrong numbers:
 
-Driving all 16 connections at a **single coordinator** node vs **fanning them
-across all 3 nodes** (round-robin), in the C4 (3-node quorum) config:
+- **PostgreSQL**: `ALTER SYSTEM` and `pg_reload_conf()` must be separate
+  `psql -c` invocations — combining them errors ("cannot run inside a
+  transaction block") and silently leaves the *previous* sync config active.
+  The first C3 attempt used the stale C4 setting; discarded and re-run
+  correctly.
+- **MariaDB**: `rpl_semi_sync_slave_enabled` was OFF on the replicas
+  throughout this fleet's history — only the master-side flag had ever been
+  set. With the slave flag off, `rpl_semi_sync_master_enabled=ON` silently
+  degrades to fully-async writes with no error and no timeout, which means
+  **every previous MariaDB "semi-sync" number ever published in this
+  document was actually measuring async**. Fixed this round (slave-side
+  flag set + IO thread restarted to register — verified via
+  `Rpl_semi_sync_master_clients > 0` before every semi-sync leg) and all
+  four MariaDB configs measured with genuine semi-sync where the config
+  calls for it.
 
-| Workload | single coordinator | all 3 nodes (fan-out) |
-|----------|-------------------:|----------------------:|
-| write 16c | 1,337 | 1,338 |
-| read 16c  | 3,181 | 3,178 |
-| mixed 16c | 1,891 | 1,879 |
+The previous version of this document's **leaderless fan-out sub-experiment**
+(single-coordinator vs. round-robin across all 3 skaidb nodes) was not
+re-run — the in-tree Rust bench client has no multi-host round-robin mode.
+Dropped rather than kept stale; a future re-add needs a small harness change.
 
-A single coordinator is not the bottleneck at this connection count — fan-out
-and single-coordinator are a statistical tie on every workload. The point of
-fan-out is **availability and client locality** — connect to any node, tolerate
-losing one — not throughput.
+## Memory footprint (process RSS, after this round's workload)
 
-## Memory footprint (idle, per node, of 512 MB)
-
-Measured as container `free` "used" on one node of each system, idle a few
-minutes after the benchmark run:
+Not a clean re-measurement of the original "idle, `free`-based, minutes after
+a 1,000-row run" methodology — containers were repurposed between legs this
+round. These are single-process RSS snapshots taken during/shortly after
+this round's runs, given as a rough order-of-magnitude comparison, not a
+precise re-verification:
 
 | | skaidb | MongoDB 7 | MongoDB 8 | PostgreSQL | MariaDB |
 |--|------:|----------:|----------:|-----------:|--------:|
-| node RAM used | **25 MB** | 91 MB | 97 MB | 41 MB | 51 MB |
+| process RSS | ~36 MB | ~61 MB | ~70 MB | n/m¹ | ~41 MB |
 
-(The skaidb server process itself is ~6 MB RSS; the rest is the container's
-base system.)
-
-## What the matrix shows
-
-**skaidb owns the read rows.** Its point reads lead every config except C3
-(where PostgreSQL edges it by 7%): 3,064 ops/s at C1, 3,234 at C2, and 3,000
-at C4 — 53% ahead of PostgreSQL's 1,958 in the headline 3-node-quorum config,
-despite skaidb doing a cross-node quorum confirmation per read while the
-others read purely locally from the primary. With prepared statements on both
-sides the read lead widens further (below).
-
-**PostgreSQL still leads writes and mixed, but the gap has closed sharply.**
-It tops every `write` and `mixed` row. At C3 the margins are now 5% on
-concurrent writes (1,357 vs 1,290) and 2% on mixed (1,770 vs 1,734) —
-effectively ties on this hardware; at C4 they are 27% and 8%. PostgreSQL's
-remaining edge is a commit path that is at the network-latency floor
-(single-digit-connection writes) and decades of group-commit tuning under
-concurrency (C2's async 2,270 writes/s).
-
-**skaidb is the strongest non-PostgreSQL writer in every durable config.** Its
-group-commit WAL and pipelined replication put `write 16c` at 1,290–1,369
-across C1/C3/C4 — ahead of both MongoDBs and MariaDB everywhere. Its write
-throughput barely moves with the consistency level (C2's `ONE` 1,348 ≈ C1's
-both-nodes 1,369): the replica round-trip is fully overlapped with the local
-fsync, so relaxing durability buys almost nothing — whereas MongoDB 7 jumps
-897 → 1,725 and PostgreSQL 1,924 → 2,270 when freed from the sync ack.
-
-**Waiting for all 3 (C3) vs quorum (C4)** costs skaidb almost nothing
-(1,290 vs 1,328 concurrent writes): the second peer's append+fsync happens in
-parallel with the first's. MongoDB pays the most for C3 (mongo8: 696 vs 791).
-
-**skaidb does all of this on 25 MB of node RAM** (~6 MB process RSS) — a
-fraction of MongoDB's ~95 MB and half of PostgreSQL's 41 MB, on nodes with
-only 512 MB to spend.
-
-## Caveats
-
-- **Single host, small cores.** All 15 containers share one 4-core / 8-thread
-  host, and each database node is capped at 1 vCPU. Numbers are a relative,
-  small-node comparison; absolute throughput would be far higher on server-class
-  hardware. Connection counts above 16 saturate the shared host and are not
-  reported.
-- **Run-to-run noise on a shared host is real** — treat single-digit percentage
-  differences between systems or between runs as a tie. Only alternating
-  same-day A/B runs are trusted for release-to-release deltas
-  (position-in-sequence effects are the same size as single-digit deltas).
-- **This fleet has a shared per-op floor** (~5 ms from the oversubscribed host
-  plus cross-node quorum RTT): on read-heavy legs *every* database lands in the
-  same ~2,400–3,200 ops/s band regardless of engine or cache configuration. If
-  a change doesn't move this fleet's numbers, isolate it on a single node over
-  loopback before concluding it does nothing.
-- **MariaDB** can't express "wait for all replicas" with semi-sync (acks after 1),
-  so its C3 column is effectively its C4 mode.
-- skaidb reads are **quorum reads** (the coordinator confirms with a peer to
-  satisfy `default_read_consistency = QUORUM`), so each read still costs a
-  cross-node round-trip; the other systems read locally from the primary.
-  Setting skaidb's read consistency to `ONE` would make reads node-local and
-  faster still, at the cost of read-your-writes across coordinators.
-
-## v0.81 re-run (2026-07-15)
-
-The comparison matrix above was measured on v0.19.0. A full same-day
-re-campaign on v0.81.3 (all four configs, five systems, 2 alternating runs
-each) confirms **no throughput regression** from the large storage rework
-of this release train — journal-ack writes, background flush/compaction,
-async DDL backfill (§v0.81) — despite those moving index/FTS maintenance and
-SSTable builds off the write-ack path. On this shared, oversubscribed
-4-core host the five databases again land in one band per workload (the
-environment floor documented under *Caveats*: run-to-run spread reached
-50–100% on the cold first config, warming to ±15% — cluster-level numbers
-here measure the host, not the engine). The clean single-node signal is the
-FTS leg below, which is decisive and improved at v0.81.6 (ingest +15% once the compaction loops were fixed).
-
-The headline v0.81 wins are latency-shape, not peak throughput, and don't
-show in this steady-state matrix: writes no longer stall behind flush,
-compaction, or FTS indexing; DDL acks at schema-apply instead of holding the
-write lock through a full backfill; a node restart no longer blocks minutes
-on FTS rebuild. These were validated in production (the agencik dogfood
-cluster) rather than on this fleet.
-
-## Current performance notes (v0.19.0)
-
-The durable findings from the optimization work since the matrix run — what to
-use and what to expect. (Per-release histories and the record of measured dead
-ends live in [Performance engineering notes](#performance-engineering-notes) below and git history.)
-
-**Use prepared statements for read-heavy work.** `?` placeholders +
-`Prepare`/`Execute` (v0.17.0) make point reads ~9% faster (C4 read 16c:
-2,951 → 3,214, extending the same-day lead over PostgreSQL-prepared to +14%)
-with tighter p99s; mixed gains ~4%. Writes are flat — a durable quorum write's
-service time is fsync + replication, and the ~40 µs parse was never a
-measurable part of it. Beyond speed, server-side typed bindings replace
-client-side string interpolation as the injection boundary.
-
-**Use streamed queries for large results.** A buffered `SELECT` holds the whole
-result on both sides and cannot return a result set past the 64 MiB frame limit
-at all. `query_stream()` (v0.19.0) sends ~256 KB chunks: on a 55 MB result it
-was measurably *faster* end-to-end (274 → 213 ms, transfer overlaps decode) and
-cut client peak RSS from ~140 MB to <9 MB; a 66 MB result that the buffered
-path refuses streams through in ~270 ms. Single node, loopback, release build.
-
-**`memory_target` is a capacity control, not a throughput lever.**
-`[storage] memory_target = "auto"` (v0.18.0) budgets the memtable + read cache
-from the node's cgroup/host memory limit. Isolated on loopback with 1M rows, a
-deliberately undersized 48 MB budget cost only ~8% read throughput vs
-everything fitting in a 256 MB memtable — block cache + bloom filters keep
-SSTable point-reads nearly memtable-speed. On the fleet it changed nothing,
-because the fleet is network-bound (see Caveats). Check whether your bottleneck
-is actually memory before reaching for it.
-
-**Scale exposed real bugs the small suite never hit.** Loading 1M rows into
-512 MB nodes OOM-killed them twice: an unbounded background-replication queue
-and an unpaged anti-entropy pass (both fixed in v0.18.0 — bounded queue,
-paged merge-join repair), and v0.19.0 paged the distributed full-table scan the
-same way. Benchmarks are now expected to scale to the feature's target size,
-not the suite's historical 1,000 rows.
-
-## Full-text search vs Elasticsearch (v0.38, 2026-07-08; re-run v0.81.6, 2026-07-15)
-
-The FTS performance exit benchmark: skaidb `SEARCH INDEX` against
-Elasticsearch 8.14.3 on **identical fresh containers** (p225: 2 vCPU /
-2 GB / 25 GB Debian 12 LXC each), one system running at a time with the
-rest of the bench fleet stopped. skaidb v0.38 + the background NRT
-refresher (found by this bench, see below), `memory_target = "1GB"`; ES
-with a 1 GB heap, 1 shard, 0 replicas, security off. Corpus: **280,595
-Simple English Wikipedia articles** (lead prose, ≤ 2,000 chars — Wikimedia
-discontinued the abstract dumps), identical bytes to both engines, both on
-their `standard` analyzer and 1 s refresh, per-batch durability (skaidb:
-WAL fsync per statement; ES: translog fsync per bulk request). Client: one
-connection on each system's canonical protocol (skaidb binary / ES HTTP
-keep-alive) from a container on the same bridge (0.1 ms RTT). 1,000-doc
-batches; queries are the same 400 generated term/AND/OR/phrase inputs,
-top-10 ranked. Two alternating runs per system; run-2 (warm) shown for ES,
-skaidb was stable across both.
-
-|                       | skaidb 0.81.6 | Elasticsearch 8.14.3 |
-|-----------------------|--------------:|---------------------:|
-| ingest (docs/s)       | **11,084–11,124** | 4,980 (3,832 cold) |
-| term p50 / p95 (ms)   | **0.5 / 0.7** |           6.2 / 10.6 |
-| AND p50 / p95 (ms)    | **0.5 / 0.6** |            6.5 / 9.5 |
-| OR p50 / p95 (ms)     | **0.7 / 1.0** |           7.1 / 14.0 |
-| phrase p50 / p95 (ms) | **0.7 / 6.4** |           5.8 / 18.5 |
-| NRT visibility (ms)   |     471 |            98–629 |
-
-Both §4 single-node targets hold at v0.81.6: query latency ~10× under ES on
-every class (identical per-query hit counts — 1000/845/1000/495
-term/AND/OR/phrase — so the sets are equivalent), ingest ~2.2× ES bulk.
-
-**Measured on v0.81.6, after the compaction-loop fix.** The first v0.81.x
-re-run (on v0.81.3) reported 9,331–9,690 docs/s ingest; that build still had
-two background-compaction loops (a global-epoch discard and a deepest-level
-self-compaction, fixed in v0.81.5/v0.81.6) that churned the write path and
-depressed ingest ~15%. With them fixed, ingest recovered to ~11,100 docs/s
-across two stable runs. Query latency was unchanged between the two builds
-(reads never touched the loops), confirming the delta was write-path
-contention, not a search-side effect. The journal-ack + background
-flush/compaction rework (§v0.81) thus holds its throughput once the
-scheduler bugs it introduced were closed — FTS indexing runs off the
-write-ack path with no ingest cost.
-
-**Cluster leg** (3-node test cluster on v0.39, RF=3 QUORUM, 1 GB nodes,
-60 k docs): ingest 3,053 docs/s through one coordinator (every row
-replicated ×3), ranked top-10 scatter queries p50 2–3 ms / p99
-2.9–7.6 ms (term/AND/OR) — the scatter adds well under the ≤ 10 ms p99
-budget over single-node. NRT visibility 149 ms cluster-wide. Kill -9 on a
-member left searches complete, a quorum write during the outage landed,
-and the rejoined node served the converged result set.
-
-Caveats, honestly: part of the per-query gap is protocol — ES answers
-JSON-over-HTTP (its only surface), skaidb its binary protocol; both are
-each system's canonical path, but they are not equal-cost framing. A 1 GB
-heap is small for ES (it is also half the container, matching skaidb's
-budget); hit counts agreed within tokenizer-level differences (AND 850 vs
-845, phrase 551 vs 495). Single query stream; the host carries unrelated
-(identical for both) background load. Cluster scatter-gather overhead
-(§4's ≤ 10 ms p99 target) is a separate leg on the 3-node test cluster,
-pending its upgrade to ≥ v0.38.
-
-**The bench found a real bug**: skaidb's NRT probe initially hung forever —
-index refresh checks ran only on the write path, so an idle table's *last*
-writes never became visible to read-only searches. Fixed with a background
-refresher tick in the server (v0.39); the probe then measured 43–1,197 ms,
-inside the refresh_ms + tick bound.
-
-**Result-set parity** (the FTS query-DSL exit, same corpus and
-queries): mean top-10 overlap per query against ES initially measured
-89.2% — score traces put nearly all of the divergence in tokenization
-(skaidb's `standard` split on every non-alphanumeric; ES uses Unicode word
-segmentation, so postings, phrase adjacency, and length norms differed).
-Replacing the simple tokenizer with a UAX §29 word tokenizer (v0.39)
-brought it to **98.5% strict top-10 overlap / 99.8% with tie tolerance**
-(each engine's top-10 within the other's top-15) across
-term/AND/OR/phrase, with per-query hit counts matching ES exactly and no
-measurable query-latency cost. The remaining ~1.5% is BM25 fieldnorm
-quantization flipping near-tied docs at the cutoff. Run it:
-`fts_bench.py parity <skaidb:7080> <es:9200> <data_dir>`.
-
-Reproduce: `bench/clients/fts_corpus.py` (corpus + query generation from a
-MediaWiki dump) and `bench/clients/fts_bench.py`
-(`fts_bench.py <skaidb|es> <addr> <setup|ingest|query|nrt> <data_dir>`).
-
-### Aggregations (logs track, v0.41)
-
-The phase-6 exit: a 500 k-doc synthetic http_logs-shape corpus
-(`bench/clients/fts_logs_corpus.py` — request line text, keyword
-method/status, long bytes, date ts), same containers and procedure as
-above, 20 MATCH-filtered aggregation queries per class, warm runs:
-
-|                                     | skaidb 0.41 | Elasticsearch 8.14.3 |
-|-------------------------------------|------------:|---------------------:|
-| ingest (docs/s)                     |  **34,400** |  20,500 (15,400 cold) |
-| terms buckets p50 (ms)              |    **0.6** |                  6.8 |
-| date_histogram p50 (ms)             |    **1.5** |                 10.4 |
-| global stats p50 (ms)               |    **2.1** |                  6.3 |
-| COUNT(DISTINCT) p50 (ms)            |    **0.5** (exact) |     4.4 (approx.) |
-| grouped multi-metric p50 (ms)       |        276 |             **10.4** |
-
-**Result parity: 80/80 aggregation queries identical** (bucket sets,
-counts, sums, averages; skaidb's `COUNT(DISTINCT)` is exact where ES's
-cardinality is HLL-approximate).
-
-The grouped multi-metric row is the interesting one — and it's the row
-that made this benchmark worth running. The first pass pushed grouped
-`SUM`/`AVG` into Tantivy sub-aggregations and the parity check caught
-**silently wrong sums on minority buckets** (counts exact, sums ~40% low):
-an upstream tantivy 0.26.1 bug where `CachedSubAggs::flush_local` drops
-small buckets' cached doc ids uncollected on periodic flushes (triggered
-by merged segments > 2048 docs). No count-based exactness check can see
-it. skaidb now declines that pushdown shape — grouped queries push down
-only when every metric reads the bucket's doc count, and per-bucket
-metrics take the exact row-materialization fallback (the 276 ms above,
-~29 k rows per query). The gap closes when the upstream fix lands.
+¹ PostgreSQL's per-backend-process model makes a single process RSS
+misleading (shared_buffers is shared memory, not counted per-process); not
+measured this round rather than publish a number known to understate it.
 
 ## Reproducing
 
@@ -372,32 +191,144 @@ come from `cargo run --release --example index_bench -p skaidb-engine`
 Write consistency is set per node via `cluster.default_write_consistency`
 (`ONE` | `QUORUM` | `ALL`) and replication factor via `cluster.replication_factor`.
 
-## Sharded scatter partials — fleet verification (v0.57.0, 2026-07-09)
+**Run the client from a VLAN-local container**, not the workstation —
+see Setup. `bench/run_suite.sh` needs the client binaries and (for
+Mongo/Postgres/MariaDB) a Python venv with `pymongo psycopg2-binary pymysql`
+pushed into that container; `pct push`/`pct pull` move files between the
+Proxmox host and a container (direct SSH to container IPs from outside the
+VLAN is not set up on this fleet).
 
-3-LXC fleet on shared hardware (1 GB memory target each), **RF = 2 over 3
-members** — a genuinely sharded corpus, every document replicated twice.
-100,000 deterministic log docs (text `msg`, keyword `level`, long
-`bytes`) ingested over the ES bulk endpoint; ground truth computed
-independently from the generator.
+## Global-index routed probe — phase-4 A/B (v0.92.1, 2026-07-16)
 
-- **Parity**: grouped per-level counts, global
-  `COUNT(*)`/`SUM`/`MIN`/`MAX` (24,998 matching docs), and `AVG` (row
-  fallback) — exact from **every** coordinator. Double replication never
-  double-counted: the ownership arcs tile the key-space.
+Two rounds this pass, both RF=1 (genuinely sharded — every row lives on
+exactly one member), 250k rows / 5,000 distinct indexed values, one LOCAL
+secondary index and one GLOBAL index on identical twin tables, 100 equality
+probes per round with the same seeded value sequence on both, interleaved
+so host-contention noise (this host also ran the C1–C4 matrix's containers
+plus the FTS soak) hits both arms equally.
+
+**Correctness: exact in both rounds** — identical row counts returned by the
+local-index scatter and the global-index routed probe on every round, at
+both topologies below. Getting a clean result here is itself the finding:
+this bench caught two real backfill bugs on its first attempts, both fixed
+before any number was trusted:
+
+1. The backfill driver wrote entries one replicated quorum write at a time
+   (~15 ms each → close to an hour for 250k rows), and a repair pass would
+   queue a duplicate full re-drive on top. Fixed: entries batch into one
+   `ApplyBatch` per destination per page, and a drive exits immediately if
+   the index is already ready.
+2. Under host memory/CPU pressure the driver **logged and silently skipped**
+   entry batches that failed to reach write quorum, then broadcast readiness
+   anyway — every probe would have silently missed ~1% of rows, permanently
+   at RF < members (no full-copy verify leg to catch it). Fixed: failed
+   batches retry with backoff; a batch that still fails aborts the drive
+   with `building` left set, so probes keep the correct (if slower) scatter
+   fallback until a re-drive completes cleanly.
+3. At 3 members, the backfill silently stalled below quorum on one member
+   (a fresh 3-node ring joining right as 250k-row loads landed) and needed
+   an explicit `REPAIR CLUSTER` to re-drive — the phase-3 hardening's
+   re-queue-on-`building` logic picked it up and completed cleanly within
+   the same repair pass. Automatic re-drive depends on
+   `anti_entropy_interval_secs`; this fleet has it pinned to 3600s to avoid
+   the repair-storm failure mode (see Setup), so a stalled backfill during
+   active benchmarking needs a manual nudge — noted as a real operational
+   texture, not hidden.
+
+**Latency:**
+
+| Members | RF | local-index scatter (median / p95) | global-index routed probe (median / p95) |
+|--------:|---:|----------------------------------:|------------------------------------------:|
+| 2 | 1 | 11.5 / 28.2 ms | 11.3 / 32.3 ms |
+| 3 | 1 | 3.3 / 4.5 ms | 2.9 / 4.0 ms |
+
+At 2 members the two are at parity — the ~50-candidate quorum resolve
+dominates both arms, and 2-member scatter costs exactly one extra peer RPC.
+At 3 members the routed probe pulls ahead (~12% faster median): the
+scatter's fan-out cost grows with member count while the routed probe's does
+not, matching the design's core thesis. (The 3-member absolute latencies are
+far lower than the 2-member row because this leg ran without the C1-C4
+matrix's host contention alongside it — not a topology effect; don't compare
+the two rows' absolute numbers to each other.) The routing win is expected
+to widen further at higher member counts (untested — this fleet tops out at
+3 containers); re-run at 5+ members if that fleet becomes available before
+any prod-adoption call. At RF = full (the current production topology) a
+global index buys nothing by design — every node already holds every row.
+
+## Sharded scatter partials — fleet verification (v0.92.1, 2026-07-16)
+
+3-node fleet, **RF = 2 over 3 members** — a genuinely sharded corpus, every
+document replicated twice. 100,000 deterministic synthetic log documents
+(text `msg`, keyword `level`, long `bytes`), ingested via the binary
+protocol driver.
+
+- **Parity**: grouped per-level counts (error 10,084 / info 69,945 / warn
+  19,971, summing to exactly 100,000), global `COUNT`/`SUM`/`MIN`/`MAX`, and
+  `AVG` all exact.
 - **Latency** (grouped count over `MATCH`, p50/p95 of 15 runs, warm):
-  partials **169 / 180 ms** vs forced row fallback **598 / 668 ms** —
-  ~3.5× at this size, and the gap itself proves which path served.
-- **Kill**: with one member down the scatter declines and the fallback
-  answers **exactly** (RF = 2 keeps every key on a survivor) at ~990 ms;
-  after rejoin the partials path restores (169 ms, exact).
-- **Reshard**: live remove-node → 2 members (RF ≥ members local path,
-  exact) → re-add at a new epoch → sharded path back, exact.
+  partials **184.4 / 229.6 ms** vs. a forced row-fallback (a residual
+  predicate the aggregation pushdown can't cover) **8,166.3 / 8,754.4 ms** —
+  a **44.3×** p50 speedup, and the gap itself proves which path served each
+  query.
+- **Sorted top-k**: exact 10-row result in 203.6 ms.
 
-Surface completion re-check (same fleet, 30 k docs): **sorted top-k**
-exact from every coordinator (per-shard fast-field top-k, k-way merged),
-**AVG** now partials-class (~71 ms p50 vs its former fallback-class
-latency) via the SUM+COUNT rewrite, and **per-hit explain** answering on
-every hit through the key-routed forward — all three coordinators.
+Scope note: this pass re-verified parity and the partials-vs-fallback
+latency gap — the prior version's kill/rejoin and live-reshard resilience
+demos were not re-run this round (they exercise cluster membership
+mechanics, not benchmark throughput, and would have meaningfully extended
+an already long fleet campaign). Re-run them before citing resilience
+claims from this document.
+
+## Full-text search vs Elasticsearch (v0.92.1, 2026-07-16)
+
+skaidb `SEARCH INDEX` (single node) against Elasticsearch 8.14.3 (single
+node), both on dedicated 2 vCPU / 2 GB Debian 12 LXCs, driven from a third
+VLAN-local client container. **100,000-document synthetic corpus** (short
+prose sentences, deterministic generation, `id`/`title`/`body` schema) —
+**not** the original benchmark's 280,595-document Simple English Wikipedia
+corpus. The original corpus generator needs a MediaWiki `pages-articles`
+XML dump that isn't staged on this fleet and wasn't re-downloaded this
+round (Wikimedia discontinued the shortcut abstract dumps the generator
+was written against); regenerating a matching Wikipedia corpus is future
+work, tracked in TODO.md. Both engines: `standard` analyzer, 1 s refresh,
+per-batch durability (skaidb: WAL fsync per statement; ES: translog fsync
+per bulk request), 1 GB heap for ES / matching memtable budget for skaidb.
+
+|                       | skaidb 0.92.1 | Elasticsearch 8.14.3 |
+|-----------------------|--------------:|----------------------:|
+| ingest (docs/s)       |     **7,952** |                  4,733 |
+| term p50 / p95 (ms)   |    **1.3 / 1.7** |            14.2 / 19.9 |
+| AND p50 / p95 (ms)    |    **4.1 / 6.3** |            26.6 / 53.6 |
+| OR p50 / p95 (ms)     |    **4.4 / 5.2** |            29.3 / 32.5 |
+| phrase p50 / p95 (ms) |         26.2 / 26.8 |        **27.1 / 37.9** |
+| NRT visibility (ms)   |         **43** |                    684 |
+| process RSS (post-ingest) | **~291 MB** |               ~1,412 MB |
+
+skaidb leads ingest (1.7×) and every query class except phrase, where the
+two are within noise (26.2 vs 27.1 ms p50) — a synthetic-corpus artifact:
+the generator's limited vocabulary produces heavy phrase repetition
+("X borders the X" patterns), which is a harder phrase-adjacency shape than
+natural prose for both engines' postings.
+
+**Result-set parity** (same corpus and queries, top-10 id-set overlap):
+
+| class | strict @10 | @10-in-15 (tie-tolerant) |
+|-------|-----------:|--------------------------:|
+| term | 94.7% | 100.0% |
+| and | 99.0% | 100.0% |
+| or | 97.0% | 100.0% |
+| phrase | 86.0% | 98.0% |
+| **overall** | **94.2%** | **99.6%** |
+
+In line with the original benchmark's 98.5%/99.8% (natural-prose corpus);
+the gap here is attributable to the synthetic corpus's repetitive phrasing
+stressing BM25 tie-breaking harder than the original's real-article prose.
+
+Scope note: the original benchmark's cluster leg (3-node ingest + scatter
+query latency + kill/rejoin) and the NRT-visibility bug-discovery narrative
+are historical record from when they were found, not re-verified this
+round — re-run before citing cluster-scale FTS latency claims from this
+document.
 
 ## Performance engineering notes
 
@@ -421,7 +352,10 @@ under `[perf]`; what follows is the record that keeps dead ends dead.*
   buffers and allocate nothing steady-state.
 - Row-returning results can stream in ~256 KB chunks (`QueryStream`), and
   distributed full-table gathers + anti-entropy are paged (2,000 rows/page) —
-  coordinator memory is O(pages in flight), not O(table).
+  coordinator memory is O(pages in flight), not O(table). Raw time-series
+  dumps are scan-metered (v0.91) so an unbounded range fails cleanly instead
+  of growing until OOM; forward index-ordered walks stream (v0.91) instead
+  of materializing the whole entry range up front.
 - Client connections **pipeline**: id-tagged requests (`OP_TAGGED`) let a
   client keep any number of requests in flight per connection; the server
   executes serially in order (session semantics unchanged) and echoes the id
@@ -438,6 +372,10 @@ under `[perf]`; what follows is the record that keeps dead ends dead.*
 - The pre-`ScanPage` repair fallback (used only against peers too old to
   answer `ScanPage`) necessarily remains O(table) — the old peer's wire
   protocol has no paging. It never fires between current versions.
+- Repair digests skip a stamp scan entirely for unchanged tables (v0.88.1's
+  versioned digest cache) and, when a scan is needed, never decompress
+  value bytes (the `.stamps` sidecar) — a converged prod pass dropped from
+  >240s to ~60s (measured post-v0.89.0 roll).
 
 ### Deliberately skipped (documented reasons)
 
@@ -478,34 +416,21 @@ under `[perf]`; what follows is the record that keeps dead ends dead.*
 - If every system lands in the same band on a fleet leg, suspect a shared
   environmental floor and isolate on a single node over loopback before
   concluding a change does nothing (or something).
-
-## Global-index routed probe — phase-4 A/B (v0.91.x, 2026-07-16)
-
-2× 1-vCPU/512 MB bench LXCs, **RF = 1 over 2 members** (genuinely
-sharded), two identical 250 k-row tables on the same cluster — one with a
-LOCAL secondary index (`i_l`), one GLOBAL (`i_g`) — 5 000 senders × ~50
-rows. 100 equality probes per round, same seeded senders both arms,
-rounds interleaved L,G,L,G from one coordinator (the FTS soak shared the
-host; interleaving puts its noise on both arms equally).
-
-- **Correctness: exact.** Both arms returned identical row counts on
-  every round (9 896 = 9 896). Getting here is the real result — the
-  bench caught two backfill bugs on its first runs:
-  1. the driver wrote entries one replicated quorum write at a time
-     (~15 ms each → an hour for 250 k rows) and every repair pass queued
-     a duplicate full re-drive (fixed in v0.91.1: batched ApplyBatch per
-     destination per page + drives skip when already ready);
-  2. under post-load memory pressure the driver **logged and skipped**
-     shed batches, then broadcast readiness — probes silently missed
-     ~1.2 % of rows, unhealable at RF < members (fixed in v0.91.2:
-     retry with backoff; persistent failure aborts with `building` left
-     set, so probes keep the correct scatter fallback until a re-drive
-     completes).
-- **Latency: parity at 2 members.** local scatter median 11.5 ms /
-  p95 28.2 ms vs routed probe median 11.3 ms / p95 32.3 ms (n=200 each).
-  Expected shape: the ~50-candidate quorum resolve dominates both arms,
-  and 2-member scatter costs exactly one extra peer RPC. The routing
-  thesis — probe stays one replica-set round-trip while scatter fans to
-  every member — needs 3+ members to surface; re-run at 3+ nodes when
-  the fleet frees up before any prod-adoption call. At RF = full (the
-  current production topology) a global index buys nothing by design.
+- **Run the client inside the VLAN, never from the workstation** (2026-07-16):
+  workstation→VLAN RTT measured 17–40 ms on this network, enough to
+  dominate every sub-10ms latency this fleet measures. Stage the client
+  binary/venv on a spare container via `pct push`.
+- **A fresh bench-fleet config is not automatically a *safe* config** —
+  it must carry every production hardening lesson explicitly (this round's
+  `anti_entropy_interval_secs` omission reproduced a documented repair-storm
+  failure mode). Diff a new fleet config against the current production
+  template before trusting numbers from it.
+- **A silently-wrong config produces a silently-wrong number, not an error**
+  — this round caught PostgreSQL running the previous sync mode (a
+  transaction-block error was visible, but easy to miss in scrollback) and
+  MariaDB "semi-sync" actually running fully async for this fleet's entire
+  history (no error at all — the slave-side flag being off degrades
+  silently). Verify the actual engaged state
+  (`SHOW STATUS LIKE 'Rpl_semi_sync_master_clients'`, `SHOW
+  synchronous_standby_names`, `SHOW INDEXES` for skaidb) before trusting a
+  config-switch, not just the command that was supposed to set it.
