@@ -115,9 +115,28 @@ impl Backend {
                         .execute_session_read_statement(current_db, stmt)
                         .map(SessionEffect::Output);
                 }
-                db.write()
+                // Run the statement under the exclusive lock but sync its
+                // group commits AFTER releasing it: the WAL fsync is ~the
+                // whole write latency, and holding the lock across it
+                // serializes concurrent writers completely (16 connections
+                // measured no faster than 1). Synced outside, concurrent
+                // sessions coalesce in WalSync::sync_through instead — the
+                // same design the cluster path (Node::replicate) uses.
+                // Reads-after-writes hold (the memtable has the rows before
+                // the fsync); the response isn't sent until the sync lands,
+                // so durability-before-ack is unchanged. The sync runs on
+                // error too — rows applied before a mid-statement error must
+                // become durable either way (same contract as inline).
+                let (res, pending) = db
+                    .write()
                     .map_err(|_| EngineError::Cluster("server lock poisoned".into()))?
-                    .execute_session_statement(current_db, stmt)
+                    .execute_session_statement_deferred(current_db, stmt);
+                let synced = pending
+                    .into_iter()
+                    .try_for_each(|(sync, commit)| sync.sync_through(commit));
+                let effect = res?;
+                synced.map_err(EngineError::from)?;
+                Ok(effect)
             }
             Backend::Cluster(node) => {
                 node.execute_session_parsed(current_db, sql, parsed?, consistency)

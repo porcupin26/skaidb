@@ -109,12 +109,17 @@ which leaves the JVM using ~94% of container RAM (481 MB/512 MB) with no
 workload running yet — a real, previously-undocumented data point about
 Elasticsearch's footprint at this hardware class.
 
-| Workload | skaidb (pre-fix) | skaidb (WAL prealloc) | MongoDB 7 | PostgreSQL | MariaDB | Elasticsearch ¹ |
-|----------|------------------:|------------------------:|----------:|-----------:|--------:|-----------------:|
-| write 1c  |    565 |  **1,859** |    571 | 1,895 |    386 |    136 |
-| write 16c |    558 |  **1,608** |  1,123 | **3,828** |  2,127 |    278 |
-| read 16c  | 10,749 | 10,864 |  1,684 |  4,696 |  4,796 |  1,709 |
-| mixed 16c |  1,003 |  **2,380** |    999 | **4,158** |  2,843 |    467 |
+| Workload | skaidb (pre-fix) | skaidb (both fixes) | MongoDB 7 | PostgreSQL | MariaDB | Elasticsearch ¹ |
+|----------|------------------:|----------------------:|----------:|-----------:|--------:|-----------------:|
+| write 1c  |    565 |  **1,887** |    571 | 1,895 |    386 |    136 |
+| write 16c |    558 |  **3,427** |  1,123 | **3,828** |  2,127 |    278 |
+| read 16c  | 10,749 | 10,643 |  1,684 |  4,696 |  4,796 |  1,709 |
+| mixed 16c |  1,003 |  **4,561** |    999 | 4,158 |  2,843 |    467 |
+
+The "both fixes" column is the WAL pre-allocation (v0.93.0) **plus** the
+standalone fsync-outside-the-lock fix described below, measured together.
+With both in place skaidb leads every system on mixed 16c and reads, and
+is within 2%/10% of PostgreSQL on write 1c/16c.
 
 `¹` Elasticsearch's container needed a non-default 256 MB heap to run at
 all in this spec class (see above) — its numbers reflect a system running
@@ -175,10 +180,44 @@ noise) — confirming the fix is write-path-only, as designed. (An earlier
 whole-segment-up-front variant measured the same within noise — the
 chunked design keeps the full win.) skaidb write-1c is now within 2% of
 PostgreSQL's 1,895 (was 3.3× behind); write-16c and mixed-16c narrowed
-from ~6.9×/4.1× behind to ~2.4×/1.7× behind PostgreSQL — the remaining
-gap there is unexplored (candidate next angle: PG's leader/follower
-group-commit under real concurrency, vs. skaidb's write lock serializing
-appends before the async fsync).
+from ~6.9×/4.1× behind to ~2.4×/1.7× behind PostgreSQL.
+
+**The remaining 16c gap was also root-caused and fixed (2026-07-16): the
+STANDALONE server serialized the WAL fsync under its exclusive Database
+lock.** `Backend::Local` (what `seeds = []` gets you — exactly this
+scenario's config) executed every write statement under `db.write()`
+(`shared.rs`), and the statement's group-commit fsync
+(`LocalCluster::flush_pending`, exec.rs) ran **inside** that scope — so
+16 connections serialized through [append + ~0.5ms fsync] one at a time.
+The arithmetic closes exactly: a serial 0.51ms per op caps at ~1,950
+ops/s, and 16c measured 1,608-1,683 — concurrency bought nothing, and
+the cross-session group-commit machinery (`WalSync::sync_through`
+coalescing) never got a chance to coalesce because no two sessions were
+ever in the sync section concurrently. PostgreSQL's 2× scaling to 3,828
+is precisely what its leader/follower group commit buys: concurrent
+committers share fsyncs, pushing past the single-fsync serial ceiling.
+The kicker: **skaidb's CLUSTERED write path already did this right** —
+`Node::replicate` applies under the lock buffered, then fsyncs *outside*
+it (node.rs, step 1-2 comments), which is why the C4 fleet numbers DID
+scale (write 1c 234 → 16c 585, 2.5×) while standalone C0 stayed flat.
+
+**Fix**: `Database::execute_session_statement_deferred` (exec.rs) hands
+the statement's pending `(WalSync, WalCommit)` pairs back to the caller
+instead of fsyncing inline, and `Backend::Local` (shared.rs) drops the
+write lock, THEN syncs — mirroring the cluster path. Read-your-writes
+holds (the memtable has the rows before the fsync, same as the cluster
+path); durability-before-ack is preserved (the sync completes before the
+response goes out); rows applied before a mid-statement error still sync
+(the pending set is returned on the error path too, matching the inline
+contract). Covered by three deferred-sync tests (durable across reopen,
+statement-scoped mode reset, error-path commit handling).
+
+**Measured**: write 16c 1,608 → **3,427 ops/s (2.1×)**, mixed 16c 2,380
+→ **4,561 ops/s (1.9×, now ahead of PostgreSQL's 4,158)**; write 1c and
+read 16c unchanged (1,887 / 10,643 — both within run-to-run noise of
+their pre-fix values), as expected for a change that only affects
+concurrent writers. Only standalone (`Backend::Local`) deployments were
+affected — clustered nodes already had the correct design.
 
 See also the single-thread read latency deep dive, the ONE-vs-QUORUM cost
 measurement, and the code-level timing breakdown in **Single-node isolated

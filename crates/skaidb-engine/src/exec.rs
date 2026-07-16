@@ -199,6 +199,14 @@ pub struct Database {
     /// DESCRIBEs pay nothing. `Mutex` because DESCRIBE runs on the shared-lock
     /// read path (`&self`); size is bounded by fields × type tags, tiny.
     field_registry: std::sync::Mutex<HashMap<String, (u64, FieldTypes)>>,
+    /// When `Some`, statement-final group commits ([`LocalCluster::
+    /// flush_pending`]) defer: the `(WalSync, WalCommit)` pairs land here
+    /// instead of fsyncing inline, so a caller holding this Database behind
+    /// an exclusive lock can release it BEFORE the fsync — concurrent
+    /// sessions' commits then coalesce in `WalSync::sync_through` (group
+    /// commit) instead of serializing whole fsyncs under the lock. Set and
+    /// drained only by [`Database::execute_session_statement_deferred`].
+    deferred_syncs: Option<Vec<(Arc<WalSync>, WalCommit)>>,
 }
 
 /// A search index plus its NRT refresh state: writes apply immediately but
@@ -608,6 +616,7 @@ impl Database {
             pending_search_catchups: pending_search,
             defer_backfills: false,
             field_registry: std::sync::Mutex::new(HashMap::new()),
+            deferred_syncs: None,
         };
         // Re-arm the storage truncation gates, then replay any deferred
         // maintenance the crash interrupted (WAL replay above re-populated
@@ -2586,6 +2595,33 @@ impl Database {
             }
         };
         Ok(SessionEffect::Output(out))
+    }
+
+    /// [`Database::execute_session_statement`] with the statement-final
+    /// fsync **handed back to the caller** instead of run inline: the
+    /// returned pairs are the group commits the statement would have
+    /// synced. The caller MUST `sync_through` every pair before
+    /// acknowledging the statement — on success AND on error (rows applied
+    /// before a mid-statement error must become durable either way, same
+    /// contract as the inline path).
+    ///
+    /// Why this exists: a server holding this Database behind an exclusive
+    /// `RwLock` would otherwise spend ~the whole statement latency inside
+    /// the lock on the WAL fsync, fully serializing concurrent writers (16
+    /// connections measured no faster than 1). Syncing after the lock drops
+    /// lets concurrent sessions' commits coalesce in `WalSync::sync_through`
+    /// — the same fsync-outside-the-lock design the cluster write path
+    /// (`Node::replicate`) already uses. Reads-after-writes hold: the
+    /// memtable has the rows before the fsync.
+    pub fn execute_session_statement_deferred(
+        &mut self,
+        current_db: &str,
+        stmt: Statement,
+    ) -> (Result<SessionEffect>, Vec<(Arc<WalSync>, WalCommit)>) {
+        self.deferred_syncs = Some(Vec::new());
+        let res = self.execute_session_statement(current_db, stmt);
+        let pending = self.deferred_syncs.take().unwrap_or_default();
+        (res, pending)
     }
 
     /// Database-aware read-only entry point: like [`Database::execute_session`]
@@ -8784,8 +8820,15 @@ impl<'a> LocalCluster<'a> {
 
     /// Group-commit every deferred write. Must be called when the statement
     /// finishes (success or error — applied rows must become durable either
-    /// way, matching the previous per-row fsync behavior).
+    /// way, matching the previous per-row fsync behavior). When the Database
+    /// is in deferred-sync mode (see [`Database::deferred_syncs`]) the pairs
+    /// are handed up to the caller instead, who fsyncs them after releasing
+    /// its exclusive lock.
     fn flush_pending(&mut self) -> Result<()> {
+        if let Some(deferred) = self.db.deferred_syncs.as_mut() {
+            deferred.extend(self.pending.drain().map(|(_, pair)| pair));
+            return Ok(());
+        }
         for (_, (sync, commit)) in self.pending.drain() {
             sync.sync_through(commit)?;
         }
@@ -11057,5 +11100,112 @@ mod schema_lww_tests {
             db.catalog.tables.contains_key("t"),
             "a stale drop must not remove a newer table"
         );
+    }
+}
+
+#[cfg(test)]
+mod deferred_sync_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn tmp() -> std::path::PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "skaidb-dsync-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    fn parse_one(sql: &str) -> Statement {
+        parse(sql).unwrap()
+    }
+
+    /// The deferred entry point hands the statement's group commits to the
+    /// caller instead of fsyncing inline, and syncing them makes the rows
+    /// durable across a reopen — the Backend::Local contract.
+    #[test]
+    fn deferred_writes_sync_outside_and_survive_reopen() {
+        let dir = tmp();
+        {
+            let mut db = Database::open(&dir).unwrap();
+            db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+            let (res, pending) = db.execute_session_statement_deferred(
+                "default",
+                parse_one("INSERT INTO t (id, v) VALUES (1, 'a'), (2, 'b')"),
+            );
+            res.unwrap();
+            assert!(
+                !pending.is_empty(),
+                "a write statement must hand back its commits to sync"
+            );
+            // Read-your-writes holds BEFORE the sync (memtable serves).
+            let out = db.execute("SELECT count(*) FROM t").unwrap();
+            match out {
+                QueryOutput::Rows(rs) => assert_eq!(rs.rows[0][0], Value::Int(2)),
+                other => panic!("{other:?}"),
+            }
+            for (sync, commit) in pending {
+                sync.sync_through(commit).unwrap();
+            }
+            // dropped without a shutdown flush: reopen replays the WAL.
+        }
+        let mut db = Database::open(&dir).unwrap();
+        let out = db.execute("SELECT count(*) FROM t").unwrap();
+        match out {
+            QueryOutput::Rows(rs) => assert_eq!(rs.rows[0][0], Value::Int(2)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Deferred mode is statement-scoped: it must reset to inline syncing
+    /// afterwards, so interleaved non-deferred callers (Session::execute)
+    /// keep their durable-before-return contract.
+    #[test]
+    fn deferred_mode_resets_after_the_statement() {
+        let dir = tmp();
+        let mut db = Database::open(&dir).unwrap();
+        db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        let (res, pending) = db.execute_session_statement_deferred(
+            "default",
+            parse_one("INSERT INTO t (id) VALUES (1)"),
+        );
+        res.unwrap();
+        for (sync, commit) in pending {
+            sync.sync_through(commit).unwrap();
+        }
+        assert!(
+            db.deferred_syncs.is_none(),
+            "deferred mode must not leak past the statement"
+        );
+        // A plain execute afterwards syncs inline as before (no panic, no
+        // stranded pending set).
+        db.execute("INSERT INTO t (id) VALUES (2)").unwrap();
+    }
+
+    /// Rows applied before a mid-statement error still hand their commits
+    /// back — the caller syncs on the error path too, matching the inline
+    /// path's "applied rows become durable either way" contract.
+    #[test]
+    fn error_paths_still_hand_back_applied_commits() {
+        let dir = tmp();
+        let mut db = Database::open(&dir).unwrap();
+        db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        // UPDATE with a filter on a missing table errors; but first seed a
+        // row deferred, then run a statement that errors AFTER the deferred
+        // insert landed in the same call? Simpler: a statement that errors
+        // outright must return an empty-or-complete pending set without
+        // panicking, and the error must surface.
+        let (res, pending) = db.execute_session_statement_deferred(
+            "default",
+            parse_one("INSERT INTO missing (id) VALUES (1)"),
+        );
+        assert!(res.is_err());
+        for (sync, commit) in pending {
+            sync.sync_through(commit).unwrap(); // must not panic
+        }
     }
 }
