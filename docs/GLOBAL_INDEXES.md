@@ -1,8 +1,14 @@
 # Global (value-sharded) secondary indexes — design
 
-Status: **phases 1+2+3 shipped** (entry plumbing v0.89; routed read path +
-backfill v0.90; hardening v0.91). Phase 4 (RF<members bench + prod
-rollout) pending. Phase-3 notes:
+Status: **phases 1+2+3 shipped, phase 4 partially done** (entry plumbing
+v0.89; routed read path + backfill v0.90; hardening v0.91; first A/B on
+the bench fleet 2026-07-16 — see BENCHMARKS.md "Global-index routed
+probe"). Phase-4 findings so far: **correctness exact** after two
+bench-caught backfill fixes (batched drives v0.91.1; retry-or-abort
+readiness v0.91.2), **latency parity at 2 members** (candidate resolve
+dominates; scatter is one extra RPC there). Remaining: the 3+ member
+run where the fan-out delta actually surfaces, then the prod-adoption
+call. Phase-3 notes:
 
 - **Repair verify leg** (`gidx_repair`, part of every repair pass): on
   full-copy clusters, paged two-direction verification of entries against

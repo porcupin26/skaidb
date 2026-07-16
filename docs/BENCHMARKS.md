@@ -478,3 +478,34 @@ under `[perf]`; what follows is the record that keeps dead ends dead.*
 - If every system lands in the same band on a fleet leg, suspect a shared
   environmental floor and isolate on a single node over loopback before
   concluding a change does nothing (or something).
+
+## Global-index routed probe — phase-4 A/B (v0.91.x, 2026-07-16)
+
+2× 1-vCPU/512 MB bench LXCs, **RF = 1 over 2 members** (genuinely
+sharded), two identical 250 k-row tables on the same cluster — one with a
+LOCAL secondary index (`i_l`), one GLOBAL (`i_g`) — 5 000 senders × ~50
+rows. 100 equality probes per round, same seeded senders both arms,
+rounds interleaved L,G,L,G from one coordinator (the FTS soak shared the
+host; interleaving puts its noise on both arms equally).
+
+- **Correctness: exact.** Both arms returned identical row counts on
+  every round (9 896 = 9 896). Getting here is the real result — the
+  bench caught two backfill bugs on its first runs:
+  1. the driver wrote entries one replicated quorum write at a time
+     (~15 ms each → an hour for 250 k rows) and every repair pass queued
+     a duplicate full re-drive (fixed in v0.91.1: batched ApplyBatch per
+     destination per page + drives skip when already ready);
+  2. under post-load memory pressure the driver **logged and skipped**
+     shed batches, then broadcast readiness — probes silently missed
+     ~1.2 % of rows, unhealable at RF < members (fixed in v0.91.2:
+     retry with backoff; persistent failure aborts with `building` left
+     set, so probes keep the correct scatter fallback until a re-drive
+     completes).
+- **Latency: parity at 2 members.** local scatter median 11.5 ms /
+  p95 28.2 ms vs routed probe median 11.3 ms / p95 32.3 ms (n=200 each).
+  Expected shape: the ~50-candidate quorum resolve dominates both arms,
+  and 2-member scatter costs exactly one extra peer RPC. The routing
+  thesis — probe stays one replica-set round-trip while scatter fans to
+  every member — needs 3+ members to surface; re-run at 3+ nodes when
+  the fleet frees up before any prod-adoption call. At RF = full (the
+  current production topology) a global index buys nothing by design.

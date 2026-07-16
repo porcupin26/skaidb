@@ -103,11 +103,15 @@ names) lives in git history. Still open:
   (v0.89 entry plumbing; v0.90 routed probe + backfill; v0.91
   hardening: full-copy repair verify leg [heal missing entries / GC
   orphans], ready-stamped `building` convergence, backfill re-drive on
-  repair, IN-list multi-tuple probes). Remaining: **phase 4** — bench
-  the 250k-row probe on the fleet at RF<members, prod rollout; and the
-  deferred RF<members verify leg (needs a batched cross-node stamp
-  exchange; orphans are harmless meanwhile, missing entries bounded by
-  the write crash window).
+  repair, IN-list multi-tuple probes). **Phase 4 first A/B done
+  (2026-07-16, BENCHMARKS.md)**: correctness exact after two
+  bench-caught backfill fixes (v0.91.1 batched drives, v0.91.2
+  retry-or-abort readiness); latency parity at 2 members as expected —
+  the fan-out delta needs a **3+ member re-run** (fleet was
+  soak-constrained) before any prod call. Also remaining: the
+  RF<members verify leg (batched cross-node stamp exchange; orphans
+  harmless meanwhile, missing entries bounded by write consistency +
+  the abort-not-ready backfill).
 - [ ] **[cluster] Distributed / multi-key transactions** (deferred, large)
   — cluster mode autocommits per statement (`BEGIN/COMMIT/ROLLBACK`
   rejected); no 2PC/coordinator exists. agencik designs around it with
