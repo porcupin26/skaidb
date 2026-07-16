@@ -11,6 +11,7 @@
 //! open. Blocks are never modified — compaction writes a replacement and
 //! deletes the inputs; retention deletes whole directories.
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -53,7 +54,27 @@ pub struct Block {
     pub dir: PathBuf,
     pub meta: BlockMeta,
     series: Vec<BlockSeries>,
+    /// Label postings over `series` (key → value → indexes), built once at
+    /// open — blocks are immutable — so matcher evaluation selects candidate
+    /// series instead of testing every series' label set per query.
+    postings: HashMap<String, HashMap<String, Vec<u32>>>,
     chunks: File,
+}
+
+/// Build the postings map over a block's decoded series.
+fn build_postings(series: &[BlockSeries]) -> HashMap<String, HashMap<String, Vec<u32>>> {
+    let mut postings: HashMap<String, HashMap<String, Vec<u32>>> = HashMap::new();
+    for (i, s) in series.iter().enumerate() {
+        for (k, v) in &s.labels {
+            postings
+                .entry(k.clone())
+                .or_default()
+                .entry(v.clone())
+                .or_default()
+                .push(i as u32);
+        }
+    }
+    postings
 }
 
 /// Write a block from flushed head data. `series` need not be sorted.
@@ -155,10 +176,12 @@ impl Block {
             series.push(BlockSeries { labels, chunks });
         }
 
+        let postings = build_postings(&series);
         Ok(Block {
             dir: dir.to_path_buf(),
             meta,
             series,
+            postings,
             chunks: File::open(dir.join("chunks.dat"))?,
         })
     }
@@ -222,6 +245,79 @@ impl Block {
     }
 
     /// Samples in `[t0, t1]` for series accepted by `keep`.
+    /// [`Block::query`] driven by matchers: candidate series come from the
+    /// block's postings (smallest Eq posting, else a regex over the label's
+    /// value dictionary) instead of testing every series, then re-check the
+    /// full matcher set. Falls back to the full walk when no matcher can
+    /// restrict.
+    pub fn query_matchers(
+        &self,
+        matchers: &[crate::store::Matcher],
+        t0: i64,
+        t1: i64,
+    ) -> Result<Vec<(Labels, Vec<Sample>)>> {
+        if t1 < self.meta.min_ts || t0 > self.meta.max_ts {
+            return Ok(Vec::new());
+        }
+        let keep = |l: &Labels| matchers.iter().all(|m| m.accepts(l));
+        match crate::store::postings_candidates(
+            matchers,
+            |k, v| {
+                self.postings
+                    .get(k)
+                    .and_then(|values| values.get(v))
+                    .cloned()
+                    .unwrap_or_default()
+            },
+            |k, re| {
+                let mut out = Vec::new();
+                if let Some(values) = self.postings.get(k) {
+                    for (v, ids) in values {
+                        if re.is_match(v) {
+                            out.extend_from_slice(ids);
+                        }
+                    }
+                }
+                out
+            },
+        ) {
+            Some(candidates) => {
+                let mut out = Vec::new();
+                for i in candidates {
+                    let Some(s) = self.series.get(i as usize) else { continue };
+                    if keep(&s.labels) {
+                        if let Some(hit) = self.read_series(s, t0, t1)? {
+                            out.push(hit);
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            None => self.query(keep, t0, t1),
+        }
+    }
+
+    /// Read one series' samples in `[t0, t1]`; `None` when empty.
+    fn read_series(
+        &self,
+        s: &BlockSeries,
+        t0: i64,
+        t1: i64,
+    ) -> Result<Option<(Labels, Vec<Sample>)>> {
+        let mut samples = Vec::new();
+        for r in &s.chunks {
+            if r.max_ts < t0 || r.min_ts > t1 {
+                continue;
+            }
+            for sample in self.read_chunk(r)? {
+                if sample.ts >= t0 && sample.ts <= t1 {
+                    samples.push(sample);
+                }
+            }
+        }
+        Ok((!samples.is_empty()).then(|| (s.labels.clone(), samples)))
+    }
+
     pub fn query(
         &self,
         keep: impl Fn(&Labels) -> bool,

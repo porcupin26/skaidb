@@ -125,6 +125,44 @@ fn matches_all(matchers: &[Matcher], labels: &Labels) -> bool {
     matchers.iter().all(|m| m.matches(labels))
 }
 
+/// Candidate series from a postings index: the smallest usable `Eq`
+/// posting, else the first usable regex's value-dictionary union. `None` =
+/// no matcher can restrict and the caller scans everything. Candidates are
+/// a SUPERSET selected by one matcher — the caller re-checks the full set
+/// (`matches_all`), so this only ever narrows, never decides.
+///
+/// Usable: `Eq` with a non-empty value (an empty value also matches series
+/// LACKING the label, which postings cannot enumerate), and `Re` whose
+/// regex rejects `""` for the same reason. `Ne`/`NotRe` exclude rather
+/// than select and never restrict.
+pub(crate) fn postings_candidates<Id: Copy + Ord>(
+    matchers: &[Matcher],
+    posting: impl Fn(&str, &str) -> Vec<Id>,
+    posting_regex: impl Fn(&str, &regex::Regex) -> Vec<Id>,
+) -> Option<Vec<Id>> {
+    let mut best: Option<Vec<Id>> = None;
+    for m in matchers {
+        if let Matcher::Eq(k, v) = m {
+            if v.is_empty() {
+                continue;
+            }
+            let ids = posting(k, v);
+            if best.as_ref().is_none_or(|b| ids.len() < b.len()) {
+                best = Some(ids);
+            }
+        }
+    }
+    let mut out = best.or_else(|| {
+        matchers.iter().find_map(|m| match m {
+            Matcher::Re(k, r) if !r.is_match("") => Some(posting_regex(k, r)),
+            _ => None,
+        })
+    })?;
+    out.sort_unstable();
+    out.dedup();
+    Some(out)
+}
+
 /// Counters for one `append_batch` call.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct AppendResult {
@@ -381,17 +419,35 @@ impl Tsdb {
         let inner = self.inner.lock().expect("tsdb lock");
         let mut merged: BTreeMap<Labels, Vec<Sample>> = BTreeMap::new();
         // Blocks are time-ordered and per-series ranges are disjoint, so
-        // appending block-by-block then head keeps samples sorted.
+        // appending block-by-block then head keeps samples sorted. Matchers
+        // select candidates through each structure's label postings (falling
+        // back to the full walk when none can restrict).
         for block in &inner.blocks {
-            for (labels, samples) in block.query(|l| matches_all(matchers, l), t0, t1)? {
+            for (labels, samples) in block.query_matchers(matchers, t0, t1)? {
                 merged.entry(labels).or_default().extend(samples);
             }
         }
-        let head_hits: Vec<(u64, Labels)> = inner
-            .head
-            .series_matching(|l| matches_all(matchers, l))
-            .map(|(id, l)| (id, l.clone()))
-            .collect();
+        let head_hits: Vec<(u64, Labels)> = match postings_candidates(
+            matchers,
+            |k, v| inner.head.posting(k, v),
+            |k, re| inner.head.posting_regex(k, re),
+        ) {
+            Some(candidates) => candidates
+                .into_iter()
+                .filter_map(|id| {
+                    inner
+                        .head
+                        .labels_of(id)
+                        .filter(|l| matches_all(matchers, l))
+                        .map(|l| (id, l.clone()))
+                })
+                .collect(),
+            None => inner
+                .head
+                .series_matching(|l| matches_all(matchers, l))
+                .map(|(id, l)| (id, l.clone()))
+                .collect(),
+        };
         for (id, labels) in head_hits {
             let samples = inner.head.samples(id, t0, t1)?;
             if !samples.is_empty() {
@@ -618,6 +674,80 @@ mod tests {
             sync_on_append: false,
             ..TsdbOptions::default()
         }
+    }
+
+    /// The postings index is invisible to results: every matcher form
+    /// (Eq, Ne, Re, NotRe — including the empty-matching regex and
+    /// missing-label shapes that postings CANNOT serve) returns exactly the
+    /// brute-force answer, across head + flushed blocks + a GC'd-and-
+    /// recreated series.
+    #[test]
+    fn postings_match_brute_force_for_every_matcher_form() {
+        let dir = temp_dir("postings");
+        let db = Tsdb::open(&dir, opts(10_000)).unwrap();
+        // 60 series over three label dimensions; `extra` exists only on
+        // some series (the missing-label semantics trap).
+        let mut rows = Vec::new();
+        for i in 0..60i64 {
+            let mut ls: Labels = vec![
+                ("host".into(), format!("web{}", i % 12)),
+                ("job".into(), if i % 3 == 0 { "node" } else { "app" }.into()),
+            ];
+            if i % 4 == 0 {
+                ls.push(("extra".into(), format!("e{}", i % 5)));
+            }
+            ls.sort();
+            for w in 0..2i64 {
+                rows.push((ls.clone(), w * 10_000 + (i % 7) * 100, i as f64));
+            }
+        }
+        db.append_batch(&rows).unwrap();
+        assert!(db.stats().blocks >= 1, "first window flushed to a block");
+
+        let cases: Vec<Vec<Matcher>> = vec![
+            vec![Matcher::Eq("host".into(), "web3".into())],
+            vec![Matcher::Eq("host".into(), "nosuch".into())],
+            vec![Matcher::Eq("extra".into(), "e0".into())],
+            vec![Matcher::Eq("extra".into(), "".into())], // matches label-absent series
+            vec![Matcher::Ne("job".into(), "node".into())],
+            vec![Matcher::re("host", "web[12]").unwrap()],
+            vec![Matcher::re("extra", "e.*|").unwrap()], // matches "" → no postings
+            vec![Matcher::not_re("host", "web[0-5]").unwrap()],
+            vec![
+                Matcher::Eq("job".into(), "node".into()),
+                Matcher::re("host", "web1?[02]").unwrap(),
+            ],
+            vec![
+                Matcher::re("host", "web.*").unwrap(),
+                Matcher::Ne("extra".into(), "e0".into()),
+            ],
+        ];
+        let all = db.query(&[], i64::MIN, i64::MAX).unwrap();
+        for matchers in &cases {
+            let got = db.query(matchers, i64::MIN, i64::MAX).unwrap();
+            let expect: Vec<_> = all
+                .iter()
+                .filter(|(l, _)| matchers.iter().all(|m| m.accepts(l)))
+                .cloned()
+                .collect();
+            assert_eq!(got, expect, "matchers {matchers:?}");
+        }
+
+        // GC a series (flush leaves it idle, slot cleared), recreate it, and
+        // confirm postings survived the churn.
+        db.append_batch(&[(
+            vec![("host".into(), "web3".into()), ("job".into(), "app".into())],
+            50_000,
+            1.0,
+        )])
+        .unwrap();
+        let got = db
+            .query(&[Matcher::Eq("host".into(), "web3".into())], i64::MIN, i64::MAX)
+            .unwrap();
+        assert!(
+            got.iter().any(|(_, s)| s.iter().any(|x| x.ts == 50_000)),
+            "recreated series found via postings"
+        );
     }
 
     #[test]

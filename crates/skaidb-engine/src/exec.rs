@@ -6175,6 +6175,57 @@ impl Database {
         Ok(((!done).then_some(next).flatten(), added))
     }
 
+    /// The subset of `keys` that exist as LIVE puts in `table` (order
+    /// preserved). Bloom-gated point reads — the RF<members verify leg's
+    /// presence probe.
+    pub fn keys_present(&self, table: &str, keys: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
+        let Some(engine) = self.tables.get(table) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for k in keys {
+            if engine.get(k)?.is_some() {
+                out.push(k.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    /// The subset of GLOBAL-index `entry_keys` still PRODUCED by this node's
+    /// rows: for each, the embedded row exists locally and its current
+    /// document yields exactly that entry key. Asked of a row's primary
+    /// owner, so "row absent here" soundly means "row absent" — the orphan
+    /// direction of the RF<members verify leg.
+    pub fn gidx_produced(&self, index: &str, entry_keys: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
+        let Some((base_table, paths)) = self.gidx_def(index) else {
+            return Ok(Vec::new());
+        };
+        let Some(engine) = self.tables.get(&base_table) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for ekey in entry_keys {
+            let Some(row_key) = gidx_entry_row_key(ekey) else {
+                continue; // malformed: never "produced"
+            };
+            let produced = engine
+                .get(row_key)?
+                .and_then(|bytes| match Value::decode(&bytes) {
+                    Ok(Value::Document(doc)) => Some(doc),
+                    _ => None,
+                })
+                .is_some_and(|doc| {
+                    index_value_tuples(&doc, &paths)
+                        .iter()
+                        .any(|values| gidx_entry_key(values, row_key) == *ekey)
+                });
+            if produced {
+                out.push(ekey.clone());
+            }
+        }
+        Ok(out)
+    }
+
     /// Run a single-node GLOBAL-index backfill to completion, inline.
     pub fn run_gidx_backfill(&mut self, name: &str) -> Result<()> {
         let mut cursor = None;

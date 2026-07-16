@@ -139,6 +139,17 @@ pub enum Request {
     /// coordinator drove every member's shard): unmark `building` so the
     /// planner starts routing probes to it.
     GidxReady { index: String },
+    /// Which of `keys` exist as live puts in `table` (answered with
+    /// [`Response::Keys`]: the present subset). The RF<members global-index
+    /// verify leg: a row's primary owner asks the entry owners whether the
+    /// entries its rows imply actually exist, and heals the absentees.
+    KeysPresent { table: String, keys: Vec<Vec<u8>> },
+    /// Which of these GLOBAL-index entry keys are still PRODUCED by the
+    /// responder's rows (answered with [`Response::Keys`]: the produced
+    /// subset). The orphan direction of the RF<members verify leg: an entry
+    /// owner asks each row-primary-owner to recompute produced-ness locally,
+    /// then tombstones the rest.
+    GidxProduced { index: String, entry_keys: Vec<Vec<u8>> },
     /// This shard's top-`fetch` candidate keys for `ORDER BY col [DESC]`
     /// under `filter`, served only when a local index walks in that order
     /// (answered with [`Response::Keys`]; an empty-handed node that cannot
@@ -399,6 +410,8 @@ const REQ_SORTEDSCAN: u8 = 30;
 const REQ_REPAIRDIGEST: u8 = 31;
 const REQ_ENTRYRANGE: u8 = 32;
 const REQ_GIDXREADY: u8 = 33;
+const REQ_KEYSPRESENT: u8 = 34;
+const REQ_GIDXPRODUCED: u8 = 35;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
@@ -574,6 +587,22 @@ impl Request {
             Request::GidxReady { index } => {
                 o.push(REQ_GIDXREADY);
                 put_str(o, index);
+            }
+            Request::KeysPresent { table, keys } => {
+                o.push(REQ_KEYSPRESENT);
+                put_str(o, table);
+                o.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+                for k in keys {
+                    put_bytes(o, k);
+                }
+            }
+            Request::GidxProduced { index, entry_keys } => {
+                o.push(REQ_GIDXPRODUCED);
+                put_str(o, index);
+                o.extend_from_slice(&(entry_keys.len() as u32).to_le_bytes());
+                for k in entry_keys {
+                    put_bytes(o, k);
+                }
             }
             Request::VectorSearch { index, query, k } => {
                 o.push(REQ_VECTOR);
@@ -793,6 +822,24 @@ impl Request {
                 limit: c.u32()?,
             },
             REQ_GIDXREADY => Request::GidxReady { index: c.string()? },
+            REQ_KEYSPRESENT => {
+                let table = c.string()?;
+                let n = c.u32()? as usize;
+                let mut keys = Vec::with_capacity(n.min(65_536));
+                for _ in 0..n {
+                    keys.push(c.bytes()?);
+                }
+                Request::KeysPresent { table, keys }
+            }
+            REQ_GIDXPRODUCED => {
+                let index = c.string()?;
+                let n = c.u32()? as usize;
+                let mut entry_keys = Vec::with_capacity(n.min(65_536));
+                for _ in 0..n {
+                    entry_keys.push(c.bytes()?);
+                }
+                Request::GidxProduced { index, entry_keys }
+            }
             REQ_VECTOR => {
                 let index = c.string()?;
                 let n = c.u32()? as usize;

@@ -169,9 +169,9 @@ All tracked, with more detail, in [`TODO.md`](TODO.md).
 | PromQL partial gather | `/api/v1/query_range` still ships raw samples; the SQL surface uses the v0.31.0 partial pushdown | open |
 | In-retention rollup serving, clustered | single-node ships; clustered needs a min-over-replicas head-boundary exchange | with sharded partials |
 | PromQL: regex matchers, offset, arithmetic, histogram_quantile | the shipped subset covers selectors, rate/increase/delta, and sum/avg/min/max/count by/without | phase 7 follow-up |
-| Label postings index | matchers scan the per-block series list (fine at moderate cardinality) | with pushdown work |
+| ~~Label postings index~~ | **shipped v0.92**: per-label-value postings in the head (maintained at series create/GC) and per block (built at open); Eq matchers select the smallest posting, regex matchers walk the label's value dictionary instead of the series population, and every candidate set is re-checked against the full matcher semantics (missing-label `=""` / empty-matching regexes keep the full walk) | done |
 | Regex label matchers | only `=` / `!=` push down | with postings |
 | TS gauges on `/metrics` | per-store stats are in `SHOW STATUS`; Prometheus-endpoint gauges pending | soon |
 | `memory_target` integration | head memory isn't yet part of the storage budget | soon |
-| Streamed TS results | TS SELECT materializes its result before the (streamable) wire; raw range dumps of very large windows should stream end-to-end | later |
+| Streamed TS results | raw dumps are scan-metered (v0.91) and both wire surfaces chunk-stream; true end-to-end streaming is an architecture item (see TODO) | later |
 | Exemplars / native histograms | schema headroom reserved in the chunk format | later |

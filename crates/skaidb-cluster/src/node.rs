@@ -3091,6 +3091,7 @@ impl Node {
                 continue;
             }
             if !full_copy {
+                fixed += self.gidx_verify_sharded(&name);
                 continue;
             }
             let mut cursor: Option<Vec<u8>> = None;
@@ -3132,6 +3133,193 @@ impl Node {
         }
         if fixed > 0 {
             skaidb_types::slog!("skaidb: global-index verify fixed {fixed} entries");
+        }
+        fixed
+    }
+
+    /// The RF < members verify leg: rows and entries live on different
+    /// owners, so verification is a batched cross-node exchange instead of
+    /// local point reads. Each direction is driven by the shard's PRIMARY
+    /// owner (so the work runs once, not RF times):
+    ///
+    /// - **missing**: this node pages the rows it primarily owns, derives
+    ///   their entry keys, asks each entry-primary-owner which exist
+    ///   (`KeysPresent`), and re-puts the absentees to the entry's full
+    ///   replica set — a missing entry silently hides its row from probes.
+    /// - **orphans**: this node pages the entries it primarily owns, asks
+    ///   each row-primary-owner which are still produced (`GidxProduced` —
+    ///   produced-ness is recomputed on the node that HAS the row), and
+    ///   tombstones the rest. An unreachable owner skips the batch: absence
+    ///   of an answer is never treated as absence of the row.
+    ///
+    /// Writes go through the repair primitives (`apply_batch_local` /
+    /// `send_batch`), page-paced like the rest of the pass.
+    fn gidx_verify_sharded(&self, index: &str) -> usize {
+        let (base_table, paths) = {
+            let Ok(db) = self.local.read() else { return 0 };
+            let Some(def) = db.gidx_def(index) else { return 0 };
+            def
+        };
+        let entry_table = skaidb_engine::gidx_table(index);
+        let empty = Value::Document(Document::new()).encode();
+        let mut fixed = 0usize;
+
+        // Deliver one entry-key batch (put or tombstone) to the entry's full
+        // replica set.
+        let deliver = |keys: &[Vec<u8>], is_put: bool| -> usize {
+            let mut per_set: HashMap<Vec<NodeId>, Vec<BatchRow>> = HashMap::new();
+            for k in keys {
+                let owners = self.replicas_for(skaidb_engine::gidx_placement_prefix(k));
+                let value = if is_put { empty.clone() } else { Vec::new() };
+                per_set
+                    .entry(owners)
+                    .or_default()
+                    .push((k.clone(), value, self.clock.now(), is_put));
+            }
+            let mut n = 0usize;
+            for (owners, rows) in per_set {
+                for owner in owners {
+                    if owner == self.id {
+                        if self.apply_batch_local(&entry_table, &rows).is_ok() {
+                            n = n.max(rows.len());
+                        }
+                    } else if let Some(addr) = self.peer_addr(&owner) {
+                        if self.send_batch(&addr, &entry_table, &rows) {
+                            n = n.max(rows.len());
+                        }
+                    }
+                }
+            }
+            n
+        };
+
+        // Ask `owner` which of `keys` it has / still produces; `None` =
+        // unreachable (skip — never conclude from silence).
+        let ask = |owner: &NodeId, req: Request| -> Option<Vec<Vec<u8>>> {
+            if *owner == self.id {
+                let db = self.local.read().ok()?;
+                return match req {
+                    Request::KeysPresent { table, keys } => db.keys_present(&table, &keys).ok(),
+                    Request::GidxProduced { index, entry_keys } => {
+                        db.gidx_produced(&index, &entry_keys).ok()
+                    }
+                    _ => None,
+                };
+            }
+            let addr = self.peer_addr(owner)?;
+            match self.pool.call(&addr, &req) {
+                Ok(Response::Keys { keys }) => Some(keys),
+                _ => None,
+            }
+        };
+
+        // Missing direction: my primary-owned rows → expected entries.
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let page = match self.local.read() {
+                Ok(db) => match db.local_scan_versioned_page(
+                    &base_table,
+                    cursor.as_deref(),
+                    REPAIR_PAGE_ROWS,
+                ) {
+                    Ok(rows) => rows,
+                    Err(_) => break, // dropped mid-pass
+                },
+                Err(_) => return fixed,
+            };
+            let done = page.len() < REPAIR_PAGE_ROWS;
+            cursor = page.last().map(|(k, _, _, _)| k.clone());
+            let mut per_owner: HashMap<NodeId, Vec<Vec<u8>>> = HashMap::new();
+            for (row_key, value, _hlc, is_put) in &page {
+                if !is_put || self.replicas_for(row_key).first() != Some(&self.id) {
+                    continue;
+                }
+                let Ok(Value::Document(doc)) = Value::decode(value) else { continue };
+                let (_, puts) =
+                    skaidb_engine::global_entry_delta(&paths, row_key, None, Some(&doc));
+                for ekey in puts {
+                    let owner = self
+                        .replicas_for(skaidb_engine::gidx_placement_prefix(&ekey))
+                        .first()
+                        .cloned();
+                    if let Some(owner) = owner {
+                        per_owner.entry(owner).or_default().push(ekey);
+                    }
+                }
+            }
+            for (owner, keys) in per_owner {
+                let req = Request::KeysPresent {
+                    table: entry_table.clone(),
+                    keys: keys.clone(),
+                };
+                let Some(present) = ask(&owner, req) else { continue };
+                let present: std::collections::HashSet<Vec<u8>> = present.into_iter().collect();
+                let missing: Vec<Vec<u8>> =
+                    keys.into_iter().filter(|k| !present.contains(k)).collect();
+                if !missing.is_empty() {
+                    fixed += deliver(&missing, true);
+                }
+            }
+            if done {
+                break;
+            }
+            thread::sleep(REPAIR_PAGE_PAUSE);
+        }
+
+        // Orphan direction: my primary-owned entries → still produced?
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let page = match self.local.read() {
+                Ok(db) => match db.local_scan_versioned_page(
+                    &entry_table,
+                    cursor.as_deref(),
+                    REPAIR_PAGE_ROWS,
+                ) {
+                    Ok(rows) => rows,
+                    Err(_) => break,
+                },
+                Err(_) => return fixed,
+            };
+            let done = page.len() < REPAIR_PAGE_ROWS;
+            cursor = page.last().map(|(k, _, _, _)| k.clone());
+            let mut per_owner: HashMap<NodeId, Vec<Vec<u8>>> = HashMap::new();
+            for (ekey, _value, _hlc, is_put) in &page {
+                if !is_put {
+                    continue;
+                }
+                if self
+                    .replicas_for(skaidb_engine::gidx_placement_prefix(ekey))
+                    .first()
+                    != Some(&self.id)
+                {
+                    continue; // another entry replica drives this one
+                }
+                let Some(row_key) = skaidb_engine::gidx_entry_row_key(ekey) else {
+                    fixed += deliver(std::slice::from_ref(ekey), false); // malformed
+                    continue;
+                };
+                if let Some(owner) = self.replicas_for(row_key).first().cloned() {
+                    per_owner.entry(owner).or_default().push(ekey.clone());
+                }
+            }
+            for (owner, ekeys) in per_owner {
+                let req = Request::GidxProduced {
+                    index: index.to_string(),
+                    entry_keys: ekeys.clone(),
+                };
+                let Some(produced) = ask(&owner, req) else { continue };
+                let produced: std::collections::HashSet<Vec<u8>> =
+                    produced.into_iter().collect();
+                let orphans: Vec<Vec<u8>> =
+                    ekeys.into_iter().filter(|k| !produced.contains(k)).collect();
+                if !orphans.is_empty() {
+                    fixed += deliver(&orphans, false);
+                }
+            }
+            if done {
+                break;
+            }
+            thread::sleep(REPAIR_PAGE_PAUSE);
         }
         fixed
     }
@@ -4141,6 +4329,20 @@ impl Node {
                     Response::Ack
                 }
                 Err(_) => Response::Err("local lock poisoned".into()),
+            },
+            Request::KeysPresent { table, keys } => match self.local_read_bounded() {
+                Some(db) => match db.keys_present(&table, &keys) {
+                    Ok(present) => Response::Keys { keys: present },
+                    Err(e) => Response::Err(e.to_string()),
+                },
+                None => Response::Err("busy: engine write-locked, retry".into()),
+            },
+            Request::GidxProduced { index, entry_keys } => match self.local_read_bounded() {
+                Some(db) => match db.gidx_produced(&index, &entry_keys) {
+                    Ok(produced) => Response::Keys { keys: produced },
+                    Err(e) => Response::Err(e.to_string()),
+                },
+                None => Response::Err("busy: engine write-locked, retry".into()),
             },
             Request::TsAppend { table, rows } => match self.local_read_bounded() {
                 Some(db) => match db.ts_append(&table, &rows) {
@@ -8889,6 +9091,108 @@ mod tests {
                 na.execute("SELECT id FROM msgs WHERE sender IN ('user0', 'user1')").unwrap()
             )),
             (0..10).chain(std::iter::once(50)).collect::<Vec<i64>>()
+        );
+    }
+
+    /// The RF<members verify leg: rows and entries live on different owners
+    /// (rf=1 pair), so healing is the batched cross-node exchange — a
+    /// tombstoned entry (missing) is re-derived from its row's primary
+    /// owner, and a ghost entry (orphan) is tombstoned after the row's
+    /// owner disclaims it.
+    #[test]
+    fn global_index_sharded_verify_heals() {
+        let (a, b) = (free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b)];
+        let na = Node::new(Database::open(temp_dir("gsa")).unwrap(), rf1("a", &a, &members));
+        let nb = Node::new(Database::open(temp_dir("gsb")).unwrap(), rf1("b", &b, &members));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE msgs (PRIMARY KEY (id))").unwrap();
+        for i in 0..20 {
+            na.execute(&format!("INSERT INTO msgs (id, sender) VALUES ({i}, 'user{}')", i % 2))
+                .unwrap();
+        }
+        na.execute("CREATE INDEX msgs_sender ON msgs (sender) WITH (global = true)")
+            .unwrap();
+        let filter = {
+            let skaidb_sql::Statement::Select(s) =
+                skaidb_sql::parse("SELECT * FROM msgs WHERE sender = 'user0'").unwrap()
+            else {
+                panic!()
+            };
+            s.filter
+        };
+        for attempt in 0.. {
+            if na.local.read().unwrap().plan_global_probe("msgs", &filter).is_some() {
+                break;
+            }
+            assert!(attempt < 200, "backfill never ready");
+            thread::sleep(Duration::from_millis(50));
+        }
+        let ids = |n: &Arc<Node>| {
+            sorted_ids(rows(n.execute("SELECT id FROM msgs WHERE sender = 'user0'").unwrap()))
+        };
+        assert_eq!(ids(&na), (0..20).filter(|i| i % 2 == 0).collect::<Vec<i64>>());
+
+        // Missing: tombstone id 4's entry behind the index's back on both
+        // nodes (whichever owns it sees the tombstone; the probe loses the
+        // row).
+        let row4 = Value::Array(vec![Value::Int(4)]).encode_key();
+        let e4 = skaidb_engine::gidx_entry_key(&[Value::String("user0".into())], &row4);
+        for addr in [&a, &b] {
+            let _ = internode::call(
+                addr,
+                &Request::ApplyDelete {
+                    table: skaidb_engine::gidx_table("msgs_sender"),
+                    key: e4.clone(),
+                    hlc: na.clock.now(),
+                },
+            );
+        }
+        assert!(!ids(&na).contains(&4), "probe misses the tombstoned entry");
+
+        // Orphan: a ghost entry for a row that never existed.
+        let ghost_row = Value::Array(vec![Value::Int(777)]).encode_key();
+        let orphan =
+            skaidb_engine::gidx_entry_key(&[Value::String("user0".into())], &ghost_row);
+        for addr in [&a, &b] {
+            let _ = internode::call(
+                addr,
+                &Request::ApplyPut {
+                    table: skaidb_engine::gidx_table("msgs_sender"),
+                    key: orphan.clone(),
+                    value: Value::Document(Document::new()).encode(),
+                    hlc: na.clock.now(),
+                },
+            );
+        }
+
+        // Each node's repair drives its own primary-owned shards; run both.
+        na.repair().unwrap();
+        nb.repair().unwrap();
+
+        assert!(ids(&na).contains(&4), "missing entry healed cross-node");
+        assert!(ids(&nb).contains(&4));
+        assert!(!ids(&na).contains(&777), "orphan never surfaced");
+        // The orphan is tombstoned on its OWNER's shard (the copy planted on
+        // the non-owner is unowned territory — RECLAIM's job, and invisible
+        // to probes, which only read the owner set).
+        let owner = na
+            .replicas_for(skaidb_engine::gidx_placement_prefix(&orphan))
+            .first()
+            .cloned()
+            .unwrap();
+        let owner_node = if owner == na.id { &na } else { &nb };
+        let entries = owner_node
+            .local
+            .read()
+            .unwrap()
+            .local_scan_versioned_page(&skaidb_engine::gidx_table("msgs_sender"), None, 200)
+            .unwrap();
+        assert!(
+            entries.iter().all(|(k, _, _, p)| !p || *k != orphan),
+            "orphan tombstoned on its owner"
         );
     }
 

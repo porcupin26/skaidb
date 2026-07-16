@@ -49,9 +49,7 @@ git history.
   gather (per-series k-way field merge over owned samples). Do it when a
   real >250k-sample raw-dump consumer exists; the budget error names the
   workaround (narrow the range / aggregate).
-- [ ] **[ts] Label postings index** — regex matchers shipped
-  (scan-based, fine at moderate cardinality); a postings index remains
-  the perf unlock for high-cardinality matching.
+
 - [ ] **[ts] PromQL partial gather** — investigated 2026-07-08 and
   **declined as inexact**: the raw evaluator's range window is
   `[t-w, t]` (both boundaries inclusive) while partials bucket
@@ -108,10 +106,10 @@ names) lives in git history. Still open:
   bench-caught backfill fixes (v0.91.1 batched drives, v0.91.2
   retry-or-abort readiness); latency parity at 2 members as expected —
   the fan-out delta needs a **3+ member re-run** (fleet was
-  soak-constrained) before any prod call. Also remaining: the
-  RF<members verify leg (batched cross-node stamp exchange; orphans
-  harmless meanwhile, missing entries bounded by write consistency +
-  the abort-not-ready backfill).
+  soak-constrained) before any prod call. The RF<members verify leg
+  shipped in v0.92 (batched `KeysPresent`/`GidxProduced` exchanges driven
+  by each shard's primary owner) — every crash-window direction now heals
+  at every topology.
 - [ ] **[cluster] Distributed / multi-key transactions** (deferred, large)
   — cluster mode autocommits per statement (`BEGIN/COMMIT/ROLLBACK`
   rejected); no 2PC/coordinator exists. agencik designs around it with

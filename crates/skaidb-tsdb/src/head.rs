@@ -40,6 +40,12 @@ pub struct Head {
     map: HashMap<Labels, u64>,
     entries: Vec<Option<SeriesEntry>>,
     live: usize,
+    /// Label postings: key → value → live series ids carrying that pair.
+    /// Maintained at series create/GC; lets an equality or regex matcher
+    /// select candidate ids without walking every live series (the
+    /// high-cardinality unlock). Candidates are always re-checked against
+    /// the full matcher set by the caller, so the index only ever narrows.
+    postings: HashMap<String, HashMap<String, Vec<u64>>>,
     /// Highest timestamp ever appended.
     pub max_ts: i64,
 }
@@ -118,6 +124,14 @@ impl Head {
             last_ts: i64::MIN,
         }));
         self.map.insert(labels.clone(), id);
+        for (k, v) in labels {
+            self.postings
+                .entry(k.clone())
+                .or_default()
+                .entry(v.clone())
+                .or_default()
+                .push(id);
+        }
         self.live += 1;
         Ok((id, true))
     }
@@ -201,7 +215,9 @@ impl Head {
         block_span: i64,
     ) -> Result<Vec<(Labels, Vec<SealedChunk>)>> {
         let mut out = Vec::new();
-        for slot in &mut self.entries {
+        let postings = &mut self.postings;
+        for (id, slot) in self.entries.iter_mut().enumerate() {
+            let id = id as u64;
             let Some(entry) = slot else { continue };
             if entry
                 .open
@@ -246,6 +262,13 @@ impl Head {
             if entry.sealed.is_empty() && entry.open.is_none() && entry.ooo.is_empty() {
                 // Idle series: garbage-collect (recreated on next append).
                 self.map.remove(&entry.labels);
+                for (k, v) in &entry.labels {
+                    if let Some(values) = postings.get_mut(k) {
+                        if let Some(ids) = values.get_mut(v) {
+                            ids.retain(|i| *i != id);
+                        }
+                    }
+                }
                 *slot = None;
                 self.live -= 1;
             }
@@ -302,6 +325,36 @@ impl Head {
     }
 
     /// Ids and labels of series matching `keep` (head-side query planning).
+    /// The live ids carrying label pair `(k, v)` (cloned posting).
+    pub fn posting(&self, k: &str, v: &str) -> Vec<u64> {
+        self.postings
+            .get(k)
+            .and_then(|values| values.get(v))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The union of postings for every value of `k` accepted by `re` — a
+    /// regex matcher walks the key's value dictionary (distinct values),
+    /// not the series population.
+    pub fn posting_regex(&self, k: &str, re: &regex::Regex) -> Vec<u64> {
+        let Some(values) = self.postings.get(k) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (v, ids) in values {
+            if re.is_match(v) {
+                out.extend_from_slice(ids);
+            }
+        }
+        out
+    }
+
+    /// The labels of live series `id`, if it exists.
+    pub fn labels_of(&self, id: u64) -> Option<&Labels> {
+        self.entries.get(id as usize)?.as_ref().map(|e| &e.labels)
+    }
+
     pub fn series_matching<'a>(
         &'a self,
         keep: impl Fn(&Labels) -> bool + 'a,

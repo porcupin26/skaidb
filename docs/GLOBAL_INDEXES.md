@@ -10,14 +10,18 @@ dominates; scatter is one extra RPC there). Remaining: the 3+ member
 run where the fan-out delta actually surfaces, then the prod-adoption
 call. Phase-3 notes:
 
-- **Repair verify leg** (`gidx_repair`, part of every repair pass): on
-  full-copy clusters, paged two-direction verification of entries against
-  rows — *heals missing entries* (a missing entry silently hides its row
-  from probes; the correctness direction) and *GCs orphans* (harmless,
-  pure waste). Fixes apply locally; the entry table's own anti-entropy
-  spreads them. At RF < members verification needs cross-node reads —
-  deferred (orphans stay harmless; missing entries stay bounded by the
-  write crash window).
+- **Repair verify leg** (`gidx_repair`, part of every repair pass): paged
+  two-direction verification of entries against rows — *heals missing
+  entries* (a missing entry silently hides its row from probes; the
+  correctness direction) and *GCs orphans* (harmless, pure waste). On
+  full-copy clusters everything is local point reads. At RF < members
+  (v0.92) it is a batched cross-node exchange driven by each shard's
+  PRIMARY owner: row-primaries derive their rows' entries and ask entry
+  owners which exist (`KeysPresent`, absentees re-put to the entry's
+  replica set); entry-primaries ask row-owners which entries are still
+  produced (`GidxProduced` — recomputed on the node that HAS the row) and
+  tombstone the rest. An unreachable owner skips the batch: silence is
+  never treated as absence.
 - **`building` convergence**: readiness advances the index's schema
   stamp, and schema replay emits `WITH (global = true, ready = true)` —
   a node that missed the `GidxReady` broadcast (down at the time, or
