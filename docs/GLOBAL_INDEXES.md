@@ -1,7 +1,37 @@
 # Global (value-sharded) secondary indexes — design
 
-Status: **phase 1 (entry plumbing) shipped** (2026-07-15, v0.89);
-phases 2–4 pending. Phase-1 notes:
+Status: **phases 1+2 shipped** (entry plumbing v0.89; routed read path +
+backfill v0.90). Phases 3 (repair leg / orphan GC) and 4 (RF<members
+bench + prod rollout) pending. Phase-2 notes:
+
+- **Entry keys are self-describing for placement**:
+  `u16 BE prefix_len ‖ values_prefix ‖ row_key`. Every ring lookup with
+  table context (writes, repair ownership, reshard/joiner motion, reads)
+  places `__gidx__` keys by the embedded VALUES prefix, so one value's
+  entries live on one replica set — the routed-probe contract. ⚠ This
+  supersedes v0.89's full-key-hash placement and array-encoded entry keys:
+  an index created ON v0.89 must be dropped and recreated (none existed).
+- **Probe**: full-tuple equality only (`plan_global_probe`), consulted by
+  the coordinator after PK and local-index plans decline. Reads the entry
+  range from the value's replica set at the statement's consistency
+  (`Request::EntryRange`), LWW-merges per entry key, resolves row keys via
+  the standard candidate quorum re-read + residual filter (orphan entries
+  drop out there). Falls back to the scatter paths on any shortfall:
+  entry-set quorum miss, a pre-v0.90 peer, or a hot value past
+  `GIDX_PROBE_MAX` (10 000 candidates). Ranges/partial prefixes never
+  route (hash placement) and keep the scatter paths.
+- **Backfill**: the DDL-coordinating node drives it in the background —
+  pages every member's shard (`ScanPage`), writes entries for rows the
+  member primarily owns (exactly-once across members) through the normal
+  routed write path at QUORUM, then broadcasts `GidxReady`; every node
+  flips `building` off and starts routing probes. Single-node databases
+  backfill inline before the DDL returns. A node down during the ready
+  broadcast keeps `building` (routes no probes — safe, slow) until
+  phase-3 flag convergence.
+- EXPLAIN: access `global-index probe via '<name>' (routed …)`;
+  cluster.fan_out `global-index probe routed to the value's replica set`.
+
+Phase-1 notes:
 
 - Syntax landed: `CREATE INDEX i ON t (cols) WITH (global = true)`;
   `IndexDef.global` (serde-default false). SHOW INDEXES reports kind

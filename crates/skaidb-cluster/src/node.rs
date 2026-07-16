@@ -193,6 +193,11 @@ pub struct Node {
     /// change bumps write_seq on the node that has it, forcing a fresh
     /// digest (and a mismatch) on at least one side of the pair.
     repair_digests: Mutex<HashMap<String, CachedDigest>>,
+    /// GLOBAL indexes whose cluster-wide backfill this node owes (it
+    /// coordinated the CREATE): drained by the background worker, which
+    /// pages every member's shard and writes entries through the routed
+    /// replicated write path, then broadcasts readiness.
+    pending_gidx: Mutex<Vec<String>>,
     /// Physical-time (ms) high-water mark of data writes this node has
     /// *coordinated*. Replication lag for a peer is `watermark − acked[peer]`
     /// (both track data writes). Unlike the HLC frontier (`clock.peek()`), this advances
@@ -356,11 +361,20 @@ const INDEX_POINT_READ_MAX: usize = 256;
 /// candidate union — members × 4×k — stops beating the exact full gather).
 const SORTED_TOPK_MAX: usize = 1000;
 
+/// Candidate-set cap for the routed GLOBAL-index probe. A value hotter than
+/// this (one indexed value → more rows than any sane point-resolve) falls
+/// back to the bounded scatter paths instead of a huge quorum re-read.
+const GIDX_PROBE_MAX: usize = 10_000;
+
 /// Rows keyed by their storage key (the gather result shape).
 type KeyedRows = Vec<(Vec<u8>, Document)>;
 /// A cached repair digest: the table version it was computed at (see
 /// `Database::table_repair_version`) plus the digest buckets.
 type CachedDigest = ((Hlc, u64), Vec<u64>);
+/// A routed global-index probe plan: `(index name, entry range start, end)`.
+type GidxProbe = (String, Vec<u8>, Vec<u8>);
+/// `None` = the probe cannot serve; fall back to the scatter paths.
+type ProbeRows = Option<Vec<(Vec<u8>, Document)>>;
 
 /// Journal-ack applier queue bound: past this, write acks block until the
 /// applier drains — sustained-overload backpressure, not per-burst shedding.
@@ -640,6 +654,7 @@ impl Node {
             maint_pending: AtomicUsize::new(0),
             repairing: AtomicBool::new(false),
             repair_digests: Mutex::new(HashMap::new()),
+            pending_gidx: Mutex::new(Vec::new()),
             write_watermark: AtomicU64::new(0),
             membership_lock: Mutex::new(()),
             bg,
@@ -791,6 +806,16 @@ impl Node {
                         }
                     }
                 }
+            }
+            // GLOBAL-index backfills this node coordinated: page every
+            // member's shard, write entries through the routed write path,
+            // broadcast readiness.
+            let pending: Vec<String> = match node.pending_gidx.lock() {
+                Ok(mut q) => std::mem::take(&mut *q),
+                Err(_) => return,
+            };
+            for name in pending {
+                node.drive_gidx_backfill(&name);
             }
             // Vector backfills: same paged drain (searches on the index answer
             // "rebuilding — retry shortly" until the pages complete).
@@ -1442,6 +1467,21 @@ impl Node {
     /// Total member count (peers + self).
     fn member_count(&self) -> usize {
         self.topo.read().expect("topo lock").peers.len() + 1
+    }
+
+    /// Ring-placement bytes for `key` of `table`: GLOBAL-index entry tables
+    /// place by the embedded VALUES prefix — every entry for one indexed
+    /// value lands on one replica set, the routed-probe contract — while
+    /// every other table places by the full key. Every ring lookup that has
+    /// table context (writes, reads, repair ownership, resharding motion)
+    /// must go through this; a site that hashes a raw entry key would place
+    /// or repair entries onto the wrong set at RF < members.
+    fn placement<'a>(table: &str, key: &'a [u8]) -> &'a [u8] {
+        if skaidb_engine::is_gidx_table(table) {
+            skaidb_engine::gidx_placement_prefix(key)
+        } else {
+            key
+        }
     }
 
     /// Replica set for `key` at the configured replication factor (snapshot).
@@ -2279,6 +2319,17 @@ impl Node {
             .collect()
     }
 
+    /// All current peers as `(id, addr)` pairs (snapshot, cloned).
+    fn peer_addrs_with_ids(&self) -> Vec<(NodeId, String)> {
+        self.topo
+            .read()
+            .expect("topo lock")
+            .peers
+            .iter()
+            .map(|(id, addr)| (id.clone(), addr.clone()))
+            .collect()
+    }
+
     /// The full current membership (`(id, addr)` pairs), including this node.
     fn members_snapshot(&self) -> Vec<(NodeId, String)> {
         self.topo.read().expect("topo lock").members.clone()
@@ -2422,8 +2473,9 @@ impl Node {
                 let pending: Vec<BatchRow> = page
                     .into_iter()
                     .filter(|(key, _, _, _)| {
-                        self.replicas_for(key).contains(joiner)
-                            && old_ring.primary_for(key) == Some(self.id.clone())
+                        let pkey = Self::placement(&table, key);
+                        self.replicas_for(pkey).contains(joiner)
+                            && old_ring.primary_for(pkey) == Some(self.id.clone())
                     })
                     .collect();
                 for chunk in pending.chunks(batch) {
@@ -2500,8 +2552,9 @@ impl Node {
                 // round-trip + one fsync per chunk) instead of one per row.
                 let mut per_dest: BTreeMap<NodeId, Vec<BatchRow>> = BTreeMap::new();
                 for (key, value, hlc, is_put) in page {
-                    let old = self.replicas_for(&key); // current ring (includes self)
-                    for replica in new_ring.replicas_for(&key, rf) {
+                    let pkey = Self::placement(&table, &key);
+                    let old = self.replicas_for(pkey); // current ring (includes self)
+                    for replica in new_ring.replicas_for(pkey, rf) {
                         if old.contains(&replica) {
                             continue; // that node already holds this row
                         }
@@ -2795,7 +2848,7 @@ impl Node {
                 let done = page.len() < MIGRATE_PAGE_ROWS;
                 cursor = page.last().map(|(k, _, _, _)| k.clone());
                 for (key, _value, hlc, _is_put) in page {
-                    let owners = self.replicas_for(&key);
+                    let owners = self.replicas_for(Self::placement(&table, &key));
                     if owners.contains(&self.id) {
                         continue; // we still own it
                     }
@@ -3050,7 +3103,7 @@ impl Node {
             let Some((last_key, _, _)) = rows.last() else { break };
             after = Some(last_key.clone());
             for (key, hlc, is_put) in &rows {
-                let owners = self.replicas_for(key);
+                let owners = self.replicas_for(Self::placement(table, key));
                 if !(owners.contains(&self.id) || owners.contains(peer)) {
                     continue; // neither side is responsible: reclaim territory
                 }
@@ -3156,26 +3209,26 @@ impl Node {
                 (None, None) => break,
                 (Some(_), None) => {
                     let (key, value, hlc, is_put) = local.pop();
-                    if self.replicas_for(&key).contains(pid) {
+                    if self.replicas_for(Self::placement(table, &key)).contains(pid) {
                         push.push((key, value, hlc, is_put));
                     }
                 }
                 (None, Some(_)) => {
                     let (key, value, hlc, is_put) = remote.pop();
-                    if self.replicas_for(&key).contains(&self.id) {
+                    if self.replicas_for(Self::placement(table, &key)).contains(&self.id) {
                         pull.push((key, value, hlc, is_put));
                     }
                 }
                 (Some(l), Some(r)) => match l.0.cmp(&r.0) {
                     std::cmp::Ordering::Less => {
                         let (key, value, hlc, is_put) = local.pop();
-                        if self.replicas_for(&key).contains(pid) {
+                        if self.replicas_for(Self::placement(table, &key)).contains(pid) {
                             push.push((key, value, hlc, is_put));
                         }
                     }
                     std::cmp::Ordering::Greater => {
                         let (key, value, hlc, is_put) = remote.pop();
-                        if self.replicas_for(&key).contains(&self.id) {
+                        if self.replicas_for(Self::placement(table, &key)).contains(&self.id) {
                             pull.push((key, value, hlc, is_put));
                         }
                     }
@@ -3186,12 +3239,16 @@ impl Node {
                         let rrow = remote.pop();
                         match lh.cmp(&rh) {
                             std::cmp::Ordering::Greater
-                                if self.replicas_for(&lrow.0).contains(pid) =>
+                                if self
+                                    .replicas_for(Self::placement(table, &lrow.0))
+                                    .contains(pid) =>
                             {
                                 push.push(lrow);
                             }
                             std::cmp::Ordering::Less
-                                if self.replicas_for(&rrow.0).contains(&self.id) =>
+                                if self
+                                    .replicas_for(Self::placement(table, &rrow.0))
+                                    .contains(&self.id) =>
                             {
                                 pull.push(rrow);
                             }
@@ -3274,7 +3331,7 @@ impl Node {
         let mut pull: Vec<BatchRow> = Vec::new();
         for (key, value, hlc, is_put) in &remote {
             remote_hlc.insert(key.clone(), *hlc);
-            if !self.replicas_for(key).contains(&self.id) {
+            if !self.replicas_for(Self::placement(table, key)).contains(&self.id) {
                 continue;
             }
             if local_map.get(key).is_some_and(|(lh, _, _)| *lh >= *hlc) {
@@ -3287,7 +3344,7 @@ impl Node {
         }
         let mut push: Vec<BatchRow> = Vec::new();
         for (key, (lh, is_put, value)) in &local_map {
-            if !self.replicas_for(key).contains(pid) {
+            if !self.replicas_for(Self::placement(table, key)).contains(pid) {
                 continue;
             }
             if remote_hlc.get(key).is_some_and(|rh| rh >= lh) {
@@ -3982,6 +4039,27 @@ impl Node {
                     Err(e) => Response::Err(e.to_string()),
                 }
             }
+            Request::EntryRange { table, start, end, limit } => {
+                match self.local_read_bounded() {
+                    Some(db) => match db.local_scan_versioned_range(
+                        &table,
+                        Some(&start),
+                        Some(&end),
+                        limit as usize,
+                    ) {
+                        Ok(rows) => Response::Scan { rows },
+                        Err(e) => Response::Err(e.to_string()),
+                    },
+                    None => Response::Err("busy: engine write-locked, retry".into()),
+                }
+            }
+            Request::GidxReady { index } => match self.local.write() {
+                Ok(mut db) => {
+                    db.finish_global_backfill(&index);
+                    Response::Ack
+                }
+                Err(_) => Response::Err("local lock poisoned".into()),
+            },
             Request::TsAppend { table, rows } => match self.local_read_bounded() {
                 Some(db) => match db.ts_append(&table, &rows) {
                     Ok(_) => Response::Ack,
@@ -4433,6 +4511,20 @@ impl Node {
                 _ => sql,
             };
             self.broadcast_ddl(current_db, sql)?;
+            // A GLOBAL index acks at schema-apply everywhere with `building`
+            // set; this node (the DDL coordinator) then drives the
+            // replicated backfill of pre-existing rows in the background —
+            // paging every member's shard and writing entries through the
+            // normal routed write path — and broadcasts readiness.
+            if let Statement::CreateIndex(ci) = &stmt {
+                if ci.global {
+                    let internal =
+                        skaidb_engine::namespace::qualify(current_db, &ci.name);
+                    if let Ok(mut q) = self.pending_gidx.lock() {
+                        q.push(internal);
+                    }
+                }
+            }
             return Ok(SessionEffect::Output(QueryOutput::Ddl));
         }
         // BACKUP copies THIS node's shard (each node backs up its own
@@ -4504,6 +4596,8 @@ impl Node {
                             "point-read set ({} keys) routed to each key's replica set",
                             keys.len()
                         )
+                    } else if db.plan_global_probe(&sel.from, &sel.filter).is_some() {
+                        "global-index probe routed to the value's replica set".to_string()
                     } else if rf >= members {
                         "every member holds all data — served without fan-out".to_string()
                     } else {
@@ -4651,6 +4745,194 @@ impl Node {
         Ok(())
     }
 
+    /// The routed GLOBAL-index equality probe: read one value's entry range
+    /// from the value's replica set at the statement's consistency,
+    /// LWW-merge per entry key, extract row keys, and resolve them exactly
+    /// like local-index candidates (quorum point reads + the caller's
+    /// residual filter re-check — an orphan entry from the write crash
+    /// window resolves to a missing/non-matching row and drops out here).
+    /// Returns `None` when the probe cannot serve — quorum shortfall on the
+    /// entry set, a pre-0.90 peer that lacks the op, or a candidate set past
+    /// [`GIDX_PROBE_MAX`] — and the caller falls back to the scatter paths.
+    fn global_index_lookup(
+        self: &Arc<Self>,
+        table: &str,
+        index: &str,
+        start: &[u8],
+        end: &[u8],
+        oc: Option<Consistency>,
+    ) -> EngineResult<ProbeRows> {
+        let entry_table = skaidb_engine::gidx_table(index);
+        // `start` is exactly the placement prefix (length header ‖ values):
+        // the same bytes every entry in the range hashes to.
+        let replicas = self.replicas_for(start);
+        let needed = oc
+            .unwrap_or(self.cfg.read_consistency)
+            .required(replicas.len().max(1));
+        let limit = GIDX_PROBE_MAX + 1;
+        let mut responders = 0usize;
+        let mut merged: HashMap<Vec<u8>, (Hlc, bool)> = HashMap::new();
+        for id in &replicas {
+            if responders >= needed {
+                break;
+            }
+            let rows = if *id == self.id {
+                let Some(db) = self.local_read_bounded() else { continue };
+                match db.local_scan_versioned_range(
+                    &entry_table,
+                    Some(start),
+                    Some(end),
+                    limit,
+                ) {
+                    Ok(rows) => rows,
+                    Err(_) => continue,
+                }
+            } else {
+                let Some(addr) = self.peer_addr(id) else { continue };
+                let req = Request::EntryRange {
+                    table: entry_table.clone(),
+                    start: start.to_vec(),
+                    end: end.to_vec(),
+                    limit: limit as u32,
+                };
+                match self.pool.call(&addr, &req) {
+                    Ok(Response::Scan { rows }) => rows,
+                    _ => continue, // unreachable or pre-phase-2 peer
+                }
+            };
+            responders += 1;
+            for (key, _value, hlc, is_put) in rows {
+                match merged.get(&key) {
+                    Some((h, _)) if *h >= hlc => {}
+                    _ => {
+                        merged.insert(key, (hlc, is_put));
+                    }
+                }
+            }
+        }
+        if responders < needed {
+            return Ok(None); // entry set below quorum: scatter serves instead
+        }
+        let mut keys: BTreeMap<Vec<u8>, ()> = BTreeMap::new();
+        for (ekey, (_hlc, is_put)) in &merged {
+            if !is_put {
+                continue; // retracted entry
+            }
+            if let Some(rk) = skaidb_engine::gidx_entry_row_key(ekey) {
+                keys.insert(rk.to_vec(), ());
+            }
+        }
+        if keys.len() > GIDX_PROBE_MAX {
+            return Ok(None); // hot value: bounded scatter beats a huge resolve
+        }
+        Ok(Some(self.resolve_candidates(table, keys, oc)?))
+    }
+
+    /// Drive one GLOBAL index's cluster-wide backfill (this node coordinated
+    /// its CREATE): page every member's shard of the base table, and for
+    /// each row the member primarily owns, write its entries through the
+    /// routed replicated write path. Every row has exactly one primary
+    /// owner, so entries are written once each; rows written concurrently
+    /// are maintained by their own coordinators (idempotent overlap). On
+    /// completion, broadcast readiness so every node's planner starts
+    /// routing probes.
+    fn drive_gidx_backfill(self: &Arc<Self>, index: &str) {
+        let (base_table, paths) = {
+            let Ok(db) = self.local.read() else { return };
+            let Some((t, p)) = db.gidx_def(index) else {
+                return; // dropped before the backfill started
+            };
+            (t, p)
+        };
+        let entry_table = skaidb_engine::gidx_table(index);
+        let empty = Value::Document(Document::new()).encode();
+        let members: Vec<Option<(NodeId, String)>> = std::iter::once(None)
+            .chain(self.peer_addrs_with_ids().into_iter().map(Some))
+            .collect();
+        for member in members {
+            let member_id = member
+                .as_ref()
+                .map(|(id, _)| id.clone())
+                .unwrap_or_else(|| self.id.clone());
+            let mut cursor: Option<Vec<u8>> = None;
+            loop {
+                let page = match &member {
+                    None => match self.local.read() {
+                        Ok(db) => match db.local_scan_versioned_page(
+                            &base_table,
+                            cursor.as_deref(),
+                            MIGRATE_PAGE_ROWS,
+                        ) {
+                            Ok(rows) => rows,
+                            Err(_) => break, // table dropped mid-backfill
+                        },
+                        Err(_) => return,
+                    },
+                    Some((_, addr)) => {
+                        let req = Request::ScanPage {
+                            table: base_table.clone(),
+                            after: cursor.clone(),
+                            limit: MIGRATE_PAGE_ROWS as u32,
+                        };
+                        match self.pool.call(addr, &req) {
+                            Ok(Response::Scan { rows }) => rows,
+                            _ => break, // unreachable: its rows also live on replicas we do page
+                        }
+                    }
+                };
+                let done = page.len() < MIGRATE_PAGE_ROWS;
+                cursor = page.last().map(|(k, _, _, _)| k.clone());
+                for (key, value, _hlc, is_put) in page {
+                    if !is_put {
+                        continue;
+                    }
+                    // Exactly-once across members: only the row's primary
+                    // owner's shard contributes it.
+                    if self.replicas_for(&key).first() != Some(&member_id) {
+                        continue;
+                    }
+                    let Ok(Value::Document(doc)) = Value::decode(&value) else {
+                        continue;
+                    };
+                    let (_, puts) =
+                        skaidb_engine::global_entry_delta(&paths, &key, None, Some(&doc));
+                    for ekey in puts {
+                        let hlc = self.clock.now();
+                        if let Err(e) = self.replicate(
+                            &entry_table,
+                            &ekey,
+                            WriteOp::Put(empty.clone()),
+                            hlc,
+                            Some(Consistency::Quorum),
+                        ) {
+                            skaidb_types::slog!(
+                                "skaidb: global-index backfill write failed on {index}: {e}"
+                            );
+                        }
+                    }
+                }
+                if done {
+                    break;
+                }
+                // Breather so the backfill never monopolizes writers.
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        // Ready: locally first, then every peer (a peer that misses this —
+        // down right now — keeps `building` and simply doesn't route probes;
+        // phase-3 hardening converges the flag via repair).
+        if let Ok(mut db) = self.local.write() {
+            db.finish_global_backfill(index);
+        }
+        let req = Request::GidxReady {
+            index: index.to_string(),
+        };
+        for addr in self.peer_addrs() {
+            let _ = self.pool.call(&addr, &req);
+        }
+        skaidb_types::slog!("skaidb: global-index backfill complete: {index}");
+    }
+
     fn replicate(
         self: &Arc<Self>,
         table: &str,
@@ -4664,7 +4946,7 @@ impl Node {
         }
         self.counters.writes_total.fetch_add(1, Ordering::Relaxed);
         self.note_local_write(hlc);
-        let replicas = self.replicas_for(key);
+        let replicas = self.replicas_for(Self::placement(table, key));
         let needed = oc
             .unwrap_or(self.cfg.write_consistency)
             .required(replicas.len().max(1));
@@ -4837,7 +5119,7 @@ impl Node {
         // distinct set.
         let mut groups: Vec<(Vec<NodeId>, Vec<BatchRow>)> = Vec::new();
         for (key, value, hlc) in rows {
-            let replicas = self.replicas_for(&key);
+            let replicas = self.replicas_for(Self::placement(table, &key));
             let row: BatchRow = (key, value, hlc, true);
             match groups.iter_mut().find(|(r, _)| *r == replicas) {
                 Some((_, group)) => group.push(row),
@@ -5169,7 +5451,7 @@ impl Node {
         oc: Option<Consistency>,
     ) -> EngineResult<Vec<(Vec<u8>, Document)>> {
         self.counters.reads_total.fetch_add(1, Ordering::Relaxed);
-        let replicas = self.replicas_for(key);
+        let replicas = self.replicas_for(Self::placement(table, key));
         let needed = oc
             .unwrap_or(self.cfg.read_consistency)
             .required(replicas.len().max(1));
@@ -6695,6 +6977,19 @@ impl Coordinator {
             .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
             .plan_index_scan(table, filter))
     }
+
+    fn plan_global_probe(
+        &self,
+        table: &str,
+        filter: &Option<Expr>,
+    ) -> EngineResult<Option<GidxProbe>> {
+        Ok(self
+            .node
+            .local
+            .read()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .plan_global_probe(table, filter))
+    }
 }
 
 impl Coordinator {
@@ -7095,6 +7390,18 @@ impl Cluster for Coordinator {
         if let Some((index, start, end)) = self.plan_index_scan(table, filter)? {
             let rows = self.node.index_lookup(table, &index, start, end, self.oc)?;
             return filter_rows(filter, rows);
+        }
+        // GLOBAL (value-sharded) index: route the equality probe to the
+        // value's replica set — one replica-set round-trip instead of a
+        // cluster-wide scatter. Any probe shortfall (entry quorum miss,
+        // pre-phase-2 peer, hot value past the candidate cap) falls through
+        // to the scatter paths below.
+        if let Some((index, start, end)) = self.plan_global_probe(table, filter)? {
+            if let Some(rows) =
+                self.node.global_index_lookup(table, &index, &start, &end, self.oc)?
+            {
+                return filter_rows(filter, rows);
+            }
         }
         // Non-indexed predicate: push the filter to each node and gather only the
         // matching candidate keys (then re-read at quorum), instead of shipping
@@ -8226,6 +8533,103 @@ mod tests {
         // Row delete retracts its entry wherever it lives.
         nb.execute("DELETE FROM msgs WHERE id = 1").unwrap();
         assert_eq!(live_entries(&na).len() + live_entries(&nb).len(), 39);
+    }
+
+    /// GLOBAL index phase 2 end-to-end at rf=1: CREATE on a populated table
+    /// drives the coordinator's replicated backfill across both members'
+    /// shards, readiness broadcasts, and the equality probe — routed to the
+    /// value's replica set — returns the exact cross-shard match set from
+    /// either coordinator. Before readiness the same query answers via the
+    /// scatter fallback, so correctness never blinks.
+    #[test]
+    fn global_index_probe_end_to_end() {
+        let (a, b) = (free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b)];
+        let na = Node::new(Database::open(temp_dir("gpa")).unwrap(), rf1("a", &a, &members));
+        let nb = Node::new(Database::open(temp_dir("gpb")).unwrap(), rf1("b", &b, &members));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE msgs (PRIMARY KEY (id))").unwrap();
+        for i in 0..60 {
+            na.execute(&format!(
+                "INSERT INTO msgs (id, sender, body) VALUES ({i}, 'user{}', 'b{i}')",
+                i % 6
+            ))
+            .unwrap();
+        }
+        na.execute("CREATE INDEX msgs_sender ON msgs (sender) WITH (global = true)")
+            .unwrap();
+
+        // Correct answers even while the backfill races (scatter fallback).
+        let expect: Vec<i64> = (0..60).filter(|i| i % 6 == 2).collect();
+        assert_eq!(sorted_ids(rows(
+            nb.execute("SELECT id FROM msgs WHERE sender = 'user2'").unwrap()
+        )), expect);
+
+        // Wait for the driver to finish and broadcast readiness everywhere.
+        let filter = {
+            let skaidb_sql::Statement::Select(s) =
+                skaidb_sql::parse("SELECT * FROM msgs WHERE sender = 'user2'").unwrap()
+            else {
+                panic!("expected select")
+            };
+            s.filter
+        };
+        for node in [&na, &nb] {
+            for attempt in 0.. {
+                let ready = node
+                    .local
+                    .read()
+                    .unwrap()
+                    .plan_global_probe("msgs", &filter)
+                    .is_some();
+                if ready {
+                    break;
+                }
+                assert!(attempt < 200, "backfill never became ready");
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        // The routed probe from BOTH coordinators returns the exact set.
+        for node in [&na, &nb] {
+            assert_eq!(
+                sorted_ids(rows(
+                    node.execute("SELECT id FROM msgs WHERE sender = 'user2'").unwrap()
+                )),
+                expect
+            );
+        }
+
+        // Probe stays correct under churn: value change, delete, new row.
+        nb.execute("UPDATE msgs SET sender = 'user2' WHERE id = 0").unwrap();
+        nb.execute("DELETE FROM msgs WHERE id = 2").unwrap();
+        nb.execute("INSERT INTO msgs (id, sender) VALUES (100, 'user2')").unwrap();
+        let expect2: Vec<i64> = std::iter::once(0)
+            .chain((0..60).filter(|i| i % 6 == 2 && *i != 2))
+            .chain(std::iter::once(100))
+            .collect::<std::collections::BTreeSet<i64>>()
+            .into_iter()
+            .collect();
+        for node in [&na, &nb] {
+            assert_eq!(
+                sorted_ids(rows(
+                    node.execute("SELECT id FROM msgs WHERE sender = 'user2'").unwrap()
+                )),
+                expect2
+            );
+        }
+
+        // EXPLAIN names the routed fan-out.
+        let rs = rows(na.execute("EXPLAIN SELECT id FROM msgs WHERE sender = 'user2'").unwrap());
+        let fan = rs
+            .rows
+            .iter()
+            .find(|r| r[0] == Value::String("cluster.fan_out".into()))
+            .map(|r| format!("{:?}", r[1]))
+            .unwrap_or_default();
+        assert!(fan.contains("global-index probe"), "got: {fan}");
     }
 
     #[test]

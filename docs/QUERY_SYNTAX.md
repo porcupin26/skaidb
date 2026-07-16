@@ -28,7 +28,8 @@ CREATE ROLLUP [IF NOT EXISTS] <name> ON <ts-table> BUCKET <duration>
 DROP   TABLE [IF EXISTS] <table>
        -- cascades to every derived index on the table (secondary, search, vector)
 CREATE INDEX [IF NOT EXISTS] <name> ON <table> (<path>[[]] [, <path>[[]] ...]) [WITH (global = true)]
-       -- WITH (global = true): value-sharded entries (phase 1: write path only; see GLOBAL_INDEXES.md)
+       -- WITH (global = true): value-sharded index — equality probes route to the value's
+       -- replica set instead of scattering; ranges keep the scatter path (GLOBAL_INDEXES.md)
 DROP   INDEX [IF EXISTS] <name>
 CREATE VECTOR INDEX [IF NOT EXISTS] <name> ON <table> (<path>) DIM <n> [USING <metric>]
 DROP   VECTOR INDEX [IF EXISTS] <name>

@@ -182,10 +182,12 @@ CREATE INDEX [IF NOT EXISTS] i ON t (path [, path ...])   -- composite = leftmos
 --   a `path[]` component makes the index MULTIKEY: one entry per array
 --   element, so `col = 'x'` containment is an index probe (exact counts);
 --   planner requires equality through the [] column; max one [] per index
---   append WITH (global = true) for a value-sharded GLOBAL index
---   (v0.89 phase 1: write-path entries only, no reads yet — see
---   docs/GLOBAL_INDEXES.md; local remains the default and the planner
---   ignores global indexes until the routed read path lands)
+--   append WITH (global = true) for a value-sharded GLOBAL index: a
+--   full-tuple equality probe routes to the value's replica set (one
+--   round-trip, no cluster scatter — the RF<members win). Ranges and
+--   partial prefixes fall back to scatter. Backfill runs in the
+--   background after DDL (probes route once it completes); local
+--   indexes remain the default. See docs/GLOBAL_INDEXES.md.
 DROP INDEX [IF EXISTS] i
 CREATE VECTOR INDEX [IF NOT EXISTS] v ON t (path) DIM n [USING cosine|l2|dot]
 DROP VECTOR INDEX [IF EXISTS] v

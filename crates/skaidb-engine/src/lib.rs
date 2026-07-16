@@ -22,6 +22,7 @@ pub use exec::{
     TsRollupInfo,
     DecodedMaint, MaintTask,
     gidx_table, global_entry_delta, index_entry_key,
+    gidx_entry_key, gidx_entry_row_key, gidx_placement_prefix, gidx_probe_bounds, is_gidx_table,
 };
 pub use skaidb_storage::{Codec, EngineOptions, DEFAULT_SEARCH_WRITER_HEAP};
 pub use namespace::DEFAULT_DATABASE;
@@ -2218,6 +2219,14 @@ mod tests {
         assert!(db.execute("EXPLAIN EXPLAIN SELECT * FROM e").is_err());
     }
 
+    /// The WHERE expression of `SELECT * FROM t WHERE <cond>` (test helper).
+    fn parse_filter(cond: &str) -> Option<skaidb_sql::Expr> {
+        match skaidb_sql::parse(&format!("SELECT * FROM t WHERE {cond}")).unwrap() {
+            skaidb_sql::Statement::Select(s) => s.filter,
+            other => panic!("expected select, got {other:?}"),
+        }
+    }
+
     /// GLOBAL index entry plumbing (phase 1, docs/GLOBAL_INDEXES.md): row
     /// mutations keep the internal `__gidx__` entry table in exact lockstep —
     /// puts add entries, value changes retract the old entry, deletes retract
@@ -2276,7 +2285,9 @@ mod tests {
             "entry table hidden"
         );
 
-        // The planner never picks a global index (no reader in phase 1).
+        // Phase 2: a ready global index plans the routed probe (the local
+        // planner still refuses it — plan_index excludes global — but the
+        // probe planner and EXPLAIN pick it up).
         let rs = rows(db.execute("EXPLAIN SELECT * FROM msgs WHERE sender = 'bob'").unwrap());
         let access = rs
             .rows
@@ -2285,13 +2296,53 @@ mod tests {
             .map(|r| format!("{:?}", r[1]))
             .unwrap_or_default();
         assert!(
-            access.contains("full table scan"),
-            "global index must not plan yet, got: {access}"
+            access.contains("global-index probe"),
+            "ready global index must plan the routed probe, got: {access}"
+        );
+        assert!(
+            db.plan_global_probe("msgs", &parse_filter("sender = 'bob'")).is_some(),
+            "full-tuple equality plans a probe"
+        );
+        assert!(
+            db.plan_global_probe("msgs", &parse_filter("sender > 'a'")).is_none(),
+            "ranges do not route"
+        );
+        assert!(
+            db.plan_global_probe("msgs", &parse_filter("body = 'x'")).is_none(),
+            "non-indexed column does not route"
         );
 
         // DROP INDEX removes the entry table with it.
         db.execute("DROP INDEX msgs_user").unwrap();
         assert!(db.local_scan_versioned_page(&gidx_table("msgs_user"), None, 10).is_err());
+    }
+
+    /// GLOBAL index backfill (phase 2): creating the index on an already
+    /// populated table generates entries for every pre-existing row (inline
+    /// on a single node), and the probe planner only serves once backfill
+    /// completes.
+    #[test]
+    fn global_index_backfills_preexisting_rows() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE msgs (PRIMARY KEY (id))").unwrap();
+        for i in 0..30 {
+            db.execute(&format!(
+                "INSERT INTO msgs (id, sender) VALUES ({i}, 'user{}')",
+                i % 5
+            ))
+            .unwrap();
+        }
+        db.execute("CREATE INDEX msgs_sender ON msgs (sender) WITH (global = true)")
+            .unwrap();
+        let live = db
+            .local_scan_versioned_page(&gidx_table("msgs_sender"), None, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, _, _, is_put)| *is_put)
+            .count();
+        assert_eq!(live, 30, "backfill produced one entry per pre-existing row");
+        // Single-node DDL runs the backfill inline: ready immediately.
+        assert!(db.plan_global_probe("msgs", &parse_filter("sender = 'user3'")).is_some());
     }
 
     /// Deferred vector backfill (cluster mode): CREATE VECTOR INDEX with an

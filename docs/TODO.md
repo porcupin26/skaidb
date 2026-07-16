@@ -90,15 +90,16 @@ chunked-streaming REST rows, CAST syntax, batched executemany wire op,
 distributed sorted top-k for QUORUM ordered reads, humanized EXPLAIN
 names) lives in git history. Still open:
 
-- [ ] **[cluster] Global (value-sharded) secondary indexes** (large —
-  see [GLOBAL_INDEXES.md](GLOBAL_INDEXES.md)) — **phase 1 (entry
-  plumbing) shipped in v0.89**: `WITH (global = true)` DDL, `__gidx__`
-  entry table, coordinator companion writes at the row's consistency,
-  single-node parity, planner exclusion. Next: **phase 2** — routed
-  equality-probe read path + planner pick + EXPLAIN
-  `global-index probe (routed)` + backfill of pre-existing rows; then
-  phase 3 (repair leg / orphan GC) and phase 4 (bench at RF<members,
-  prod rollout behind the flag).
+- [ ] **[cluster] Global (value-sharded) secondary indexes** (see
+  [GLOBAL_INDEXES.md](GLOBAL_INDEXES.md)) — **phases 1+2 shipped**
+  (entry plumbing v0.89; v0.90: prefix-placed self-describing entry
+  keys, routed equality probe at statement consistency with scatter
+  fallback, EXPLAIN texts, coordinator-driven replicated backfill +
+  `GidxReady` broadcast, single-node inline backfill). Remaining:
+  **phase 3** — repair leg regenerating entries from rows, orphan GC,
+  `building`-flag convergence for nodes that miss the ready broadcast,
+  IN-list probes (multi-tuple), backfill resumability; **phase 4** —
+  bench the 250k-row probe on the fleet at RF<members, prod rollout.
 - [ ] **[cluster] Distributed / multi-key transactions** (deferred, large)
   — cluster mode autocommits per statement (`BEGIN/COMMIT/ROLLBACK`
   rejected); no 2PC/coordinator exists. agencik designs around it with
@@ -156,10 +157,6 @@ lives in [BENCHMARKS.md](BENCHMARKS.md#performance-engineering-notes).)
   live in RAM and in the snapshot (182k × dim × 4 B for the gmail set) —
   quantize the in-RAM copy, and mmap the (possibly per-segment) snapshot
   instead of a full deserialize, when vector memory becomes the constraint.
-- [ ] **[perf] Lazy index-order merge for unbounded `ORDER BY`** —
-  `ORDER BY <indexed>` without `LIMIT` still materializes the index in
-  order first; a lazy merge would stream it. (With `LIMIT` the top-k
-  path already avoids the sort.)
 - [ ] **[perf] Per-statement replica/peer snapshot** — `replicas_for`
   builds a fresh `Vec` per row in batch replication and peer addresses
   clone per fan-out site. Measured class: a few small allocations next

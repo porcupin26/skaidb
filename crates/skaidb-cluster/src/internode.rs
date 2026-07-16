@@ -125,6 +125,20 @@ pub enum Request {
         /// pair-ownership row filter the requester used.
         requester: String,
     },
+    /// One bounded versioned range `[start, end)` of `table`, tombstones
+    /// included (answered with [`Response::Scan`]). The routed GLOBAL-index
+    /// probe reads one value's entry range from each replica of the value's
+    /// set and LWW-merges per entry key.
+    EntryRange {
+        table: String,
+        start: Vec<u8>,
+        end: Vec<u8>,
+        limit: u32,
+    },
+    /// The GLOBAL index `index` finished its cluster-wide backfill (the DDL
+    /// coordinator drove every member's shard): unmark `building` so the
+    /// planner starts routing probes to it.
+    GidxReady { index: String },
     /// This shard's top-`fetch` candidate keys for `ORDER BY col [DESC]`
     /// under `filter`, served only when a local index walks in that order
     /// (answered with [`Response::Keys`]; an empty-handed node that cannot
@@ -383,6 +397,8 @@ const REQ_SEARCHEXPLAIN: u8 = 28;
 const REQ_HOSTSTATS: u8 = 29;
 const REQ_SORTEDSCAN: u8 = 30;
 const REQ_REPAIRDIGEST: u8 = 31;
+const REQ_ENTRYRANGE: u8 = 32;
+const REQ_GIDXREADY: u8 = 33;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
@@ -547,6 +563,17 @@ impl Request {
                 o.push(REQ_REPAIRDIGEST);
                 put_str(o, table);
                 put_str(o, requester);
+            }
+            Request::EntryRange { table, start, end, limit } => {
+                o.push(REQ_ENTRYRANGE);
+                put_str(o, table);
+                put_bytes(o, start);
+                put_bytes(o, end);
+                o.extend_from_slice(&limit.to_le_bytes());
+            }
+            Request::GidxReady { index } => {
+                o.push(REQ_GIDXREADY);
+                put_str(o, index);
             }
             Request::VectorSearch { index, query, k } => {
                 o.push(REQ_VECTOR);
@@ -759,6 +786,13 @@ impl Request {
                 table: c.string()?,
                 requester: c.string()?,
             },
+            REQ_ENTRYRANGE => Request::EntryRange {
+                table: c.string()?,
+                start: c.bytes()?,
+                end: c.bytes()?,
+                limit: c.u32()?,
+            },
+            REQ_GIDXREADY => Request::GidxReady { index: c.string()? },
             REQ_VECTOR => {
                 let index = c.string()?;
                 let n = c.u32()? as usize;

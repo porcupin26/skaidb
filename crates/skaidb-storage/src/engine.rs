@@ -679,6 +679,39 @@ impl Engine {
             .collect()
     }
 
+    /// Versioned scan of the half-open range `[start, end)`, **tombstones
+    /// included**, up to `limit` rows in key order. The routed global-index
+    /// probe reads an entry range from each replica and LWW-merges per key —
+    /// which needs deletes, exactly like the whole-table versioned scans.
+    /// Seeks every source, so cost is proportional to the range.
+    pub fn scan_versioned_range(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<VersionedTombstoneRow>> {
+        let mut sources: Vec<MergeSource<'_>> = Vec::with_capacity(1 + self.sstable_count());
+        sources.push(Box::new(self.mem.range_latest(start, end).into_iter().map(Ok)));
+        for f in self.frozen.iter().rev() {
+            sources.push(Box::new(f.mem.range_latest(start, end).into_iter().map(Ok)));
+        }
+        for sst in self.sstables_newest_first() {
+            let entries = sst.range(start, end)?;
+            sources.push(Box::new(
+                entries.into_iter().map(|e| Ok((e.key, e.hlc, e.value))),
+            ));
+        }
+        KWayMerge::new(sources)
+            .take(limit)
+            .map(|item| {
+                item.map(|(k, hlc, v)| match v {
+                    VersionValue::Put(bytes) => (k, hlc, Some(bytes)),
+                    VersionValue::Delete => (k, hlc, None),
+                })
+            })
+            .collect()
+    }
+
     /// Scan only the live keys that start with `prefix`, in key order. Used by
     /// secondary indexes, whose entries are prefixed by the indexed value.
     /// Delegates to [`Engine::scan_range`], so cost is proportional to the
@@ -715,6 +748,51 @@ impl Engine {
                 Err(e) => Some(Err(e)),
             })
             .collect()
+    }
+
+    /// Streaming [`Engine::scan_range`]: live keys in `[start, end)` in key
+    /// order, one entry in flight at a time. An unbounded index-ordered
+    /// `ORDER BY` walk used to materialize its whole entry range up front —
+    /// O(range) memory for O(1) benefit; this holds one merge head per
+    /// source instead. Same sources and bounds as `scan_range`.
+    pub fn scan_range_iter<'a>(
+        &'a self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a {
+        let mut sources: Vec<MergeSource<'a>> = Vec::with_capacity(1 + self.sstable_count());
+        sources.push(Box::new(self.mem.range_latest(start, end).into_iter().map(Ok)));
+        for f in self.frozen.iter().rev() {
+            sources.push(Box::new(f.mem.range_latest(start, end).into_iter().map(Ok)));
+        }
+        for sst in self.sstables_newest_first() {
+            // Seek via the block index, then trim: `iter_from` starts at the
+            // block that may hold `start`, so entries before it (and past
+            // `end`) are filtered per source — each SSTable contributes a
+            // stream, never a collected range.
+            let iter = match start {
+                Some(s) => sst.iter_from(s),
+                None => sst.iter(),
+            };
+            let start_v = start.map(|s| s.to_vec());
+            let end_v = end.map(|e| e.to_vec());
+            sources.push(Box::new(
+                iter.map(|r| r.map(|e| (e.key, e.hlc, e.value)))
+                    .skip_while(move |item| {
+                        matches!(item, Ok((k, _, _))
+                            if start_v.as_deref().is_some_and(|s| k.as_slice() < s))
+                    })
+                    .take_while(move |item| match (item, &end_v) {
+                        (Ok((k, _, _)), Some(e)) => k.as_slice() < e.as_slice(),
+                        _ => true,
+                    }),
+            ));
+        }
+        KWayMerge::new(sources).filter_map(|item| match item {
+            Ok((k, _, VersionValue::Put(bytes))) => Some(Ok((k, bytes))),
+            Ok((_, _, VersionValue::Delete)) => None,
+            Err(e) => Some(Err(e)),
+        })
     }
 
     /// Count live keys in the half-open byte range `[start, end)` without
@@ -1920,6 +1998,34 @@ mod tests {
         e.flush().unwrap();
         assert_eq!(e.get(b"d000").unwrap(), None);
         assert!(!e.scan().unwrap().iter().any(|(k, _)| k == b"d000"));
+    }
+
+    #[test]
+    fn scan_range_iter_matches_scan_range() {
+        // Data spread over memtable + several SSTables with overwrites and
+        // deletes, so the streaming merge exercises every source kind.
+        let mut e = Engine::open_with_options(tempdir(), small_opts()).unwrap();
+        for i in 0..150u32 {
+            e.put(format!("r{i:04}").as_bytes(), vec![i as u8; 30]).unwrap();
+        }
+        e.delete(b"r0010").unwrap();
+        e.flush().unwrap();
+        for i in 100..160u32 {
+            e.put(format!("r{i:04}").as_bytes(), vec![9u8; 30]).unwrap(); // overwrites + fresh
+        }
+        e.delete(b"r0120").unwrap();
+
+        for (start, end) in [
+            (None, None),
+            (Some(b"r0050".as_slice()), None),
+            (None, Some(b"r0100".as_slice())),
+            (Some(b"r0025".as_slice()), Some(b"r0130".as_slice())),
+        ] {
+            let collected = e.scan_range(start, end).unwrap();
+            let streamed: Vec<(Vec<u8>, Vec<u8>)> =
+                e.scan_range_iter(start, end).collect::<Result<_>>().unwrap();
+            assert_eq!(streamed, collected, "range {start:?}..{end:?}");
+        }
     }
 
     #[test]

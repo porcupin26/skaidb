@@ -1703,6 +1703,17 @@ impl Database {
                         } else {
                             push("access", format!("index scan via '{idx}' ({bounds})"));
                         }
+                    } else if let Some((idx, _, _)) =
+                        self.plan_global_probe(&sel.from, &sel.filter)
+                    {
+                        push(
+                            "access",
+                            format!(
+                                "global-index probe via '{}' (routed to the value's \
+                                 replica set)",
+                                namespace::split(&idx).1
+                            ),
+                        );
                     } else {
                         push("access", "full table scan (streaming k-way merge)".into());
                     }
@@ -3431,12 +3442,20 @@ impl Database {
                 IndexDef {
                     table: table.to_string(),
                     paths: paths.to_vec(),
-                    building: false,
+                    building: true,
                     global: true,
                 },
             );
             self.record_schema(key, hlc, false);
             self.save_catalog()?;
+            // Backfill of pre-existing rows: inline on a single node (the
+            // local shard is the whole ring); in cluster mode the DDL
+            // coordinator drives a replicated backfill across every member's
+            // shard and broadcasts readiness — this engine-side apply does
+            // nothing more.
+            if !self.defer_backfills {
+                self.run_gidx_backfill(name)?;
+            }
             return Ok(QueryOutput::Ddl);
         }
         // Schema-only: the index exists (empty, marked `building`) the
@@ -4400,14 +4419,18 @@ impl Database {
             .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
 
         let mut out = Vec::new();
-        let entries = index_engine.scan_range(start.as_deref(), end.as_deref())?;
         // A DESC request on the index's scan column: entry keys ascend, so
-        // the tail of the range is the DESC head — walk the entries reversed
-        // (entry keys are cheap; rows are read only until the fetch limit).
-        let iter: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)>> = if reverse {
-            Box::new(entries.into_iter().rev())
+        // the tail of the range is the DESC head — that walk materializes
+        // the entry range and reverses it (block iterators only run
+        // forward). Forward walks STREAM the merge instead: one entry in
+        // flight, so an unbounded `ORDER BY <indexed>` no longer holds the
+        // whole index range in memory before emitting its first row.
+        type EntryItem = std::result::Result<(Vec<u8>, Vec<u8>), skaidb_storage::StorageError>;
+        let iter: Box<dyn Iterator<Item = EntryItem>> = if reverse {
+            let entries = index_engine.scan_range(start.as_deref(), end.as_deref())?;
+            Box::new(entries.into_iter().rev().map(Ok))
         } else {
-            Box::new(entries.into_iter())
+            Box::new(index_engine.scan_range_iter(start.as_deref(), end.as_deref()))
         };
         // Multi-key ORDER BY: the walk satisfies only the leading key, so
         // reaching the limit isn't enough — every row TIED with the boundary
@@ -4417,7 +4440,8 @@ impl Database {
         // than by the secondary keys.
         let exact_order = order.is_none_or(|(_, _, exact)| exact);
         let mut tie_boundary: Option<Option<Value>> = None;
-        for (_entry_key, row_key) in iter {
+        for item in iter {
+            let (_entry_key, row_key) = item?;
             crate::scan_meter::tick(1)?;
             let Some(bytes) = table_engine.get(&row_key)? else {
                 continue; // index entry for a since-deleted row
@@ -5824,6 +5848,141 @@ impl Database {
             .get(table)
             .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
         Ok(engine.scan_stamps_page(after, limit)?)
+    }
+
+    /// One bounded versioned range `[start, end)` of `table`, tombstones
+    /// included — the per-replica read behind the routed global-index probe.
+    pub fn local_scan_versioned_range(
+        &self,
+        table: &str,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<VersionedTombstoneRow>> {
+        let engine = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+        Ok(engine
+            .scan_versioned_range(start, end, limit)?
+            .into_iter()
+            .map(|(key, hlc, value)| match value {
+                Some(bytes) => (key, bytes, hlc, true),
+                None => (key, Vec::new(), hlc, false),
+            })
+            .collect())
+    }
+
+    /// Plan a routed GLOBAL-index probe for `filter`: the first ready
+    /// (non-building) global index on `table` whose EVERY column is pinned
+    /// by an equality in the filter, as `(index name, entry range start,
+    /// end)`. Full-tuple equality only — leftmost prefixes and ranges do not
+    /// route under hash placement and keep the scatter paths. Consulted by
+    /// the cluster coordinator after PK and local-index plans decline.
+    pub fn plan_global_probe(
+        &self,
+        table: &str,
+        filter: &Option<Expr>,
+    ) -> Option<(String, Vec<u8>, Vec<u8>)> {
+        let constraints = column_constraints(filter);
+        for (name, idx) in self
+            .catalog
+            .indexes
+            .iter()
+            .filter(|(_, i)| i.table == table && i.global && !i.building)
+        {
+            let cols = index_key_names(&idx.paths);
+            let values: Vec<Value> = cols
+                .iter()
+                .filter_map(|c| {
+                    constraints
+                        .iter()
+                        .find(|(col, _)| col == c)
+                        .and_then(|(_, con)| con.eq.clone())
+                })
+                .collect();
+            if values.len() != cols.len() {
+                continue; // not fully pinned: this index cannot route
+            }
+            if let Some((start, end)) = gidx_probe_bounds(&values) {
+                return Some((name.clone(), start, end));
+            }
+        }
+        None
+    }
+
+    /// A GLOBAL index's `(base table, paths)`, if it exists and is global.
+    pub fn gidx_def(&self, index: &str) -> Option<(String, Vec<String>)> {
+        self.catalog
+            .indexes
+            .get(index)
+            .filter(|d| d.global)
+            .map(|d| (d.table.clone(), d.paths.clone()))
+    }
+
+    /// Flip a GLOBAL index out of `building` (the backfill driver finished).
+    pub fn finish_global_backfill(&mut self, name: &str) {
+        if let Some(def) = self.catalog.indexes.get_mut(name) {
+            if def.global && def.building {
+                def.building = false;
+                let _ = self.save_catalog();
+            }
+        }
+    }
+
+    /// One page of a single-node GLOBAL-index backfill: entries for up to
+    /// `limit` live rows of the base table after `cursor`, written to the
+    /// local entry table (on a single node the local shard IS the ring).
+    /// Returns the next cursor; `None` when complete (index unmarked
+    /// `building`). Cluster nodes do NOT use this — the DDL coordinator
+    /// drives a replicated backfill across every member's shard instead.
+    pub fn backfill_gidx_page(
+        &mut self,
+        name: &str,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(def) = self.catalog.indexes.get(name).cloned() else {
+            return Ok(None); // dropped mid-backfill
+        };
+        if !def.global || !def.building {
+            return Ok(None);
+        }
+        let rows = {
+            let Some(engine) = self.tables.get(&def.table) else {
+                self.finish_global_backfill(name);
+                return Ok(None);
+            };
+            engine.scan_versioned_page(cursor.as_deref(), limit)?
+        };
+        let done = rows.len() < limit;
+        let next = rows.last().map(|(k, _, _)| k.clone());
+        let gname = gidx_table(name);
+        if let Some(engine) = self.tables.get_mut(&gname) {
+            for (row_key, _hlc, bytes) in rows {
+                let Some(bytes) = bytes else { continue }; // tombstone
+                if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
+                    let (_, puts) = global_entry_delta(&def.paths, &row_key, None, Some(&doc));
+                    for k in puts {
+                        engine.put(&k, Value::encode_document(&Document::new()))?;
+                    }
+                }
+            }
+        }
+        if done {
+            self.finish_global_backfill(name);
+            return Ok(None);
+        }
+        Ok(next)
+    }
+
+    /// Run a single-node GLOBAL-index backfill to completion, inline.
+    pub fn run_gidx_backfill(&mut self, name: &str) -> Result<()> {
+        let mut cursor = None;
+        while let Some(next) = self.backfill_gidx_page(name, cursor.take(), 2048)? {
+            cursor = Some(next);
+        }
+        Ok(())
     }
 
     /// **Filter pushdown**: the primary keys of this node's rows whose latest
@@ -9210,7 +9369,7 @@ pub fn global_entry_delta(
         doc.map(|d| {
             index_value_tuples(d, paths)
                 .iter()
-                .map(|values| index_entry_key(values, row_key))
+                .map(|values| gidx_entry_key(values, row_key))
                 .collect()
         })
         .unwrap_or_default()
@@ -9220,6 +9379,64 @@ pub fn global_entry_delta(
     let dels = old_keys.difference(&new_keys).cloned().collect();
     let puts = new_keys.difference(&old_keys).cloned().collect();
     (dels, puts)
+}
+
+/// One GLOBAL index entry key: `u16 BE prefix_len ‖ values_prefix ‖ row_key`,
+/// where `values_prefix` is the order-preserving encoding of the indexed
+/// value tuple (`index_prefix_n`). Self-describing on purpose: ring
+/// placement, repair ownership, and resharding must recover the VALUES
+/// prefix from the key alone ([`gidx_placement_prefix`]) so every entry for
+/// one value lands on — and stays on — one replica set, which is what makes
+/// the routed equality probe a single replica-set round-trip.
+pub fn gidx_entry_key(values: &[Value], row_key: &[u8]) -> Vec<u8> {
+    let prefix = index_prefix_n(values);
+    let mut key = Vec::with_capacity(2 + prefix.len() + row_key.len());
+    key.extend_from_slice(&(prefix.len() as u16).to_be_bytes());
+    key.extend_from_slice(&prefix);
+    key.extend_from_slice(row_key);
+    key
+}
+
+/// The ring-placement bytes of a GLOBAL index entry key: the length header
+/// plus the values prefix (everything but the row-key tail). Malformed keys
+/// (foreign writes, pre-phase-2 entries) fall back to the whole key — safe,
+/// they just don't co-locate.
+pub fn gidx_placement_prefix(key: &[u8]) -> &[u8] {
+    if key.len() >= 2 {
+        let n = u16::from_be_bytes([key[0], key[1]]) as usize;
+        if 2 + n <= key.len() {
+            return &key[..2 + n];
+        }
+    }
+    key
+}
+
+/// The row key embedded in a GLOBAL index entry key; `None` if malformed.
+pub fn gidx_entry_row_key(key: &[u8]) -> Option<&[u8]> {
+    if key.len() >= 2 {
+        let n = u16::from_be_bytes([key[0], key[1]]) as usize;
+        if 2 + n <= key.len() {
+            return Some(&key[2 + n..]);
+        }
+    }
+    None
+}
+
+/// The `[start, end)` entry-key range holding every entry whose value tuple
+/// is exactly `values` — the routed probe's read range. `None` only in the
+/// degenerate all-0xFF-prefix case.
+pub fn gidx_probe_bounds(values: &[Value]) -> Option<(Vec<u8>, Vec<u8>)> {
+    let prefix = index_prefix_n(values);
+    let mut start = Vec::with_capacity(2 + prefix.len());
+    start.extend_from_slice(&(prefix.len() as u16).to_be_bytes());
+    start.extend_from_slice(&prefix);
+    let end = prefix_upper_bound(&start)?;
+    Some((start, end))
+}
+
+/// Whether `table` (internal name) is a GLOBAL index entry table.
+pub fn is_gidx_table(table: &str) -> bool {
+    namespace::split(table).1.starts_with("__gidx__")
 }
 
 /// The internal replicated table holding a GLOBAL index's entries:

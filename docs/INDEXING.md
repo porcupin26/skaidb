@@ -15,7 +15,7 @@ LLM-facing reference).
 | Primary key | `CREATE TABLE t (PRIMARY KEY (a [, b ...]))` | point reads, **prefix-equality slices** (+ one trailing range) | the table IS the index; `WHERE a = ?` on PK `(a, b)` scans only that slice |
 | Secondary | `CREATE INDEX i ON t (a, b, ...)` | equality/range filters, index-served `ORDER BY`, index-only counts | composite = leftmost-prefix; see planner section |
 | Multikey | `CREATE INDEX i ON t (a, tags[])` | array **element** equality (`tags = 'x'` containment), exact index-only counts | one `[]` component per index; entry per element |
-| Global | `CREATE INDEX i ON t (a) WITH (global = true)` | (phase 1, v0.89: write-path entry plumbing only — no reads yet) | entries value-sharded on the ring; see [GLOBAL_INDEXES.md](GLOBAL_INDEXES.md) |
+| Global | `CREATE INDEX i ON t (a) WITH (global = true)` | full-tuple equality probes routed to the value's replica set (one round-trip, no scatter) | ranges/partial prefixes fall back to scatter; backfill runs in the background after DDL; see [GLOBAL_INDEXES.md](GLOBAL_INDEXES.md) |
 | Vector | `CREATE VECTOR INDEX v ON t (emb) DIM n [USING cosine\|l2\|dot]` | `NEAREST` k-NN | HNSW; snapshotted for fast restarts |
 | Search | `CREATE SEARCH INDEX s ON t (body, title) [WITH (...)]` | `MATCH()`, `SEARCH()`, BM25 ranking, fast-field aggregations | see SEARCH.md; fast fields answer `GROUP BY`/counts index-side |
 
