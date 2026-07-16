@@ -5003,15 +5003,43 @@ impl Node {
                 // 250k-row backfill into an hour (found by the phase-4
                 // bench). replicate_batch groups by placement, which is
                 // entry-prefix-aware.
+                //
+                // A failed batch is RETRIED, and a persistently failing one
+                // ABORTS the drive with `building` left set (repair
+                // re-drives later): the same bench caught the
+                // log-and-continue version shedding 5 batches under
+                // post-load memory pressure and then declaring the index
+                // ready — silently missing ~1% of rows from every probe.
                 if !batch.is_empty() {
-                    if let Err(e) = self.replicate_batch(
-                        &entry_table,
-                        std::mem::take(&mut batch),
-                        Some(Consistency::Quorum),
-                    ) {
-                        skaidb_types::slog!(
-                            "skaidb: global-index backfill batch failed on {index}: {e}"
-                        );
+                    let pending = std::mem::take(&mut batch);
+                    let mut attempt = 0u32;
+                    loop {
+                        match self.replicate_batch(
+                            &entry_table,
+                            pending.clone(),
+                            Some(Consistency::Quorum),
+                        ) {
+                            Ok(()) => break,
+                            Err(e) if attempt < 10 => {
+                                attempt += 1;
+                                if attempt == 1 {
+                                    skaidb_types::slog!(
+                                        "skaidb: global-index backfill batch on {index} \
+                                         failed ({e}) — retrying"
+                                    );
+                                }
+                                thread::sleep(Duration::from_millis(
+                                    500 * u64::from(attempt.min(4)),
+                                ));
+                            }
+                            Err(e) => {
+                                skaidb_types::slog!(
+                                    "skaidb: global-index backfill on {index} aborted \
+                                     ({e}) — still building; repair will re-drive"
+                                );
+                                return;
+                            }
+                        }
                     }
                 }
                 if done {
