@@ -9679,10 +9679,27 @@ mod tests {
         na.add_member("c", &c).unwrap();
 
         // Every row is still found through the index, from every coordinator
-        // (the keys c now owns migrated to it, and its index followed).
+        // (the keys c now owns migrated to it, and its index followed). The
+        // new owner's search indexing commits on the NRT refresh tick, so
+        // poll instead of asserting instantly — the bare assert flaked on a
+        // loaded CI runner.
         for coord in [&na, &nb, &nc] {
-            let rs = rows(coord.execute("SELECT id FROM t WHERE MATCH(body, 'searchable')").unwrap());
-            assert_eq!(rs.rows.len(), n, "complete result set after the join");
+            for attempt in 0.. {
+                let rs = rows(
+                    coord
+                        .execute("SELECT id FROM t WHERE MATCH(body, 'searchable')")
+                        .unwrap(),
+                );
+                if rs.rows.len() == n {
+                    break;
+                }
+                assert!(
+                    attempt < 100,
+                    "incomplete result set after the join: {} of {n}",
+                    rs.rows.len()
+                );
+                thread::sleep(Duration::from_millis(100));
+            }
         }
 
         // A write after the join indexes on the new owner and is searchable
