@@ -2809,12 +2809,11 @@ impl Database {
                 Value::String(namespace::split(name).1.to_string()),
                 Value::String(namespace::split(&idx.table).1.to_string()),
                 Value::String(
-                    if idx.global {
-                        "global"
-                    } else if idx.building {
-                        "secondary (building)"
-                    } else {
-                        "secondary"
+                    match (idx.global, idx.building) {
+                        (true, true) => "global (building)",
+                        (true, false) => "global",
+                        (false, true) => "secondary (building)",
+                        (false, false) => "secondary",
                     }
                     .into(),
                 ),
@@ -2870,10 +2869,12 @@ impl Database {
     fn index_local_health(&self, name: &str, class: IndexClass) -> &'static str {
         match class {
             IndexClass::Secondary => match self.catalog.indexes.get(name) {
-                // Global entries are replicated table rows — there is no
-                // per-node local state to be missing.
-                Some(d) if d.global => "ok",
+                // `building` first: a global index mid-backfill must say so
+                // (probes don't route to it yet). Once ready, global entries
+                // are replicated table rows — no per-node state to be
+                // missing.
                 Some(d) if d.building => "building",
+                Some(d) if d.global => "ok",
                 _ if self.indexes.contains_key(name) => "ok",
                 _ => "missing",
             },
@@ -5379,7 +5380,15 @@ impl Database {
             rows.push(vec![
                 Value::String(name.clone()),
                 Value::String(idx.table.clone()),
-                Value::String(if idx.global { "global" } else { "secondary" }.into()),
+                Value::String(
+                    match (idx.global, idx.building) {
+                        (true, true) => "global (building)",
+                        (true, false) => "global",
+                        (false, true) => "secondary (building)",
+                        (false, false) => "secondary",
+                    }
+                    .into(),
+                ),
                 Value::String(idx.paths.join(", ")),
                 Value::String(self.index_local_health(name, IndexClass::Secondary).into()),
             ]);

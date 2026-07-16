@@ -16,7 +16,7 @@ LLM-facing reference).
 | Secondary | `CREATE INDEX i ON t (a, b, ...)` | equality/range filters, index-served `ORDER BY`, index-only counts | composite = leftmost-prefix; see planner section |
 | Multikey | `CREATE INDEX i ON t (a, tags[])` | array **element** equality (`tags = 'x'` containment), exact index-only counts | one `[]` component per index; entry per element |
 | Global | `CREATE INDEX i ON t (a) WITH (global = true)` | full-tuple equality probes routed to the value's replica set (one round-trip, no scatter) | ranges/partial prefixes fall back to scatter; backfill runs in the background after DDL; see [GLOBAL_INDEXES.md](GLOBAL_INDEXES.md) |
-| Vector | `CREATE VECTOR INDEX v ON t (emb) DIM n [USING cosine\|l2\|dot]` | `NEAREST` k-NN | HNSW; snapshotted for fast restarts |
+| Vector | `CREATE VECTOR INDEX v ON t (emb) DIM n [USING cosine\|l2\|dot]` | `NEAREST` k-NN | HNSW; snapshotted for fast restarts; DDL acks at schema-apply, `local = building` while the paged backfill runs (searches say "rebuilding — retry shortly") |
 | Search | `CREATE SEARCH INDEX s ON t (body, title) [WITH (...)]` | `MATCH()`, `SEARCH()`, BM25 ranking, fast-field aggregations | see SEARCH.md; fast fields answer `GROUP BY`/counts index-side |
 
 Memory tables (`WITH (memory = true)`) reject indexes — they are ephemeral
@@ -26,8 +26,10 @@ by contract.
 
 ```sql
 CREATE INDEX IF NOT EXISTS i_mail_star ON mail (account, _tombstone, is_starred);
-SHOW INDEXES;          -- name, table, type, paths (multikey keep their []),
-                       -- and `local`: THIS node's live state (ok/building/missing)
+SHOW INDEXES;          -- name, table, type (secondary/global/vector/search,
+                       -- with "(building)" while a backfill runs), paths
+                       -- (multikey keep their []), and `local`: THIS node's
+                       -- live state (ok/building/missing)
 DROP INDEX IF EXISTS i_mail_star;
 ```
 
@@ -45,6 +47,67 @@ DROP INDEX IF EXISTS i_mail_star;
 - `ALTER TABLE ... RENAME COLUMN` rewrites index definitions (including
   multikey markers) automatically.
 
+## Global (value-sharded) indexes
+
+```sql
+CREATE INDEX i_msgs_sender ON msgs (sender) WITH (global = true);
+
+SELECT id, body FROM msgs WHERE sender = 'ada';            -- routed probe
+SELECT id FROM msgs WHERE sender IN ('ada', 'bob');        -- one probe per value
+EXPLAIN SELECT id FROM msgs WHERE sender = 'ada';
+-- access:          global-index probe via 'i_msgs_sender' (routed to the value's replica set)
+-- cluster.fan_out: global-index probe routed to the value's replica set
+```
+
+**What it is.** A regular secondary index is *local*: each node indexes only
+its own shard, so a non-PK equality probe must scatter to **every** member
+to gather candidates. A global index instead stores its entries in an
+internal replicated table **placed on the ring by indexed value** — all
+entries for `sender = 'ada'` live on one replica set. An equality probe
+routes there directly: one replica-set round-trip, like a PK point read,
+regardless of cluster size.
+
+**When to use it.** Only when **RF < members** (a genuinely sharded
+cluster) *and* the hot shape is full equality on the indexed columns — the
+"fetch everything for this value" class (dedup probes, per-user/per-account
+lookups). On a full-copy cluster (RF ≥ members) every node already holds
+all data and a local index answers without any fan-out — global buys
+nothing there. Measured: at 2 members the two are at parity (the candidate
+re-read dominates); the routing win grows with member count since scatter
+cost scales with members and the probe does not.
+
+**What routes, what doesn't.**
+- Routes: the **full value tuple** pinned by `=` or a literal `IN` list
+  (composite `(a, b)` needs both pinned; `IN` lists cross-multiply into one
+  probe range per tuple, up to 100). A multikey component (`tags[]`) routes
+  on element equality like the local form.
+- Falls back to the scatter paths (still correct, just wider): value
+  ranges (`sender > 'a'`), partial prefixes of a composite, `IN` lists past
+  the cap, values hotter than 10 000 candidate rows, an entry replica set
+  below read quorum, or the index still `building`.
+- Candidates are always quorum re-read and re-checked against the full
+  WHERE, exactly like local-index candidates — a stale or orphaned entry
+  can surface a candidate but never a wrong row.
+
+**Lifecycle.** DDL acks at schema-apply; the coordinating node then
+backfills pre-existing rows through the replicated write path in the
+background and broadcasts readiness. Until then `SHOW INDEXES` reports
+`global (building)` and probes fall back to scatter. After that, every
+INSERT/UPDATE/DELETE maintains entries as part of the statement (one extra
+replicated write per changed indexed value, at the statement's write
+consistency, plus one point read of the row's old version on write). The
+anti-entropy pass verifies entries against rows both ways — a crash between
+a row write and its entry write self-heals within a repair interval.
+
+**Costs to keep in mind.** Writes to the table pay the companion entry
+write + old-row read; multi-row INSERTs take a per-row path. Entries are
+rows in a hidden replicated table (`__gidx__<name>`), so they consume
+storage on their owners and participate in repair like any table. Local
+indexes remain the default and the better choice for everything except the
+sharded equality-probe shape.
+
+Design details, internals, and the phase history: [GLOBAL_INDEXES.md](GLOBAL_INDEXES.md).
+
 ## How the planner chooses (what your index must look like)
 
 - **Leftmost prefix.** A composite index `(a, b, c)` serves filters that pin
@@ -53,6 +116,11 @@ DROP INDEX IF EXISTS i_mail_star;
 - **Selectivity ranking.** Among usable indexes, the one consuming the most
   equality columns (then a range) wins — a two-equality probe beats a
   sibling index that pins one column and spans half the table.
+- **Global indexes are consulted last, on the cluster path only.** The
+  coordinator tries PK point reads, then local-index plans, then a global
+  probe (full-tuple equality/`IN` only), then the scatter fallbacks. A
+  local index on the same columns therefore wins over a global one —
+  don't declare both on one shape.
 - **A fully pinned primary key is a point-read set.** Every PK column
   pinned by `=` or a literal `IN` list (bound array parameters included)
   resolves to exact candidate keys — one bloom-gated point read each
@@ -110,6 +178,10 @@ The workflow that has caught every production shape so far:
    - *Array containment* (`tags = 'x'` where `tags` is an array)? — a
      multikey index `( ..., tags[])`. Without it the filter cannot be served
      by any scalar index and always scans.
+   - *Equality probe on a sharded (RF < members) cluster whose latency grows
+     with member count?* — that is the local-index scatter tax; a **global**
+     index (`WITH (global = true)`) routes the probe to one replica set.
+     Irrelevant on full-copy clusters.
    - *Substring/text search?* — there is no `LIKE '%x%'` fast path; use a
      search index and `MATCH`/`SEARCH()`. Counts and `GROUP BY` over search
      predicates can be answered by fast fields.

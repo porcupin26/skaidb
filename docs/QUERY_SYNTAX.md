@@ -131,6 +131,14 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   read). Useful for caches, sessions, and rolling event windows.
 - `CREATE INDEX` with one path is a single-column index; with several it is a
   **composite** index (ordered left-to-right). See indexing notes below.
+- `WITH (global = true)` makes it a **global (value-sharded) index**: entries
+  live in an internal replicated table placed on the ring by indexed value,
+  so a full-tuple equality/`IN` probe routes to one replica set instead of
+  scattering to every member — the RF < members win; local stays the default.
+  Ranges and partial prefixes keep the scatter path. The DDL acks at
+  schema-apply and backfills in the background (`SHOW INDEXES` says
+  `global (building)`; probes fall back to scatter until ready). Guide:
+  [INDEXING.md](INDEXING.md#global-value-sharded-indexes).
 - A `[]` suffix on one path (`CREATE INDEX i ON t (account, labels[])`) marks
   a **multikey** component: the value there is an array and each element gets
   its own index entry, so `labels = 'x'` (element containment) becomes an
