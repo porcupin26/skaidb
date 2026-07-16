@@ -285,7 +285,13 @@ impl Engine {
             std::fs::create_dir_all(dir.join("sst"))?;
             (Wal::open_ephemeral(dir.join("wal.ephemeral"))?, Vec::new())
         } else {
-            Wal::open(dir.join("wal.log"))?
+            // Grow-ahead chunk for the WAL file (see WAL_PREALLOC_CHUNK_BYTES
+            // for the fsync-cost rationale). Capped by flush_threshold_bytes
+            // so tests with tiny thresholds don't reserve more space than the
+            // whole segment will ever hold.
+            let chunk =
+                (opts.flush_threshold_bytes as u64).min(crate::wal::WAL_PREALLOC_CHUNK_BYTES);
+            Wal::open(dir.join("wal.log"), chunk)?
         };
         let mut mem = Memtable::new();
         let mut max_hlc = Hlc::MIN;

@@ -181,18 +181,49 @@ fn list_segments(base: &Path) -> Result<Vec<u64>> {
     Ok(out)
 }
 
+/// Chunk size the WAL file grows by ahead of appends (bytes). **Why this
+/// exists**: on at least one measured storage class (the p225 bench fleet),
+/// a single-row durable write cost ~1.7ms — ~100% filesystem-metadata fsync
+/// cost from extending the WAL file on every append, vs. ~500µs to fsync an
+/// in-place overwrite of already-allocated space (measured directly, see
+/// BENCHMARKS.md's "C0 — 1 node" scenario). Growing the file one chunk at a
+/// time converts all but one-in-thousands of appends from "extend + journal
+/// metadata + flush" to "flush data only", the same trick as PostgreSQL's
+/// fixed-size WAL segments — but chunked rather than a full segment up
+/// front because skaidb keeps **one WAL per table and per index**: a whole
+/// PG-style 16 MiB reservation per WAL would cost a many-table deployment
+/// gigabytes of idle disk, while one chunk caps the per-table overhead at
+/// 1 MiB.
+pub const WAL_PREALLOC_CHUNK_BYTES: u64 = 1024 * 1024;
+
 /// An append-only write-ahead log file.
 #[derive(Debug)]
 pub struct Wal {
     sync: Arc<WalSync>,
     path: PathBuf,
+    /// Granularity the file is grown by ahead of appends (see
+    /// [`WAL_PREALLOC_CHUNK_BYTES`]); `0` disables pre-allocation entirely
+    /// (ephemeral WALs, which never fsync and gain nothing from it).
+    prealloc_chunk: u64,
+    /// Bytes currently allocated to the file (its physical length, which
+    /// runs ahead of `write_offset` by up to one chunk). Only touched under
+    /// the engine's serialized append path, like `write_offset`.
+    allocated: AtomicU64,
+}
+
+/// Round `len` up to the next multiple of `chunk` (`chunk > 0`).
+fn round_up(len: u64, chunk: u64) -> u64 {
+    len.div_ceil(chunk) * chunk
 }
 
 impl Wal {
-    /// Open (creating if needed) the WAL at `path` and replay it. A torn
-    /// trailing record is truncated so future appends start from a clean
-    /// boundary.
-    pub fn open(path: impl AsRef<Path>) -> Result<(Wal, Vec<WalRecord>)> {
+    /// Open (creating if needed) the WAL at `path` and replay it, growing the
+    /// file to the next `prealloc_chunk` boundary (`0` disables). Appends
+    /// resume from the last valid record; a torn or corrupt trailing record —
+    /// including the zero-filled unwritten tail of pre-allocated space — is
+    /// left in place (not truncated away) so it can absorb future appends
+    /// without re-paying the extension cost after a restart.
+    pub fn open(path: impl AsRef<Path>, prealloc_chunk: u64) -> Result<(Wal, Vec<WalRecord>)> {
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new()
             .read(true)
@@ -212,7 +243,12 @@ impl Wal {
         }
         let (mut active_records, good_len) = replay(&file)?;
         records.append(&mut active_records);
-        file.set_len(good_len)?; // drop any torn trailing bytes
+        let mut allocated = file.metadata()?.len();
+        if prealloc_chunk > 0 && allocated < round_up(good_len.max(1), prealloc_chunk) {
+            allocated = round_up(good_len.max(1), prealloc_chunk);
+            file.set_len(allocated)?;
+            file.sync_all()?; // commit the new size once, up front
+        }
 
         let sync = Arc::new(WalSync {
             file,
@@ -223,7 +259,15 @@ impl Wal {
             fsyncs: AtomicU64::new(0),
             sync_lock: Mutex::new(()),
         });
-        Ok((Wal { sync, path }, records))
+        Ok((
+            Wal {
+                sync,
+                path,
+                prealloc_chunk,
+                allocated: AtomicU64::new(allocated),
+            },
+            records,
+        ))
     }
 
     /// A WAL for a memory table: created then immediately unlinked, so writes
@@ -248,7 +292,14 @@ impl Wal {
             fsyncs: AtomicU64::new(0),
             sync_lock: Mutex::new(()),
         });
-        Ok(Wal { sync, path })
+        // Ephemeral WALs never fsync (sync_through no-ops), so pre-allocation
+        // buys nothing — 0 disables it.
+        Ok(Wal {
+            sync,
+            path,
+            prealloc_chunk: 0,
+            allocated: AtomicU64::new(0),
+        })
     }
 
     /// Append a record (positional write, no fsync) and return its commit point.
@@ -281,8 +332,22 @@ impl Wal {
         frame.extend_from_slice(&crc32(&frame[4..]).to_le_bytes());
 
         let offset = self.sync.write_offset.load(Ordering::SeqCst);
-        write_all_at(&self.sync.file, &frame, offset)?;
         let end = offset + frame.len() as u64;
+        // Keep the physical file a chunk ahead of the append point, so the
+        // fsync that follows most appends is a data-only flush into
+        // already-allocated space instead of also journaling a file-size
+        // extension (~3x cheaper on some storage — see WAL_PREALLOC_CHUNK_BYTES).
+        // The size change committed here is deliberately NOT fsynced: the
+        // next sync_through absorbs it (fdatasync flushes size changes),
+        // paying the metadata cost once per chunk instead of per append.
+        // A crash in between leaves a longer zero-filled file — replay
+        // treats the zero tail as clean end-of-data.
+        if self.prealloc_chunk > 0 && end > self.allocated.load(Ordering::SeqCst) {
+            let new_alloc = round_up(end, self.prealloc_chunk);
+            self.sync.file.set_len(new_alloc)?;
+            self.allocated.store(new_alloc, Ordering::SeqCst);
+        }
+        write_all_at(&self.sync.file, &frame, offset)?;
         self.sync.write_offset.store(end, Ordering::SeqCst);
         Ok(WalCommit {
             generation: self.sync.generation.load(Ordering::SeqCst),
@@ -319,6 +384,13 @@ impl Wal {
             .create(true)
             .truncate(true)
             .open(&self.path)?;
+        let mut allocated = 0;
+        if self.prealloc_chunk > 0 {
+            allocated = self.prealloc_chunk;
+            file.set_len(allocated)?;
+            file.sync_all()?;
+        }
+        self.allocated.store(allocated, Ordering::SeqCst);
         self.sync = Arc::new(WalSync {
             file,
             ephemeral: false,
@@ -342,11 +414,17 @@ impl Wal {
         Ok(())
     }
 
-    /// Truncate the log to empty and bump the generation. Called after a flush
-    /// makes the logged mutations durable in an SSTable.
+    /// Truncate the log to empty (re-reserving one pre-allocation chunk) and
+    /// bump the generation. Called after a flush makes the logged mutations
+    /// durable in an SSTable.
     pub fn truncate(&self) -> Result<()> {
         let _guard = self.sync.sync_lock.lock().expect("wal sync lock");
+        // set_len(0) first so the old contents are actually released and the
+        // re-reserved chunk reads as zeros (a bare shrink to chunk size would
+        // leave stale record bytes in place, which replay would then replay).
         self.sync.file.set_len(0)?;
+        self.sync.file.set_len(self.prealloc_chunk)?;
+        self.allocated.store(self.prealloc_chunk, Ordering::SeqCst);
         self.sync.file.sync_data()?;
         self.sync.fsyncs.fetch_add(1, Ordering::SeqCst);
         self.sync.write_offset.store(0, Ordering::SeqCst);
@@ -393,6 +471,15 @@ fn replay(file: &File) -> Result<(Vec<WalRecord>, u64)> {
             Err(e) => return Err(e.into()),
         }
         let payload_len = u32::from_le_bytes(len_buf) as usize;
+        if payload_len == 0 {
+            // No real record ever encodes a zero-length payload (the
+            // smallest is op+hlc+key_len = 17 bytes) — this is the
+            // zero-filled unwritten tail of a pre-allocated segment.
+            // `crc32(&[]) == 0` too, so without this check a zero length
+            // prefix would pass the checksum below and then fail to decode,
+            // turning a clean "nothing more here" into a hard replay error.
+            break;
+        }
 
         let mut payload = vec![0u8; payload_len];
         if reader.read_exact(&mut payload).is_err() {
@@ -438,14 +525,14 @@ mod tests {
         let dir = tempdir();
         let path = dir.join("wal.log");
 
-        let (wal, recovered) = Wal::open(&path).unwrap();
+        let (wal, recovered) = Wal::open(&path, 0).unwrap();
         assert!(recovered.is_empty());
         append_synced(&wal, &rec(1, "a", WalOp::Put(b"1".to_vec())));
         append_synced(&wal, &rec(2, "b", WalOp::Put(b"2".to_vec())));
         append_synced(&wal, &rec(3, "a", WalOp::Delete));
         drop(wal);
 
-        let (_wal, recovered) = Wal::open(&path).unwrap();
+        let (_wal, recovered) = Wal::open(&path, 0).unwrap();
         assert_eq!(recovered.len(), 3);
         assert_eq!(recovered[0], rec(1, "a", WalOp::Put(b"1".to_vec())));
         assert_eq!(recovered[2], rec(3, "a", WalOp::Delete));
@@ -457,14 +544,14 @@ mod tests {
         // durable (the second commit is already <= synced).
         let dir = tempdir();
         let path = dir.join("wal.log");
-        let (wal, _) = Wal::open(&path).unwrap();
+        let (wal, _) = Wal::open(&path, 0).unwrap();
         let c1 = wal.append(&rec(1, "a", WalOp::Put(b"1".to_vec()))).unwrap();
         let c2 = wal.append(&rec(2, "b", WalOp::Put(b"2".to_vec()))).unwrap();
         wal.commit_sync(c2).unwrap();
         // c1 is already durable: its offset is below the synced point.
         wal.commit_sync(c1).unwrap();
         drop(wal);
-        let (_wal, recovered) = Wal::open(&path).unwrap();
+        let (_wal, recovered) = Wal::open(&path, 0).unwrap();
         assert_eq!(recovered.len(), 2);
     }
 
@@ -472,23 +559,23 @@ mod tests {
     fn truncate_supersedes_old_commits() {
         let dir = tempdir();
         let path = dir.join("wal.log");
-        let (wal, _) = Wal::open(&path).unwrap();
+        let (wal, _) = Wal::open(&path, 0).unwrap();
         let old = wal.append(&rec(1, "a", WalOp::Put(b"1".to_vec()))).unwrap();
         wal.truncate().unwrap();
         // Syncing a pre-truncation commit is a no-op (data is durable elsewhere).
         wal.commit_sync(old).unwrap();
         append_synced(&wal, &rec(2, "b", WalOp::Put(b"2".to_vec())));
         drop(wal);
-        let (_wal, recovered) = Wal::open(&path).unwrap();
+        let (_wal, recovered) = Wal::open(&path, 0).unwrap();
         assert_eq!(recovered, vec![rec(2, "b", WalOp::Put(b"2".to_vec()))]);
     }
 
     #[test]
-    fn torn_trailing_record_is_truncated() {
+    fn torn_trailing_record_is_ignored() {
         let dir = tempdir();
         let path = dir.join("wal.log");
 
-        let (wal, _) = Wal::open(&path).unwrap();
+        let (wal, _) = Wal::open(&path, 0).unwrap();
         append_synced(&wal, &rec(1, "a", WalOp::Put(b"1".to_vec())));
         drop(wal);
 
@@ -499,12 +586,145 @@ mod tests {
             f.flush().unwrap();
         }
 
-        let (wal, recovered) = Wal::open(&path).unwrap();
+        let (wal, recovered) = Wal::open(&path, 0).unwrap();
         assert_eq!(recovered.len(), 1, "torn tail should be ignored");
-        let clean_len = std::fs::metadata(wal.path()).unwrap().len();
-        let (_again, recovered2) = Wal::open(wal.path()).unwrap();
+        drop(wal);
+        // No longer truncated away (see zero-payload / preallocation tests
+        // below) — replaying again must still land on the same 1 record,
+        // and a fresh append must overwrite the torn bytes rather than
+        // appending after them (correctness matters here, not exact size).
+        let (again, recovered2) = Wal::open(&path, 0).unwrap();
         assert_eq!(recovered2.len(), 1);
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), clean_len);
+        append_synced(&again, &rec(2, "b", WalOp::Put(b"2".to_vec())));
+        drop(again);
+        let (_wal3, recovered3) = Wal::open(&path, 0).unwrap();
+        assert_eq!(
+            recovered3,
+            vec![
+                rec(1, "a", WalOp::Put(b"1".to_vec())),
+                rec(2, "b", WalOp::Put(b"2".to_vec())),
+            ]
+        );
+    }
+
+    #[test]
+    fn zero_length_payload_is_treated_as_clean_end() {
+        // A record can never legitimately have a zero-length payload (the
+        // smallest real one is 17 bytes), and crc32(&[]) == 0 — so a
+        // zero-filled region (pre-allocated tail, or a hole from any other
+        // source) must stop replay cleanly, not be decoded and error out.
+        let dir = tempdir();
+        let path = dir.join("wal.log");
+        let (wal, _) = Wal::open(&path, 0).unwrap();
+        append_synced(&wal, &rec(1, "a", WalOp::Put(b"1".to_vec())));
+        drop(wal);
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&[0u8; 64]).unwrap(); // zero-filled "unwritten tail"
+            f.flush().unwrap();
+        }
+        let (_wal, recovered) = Wal::open(&path, 0).unwrap();
+        assert_eq!(recovered, vec![rec(1, "a", WalOp::Put(b"1".to_vec()))]);
+    }
+
+    #[test]
+    fn fresh_wal_is_preallocated_one_chunk() {
+        let dir = tempdir();
+        let path = dir.join("wal.log");
+        let (wal, _) = Wal::open(&path, 4096).unwrap();
+        assert_eq!(std::fs::metadata(wal.path()).unwrap().len(), 4096);
+        append_synced(&wal, &rec(1, "a", WalOp::Put(b"1".to_vec())));
+        // A small append fits inside the reserved chunk — no further growth.
+        assert_eq!(std::fs::metadata(wal.path()).unwrap().len(), 4096);
+    }
+
+    #[test]
+    fn preallocation_survives_restart() {
+        let dir = tempdir();
+        let path = dir.join("wal.log");
+        let (wal, _) = Wal::open(&path, 4096).unwrap();
+        append_synced(&wal, &rec(1, "a", WalOp::Put(b"1".to_vec())));
+        drop(wal);
+        // Reopening must not shrink the file back down to just the valid
+        // record's length — that would defeat pre-allocation on every
+        // restart, re-paying the extension cost on the next append.
+        let (wal2, recovered) = Wal::open(&path, 4096).unwrap();
+        assert_eq!(recovered, vec![rec(1, "a", WalOp::Put(b"1".to_vec()))]);
+        assert_eq!(std::fs::metadata(wal2.path()).unwrap().len(), 4096);
+        append_synced(&wal2, &rec(2, "b", WalOp::Put(b"2".to_vec())));
+        drop(wal2);
+        let (_wal3, recovered3) = Wal::open(&path, 4096).unwrap();
+        assert_eq!(
+            recovered3,
+            vec![
+                rec(1, "a", WalOp::Put(b"1".to_vec())),
+                rec(2, "b", WalOp::Put(b"2".to_vec())),
+            ]
+        );
+    }
+
+    #[test]
+    fn growth_past_the_first_chunk_reserves_further_chunks() {
+        // Appends that cross a chunk boundary must extend the file by whole
+        // chunks ahead of the data and keep every record intact.
+        let dir = tempdir();
+        let path = dir.join("wal.log");
+        let (wal, _) = Wal::open(&path, 64).unwrap(); // tiny chunk, easy to cross
+        let mut expected = Vec::new();
+        for i in 0..50u64 {
+            let r = rec(i, &format!("key{i}"), WalOp::Put(format!("val{i}").into_bytes()));
+            append_synced(&wal, &r);
+            expected.push(r);
+        }
+        let len = std::fs::metadata(wal.path()).unwrap().len();
+        assert_eq!(len % 64, 0, "file grows in whole chunks");
+        assert!(len >= wal.size_bytes(), "allocation stays ahead of appends");
+        drop(wal);
+        let (_wal, recovered) = Wal::open(&path, 64).unwrap();
+        assert_eq!(recovered, expected);
+    }
+
+    #[test]
+    fn rotate_preallocates_fresh_segment() {
+        let dir = tempdir();
+        let path = dir.join("wal.log");
+        let (mut wal, _) = Wal::open(&path, 4096).unwrap();
+        append_synced(&wal, &rec(1, "a", WalOp::Put(b"1".to_vec())));
+        wal.rotate(1).unwrap();
+        // rotate() renamed the old active file to a sealed segment and
+        // opened a fresh active file in its place — that fresh file is what
+        // must be preallocated (the sealed segment keeps whatever size it
+        // already had, zero tail and all).
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 4096);
+        append_synced(&wal, &rec(2, "b", WalOp::Put(b"2".to_vec())));
+        drop(wal);
+        // Sealed segment 1 (record 1) plus the active log (record 2) both
+        // replay — rotate() doesn't discard data, only a later
+        // drop_segments_through (post-flush) would.
+        let (_wal, recovered) = Wal::open(&path, 4096).unwrap();
+        assert_eq!(
+            recovered,
+            vec![
+                rec(1, "a", WalOp::Put(b"1".to_vec())),
+                rec(2, "b", WalOp::Put(b"2".to_vec())),
+            ]
+        );
+    }
+
+    #[test]
+    fn truncate_re_reserves_a_zeroed_chunk() {
+        let dir = tempdir();
+        let path = dir.join("wal.log");
+        let (wal, _) = Wal::open(&path, 4096).unwrap();
+        append_synced(&wal, &rec(1, "a", WalOp::Put(b"1".to_vec())));
+        wal.truncate().unwrap();
+        // Still one chunk on disk, but the old record must NOT survive in it
+        // (truncate releases contents before re-reserving, so the chunk reads
+        // as zeros — otherwise replay would resurrect flushed data).
+        assert_eq!(std::fs::metadata(wal.path()).unwrap().len(), 4096);
+        drop(wal);
+        let (_wal, recovered) = Wal::open(&path, 4096).unwrap();
+        assert!(recovered.is_empty(), "truncated records must not replay");
     }
 
     fn tempdir() -> PathBuf {
