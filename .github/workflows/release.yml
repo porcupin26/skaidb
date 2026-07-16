@@ -245,7 +245,10 @@ jobs:
   release:
     name: publish release
     needs: [version, build]
-    runs-on: ubuntu-latest
+    # Self-hosted (like gate/version): hosted-runner queueing during GitHub
+    # incidents stalled/failed this stage twice on 2026-07-16; the API calls
+    # it makes work the same from either runner.
+    runs-on: [self-hosted, skaidb-linux]
     steps:
       - uses: actions/download-artifact@v8
         with:
