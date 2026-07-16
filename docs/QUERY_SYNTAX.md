@@ -536,16 +536,23 @@ WHERE (MATCH(body, 'rust') OR MATCH(title, 'rust'))
   score** of rows that already match. Every argument must itself be a
   search predicate (possibly AND/OR/NOT-composed).
 - **`EXPLAIN <statement>`** — the plan the executor would choose for any
-  SELECT/DML statement, as `(aspect, decision)` rows: the access path
-  (primary-key point read, secondary-index scan with its bounds, full
-  table scan, BM25 top-k / index-ordered / unranked search pushdown,
-  search-aggregation pushdown vs. row-gather fallback, HNSW vector
-  search), residual-filter and join-strategy notes, and — on a cluster —
-  appended `cluster.*` rows (members, replication factor, fan-out:
-  point-routed / served locally / scatter-gather). Advisory: it mirrors
-  the planner's decision logic without executing anything, so `EXPLAIN
-  DELETE ...` is safe. Gated by the wrapped statement's own privilege.
-  `EXPLAIN EXPLAIN` is rejected.
+  SELECT/DML statement, as `(aspect, decision)` rows. The `access` row
+  names the path: `point read` / `point-read set (primary-key =/IN, N
+  keys)` / `index scan via '<name>' (<bounds>)` / `index-ordered walk via
+  '<name>' (… early-stop at LIMIT)` / `global-index probe via '<name>'
+  (routed to the value's replica set)` / BM25 top-k, index-ordered or
+  unranked search pushdown / search-aggregation pushdown vs. row-gather
+  fallback / HNSW vector search / `full table scan (streaming k-way
+  merge)`. An `order` row notes ORDER BY strategy (index-served vs top-k
+  selection); residual-filter and join-strategy rows follow, and — on a
+  cluster — `cluster.*` rows (members, replication factor, fan-out:
+  point-routed / global-probe-routed / served locally on full copy /
+  scatter-gather). Advisory: it mirrors the planner's decision logic
+  without executing anything, so `EXPLAIN DELETE ...` is safe. Bindable
+  (`EXPLAIN SELECT … WHERE id = ?` prepares like the statement it wraps).
+  Gated by the wrapped statement's own privilege. `EXPLAIN EXPLAIN` is
+  rejected. Worked example with output:
+  [INDEXING.md](INDEXING.md#global-value-sharded-indexes).
 - **`EXPLAIN SCORE <select> FOR <pk literal>`** — a standalone statement
   returning the BM25 breakdown (`explanation` column, tantivy's JSON —
   per-term K1 / idf(n, N) / tf-normalization) of how the row with that
