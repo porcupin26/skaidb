@@ -565,6 +565,10 @@ container's cgroup limit. See DOCKER.md.
 **System requirements**: min 1 core / 512 MB / 1 GB disk (set
 `storage.memory_target` on small boxes); recommended 2+ cores, 2 GB+, SSD
 at 2–3× data (LSM compaction + WAL + FTS indexes); ×RF across the cluster.
+Each table/index keeps its own WAL, grown 1 MiB at a time ahead of writes
+(so fsyncs don't pay a file-extension metadata cost per commit — a
+measured 3× single-row durable-write speedup on some storage); expect a
+1 MiB floor per non-ephemeral table on disk.
 
 **Web UI** at `/ui` (embed-in-binary, RBAC-aware): status, SQL console
 with schema browser + result charts + CSV/JSON export, stats dashboards,
