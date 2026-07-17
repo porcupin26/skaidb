@@ -26,6 +26,10 @@ skaidb-proto.workspace = true
 skaidb-types.workspace = true
 skaidb-auth.workspace = true
 skaidb-sql.workspace = true
+# Witness mode: the pull loop is a SQL client of the PRIMARY cluster
+# (schema listing, registration/heartbeat) — the same driver crate every
+# external client uses, so SCRAM and failover come for free.
+skaidb-driver.workspace = true
 clap.workspace = true
 serde_json.workspace = true
 snap.workspace = true
@@ -46,5 +50,3 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"
 
-[dev-dependencies]
-skaidb-driver.workspace = true

@@ -21,6 +21,7 @@ pub mod rest;
 pub mod shared;
 pub mod slowlog;
 mod ui;
+mod witness_pull;
 mod witnesses;
 
 use std::sync::{Arc, Mutex, RwLock};
@@ -412,6 +413,10 @@ pub fn run(
             }
         });
     }
+
+    // Witness mode: start the pull loop when [witness] is enabled (no-op,
+    // with a logged refusal, otherwise — see witness_pull.rs).
+    witness_pull::spawn_if_enabled(ctx.clone());
 
     // Ensure the witness-registry tables exist. Unlike `node_stats`, nothing
     // here self-publishes on a tick — rows arrive from witness processes
@@ -2193,6 +2198,123 @@ pub(crate) mod tests {
     }
 
     /// A single-node cluster `Context`: superuser has `Admin`, `reader` does not.
+    /// Witness pull, end to end in-process: a real single-member primary
+    /// (internode served — the pull's data path) with a binary SQL endpoint
+    /// (the pull's control path), mirrored into a standalone witness
+    /// context. Covers: schema sync, byte-exact data with nested docs,
+    /// registration + heartbeat + watermarks on the primary, UPDATE and
+    /// tombstone (DELETE) propagation on re-pull, and idempotency (third
+    /// cycle applies nothing).
+    #[test]
+    fn witness_pull_mirrors_a_primary_end_to_end() {
+        // Primary: cluster backend with a LIVE internode listener.
+        let internode_addr = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let a = l.local_addr().unwrap().to_string();
+            drop(l);
+            a
+        };
+        let cfg = NodeConfig {
+            id: NodeId::new(&internode_addr),
+            internode_addr: internode_addr.clone(),
+            members: vec![(NodeId::new(&internode_addr), internode_addr.clone())],
+            replication_factor: 1,
+            vnodes_per_node: 64,
+            read_consistency: ClusterConsistency::Quorum,
+            write_consistency: ClusterConsistency::Quorum,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
+            anti_entropy_interval_secs: 0,
+        };
+        let node = Node::new(Database::open(temp_dir()).unwrap(), cfg);
+        node.serve_internode().unwrap();
+        let primary: Shared = Arc::new(Context {
+            backend: Backend::Cluster(node),
+            metrics: Metrics::new(),
+            audit: RwLock::new(quiet_audit()),
+            authn: AuthState::disabled(),
+            superuser_role: "superuser".into(),
+            admin_lock: Mutex::new(()),
+            start: Instant::now(),
+            slow_log: crate::slowlog::SlowLog::new(),
+            config: RwLock::new(Config::default()),
+            config_path: None,
+            drivers_table_ensured: std::sync::atomic::AtomicBool::new(false),
+        });
+        let (sql_addr, _h) = binary::spawn("127.0.0.1:0", primary.clone()).unwrap();
+        crate::witnesses::ensure_tables(&primary).unwrap();
+        let exec_p = |sql: &str| match crate::shared::execute_as(&primary, "superuser", sql) {
+            Response::Error(e) => panic!("primary {sql}: {e}"),
+            other => other,
+        };
+        exec_p("CREATE DATABASE mirror");
+        exec_p("CREATE TABLE mirror.items (PRIMARY KEY (id))");
+        exec_p("INSERT INTO mirror.items (id, x, meta) VALUES (1, 'a', {n: 1}), (2, 'b', {n: 2}), (3, 'c', {n: 3})");
+
+        // Witness: standalone, read-only (the intended deployment shape).
+        let witness = temp_ctx();
+        let (status, _) = witness.config_set("server.read_only", "true");
+        assert_eq!(status, 200);
+        let wcfg = skaidb_config::WitnessConfig {
+            enabled: true,
+            primary_sql_addrs: vec![sql_addr.to_string()],
+            primary_internode_addrs: vec![internode_addr.clone()],
+            user: "anonymous".into(),
+            password: String::new(),
+            databases: vec!["mirror".into()],
+            interval_secs: 3600,
+            witness_id: "w-test".into(),
+            region: "unit".into(),
+        };
+
+        // Cycle 1: full copy arrives, registration lands on the primary.
+        let s1 = crate::witness_pull::run_cycle(&witness, &wcfg).unwrap();
+        assert_eq!(s1.tables, vec![("mirror.items".to_string(), 3, 3)]);
+        let exec_w = |sql: &str| match crate::shared::execute_as(&witness, "superuser", sql) {
+            Response::Error(e) => panic!("witness {sql}: {e}"),
+            other => other,
+        };
+        let rows_of = |resp: Response| match resp {
+            Response::Rows { rows, .. } => rows,
+            other => panic!("expected rows, got {other:?}"),
+        };
+        let got = rows_of(exec_w("SELECT id, x, meta FROM mirror.items ORDER BY id"));
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0][1], Value::String("a".into()));
+        // Nested docs survive byte-exact (the internode path carries raw
+        // encoded values, not a SQL/JSON re-serialization).
+        match &got[1][2] {
+            Value::Document(d) => assert_eq!(d.0.get("n"), Some(&Value::Int(2))),
+            other => panic!("expected nested doc, got {other:?}"),
+        }
+        let reg = rows_of(exec_p(
+            "SELECT witness_id, region, last_seen_at FROM witnesses",
+        ));
+        assert_eq!(reg.len(), 1);
+        assert_eq!(reg[0][0], Value::String("w-test".into()));
+        assert_eq!(reg[0][1], Value::String("unit".into()));
+        assert!(matches!(reg[0][2], Value::Int(n) if n > 0));
+
+        // Mutate the primary: update, delete, insert — then cycle 2.
+        exec_p("UPDATE mirror.items SET x = 'A2' WHERE id = 1");
+        exec_p("DELETE FROM mirror.items WHERE id = 2");
+        exec_p("INSERT INTO mirror.items (id, x) VALUES (4, 'd')");
+        crate::witness_pull::run_cycle(&witness, &wcfg).unwrap();
+        let got = rows_of(exec_w("SELECT id, x FROM mirror.items ORDER BY id"));
+        assert_eq!(
+            got.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Int(1), Value::Int(3), Value::Int(4)],
+            "the DELETE must propagate as a tombstone"
+        );
+        assert_eq!(got[0][1], Value::String("A2".into()), "the UPDATE must propagate");
+
+        // Cycle 3: nothing changed — the staleness guard applies zero rows.
+        let s3 = crate::witness_pull::run_cycle(&witness, &wcfg).unwrap();
+        let (_name, pulled, applied) = &s3.tables[0];
+        assert!(*pulled >= 3, "tombstone + rows still page over");
+        assert_eq!(*applied, 0, "unchanged rows must be skipped, not re-applied");
+    }
+
     fn cluster_ctx() -> Shared {
         let id = "127.0.0.1:0"; // not served — status needs no network
         let cfg = NodeConfig {

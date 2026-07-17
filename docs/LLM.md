@@ -446,15 +446,24 @@ WHERE ts >= now() - 6h GROUP BY t;
   connections are not tracked (one request per connection — churn, not
   signal). Shown on the UI status tab; query it:
   `SELECT node, remote_addr, auth_user FROM drivers`.
-- **Witnesses table**: a witness (cross-region backup node that pulls on
-  its own schedule; never a ring member, never in quorum) registers and
-  heartbeats itself via plain SQL into the persistent `witnesses` table
-  (PK=witness_id: region, registered_at, last_seen_at) using an
-  operator-created role (`CREATE ROLE witness; GRANT SELECT ON <tables> TO
-  witness; GRANT INSERT, UPDATE ON witnesses TO witness`). The single-row
+- **Witness mode** (`[witness]` config on a STANDALONE node): the node
+  periodically pulls a full copy of the configured databases from a
+  primary cluster it is not a member of — a cross-region backup that
+  never joins the primary's ring or quorums and sets its own pace
+  (`interval_secs`, default 1h). Data moves over the internode protocol
+  (`ScanPage` pages: byte-exact rows with HLC stamps and tombstones —
+  re-pulls converge by last-writer-wins, deletes propagate); schema
+  listing and the registration/heartbeat/watermark row in the primary's
+  `witnesses` table (PK=witness_id: region, registered_at, last_seen_at,
+  watermarks) go over SQL with witness-scoped credentials on the primary
+  (`CREATE ROLE witness_role; GRANT INSERT, UPDATE ON witnesses TO
+  witness_role`). Pair with `server.read_only = true`: drivers can read
+  the copy, nothing can diverge it (the pull applies beneath the session
+  layer, so read-only never blocks it). The single-row
   `witness_gc_config` table holds `grace_period_secs` (default 7 days) —
   cluster-consistent because it is a table row, settable with a plain
-  `UPDATE`. Both appear on the UI status tab.
+  `UPDATE`. Registered witnesses + live drivers appear on the UI status
+  tab.
 - **Read-only mode** (`server.read_only`, default false, **live-mutable**:
   `SET CONFIG server.read_only = 'true'`): rejects every client mutation —
   INSERT/UPDATE/DELETE, DDL, user management, transactions, ES `_bulk`,
@@ -585,7 +594,10 @@ read_cache_entries, scan_row_budget (rows one statement may examine,
 default 250000, 0 = off), statement_timeout_secs (default 120, 0 = off);
 `[observability]` slow_query_ms, query_log_*,
 log_format/log_file, per_table_metrics, prometheus_port, self_scrape,
-self_scrape_interval_secs, node_stats, node_stats_interval_secs; `[ui]` enabled.
+self_scrape_interval_secs, node_stats, node_stats_interval_secs; `[ui]` enabled;
+`[witness]` enabled, primary_sql_addrs, primary_internode_addrs, user,
+password (masked in `config show`), databases, interval_secs, witness_id,
+region — see Witness mode above.
 **Live-mutable** (no restart): all `observability.*` log/slow-query keys,
 `observability.self_scrape*`, `observability.node_stats*`, `ui.enabled`,
 `server.read_only`.

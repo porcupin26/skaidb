@@ -83,6 +83,64 @@ pub struct Config {
     pub storage: StorageConfig,
     pub observability: ObservabilityConfig,
     pub ui: UiConfig,
+    pub witness: WitnessConfig,
+}
+
+/// Witness mode (`[witness]`): this node periodically PULLS a full copy of
+/// the configured databases from a primary cluster it is NOT a member of —
+/// a cross-region backup that never participates in the primary's quorums
+/// and sets its own pace. Data moves over the internode protocol
+/// (`ScanPage` pages: byte-exact rows with HLC stamps and tombstones, so
+/// re-pulls converge by last-writer-wins and deletes propagate); schema
+/// listing and the registration/heartbeat rows in the primary's
+/// `witnesses` table go over the ordinary SQL protocol with
+/// witness-scoped credentials. Requires standalone (non-cluster) mode;
+/// pair it with `server.read_only = true` so drivers can read the copy
+/// but nothing can diverge it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WitnessConfig {
+    /// Run the pull loop. Off by default; a node with this off is just a
+    /// normal server.
+    pub enabled: bool,
+    /// Primary members' SQL (binary-protocol) endpoints, `host:port` —
+    /// tried in order (failover) for schema listing and registration.
+    pub primary_sql_addrs: Vec<String>,
+    /// Primary members' internode endpoints, `host:internode_port` —
+    /// tried in order for `ScanPage` data pulls. On a full-copy primary
+    /// (replication_factor >= members) any single member serves the
+    /// whole table.
+    pub primary_internode_addrs: Vec<String>,
+    /// Credentials on the PRIMARY for schema listing + the `witnesses`
+    /// registry writes (an operator-created role: `GRANT INSERT, UPDATE
+    /// ON witnesses TO <role>`). The password is masked in `config show`.
+    pub user: String,
+    pub password: String,
+    /// Databases to mirror. Empty = witness mode refuses to start (an
+    /// explicit list is the operator stating what the backup covers).
+    pub databases: Vec<String>,
+    /// Seconds between pull cycles. A witness does not need to keep up —
+    /// default one hour.
+    pub interval_secs: u64,
+    /// Identity registered in the primary's `witnesses` table.
+    pub witness_id: String,
+    pub region: String,
+}
+
+impl Default for WitnessConfig {
+    fn default() -> Self {
+        WitnessConfig {
+            enabled: false,
+            primary_sql_addrs: Vec::new(),
+            primary_internode_addrs: Vec::new(),
+            user: String::new(),
+            password: String::new(),
+            databases: Vec::new(),
+            interval_secs: 3600,
+            witness_id: "witness".to_string(),
+            region: String::new(),
+        }
+    }
 }
 
 /// The built-in web UI (`/ui` on the REST port).
@@ -354,12 +412,11 @@ pub fn is_runtime_mutable(key: &str) -> bool {
 
 /// Mask secret fields in a serialized config so they are never echoed back.
 fn redact(root: &mut serde_json::Value) {
-    if let Some(p) = root
-        .get_mut("auth")
-        .and_then(|a| a.get_mut("superuser_password"))
-    {
-        if p.as_str().is_some_and(|s| !s.is_empty()) {
-            *p = serde_json::Value::String("***".into());
+    for (section, field) in [("auth", "superuser_password"), ("witness", "password")] {
+        if let Some(p) = root.get_mut(section).and_then(|a| a.get_mut(field)) {
+            if p.as_str().is_some_and(|s| !s.is_empty()) {
+                *p = serde_json::Value::String("***".into());
+            }
         }
     }
 }
