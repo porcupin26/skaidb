@@ -414,6 +414,32 @@ const SCAN_PAGE_ROWS: usize = 2_000;
 #[cfg(test)]
 const SCAN_PAGE_ROWS: usize = 8;
 
+/// Rows per **local** page pull specifically within `cluster_scan_collect`'s
+/// gather loop — larger than `SCAN_PAGE_ROWS`, which still governs peer
+/// pages and the round-based memory bound. Profiling a live production
+/// unfiltered `GROUP BY` (agencik E-7's residual slowness after the OOM fix
+/// landed) found the query wasn't disk- or decode-bound — `pread64` stayed
+/// fast throughout — but lock-bound: the busiest thread sat at ~3% CPU,
+/// blocked in `futex_do_wait`. `self.local.read()` is taken fresh every
+/// round (~92 times for a 183k-row table at `SCAN_PAGE_ROWS`), contending
+/// with the same lock every write on the node also takes; Linux's default
+/// writer-preferring `pthread_rwlock` lets a steady trickle of live writes
+/// repeatedly queue this reader behind pending writers, and the delay
+/// compounds across every reacquisition. Pulling a bigger local page per
+/// acquisition doesn't change how many *rounds* the loop runs (peers still
+/// pace at `SCAN_PAGE_ROWS`), but it means `local_done` flips true after far
+/// fewer rounds, so `self.local.read()` stops being touched at all for the
+/// remainder of the gather — directly cutting acquisition count, not just
+/// per-acquisition duration. `pread64`'s per-call cost is low enough (single
+/// digit µs even under load) that a page this size is still a brief hold in
+/// wall-clock terms; the memory cost (worst case here, ~220 MB for a
+/// 10.9 KB/row table) is trivial against a 4 GB node's ceiling given the
+/// page-bounded design already holds regardless of this constant.
+#[cfg(not(test))]
+const LOCAL_SCAN_BATCH_ROWS: usize = 20_000;
+#[cfg(test)]
+const LOCAL_SCAN_BATCH_ROWS: usize = 32;
+
 /// Rows per local scan page in the topology-change passes (rebalance,
 /// drain, reclaim): bounds the sender's transient memory to one page plus
 /// the in-flight batch, independent of shard size — the same fix that
@@ -6228,8 +6254,8 @@ impl Node {
                     .local
                     .read()
                     .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
-                    .local_scan_versioned_page(table, local_cursor.as_deref(), SCAN_PAGE_ROWS)?;
-                local_done = rows.len() < SCAN_PAGE_ROWS;
+                    .local_scan_versioned_page(table, local_cursor.as_deref(), LOCAL_SCAN_BATCH_ROWS)?;
+                local_done = rows.len() < LOCAL_SCAN_BATCH_ROWS;
                 if let Some((k, ..)) = rows.last() {
                     local_cursor = Some(k.clone());
                 }
