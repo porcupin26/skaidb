@@ -603,6 +603,44 @@ produced six measured, code-verified findings:
   size, may not reproduce a real table's on-disk/write-history
   characteristics (this one's remaining >120s latency was not reproduced
   by any synthetic test tried, matched row-count-for-row-count).
+- **`ORDER BY <pk> LIMIT k` OOM-killed a production node — E-7's sibling
+  on the ordered-read path** (fixed same day, 2026-07-17). While
+  validating a PK-keyset pagination shape for the witness puller,
+  `SELECT id FROM gmail_emails WHERE id > '' ORDER BY id LIMIT 500` at
+  consistency ONE kernel-OOM-killed skai1 (3.9 GB peak / 4 GB cgroup) —
+  and after the restart, a bare `ORDER BY id LIMIT 3` killed it again:
+  k is irrelevant. Root cause: only *secondary* indexes were considered
+  order-serving. The PK isn't one (E-8's clustered PK-blindness), so
+  `ORDER BY <pk>` — locally and via `local_sorted_candidates` for the
+  distributed top-k — fell through to gathering EVERY matching row's
+  full document to sort before LIMIT: the same O(table) materialization
+  E-7's fix removed from the unordered path, alive on the ordered one.
+  (Fallout: agencik's driver failed over cleanly, no app outage; cluster
+  reconverged with 0 hints and 0 rows to reconcile.) Fix, both halves in
+  `gather_rows_planned` (exec.rs) so ONE-consistency local serving,
+  standalone, AND the QUORUM distributed top-k (which gates on the local
+  planner claiming a sorted walk) all inherit it: (1) `ORDER BY
+  <leftmost pk column>` now walks the table — the table IS the primary
+  index — in key order with range bounds from the filter's pk
+  constraints and early stop at the fetch limit; DESC with a limit pages
+  the value-free stamps sidecar for the key list, reverses it, and
+  point-reads from the tail (O(range-keys) memory, honestly
+  scan-metered as O(table) work); (2) an exact single-key ORDER BY on
+  an UNINDEXED column with a limit keeps a bounded top-k buffer
+  (compact-at-2k, O(k) memory) instead of collecting every row,
+  comparing exactly as `order_compare` does (NULLs last ASC / first
+  DESC, key tiebreak) so the claimed `sorted = true` is honest.
+  **Measured on the live 3-node p225 bench fleet** (20k rows / 156 MB
+  wide table on 512 MB containers — materialization would be
+  unmissable): all six killer shapes (head / keyset page / DESC tail ×
+  ONE / QUORUM) correct in 0.3–1.8 s with coordinator RSS completely
+  flat. Regression tests pin the early-stop under a tight scan budget,
+  byte-for-byte agreement with the executor's full sort (ties, NULLs,
+  deletes, composite PKs), and both consistency levels through a real
+  3-node cluster. Process lesson, re-learned the hard way: "it's just a
+  read" is not a safe reason to probe production first — this incident's
+  probe should have hit the bench fleet, where the same query would
+  have OOM-killed a container nobody cares about.
 
 ### Deliberately skipped (documented reasons)
 

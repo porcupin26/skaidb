@@ -70,6 +70,7 @@ impl Session {
 mod tests {
     use super::*;
     use crate::EngineError;
+    use skaidb_types::Value;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -308,6 +309,144 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(got.len(), 0);
+    }
+
+    /// `ORDER BY <pk> LIMIT k` must walk the primary key range with early
+    /// stop — NOT gather every row to sort. The unbounded gather OOM-killed
+    /// a production node twice on 2026-07-17 (`ORDER BY id LIMIT 3` over
+    /// 183k rows / 1.9 GB materialized 3.9 GB); the tight scan budget here
+    /// is the proxy assertion: an early-stopping walk examines ~k rows, the
+    /// old path examined all 2000 and would die at the 500-row budget.
+    #[test]
+    fn order_by_pk_limit_walks_the_key_range_not_the_table() {
+        let mut opts = skaidb_storage::EngineOptions {
+            scan_row_budget: 500,
+            ..Default::default()
+        };
+        opts.statement_timeout_secs = 0;
+        let mut s = Session::open_with_options(tmp(), opts).unwrap();
+        s.execute("CREATE TABLE t (PRIMARY KEY (id));").unwrap();
+        for i in 0..2000 {
+            s.execute(&format!("INSERT INTO t (id, x) VALUES ({i}, 'v{i}');")).unwrap();
+        }
+        // Head of the table: 3 rows examined, not 2000.
+        let got = rows(s.execute("SELECT id FROM t ORDER BY id LIMIT 3;").unwrap());
+        assert_eq!(got, vec![vec![Value::Int(0)], vec![Value::Int(1)], vec![Value::Int(2)]]);
+        // Keyset pagination — the witness-puller shape and the exact query
+        // that killed prod: bounded start from the cursor, early stop.
+        let got = rows(
+            s.execute("SELECT id FROM t WHERE id > 100 ORDER BY id LIMIT 3;")
+                .unwrap(),
+        );
+        assert_eq!(
+            got,
+            vec![vec![Value::Int(101)], vec![Value::Int(102)], vec![Value::Int(103)]]
+        );
+        // Bounded range from both sides.
+        let got = rows(
+            s.execute("SELECT id FROM t WHERE id > 10 AND id <= 12 ORDER BY id LIMIT 10;")
+                .unwrap(),
+        );
+        assert_eq!(got, vec![vec![Value::Int(11)], vec![Value::Int(12)]]);
+        // OFFSET rides the same walk (fetch_limit = offset + limit).
+        let got = rows(
+            s.execute("SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 3;").unwrap(),
+        );
+        assert_eq!(got, vec![vec![Value::Int(3)], vec![Value::Int(4)]]);
+    }
+
+    /// The bounded ordered paths (PK walk ASC/DESC, unindexed top-k heap)
+    /// must return byte-for-byte what the executor's own full sort returns.
+    /// Reference results come through public SQL: a multi-key
+    /// `ORDER BY col, <pk>` is a non-exact order, so it takes the old
+    /// gather-then-sort path — and its explicit PK tiebreak matches the
+    /// bounded paths' key tiebreak, making the two comparable exactly.
+    #[test]
+    fn bounded_ordered_paths_match_the_full_sort() {
+        let mut s = Session::open(tmp()).unwrap();
+        s.execute("CREATE TABLE t (PRIMARY KEY (id));").unwrap();
+        for i in 0..200i64 {
+            // val collides (ties) and is MISSING (NULL) on every 13th row.
+            if i % 13 == 0 {
+                s.execute(&format!("INSERT INTO t (id, x) VALUES ({i}, 'x');")).unwrap();
+            } else {
+                s.execute(&format!(
+                    "INSERT INTO t (id, val, x) VALUES ({i}, {}, 'x');",
+                    (i * 37) % 101
+                ))
+                .unwrap();
+            }
+        }
+        let mut q = |sql: &str| rows(s.execute(sql).unwrap());
+        // PK ASC / DESC with limits, cursors, and a non-PK residual filter.
+        assert_eq!(
+            q("SELECT id FROM t ORDER BY id LIMIT 5;"),
+            q("SELECT id FROM t ORDER BY id, x LIMIT 5;")
+        );
+        assert_eq!(
+            q("SELECT id FROM t ORDER BY id DESC LIMIT 5;"),
+            q("SELECT id FROM t ORDER BY id DESC, x LIMIT 5;")
+        );
+        assert_eq!(
+            q("SELECT id FROM t WHERE id > 42 ORDER BY id LIMIT 5;"),
+            q("SELECT id FROM t WHERE id > 42 ORDER BY id, x LIMIT 5;")
+        );
+        assert_eq!(
+            q("SELECT id FROM t WHERE id < 42 ORDER BY id DESC LIMIT 5;"),
+            q("SELECT id FROM t WHERE id < 42 ORDER BY id DESC, x LIMIT 5;")
+        );
+        assert_eq!(
+            q("SELECT id FROM t WHERE val > 50 ORDER BY id LIMIT 5;"),
+            q("SELECT id FROM t WHERE val > 50 ORDER BY id, x LIMIT 5;")
+        );
+        // Unindexed column (top-k heap), ties broken by PK, NULLs last on
+        // ASC and first on DESC — exactly the executor's semantics.
+        assert_eq!(
+            q("SELECT id, val FROM t ORDER BY val LIMIT 7;"),
+            q("SELECT id, val FROM t ORDER BY val, id LIMIT 7;")
+        );
+        assert_eq!(
+            q("SELECT id, val FROM t ORDER BY val DESC LIMIT 7;"),
+            q("SELECT id, val FROM t ORDER BY val DESC, id LIMIT 7;")
+        );
+        // DESC over NULLs: the first rows are the val-less ones.
+        let head = q("SELECT val FROM t ORDER BY val DESC LIMIT 2;");
+        assert_eq!(head, vec![vec![Value::Null], vec![Value::Null]]);
+        // Deletes must not resurface through the DESC stamps walk.
+        s.execute("DELETE FROM t WHERE id = 199;").unwrap();
+        let mut q = |sql: &str| rows(s.execute(sql).unwrap());
+        assert_eq!(
+            q("SELECT id FROM t ORDER BY id DESC LIMIT 2;"),
+            vec![vec![Value::Int(198)], vec![Value::Int(197)]]
+        );
+    }
+
+    /// Composite PK: `ORDER BY <leftmost pk column>` rides the key-ordered
+    /// walk; ties on the leading column resolve by the remaining PK columns
+    /// (key order), which is what the explicit multi-key reference asks for.
+    #[test]
+    fn order_by_leading_pk_column_of_composite_key() {
+        let mut s = Session::open(tmp()).unwrap();
+        s.execute("CREATE TABLE m (PRIMARY KEY (ch, ts));").unwrap();
+        for i in 0..300 {
+            s.execute(&format!(
+                "INSERT INTO m (ch, ts, x) VALUES ('c{:02}', {i}, 'x');",
+                i % 7
+            ))
+            .unwrap();
+        }
+        let mut q = |sql: &str| rows(s.execute(sql).unwrap());
+        assert_eq!(
+            q("SELECT ch, ts FROM m ORDER BY ch LIMIT 6;"),
+            q("SELECT ch, ts FROM m ORDER BY ch, ts LIMIT 6;")
+        );
+        // DESC reverses the WHOLE key walk, so leading-column ties come back
+        // ts-DESC (both are valid arbitrary-tie top-k orders; this pins
+        // which one the walk produces).
+        assert_eq!(
+            q("SELECT ch, ts FROM m ORDER BY ch DESC LIMIT 6;"),
+            q("SELECT ch, ts FROM m ORDER BY ch DESC, ts DESC LIMIT 6;")
+        );
     }
 
     /// A leftmost PK-prefix equality (plus optional trailing range on the

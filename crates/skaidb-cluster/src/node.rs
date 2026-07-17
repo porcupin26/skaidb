@@ -9399,6 +9399,77 @@ mod tests {
         }
     }
 
+    /// `ORDER BY <pk> LIMIT k` must be served bounded at BOTH consistency
+    /// levels: ONE routes to the local replica's new PK-ordered walk;
+    /// QUORUM routes through the distributed sorted top-k, whose per-member
+    /// candidates (`local_sorted_candidates`) only serve once the local
+    /// planner claims a sorted walk — which the PK paths now do. Before the
+    /// fix, this shape gathered and sorted every matching row on the
+    /// coordinator (OOM-killed production twice, 2026-07-17).
+    #[test]
+    fn ordered_pk_limit_is_bounded_and_correct_at_one_and_quorum() {
+        let rf2 = |id: &str, addr: &str, members: &[(NodeId, String)]| NodeConfig {
+            replication_factor: 2,
+            ..rf1(id, addr, members)
+        };
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let na = Node::new(Database::open(temp_dir("opk-a")).unwrap(), rf2("a", &a, &members));
+        let nb = Node::new(Database::open(temp_dir("opk-b")).unwrap(), rf2("b", &b, &members));
+        let nc = Node::new(Database::open(temp_dir("opk-c")).unwrap(), rf2("c", &c, &members));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        nc.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE o (PRIMARY KEY (id))").unwrap();
+        for i in 0..120i64 {
+            na.execute(&format!("INSERT INTO o (id, x) VALUES ({i}, 'v{i}')"))
+                .unwrap();
+        }
+        let rows_of = |out: SessionEffect| -> Vec<Vec<Value>> {
+            match out {
+                SessionEffect::Output(QueryOutput::Rows(rs)) => rs.rows,
+                other => panic!("expected rows, got {other:?}"),
+            }
+        };
+        let expected_head: Vec<Vec<Value>> =
+            (0..5).map(|i| vec![Value::Int(i)]).collect();
+        let expected_tail: Vec<Vec<Value>> =
+            (0..5).map(|i| vec![Value::Int(119 - i)]).collect();
+        let expected_cursor: Vec<Vec<Value>> =
+            (43..48).map(|i| vec![Value::Int(i)]).collect();
+        for consistency in [Consistency::One, Consistency::Quorum] {
+            let got = rows_of(
+                na.execute_session_with(
+                    DEFAULT_DATABASE,
+                    "SELECT id FROM o ORDER BY id LIMIT 5",
+                    Some(consistency),
+                )
+                .unwrap(),
+            );
+            assert_eq!(got, expected_head, "head at {consistency:?}");
+            let got = rows_of(
+                na.execute_session_with(
+                    DEFAULT_DATABASE,
+                    "SELECT id FROM o ORDER BY id DESC LIMIT 5",
+                    Some(consistency),
+                )
+                .unwrap(),
+            );
+            assert_eq!(got, expected_tail, "tail at {consistency:?}");
+            // Keyset pagination — the witness-puller shape.
+            let got = rows_of(
+                na.execute_session_with(
+                    DEFAULT_DATABASE,
+                    "SELECT id FROM o WHERE id > 42 ORDER BY id LIMIT 5",
+                    Some(consistency),
+                )
+                .unwrap(),
+            );
+            assert_eq!(got, expected_cursor, "cursor at {consistency:?}");
+        }
+    }
+
     /// The sharded partials path (RF < members): every member aggregates
     /// its primary-owned key-space and the coordinator merges — proven
     /// directly (the sharded call answers rather than declines, and its

@@ -122,7 +122,13 @@ Key facts an agent must know:
   point read — even for an absent key (no full-table scan). A leftmost
   equality *prefix* (plus one trailing range on the next PK column) scans
   only that key slice — `WHERE channel = ?` reads one channel, `AND ts >= ?`
-  narrows it. No secondary index needed for shapes the primary key orders.
+  narrows it. No secondary index needed for shapes the primary key orders:
+  `ORDER BY <leftmost pk column> LIMIT k` (optionally with a pk range —
+  keyset pagination: `WHERE id > ? ORDER BY id LIMIT ?`) walks the table
+  in key order with early stop, at ONE and QUORUM (k ≤ 1000) alike, with
+  bounded memory. An exact single-key `ORDER BY <unindexed column>
+  LIMIT k` keeps a bounded top-k instead of gathering every row — O(k)
+  memory, though still a full-table scan's worth of work.
 - **ORDER BY**: a multi-key `ORDER BY` whose leading key is indexed walks the
   index bounded by LIMIT plus the leading-key tie group, then re-sorts by the
   full clause — exact, without gathering every matching row. When a strictly

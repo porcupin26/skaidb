@@ -130,35 +130,19 @@ names) lives in git history. Still open:
 (The audit record — what already holds, measured dead ends, methodology —
 lives in [BENCHMARKS.md](BENCHMARKS.md#performance-engineering-notes).)
 
-- [ ] **[bug/OOM] `ORDER BY <pk> LIMIT k` over a large unindexed-sort-key
-  table OOM-kills the coordinator — E-7's sibling on the ordered-read
-  path. CONFIRMED IN PRODUCTION 2026-07-17 ~22:32: two kernel OOM kills
-  of skai1** (3.9 GB peak against the 4 GB cgroup), triggered by
-  `SELECT id FROM gmail_emails WHERE id > '' ORDER BY id LIMIT 500` and
-  then — after the restart — by a bare `ORDER BY id LIMIT 3`, both at
-  consistency ONE (183k rows / 1.9 GB, `id` is the PK). k is irrelevant:
-  the coordinator materializes every matching row's full document to
-  sort before applying LIMIT. The v0.87 distributed sorted top-k only
-  engages when the sort key has a local *secondary* index; the PK is not
-  one (E-8's clustered-path PK-blindness again), so `ORDER BY <pk>`
-  falls through to gather-everything-then-sort — the exact O(table)
-  materialization E-7's fix removed from the unordered path
-  (`matching_rows`), still alive in `matching_rows_ordered`. The E-7
-  work (v0.95.2-4) never touched this branch. Neighboring landmine,
-  same root: an unfiltered `SELECT * FROM <large table>` (no ORDER BY)
-  is page-bounded through `cluster_scan_collect` but still accumulates
-  the full result Vec (`CollectSink::Rows(None)`) — O(table) on the
-  coordinator before the response is written. Fallout: the agencik
-  driver failed over cleanly (retries + peer failover, no app outage);
-  cluster reconverged (0 hints, 0 rows reconciled). **This blocks the
-  witness puller** (.priv/witness-node-plan.md Phase 4): PK-keyset
-  pagination — the natural pull shape — is exactly the killing query.
-  NEXT: (1) extend E-7's projection/paging treatment to
-  `matching_rows_ordered`'s no-index fallback, or make `ORDER BY <pk>`
-  use the key-ordered walk `cluster_scan_collect` already produces
-  (rows come back in PK order from the BTreeMap — the sort is free);
-  (2) meanwhile NEVER run ordered or unfiltered full-table selects
-  against prod-sized tables; validate on the bench fleet only.
+- [ ] **[perf] Remaining O(table) coordinator materializations on the
+  read path** — what's left after the 2026-07-17 ordered-read OOM fix
+  (see BENCHMARKS.md for the incident + fix): (a) an unfiltered
+  `SELECT * FROM <large table>` (no ORDER BY, no LIMIT) is page-bounded
+  through `cluster_scan_collect` but still accumulates the full result
+  Vec (`CollectSink::Rows(None)`) before the response is written —
+  inherent to the response size, but streaming it chunk-by-chunk from
+  the walk (QueryStream all the way down) would cap the coordinator;
+  (b) at QUORUM, an exact single-key ordered read with LIMIT >
+  `SORTED_TOPK_MAX` (1000) or a multi-key ORDER BY still falls back to
+  the full gather-then-sort; (c) `EXPLAIN` doesn't yet report the
+  PK-ordered walk or the bounded top-k (shows "full table scan"), the
+  same under-reporting E-8 notes for PK-prefix plans.
 - [ ] **[perf] Active memory release at the cgroup ceiling (skai2 #8)** —
   three production wedges in five days (2026-07-11/13/15): RSS ratchets to
   the 4 GB cgroup limit and stays there, starving file cache into an IO

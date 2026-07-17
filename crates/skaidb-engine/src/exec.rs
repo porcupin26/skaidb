@@ -4464,18 +4464,173 @@ impl Database {
                 return Ok((out, order.is_none()));
             }
         }
+        // Primary-key ORDER BY: the table itself IS the primary index, so
+        // `ORDER BY <leftmost pk column>` is served by walking the table in
+        // key order with early stop — never by materializing every matching
+        // row to sort. This is the fix for the 2026-07-17 production OOM:
+        // `SELECT id FROM gmail_emails ORDER BY id LIMIT 3` (183k rows /
+        // 1.9 GB, `id` = PK, no secondary index on it) gathered and sorted
+        // the whole table (3.9 GB peak, kernel OOM-killed the node — twice)
+        // because only *secondary* indexes were considered order-serving.
+        // Exact single-key orders only: for composite PKs, key order breaks
+        // pk[0] ties by the remaining PK columns — a valid ties-in-arbitrary-
+        // order top-k for the one requested column, but wrong for a
+        // multi-key ORDER BY, which keeps the sort-after-gather path.
+        // Cross-type caveat (schema-less PKs): rows whose pk[0] values have
+        // different types order by the encoding's type tag here
+        // (`Value::total_cmp`'s order), where a full sort would compare
+        // numerics numerically across Int/Float — the same claim every
+        // key-ordered path (e.g. `pk_point_keys`) already makes;
+        // homogeneous-typed keys agree exactly.
+        if let Some((col, desc, true)) = order {
+            let pk = self.table_def(table)?.primary_key.clone();
+            if col == pk[0] {
+                let constraints = column_constraints(filter);
+                let c = constraints
+                    .iter()
+                    .find(|(cc, _)| *cc == pk[0])
+                    .map(|(_, c)| c);
+                // Bounds from the filter's pk[0] range, widened to inclusive
+                // (`index_prefix_n` has no exclusive form): the full-filter
+                // re-check below drops a `>`-excluded boundary row.
+                let start = c
+                    .and_then(|c| c.lo.as_ref())
+                    .map(|v| index_prefix_n(std::slice::from_ref(v)));
+                let end = c
+                    .and_then(|c| c.hi.as_ref())
+                    .and_then(|v| index_upper_bound_n(std::slice::from_ref(v)));
+                let engine = self
+                    .tables
+                    .get(table)
+                    .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+                if !desc {
+                    let mut out = Vec::new();
+                    for item in engine.scan_range_iter(start.as_deref(), end.as_deref()) {
+                        let (key, bytes) = item?;
+                        crate::scan_meter::tick(1)?;
+                        let doc = Self::decode_row(&bytes, project)?;
+                        if matches_filter(filter, &doc)? {
+                            out.push((key, doc));
+                            if fetch_limit.is_some_and(|lim| out.len() >= lim) {
+                                break;
+                            }
+                        }
+                    }
+                    return Ok((out, true));
+                }
+                if let Some(lim) = fetch_limit {
+                    // DESC with a limit: block iterators only run forward, so
+                    // page the VALUE-FREE stamps (the repair sidecar read —
+                    // keys + tombstone flags, no row bytes) across the range,
+                    // reverse the key list (O(range keys) memory, ~tens of
+                    // bytes per row — not row payloads), then point-read from
+                    // the tail until the limit fills. Each examined key ticks
+                    // the scan meter: a whole-table DESC head is honestly
+                    // O(table) work even though its memory stays bounded.
+                    const STAMPS_PAGE: usize = 4096;
+                    let mut keys: Vec<Vec<u8>> = Vec::new();
+                    let mut after: Option<Vec<u8>> = start.clone().and_then(|s| {
+                        // `after` is exclusive; the inclusive start bound is
+                        // re-admitted below via the >= comparison.
+                        s.len().checked_sub(1).map(|n| s[..n].to_vec())
+                    });
+                    'pages: loop {
+                        let page = engine.scan_stamps_page(after.as_deref(), STAMPS_PAGE)?;
+                        let done = page.len() < STAMPS_PAGE;
+                        after = page.last().map(|(k, ..)| k.clone());
+                        for (key, _hlc, is_put) in page {
+                            if start.as_ref().is_some_and(|s| &key < s) {
+                                continue;
+                            }
+                            if end.as_ref().is_some_and(|e| &key >= e) {
+                                break 'pages;
+                            }
+                            crate::scan_meter::tick(1)?;
+                            if is_put {
+                                keys.push(key);
+                            }
+                        }
+                        if done {
+                            break;
+                        }
+                    }
+                    let mut out = Vec::new();
+                    for key in keys.into_iter().rev() {
+                        let Some(bytes) = engine.get(&key)? else {
+                            continue; // deleted between the stamps read and now
+                        };
+                        let doc = Self::decode_row(&bytes, project)?;
+                        if matches_filter(filter, &doc)? {
+                            out.push((key, doc));
+                            if out.len() >= lim {
+                                break;
+                            }
+                        }
+                    }
+                    return Ok((out, true));
+                }
+                // DESC without a limit: the result is O(table) whichever way
+                // it is produced — keep the ordinary gather + executor sort.
+            }
+        }
         let order2 = order.map(|(c, d, _)| (c, d));
         let Some((index_name, start, end, sorted, reverse)) =
             self.plan_index(table, filter, order2, fetch_limit)
         else {
-            // No usable index: stream the table scan (decode one row at a
-            // time) and, when no ordering is required, stop as soon as the
-            // fetch limit is satisfied — a plain `LIMIT n` touches n matching
-            // rows, not the whole table.
             let engine = self
                 .tables
                 .get(table)
                 .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+            // No usable index, but an exact single-key ORDER BY with a fetch
+            // limit: keep a bounded top-k instead of collecting every
+            // matching row for the executor to sort — the other half of the
+            // 2026-07-17 OOM class (`ORDER BY <unindexed col> LIMIT k` on a
+            // large table is O(k) memory now, though still O(table) scan
+            // work). Comparison mirrors `order_compare` exactly — NULLs last
+            // ascending, whole ordering reversed for DESC (so NULLs first),
+            // row key as the deterministic tiebreak — so the claimed
+            // `sorted = true` means precisely what the executor's own sort
+            // would have produced.
+            if let (Some((col, desc, true)), Some(lim)) = (order, fetch_limit) {
+                type Entry = (Value, Vec<u8>, Document);
+                let cmp = |a: &Entry, b: &Entry| {
+                    use std::cmp::Ordering;
+                    let ord = match (a.0.is_null(), b.0.is_null()) {
+                        (true, true) => Ordering::Equal,
+                        (true, false) => Ordering::Greater, // NULLs last
+                        (false, true) => Ordering::Less,
+                        (false, false) => {
+                            compare(&a.0, &b.0).unwrap_or_else(|| a.0.total_cmp(&b.0))
+                        }
+                    };
+                    let ord = if desc { ord.reverse() } else { ord };
+                    ord.then_with(|| a.1.cmp(&b.1))
+                };
+                let mut top: Vec<Entry> = Vec::new();
+                for item in engine.scan_iter() {
+                    crate::scan_meter::tick(1)?;
+                    let (key, bytes) = item?;
+                    let doc = Self::decode_row(&bytes, project)?;
+                    if matches_filter(filter, &doc)? {
+                        let sort_val = doc.get_path(col).cloned().unwrap_or(Value::Null);
+                        top.push((sort_val, key, doc));
+                        // Compact at 2k so the buffer stays O(k) with
+                        // amortized O(log k) per row, not a sort per row.
+                        if top.len() >= lim.saturating_mul(2).max(lim + 1) {
+                            top.sort_by(cmp);
+                            top.truncate(lim);
+                        }
+                    }
+                }
+                top.sort_by(cmp);
+                top.truncate(lim);
+                let out = top.into_iter().map(|(_, key, doc)| (key, doc)).collect();
+                return Ok((out, true));
+            }
+            // Remaining shapes: stream the table scan (decode one row at a
+            // time) and, when no ordering is required, stop as soon as the
+            // fetch limit is satisfied — a plain `LIMIT n` touches n matching
+            // rows, not the whole table.
             let mut out = Vec::new();
             for item in engine.scan_iter() {
                 crate::scan_meter::tick(1)?;
