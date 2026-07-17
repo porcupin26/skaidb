@@ -169,40 +169,41 @@ lives in [BENCHMARKS.md](BENCHMARKS.md#performance-engineering-notes).)
   it to drop as compaction rewrites files. Re-measure in a few days, then
   re-tighten `anti_entropy_interval_secs` (3600 → 900 is safe at a 60 s
   pass; the 2026-07-10 lesson only forbids interval < pass time).
-- [ ] **[perf] Unfiltered `GROUP BY` over a large table times out instead
-  of completing (agencik E-7 residual)** — the OOM crash itself is fixed
-  and verified on prod (v0.95.3: retired the whole-table `cluster_scan`
-  for the already page-bounded `cluster_scan_collect`; RSS confirmed flat
-  through a full run against the real `gmail_emails` table, see
-  BENCHMARKS.md). But the same query still doesn't finish within
-  `storage.statement_timeout_secs` (120 s) on that table (183k rows,
-  1.9 GB) — a clean, safe failure, not a crash, but not a result either.
-  Ruled out via matched-scale synthetic tests on the same prod node: row
-  width and nested-array field complexity (both fast regardless); a
-  synthetic table scales roughly linearly and projects to ~12 s at the
-  real table's round count (183k rows / 2,000 ≈ 92 rounds), yet the real
-  table doesn't finish. **Root-caused via live profiling (2026-07-17,
-  `strace -c -f` + per-thread `ps` sampling on skai1 during an active
-  run, against an idle baseline for comparison): lock contention on
+- [ ] **[perf] Unfiltered `GROUP BY`/aggregate over a large replicated
+  table hits `scan_row_budget` (agencik E-7 residual, was: times out)** —
+  the OOM crash itself is fixed and verified on prod (v0.95.3: retired
+  the whole-table `cluster_scan` for the already page-bounded
+  `cluster_scan_collect`). The query then still didn't *finish* within
+  `storage.statement_timeout_secs` (120 s) on the real `gmail_emails`
+  table (183k rows, 1.9 GB) — safe, but not useful. Root-caused via live
+  profiling (2026-07-17, `strace -c -f` + per-thread `ps` sampling on
+  skai1, idle vs. active-run comparison): lock contention on
   `Node::local` (`RwLock<Database>`, node.rs), not disk I/O or decode
-  cost.** `pread64` is fast even under load (0.35 ms/call, ~0.2% of
-  syscall time); the busiest thread in the whole 65+-thread process
-  during an active run sits at ~3% CPU, blocked in `futex_do_wait` — the
-  process is barely computing, mostly waiting. `futex` and `recvfrom`
-  syscall time both jump sharply vs. an idle baseline (recvfrom: ~10
-  calls/20s idle → ~290 calls/20s during the query). `cluster_scan_collect`
-  takes `self.local.read()` fresh every round — ~92+ times for this
-  query — against the same lock every write on the node also takes;
-  Linux's default pthread_rwlock is writer-preferring, so a steady
-  trickle of live write traffic (agencik's continuous email/task sync)
-  can repeatedly queue this query's reader behind pending writers, and
-  the delay compounds across dozens of reacquisitions. This explains why
-  no synthetic test reproduced it: every synthetic table was tested
-  without genuine concurrent write load. NEXT: confirm by reproducing
-  with a synthetic table under concurrent writer load (not just bulk-load
-  then read); if confirmed, consider acquiring the lock once per larger
-  batch of rounds rather than per round, or a snapshot/MVCC read path
-  that doesn't contend with the writer lock at all.
+  cost — `pread64` stayed fast under load, but the busiest thread in the
+  65+-thread process sat at ~3% CPU blocked in `futex_do_wait`.
+  `cluster_scan_collect` took `self.local.read()` fresh every round
+  (~92 times for this table at `SCAN_PAGE_ROWS`), contending with the
+  same lock every write on the node takes; Linux's writer-preferring
+  `pthread_rwlock` let live write traffic repeatedly queue the reader.
+  **Fixed**: `LOCAL_SCAN_BATCH_ROWS` (20,000, node.rs) decouples the
+  *local* page size from `SCAN_PAGE_ROWS` (still 2,000 for peers and the
+  round-based memory bound) — a bigger local page means `local_done`
+  flips true after far fewer rounds, so the lock stops being touched at
+  all for the rest of a large gather. Verified on prod, reproduced
+  twice: the query's behavior changed from silently timing out at 120 s
+  with negligible progress to completing 74.7 s of real work.
+  **New residual**: that 74.7 s of progress now hits
+  `storage.scan_row_budget` (default 250,000) instead — reproduced
+  twice at exactly 251,766 rows examined. This cluster is RF=3
+  full-replica, and `scan_meter::tick` counts each source's (local +
+  every peer's) contribution separately, so a full unfiltered gather
+  over a table this size inherently examines well over 250k "rows"
+  before completing, independent of the lock fix. Not obviously a bug —
+  the budget is tracking real per-source I/O/decode work — but worth
+  a decision: raise `storage.scan_row_budget` (cluster-wide, affects the
+  safety margin for every query, not just this one), or reconsider
+  whether replica-source contributions should count once instead of
+  per-source toward this specific budget.
 - [ ] **[perf] Vector index memory: quantization + mmap** — persistence
   itself already exists (snapshot + watermark-delta replay at open; saved
   at create/rebuild/graceful shutdown, and since v0.88 checkpointed every
@@ -216,3 +217,30 @@ lives in [BENCHMARKS.md](BENCHMARKS.md#performance-engineering-notes).)
   clone per fan-out site. Measured class: a few small allocations next
   to an fsync + RTT — cleaner CPU profile, no expected throughput
   change.
+- [ ] **[perf] Clustered gather has no PK-prefix-range narrowing (agencik
+  E-8, P2)** — `SELECT COUNT(*) FROM slack_messages WHERE channel = ? AND
+  thread_ts = ?` (PK `(channel, ts)`) genuinely full-table-scans in the
+  clustered path: 8.6 s at QUORUM / 0.85 s at ONE on a 130k-row table,
+  confirmed 2026-07-17. Root cause confirmed by reading both gather
+  paths: `Database::gather_rows_planned` (exec.rs, the **local/standalone**
+  path) already narrows to a leftmost equality-pinned PK-column run —
+  `channel = ?` alone bounds the scan to that channel's key slice, with
+  `thread_ts` applied as a residual filter — but
+  `Coordinator::matching_rows`/`matching_rows_ordered` (node.rs, the
+  **clustered** path every production query actually uses) has no
+  equivalent check at all: it goes full-PK-equality → PK IN-list →
+  secondary index → global index → straight to `filtered_lookup`, an
+  unbounded per-node scatter-scan, for anything in between (a partial PK
+  prefix with no covering index, exactly this shape). EXPLAIN's "full
+  table scan" label is accurate for this case, not a mislabel — but note
+  EXPLAIN's own reporting logic (exec.rs) doesn't check
+  `gather_rows_planned`'s PK-prefix branch either, so it would
+  *under-report* a standalone-mode query that actually does take the
+  narrower local path. **Moot for agencik today** — a dedicated index
+  (`i_slack_messages_channel_thread_ts`) now serves their real query
+  index-only — so this is about making every future "PK-prefix +
+  uncovered extra filter" shape safe by default, not an active
+  production issue. Fix scope: port PK-prefix-range narrowing into the
+  clustered path, adapted to the distributed candidate-scatter-then-
+  quorum-resolve pattern `index_lookup` already uses (a real, moderate
+  change — not a one-line fix). Not started.
