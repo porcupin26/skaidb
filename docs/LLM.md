@@ -434,6 +434,31 @@ WHERE ts >= now() - 6h GROUP BY t;
   keys `observability.node_stats*`). One timestamped row per node, PK=node.
   The UI NODES view reads it and shows per-row age (no probe flapping);
   query it: `SELECT node, restarts, oom_kills FROM node_stats`.
+- **Drivers table**: every live binary-protocol connection registers a row
+  in the replicated in-memory `drivers` table (PK=conn_id: node, endpoint,
+  remote_addr, auth_user, connected_at) and removes it on disconnect. REST
+  connections are not tracked (one request per connection — churn, not
+  signal). Shown on the UI status tab; query it:
+  `SELECT node, remote_addr, auth_user FROM drivers`.
+- **Witnesses table**: a witness (cross-region backup node that pulls on
+  its own schedule; never a ring member, never in quorum) registers and
+  heartbeats itself via plain SQL into the persistent `witnesses` table
+  (PK=witness_id: region, registered_at, last_seen_at) using an
+  operator-created role (`CREATE ROLE witness; GRANT SELECT ON <tables> TO
+  witness; GRANT INSERT, UPDATE ON witnesses TO witness`). The single-row
+  `witness_gc_config` table holds `grace_period_secs` (default 7 days) —
+  cluster-consistent because it is a table row, settable with a plain
+  `UPDATE`. Both appear on the UI status tab.
+- **Read-only mode** (`server.read_only`, default false, **live-mutable**:
+  `SET CONFIG server.read_only = 'true'`): rejects every client mutation —
+  INSERT/UPDATE/DELETE, DDL, user management, transactions, ES `_bulk`,
+  `POST /insert`, Prometheus remote_write — with error "read-only node:
+  mutations are disabled"; reads (SELECT/SHOW/DESCRIBE/EXPLAIN/search) and
+  the Admin/Monitor control plane work normally. RBAC is checked first, so
+  an ungranted role still sees its usual permission error. The node's
+  configured superuser role is exempt (internal telemetry and a witness's
+  data-pull applier run as it) — don't hand its credentials to
+  applications. Intended for witness nodes and maintenance write-freezes.
 
 ---
 
@@ -543,7 +568,8 @@ the table on open. Distributed: scatter, merge by distance.
 
 **Config** (TOML at `/etc/skaidb/skaidb.toml` on packaged installs; every
 key also reachable via `config set`): `[server]` bind_addr, quic_port,
-rest_port, data_dir, node_role; `[cluster]` seeds, internode_port,
+rest_port, data_dir, node_role, read_only (reject client mutations,
+superuser exempt — witness/maintenance mode); `[cluster]` seeds, internode_port,
 replication_factor, vnodes_per_node, default_read/write_consistency,
 anti_entropy_interval_secs; `[auth]` scram_enabled, superuser,
 superuser_password, internode_auth (none/token/mtls); `[storage]`
@@ -555,7 +581,8 @@ default 250000, 0 = off), statement_timeout_secs (default 120, 0 = off);
 log_format/log_file, per_table_metrics, prometheus_port, self_scrape,
 self_scrape_interval_secs, node_stats, node_stats_interval_secs; `[ui]` enabled.
 **Live-mutable** (no restart): all `observability.*` log/slow-query keys,
-`observability.self_scrape*`, `observability.node_stats*`, `ui.enabled`.
+`observability.self_scrape*`, `observability.node_stats*`, `ui.enabled`,
+`server.read_only`.
 
 Every admin endpoint above also has a SQL spelling (section 3: `SHOW
 CLUSTER`, `SHOW CONFIG`/`SET CONFIG`, `SHOW SLOW QUERIES`, `REPAIR

@@ -10,6 +10,8 @@
 //! immediately — indistinguishable from a build without a UI.
 
 use serde_json::{json, Value as Json};
+use skaidb_proto::Response;
+use skaidb_types::Value;
 
 use crate::shared::Shared;
 
@@ -306,6 +308,85 @@ pub fn hosts_json(ctx: &Shared) -> (u16, String) {
             "disk_total_bytes": disk_total,
             "disk_available_bytes": disk_avail,
         },
+    });
+    (200, body.to_string())
+}
+
+/// Live binary-protocol connections, for the status tab. Unlike
+/// `hosts_json`, this is a single local table read — `drivers` is a normal
+/// (if memory-only) replicated table, no live-peer-probing fallback needed.
+pub fn drivers_json(ctx: &Shared) -> (u16, String) {
+    let resp = crate::shared::execute_as(
+        ctx,
+        &ctx.superuser_role,
+        &format!("SELECT * FROM {}", crate::drivers::TABLE),
+    );
+    let Response::Rows { columns, rows } = resp else {
+        // Most likely: no connection has landed yet, so the table hasn't
+        // been lazily created — an empty list, not an error, matches what
+        // "nobody's connected right now" should look like.
+        return (200, json!({ "drivers": [] }).to_string());
+    };
+    let idx = |name: &str| columns.iter().position(|c| c == name);
+    let as_s = |v: Option<&Value>| match v {
+        Some(Value::String(s)) => s.clone(),
+        _ => String::new(),
+    };
+    let as_i = |v: Option<&Value>| match v {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let (node_i, endpoint_i, addr_i, user_i, ts_i) = (
+        idx("node"),
+        idx("endpoint"),
+        idx("remote_addr"),
+        idx("auth_user"),
+        idx("connected_at"),
+    );
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let drivers: Vec<Json> = rows
+        .iter()
+        .map(|row| {
+            let connected_at_ms = as_i(ts_i.and_then(|i| row.get(i)));
+            json!({
+                "node": as_s(node_i.and_then(|i| row.get(i))),
+                "endpoint": as_s(endpoint_i.and_then(|i| row.get(i))),
+                "remote_addr": as_s(addr_i.and_then(|i| row.get(i))),
+                "auth_user": as_s(user_i.and_then(|i| row.get(i))),
+                "connected_at_ms": connected_at_ms,
+                "connected_secs": ((now_ms - connected_at_ms).max(0) / 1000),
+            })
+        })
+        .collect();
+    (200, json!({ "drivers": drivers }).to_string())
+}
+
+/// Registered witnesses, for the status tab, plus the current GC grace
+/// period so an operator can see what's actually in effect.
+pub fn witnesses_json(ctx: &Shared) -> (u16, String) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let witnesses: Vec<Json> = crate::witnesses::read_all(ctx)
+        .into_iter()
+        .map(|w| {
+            json!({
+                "witness_id": w.witness_id,
+                "region": w.region,
+                "registered_at_ms": w.registered_at_ms,
+                "last_seen_at_ms": w.last_seen_at_ms,
+                "registered_secs": ((now_ms - w.registered_at_ms).max(0) / 1000),
+                "stale_secs": ((now_ms - w.last_seen_at_ms).max(0) / 1000),
+            })
+        })
+        .collect();
+    let body = json!({
+        "witnesses": witnesses,
+        "grace_period_secs": crate::witnesses::grace_period_secs(ctx),
     });
     (200, body.to_string())
 }

@@ -72,6 +72,12 @@ function mark(ok, label) {
 async function refreshStatus() {
   const [status, m] = await Promise.all([api("GET", "/status"), api("GET", "/ui/meta")]);
   meta = m;
+  // Independent of the core status/meta fetch above: a failure here (e.g.
+  // an older server mid-rolling-upgrade without these routes yet) must not
+  // break the node/cluster/members display that already worked fine
+  // without them.
+  api("GET", "/ui/drivers").then(renderDrivers).catch(() => renderDrivers({ drivers: [] }));
+  api("GET", "/ui/witnesses").then(renderWitnesses).catch(() => renderWitnesses({ witnesses: [], grace_period_secs: null }));
   kv("node-info", [
     ["version", meta.version],
     ["node", status.node_id || "standalone"],
@@ -125,6 +131,59 @@ function renderMembers(status) {
     idc.textContent = `${id} (configured, not in ring)`;
     idc.className = "bad";
     tr.append(idc, td(), td(), backlogCell(byHost.get(hostOf(id))), lagCell(byHost.get(hostOf(id))));
+    tbody.append(tr);
+  }
+}
+
+// Live binary-protocol connections (see drivers.rs — REST is one-shot per
+// request and deliberately not tracked here).
+function renderDrivers(body) {
+  const tbody = $("drivers").querySelector("tbody");
+  tbody.textContent = "";
+  const cell = (text) => {
+    const c = td();
+    c.textContent = text;
+    return c;
+  };
+  for (const d of body.drivers || []) {
+    const tr = document.createElement("tr");
+    tr.append(
+      cell(d.node),
+      cell(d.endpoint),
+      cell(d.remote_addr),
+      cell(d.auth_user),
+      cell(d.connected_secs != null ? fmtDuration(d.connected_secs) : "—"),
+    );
+    tbody.append(tr);
+  }
+}
+
+// Registered cross-region witnesses (see witnesses.rs) plus the GC grace
+// period currently in effect.
+function renderWitnesses(body) {
+  const grace = $("witness-grace-period");
+  grace.textContent = body.grace_period_secs != null
+    ? `grace period: ${fmtDuration(body.grace_period_secs)}`
+    : "";
+  const tbody = $("witnesses").querySelector("tbody");
+  tbody.textContent = "";
+  const cell = (text) => {
+    const c = td();
+    c.textContent = text;
+    return c;
+  };
+  for (const w of body.witnesses || []) {
+    const tr = document.createElement("tr");
+    // Stale styling mirrors renderHosts: a witness that's been out of touch
+    // longer than the grace period is exactly the case that matters —
+    // flag it, don't just quietly list it.
+    const lastSeen = cell(fmtDuration(w.stale_secs) + " ago");
+    if (body.grace_period_secs != null && w.stale_secs > body.grace_period_secs) {
+      lastSeen.className = "bad";
+    } else if (w.stale_secs > 3600) {
+      lastSeen.className = "warn";
+    }
+    tr.append(cell(w.witness_id), cell(w.region), cell(fmtDuration(w.registered_secs) + " ago"), lastSeen);
     tbody.append(tr);
   }
 }

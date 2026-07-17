@@ -149,6 +149,33 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) -> io::Result<()> {
                 let (status, body) = crate::ui::hosts_json(&ctx);
                 return write_json_body(&mut stream, status, &body);
             }
+            // Live driver connections + registered witnesses for the status
+            // tab: same trust level as /ui/hosts (authenticated, no
+            // table-RBAC — this is operational metadata, not tenant data).
+            "/ui/drivers" => {
+                let enabled = ctx.config.read().map(|cfg| cfg.ui.enabled).unwrap_or(false);
+                if !enabled {
+                    return write_response(&mut stream, 404, &json!({"error": "not found"}));
+                }
+                if ctx.authn.required && basic_auth_role(&ctx, req.authorization.as_deref()).is_none()
+                {
+                    return write_unauthorized(&mut stream);
+                }
+                let (status, body) = crate::ui::drivers_json(&ctx);
+                return write_json_body(&mut stream, status, &body);
+            }
+            "/ui/witnesses" => {
+                let enabled = ctx.config.read().map(|cfg| cfg.ui.enabled).unwrap_or(false);
+                if !enabled {
+                    return write_response(&mut stream, 404, &json!({"error": "not found"}));
+                }
+                if ctx.authn.required && basic_auth_role(&ctx, req.authorization.as_deref()).is_none()
+                {
+                    return write_unauthorized(&mut stream);
+                }
+                let (status, body) = crate::ui::witnesses_json(&ctx);
+                return write_json_body(&mut stream, status, &body);
+            }
             // The embedded web UI: static shell + /ui/meta. Gated on the
             // live `ui.enabled` config inside try_route (404 when off).
             path => {

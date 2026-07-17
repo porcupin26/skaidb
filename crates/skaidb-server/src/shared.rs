@@ -406,6 +406,12 @@ pub struct Context {
     /// Path the config was loaded from, used to persist `config set`. `None`
     /// when the server was started from built-in defaults (no file to write).
     pub config_path: Option<String>,
+    /// Set once the `drivers` registry table (see `drivers.rs`) has been
+    /// created on this context. Per-`Context`, not a process-global static:
+    /// tests spin up many independent `Context`s in one test binary, and a
+    /// bare static would let one context's "already ensured" state
+    /// incorrectly suppress table creation on a different, fresh context.
+    pub drivers_table_ensured: std::sync::atomic::AtomicBool,
 }
 
 impl Context {
@@ -417,6 +423,16 @@ impl Context {
     /// A snapshot of the current configuration.
     pub fn config_snapshot(&self) -> Config {
         self.config.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Live `server.read_only` — read per statement so `SET CONFIG
+    /// server.read_only` takes effect immediately (an uncontended read
+    /// lock; the same pattern every live-mutable key uses).
+    pub fn read_only(&self) -> bool {
+        self.config
+            .read()
+            .map(|c| c.server.read_only)
+            .unwrap_or(false)
     }
 
     /// `config show`: the whole config with secrets masked.
@@ -745,6 +761,32 @@ pub fn execute_session_statement_as(
             if !ok {
                 ctx.metrics.incr_authz_denied();
                 return Response::Error(format!("permission denied: {privilege:?} on {object:?}"));
+            }
+            // Read-only node (`server.read_only`, live-mutable): reject
+            // data/schema mutations after RBAC (a role that couldn't write
+            // anyway still gets its usual permission error). Keyed off the
+            // same privilege classification RBAC uses, so every mutating
+            // statement shape is covered by construction — including
+            // transactions and user management — not just a keyword list.
+            // The superuser is exempt: internal telemetry (node_stats, the
+            // drivers registry) runs as it, and a witness's data-pull
+            // applier must be able to write what it mirrors. Admin/Monitor
+            // stay allowed — the control plane (repair, SET CONFIG — the
+            // way read_only itself is toggled) is how an operator manages
+            // the node, and none of it writes table data.
+            let mutating = matches!(
+                privilege,
+                Privilege::Insert
+                    | Privilege::Update
+                    | Privilege::Delete
+                    | Privilege::Create
+                    | Privilege::Drop
+                    | Privilege::Grant
+            );
+            if mutating && role != ctx.superuser_role && ctx.read_only() {
+                return Response::Error(
+                    "read-only node: mutations are disabled (server.read_only = true)".into(),
+                );
             }
         }
     }

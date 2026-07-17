@@ -71,6 +71,10 @@ fn handle_connection(stream: TcpStream, ctx: Shared) {
         Ok(w) => w,
         Err(_) => return,
     };
+    let remote_addr = writer
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
     let mut reader = BufReader::new(stream);
 
     // SCRAM handshake first; the resolved role authorizes every later
@@ -80,6 +84,15 @@ fn handle_connection(stream: TcpStream, ctx: Shared) {
         Ok(role) => role,
         Err(()) => return, // denied or framing error → drop the connection
     };
+
+    // Registers this connection in the replicated `drivers` table and
+    // deregisters on every exit path (including the early returns below)
+    // via `Drop` — see drivers.rs for why REST doesn't get this treatment.
+    let node = ctx
+        .backend
+        .cluster_stats()
+        .map_or_else(|| "local".to_string(), |c| c.node_id);
+    let _driver_guard = crate::drivers::ConnGuard::new(&ctx, &node, &remote_addr, &role);
 
     // The current database is per-connection state: `USE` sets it for the life
     // of this connection; it starts at `default`.

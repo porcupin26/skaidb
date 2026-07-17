@@ -15,7 +15,21 @@ http://127.0.0.1:7080/ui
 - **status** — node (version, ready, uptime) and cluster (members, epoch,
   ring membership, replication factor, consistency levels, hints,
   resharding) cards, plus a members table with configured-vs-ring
-  discrepancies. Auto-refreshes every 5 s.
+  discrepancies; a **drivers** table of live binary-protocol connections
+  (node, endpoint, remote address, authenticated user, connected duration —
+  `GET /ui/drivers`, reading the replicated `drivers` table; REST
+  connections aren't tracked here, since REST is one request per
+  connection and would just be table churn for no signal); and a
+  **witnesses** table of registered cross-region backup nodes (id, region,
+  registered/last-seen duration, dimmed/flagged when a witness has gone
+  quiet past the GC grace period — `GET /ui/witnesses`, reading the
+  replicated `witnesses` table, shown alongside the grace period currently
+  in effect from `witness_gc_config`). A witness registers itself the same
+  way any client would, over an ordinary SQL connection with witness-scoped
+  credentials — see `.priv/witness-node-plan.md` for the design (not
+  committed; ask if you need it). Auto-refreshes every 5 s; the
+  drivers/witnesses fetches are independent of the core status fetch, so a
+  failure there dims those two tables without breaking the rest of the tab.
 - **query** — SQL console with a **schema browser**: databases and tables
   the logged-in role may read (`GET /ui/schema`, filtered server-side by
   the same RBAC check `/query` enforces — table, database, and global

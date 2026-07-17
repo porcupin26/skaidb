@@ -24,6 +24,13 @@ pub fn ingest(ctx: &Shared, role: &str, body: &[u8]) -> Result<usize, String> {
     ) {
         return Err(format!("permission denied: Insert on {TABLE}"));
     }
+    // remote_write bypasses the SQL statement path (`ts_append` directly),
+    // so the read-only gate in `execute_session_statement_as` never sees
+    // it — apply the same rule here. The self-scrape loop is unaffected
+    // (it calls `append_rows` directly, an internal path).
+    if role != ctx.superuser_role && ctx.read_only() {
+        return Err("read-only node: mutations are disabled (server.read_only = true)".into());
+    }
     let raw = snap::raw::Decoder::new()
         .decompress_vec(body)
         .map_err(|e| format!("snappy: {e}"))?;

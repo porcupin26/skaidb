@@ -109,6 +109,16 @@ pub struct ServerConfig {
     pub rest_port: u16,
     pub node_role: NodeRole,
     pub data_dir: String,
+    /// Reject every client-initiated mutation (INSERT/UPDATE/DELETE, DDL,
+    /// user management, transactions, remote-write ingestion) with a clear
+    /// error, while reads keep working normally. The node's own superuser
+    /// role is exempt — internal telemetry (`node_stats`, the `drivers`
+    /// registry) and a witness's data-pull applier both run as it, and a
+    /// witness that refused its own applier could never receive data.
+    /// **Live-mutable**: `SET CONFIG server.read_only = true` takes effect
+    /// immediately, no restart — a maintenance write-freeze switch as much
+    /// as a witness-node mode.
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -334,6 +344,7 @@ pub const RUNTIME_MUTABLE_KEYS: &[&str] = &[
     "observability.error_log_file",
     "observability.login_log_file",
     "ui.enabled",
+    "server.read_only",
 ];
 
 /// Whether changing `key` takes effect live (see [`RUNTIME_MUTABLE_KEYS`]).
@@ -391,6 +402,7 @@ impl Default for ServerConfig {
             rest_port: 7080,
             node_role: NodeRole::Member,
             data_dir: "/var/lib/skaidb".to_string(),
+            read_only: false,
         }
     }
 }

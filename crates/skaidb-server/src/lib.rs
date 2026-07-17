@@ -11,6 +11,7 @@ pub mod audit;
 pub mod authn;
 mod es;
 pub mod binary;
+mod drivers;
 pub mod memory;
 mod nodestats;
 mod promql;
@@ -20,6 +21,7 @@ pub mod rest;
 pub mod shared;
 pub mod slowlog;
 mod ui;
+mod witnesses;
 
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -256,6 +258,7 @@ pub fn run(
         slow_log: crate::slowlog::SlowLog::new(),
         config: RwLock::new(config.clone()),
         config_path,
+        drivers_table_ensured: std::sync::atomic::AtomicBool::new(false),
     });
 
     skaidb_types::slog!(
@@ -410,6 +413,22 @@ pub fn run(
         });
     }
 
+    // Ensure the witness-registry tables exist. Unlike `node_stats`, nothing
+    // here self-publishes on a tick — rows arrive from witness processes
+    // registering themselves over ordinary SQL connections (see
+    // `witnesses.rs` and `.priv/witness-node-plan.md`) — so this only needs
+    // to run once, with the same "cluster may not be ready at boot" retry
+    // tolerance `node_stats` has.
+    {
+        let ctx = ctx.clone();
+        std::thread::spawn(move || loop {
+            if crate::witnesses::ensure_tables(&ctx).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        });
+    }
+
     // Dedicated metrics/health listener on `observability.prometheus_port`. It
     // reuses the same handler (so `/metrics`, `/health`, `/ready`, `/status` are
     // served), giving scrapers a port separate from the data plane. Bound only
@@ -431,7 +450,7 @@ pub fn run(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpStream;
@@ -455,7 +474,7 @@ mod tests {
     }
 
     /// Context with auth disabled; anonymous connections act as the superuser.
-    fn temp_ctx() -> Shared {
+    pub(crate) fn temp_ctx() -> Shared {
         Arc::new(Context {
             backend: Backend::Local(Box::new(RwLock::new(Database::open(temp_dir()).unwrap()))),
             metrics: Metrics::new(),
@@ -467,6 +486,7 @@ mod tests {
             slow_log: crate::slowlog::SlowLog::new(),
             config: RwLock::new(Config::default()),
             config_path: None,
+            drivers_table_ensured: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -979,6 +999,9 @@ mod tests {
         assert!(resp.contains("Content-Type: text/html"), "{resp}");
         assert!(resp.contains("Content-Security-Policy: default-src 'none'"), "{resp}");
         assert!(resp.contains("<title>skaidb</title>"), "{resp}");
+        // Status tab carries the drivers/witnesses sections.
+        assert!(resp.contains(r#"<table id="drivers">"#), "{resp}");
+        assert!(resp.contains(r#"<table id="witnesses">"#), "{resp}");
         assert!(get("/ui/app.css").contains("Content-Type: text/css"));
         assert!(get("/ui/app.js").contains("Content-Type: text/javascript"));
 
@@ -1018,6 +1041,57 @@ mod tests {
         assert_eq!(v["cluster"]["reachable"], 1);
     }
 
+    #[test]
+    fn ui_drivers_and_witnesses_over_rest() {
+        let ctx = temp_ctx();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx.clone()).unwrap();
+        let get = |path: &str| -> String {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream
+                .write_all(format!("GET {path} HTTP/1.1\r\nConnection: close\r\n\r\n").as_bytes())
+                .unwrap();
+            let mut resp = String::new();
+            stream.read_to_string(&mut resp).unwrap();
+            resp
+        };
+        let json_body = |resp: &str| -> serde_json::Value {
+            serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap_or_default()).unwrap()
+        };
+
+        // No connection yet: an empty list, not an error (the `drivers`
+        // table may not even be created yet — nothing has landed on it).
+        let v = json_body(&get("/ui/drivers"));
+        assert_eq!(v["drivers"].as_array().unwrap().len(), 0);
+
+        // A live binary connection shows up with its endpoint tag. A
+        // round-trip guarantees the server has finished registering before
+        // we read the table back (auth completing on the client side
+        // doesn't guarantee the server thread's registration INSERT, on a
+        // separate thread, has landed yet).
+        let (bin_addr, _bh) = binary::spawn("127.0.0.1:0", ctx.clone()).unwrap();
+        let mut client = Client::connect(bin_addr).unwrap();
+        client.execute("SELECT 1").unwrap();
+        let v = json_body(&get("/ui/drivers"));
+        let drivers = v["drivers"].as_array().unwrap();
+        assert_eq!(drivers.len(), 1, "{v}");
+        assert_eq!(drivers[0]["endpoint"], "binary");
+        assert!(!drivers[0]["remote_addr"].as_str().unwrap().is_empty());
+
+        // Witnesses: empty until one registers (via plain SQL, exactly like
+        // a real witness process would — see witnesses.rs).
+        let v = json_body(&get("/ui/witnesses"));
+        assert_eq!(v["witnesses"].as_array().unwrap().len(), 0);
+        assert!(v["grace_period_secs"].as_i64().unwrap() > 0);
+
+        crate::witnesses::ensure_tables(&ctx).unwrap();
+        crate::witnesses::upsert_for_test(&ctx, "witness-eu", "eu-central-1", 12_345);
+        let v = json_body(&get("/ui/witnesses"));
+        let witnesses = v["witnesses"].as_array().unwrap();
+        assert_eq!(witnesses.len(), 1, "{v}");
+        assert_eq!(witnesses[0]["witness_id"], "witness-eu");
+        assert_eq!(witnesses[0]["region"], "eu-central-1");
+    }
+
     /// An unwritable config file must not block a live-mutable key from
     /// applying (packaged installs may run with a read-only /etc): the set
     /// succeeds with `persisted: false` + a warning. A restart-required key
@@ -1036,6 +1110,7 @@ mod tests {
             config: RwLock::new(Config::default()),
             // A directory is never writable as a file.
             config_path: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+            drivers_table_ensured: std::sync::atomic::AtomicBool::new(false),
         });
 
         let (status, body) = ctx.config_set("ui.enabled", "false");
@@ -1252,6 +1327,44 @@ mod tests {
             "SELECT node, restarts FROM node_stats",
         );
         assert!(matches!(resp, Response::Rows { rows, .. } if rows.len() == 1));
+    }
+
+    #[test]
+    fn drivers_registers_binary_connection_and_deregisters_on_disconnect() {
+        use skaidb_driver::Client;
+
+        let ctx = temp_ctx();
+        let (addr, _h) = binary::spawn("127.0.0.1:0", ctx.clone()).unwrap();
+
+        let mut client = Client::connect(addr).unwrap();
+        // A round-trip guarantees the server has finished authenticating and
+        // registering before we read the table back.
+        client.execute("SELECT 1").unwrap();
+        let resp = crate::shared::execute_as(&ctx, "superuser", "SELECT * FROM drivers");
+        let Response::Rows { columns, rows } = resp else {
+            panic!("expected rows, got a non-row response reading drivers");
+        };
+        assert_eq!(rows.len(), 1, "one row for the live connection");
+        let idx = |name: &str| columns.iter().position(|c| c == name).unwrap();
+        assert_eq!(rows[0][idx("endpoint")], Value::String("binary".into()));
+        assert!(!matches!(rows[0][idx("remote_addr")], Value::Null));
+
+        drop(client);
+        // Disconnection is detected asynchronously by the server thread;
+        // poll briefly rather than asserting immediately.
+        let mut remaining = 50;
+        loop {
+            let resp = crate::shared::execute_as(&ctx, "superuser", "SELECT * FROM drivers");
+            let Response::Rows { rows, .. } = resp else {
+                panic!("expected rows reading drivers");
+            };
+            if rows.is_empty() || remaining == 0 {
+                assert!(rows.is_empty(), "row should be gone after disconnect");
+                break;
+            }
+            remaining -= 1;
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     #[test]
@@ -1540,6 +1653,7 @@ mod tests {
             slow_log: crate::slowlog::SlowLog::new(),
             config: RwLock::new(Config::default()),
             config_path: None,
+            drivers_table_ensured: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1596,6 +1710,87 @@ mod tests {
         assert!(Client::connect_with(addr, "bob", "correct-horse").is_err());
     }
 
+    #[test]
+    fn read_only_rejects_mutations_but_serves_reads() {
+        use skaidb_driver::Client;
+        // ada is the superuser (exempt); bob holds real Insert/Update/Delete
+        // grants, so a rejection under read_only is the read-only gate, not
+        // an RBAC denial wearing its clothes.
+        let ctx = auth_ctx();
+        let (addr, _h) = binary::spawn("127.0.0.1:0", ctx.clone()).unwrap();
+        let mut su = Client::connect_with(addr, "ada", "pencil").unwrap();
+        su.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        su.execute("INSERT INTO t (id, x) VALUES (1, 'a')").unwrap();
+        su.execute("CREATE USER bob PASSWORD 'hunter2'").unwrap();
+        for grant in ["SELECT", "INSERT", "UPDATE", "DELETE"] {
+            su.execute(&format!("GRANT {grant} ON t TO bob")).unwrap();
+        }
+        let mut bob = Client::connect_with(addr, "bob", "hunter2").unwrap();
+        assert!(matches!(
+            bob.execute("INSERT INTO t (id, x) VALUES (2, 'b')").unwrap(),
+            Response::Mutation { .. }
+        ));
+
+        // Flip read-only live over the wire (SET CONFIG is Admin-gated and
+        // live-mutable; no restart, no config file needed).
+        su.execute("SET CONFIG server.read_only = 'true'").unwrap();
+
+        // bob: reads fine, every mutation shape rejected with the read-only
+        // error (not "permission denied" — his grants are intact).
+        assert!(matches!(
+            bob.execute("SELECT id FROM t").unwrap(),
+            Response::Rows { .. }
+        ));
+        assert!(matches!(bob.execute("SHOW TABLES").unwrap(), Response::Rows { .. }));
+        for sql in [
+            "INSERT INTO t (id, x) VALUES (3, 'c')",
+            "UPDATE t SET x = 'z' WHERE id = 1",
+            "DELETE FROM t WHERE id = 1",
+        ] {
+            let err = bob.execute(sql).unwrap_err().to_string();
+            assert!(err.contains("read-only node"), "{sql}: {err}");
+        }
+
+        // The superuser stays exempt — the witness's own applier (and the
+        // node's internal telemetry) must keep writing.
+        assert!(matches!(
+            su.execute("INSERT INTO t (id, x) VALUES (4, 'd')").unwrap(),
+            Response::Mutation { .. }
+        ));
+        // Internal telemetry proof: this connection's own drivers-registry
+        // row landed while the node was read-only.
+        assert!(matches!(
+            su.execute("SELECT conn_id FROM drivers").unwrap(),
+            Response::Rows { rows, .. } if !rows.is_empty()
+        ));
+
+        // Flip back off: bob writes again.
+        su.execute("SET CONFIG server.read_only = 'false'").unwrap();
+        assert!(matches!(
+            bob.execute("INSERT INTO t (id, x) VALUES (5, 'e')").unwrap(),
+            Response::Mutation { .. }
+        ));
+    }
+
+    #[test]
+    fn read_only_gates_remote_write_ingestion() {
+        // remote_write bypasses the SQL statement path, so it carries its
+        // own read-only check — prove it fires for a granted non-superuser
+        // role and not for the superuser.
+        let ctx = temp_ctx();
+        crate::shared::execute_as(&ctx, "superuser", "CREATE ROLE carol");
+        crate::shared::execute_as(&ctx, "superuser", "GRANT INSERT ON metrics TO carol");
+        let (status, _) = ctx.config_set("server.read_only", "true");
+        assert_eq!(status, 200);
+        // The gate fires before body decode, so an empty body suffices.
+        let err = crate::promwrite::ingest(&ctx, "carol", &[]).unwrap_err();
+        assert!(err.contains("read-only node"), "{err}");
+        // Superuser-exempt, so the request proceeds to (and fails at)
+        // snappy decode instead — proving the gate didn't fire.
+        let err = crate::promwrite::ingest(&ctx, "superuser", &[]).unwrap_err();
+        assert!(err.contains("snappy"), "{err}");
+    }
+
     fn rbac_test_ctx() -> Shared {
         Arc::new(Context {
             backend: Backend::Local(Box::new(RwLock::new(Database::open(temp_dir()).unwrap()))),
@@ -1608,6 +1803,7 @@ mod tests {
             slow_log: crate::slowlog::SlowLog::new(),
             config: RwLock::new(Config::default()),
             config_path: None,
+            drivers_table_ensured: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1849,6 +2045,7 @@ mod tests {
             slow_log: crate::slowlog::SlowLog::new(),
             config: RwLock::new(Config::default()),
             config_path: None,
+            drivers_table_ensured: std::sync::atomic::AtomicBool::new(false),
         });
 
         assert_eq!(
@@ -1896,6 +2093,7 @@ mod tests {
             slow_log: crate::slowlog::SlowLog::new(),
             config: RwLock::new(Config::default()),
             config_path: None,
+            drivers_table_ensured: std::sync::atomic::AtomicBool::new(false),
         });
 
         // One connection's current database, carried across statements.
@@ -2021,6 +2219,7 @@ mod tests {
             slow_log: crate::slowlog::SlowLog::new(),
             config: RwLock::new(Config::default()),
             config_path: None,
+            drivers_table_ensured: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
