@@ -511,44 +511,60 @@ produced six measured, code-verified findings:
   `cluster_scan_collect`'s own doc comment ("the old whole-table
   `cluster_scan` here materialized every row on the coordinator — 4.6
   GB allocated, OOM-killed two production nodes, 2026-07-13").
-  **Part 2 — retire `cluster_scan`, shrink the page.** `cluster_scan`
-  is deleted outright; its two callers now go through
-  `cluster_scan_collect`, the already-bounded sibling used by every
-  other broad gather (LIMIT pushdown, candidate resolution, anti-entropy)
-  — a page-at-a-time pull per source with a sliding "seal" frontier that
-  evicts finalized rows every round, so the coordinator never holds more
-  than roughly one page window per source. But a page is a fixed **row**
-  count (`SCAN_PAGE_ROWS`, 2,000) with no byte cap, so a wide-row table
-  still fully materializes a 2,000-row raw-byte page per source, per
-  round, before any pruning runs — pruning can't shrink a buffer that's
-  already allocated. Fix: when a projection is active, both the local
-  scan (`local_scan_versioned_page`) and the peer `ScanPage` RPC request
-  a much smaller page (`PROJECTED_SCAN_PAGE_ROWS`, 100 rows) — no
-  wire-protocol change, `Request::ScanPage.limit` already existed as a
-  runtime value. More, smaller round trips instead of fewer, larger
-  ones. **Measured on the live 3-node p225 bench fleet** (real
-  `skaidb` service, `VmRSS` from `/proc/<pid>/status`, not the
-  standalone API): an 8,000-row/62 MB wide table went from ~59-74 MB
-  growth (with `cluster_scan` retired but page size unchanged) to
-  **~11.2 MB growth**, stable across repeated trials and settling back
-  to baseline within seconds. Tripling the table to 24,000 rows/187 MB
-  grew RSS only ~26.6 MB (sub-linear vs. table size), the expected
-  signature of page-bounded rather than table-bounded memory. Correct
-  results verified at both scales. Deliberately does **not** apply to
-  `TOP k BY` (returns whole rows via `select_group_topk`, a different
-  consumer with unrestricted column needs), wildcards, joins, or set
-  operations — none of those gather shapes were audited for it. 197
-  engine tests + 86 cluster tests pass, including new targeted coverage:
-  an exhaustive (2⁹ field-subset) property test that the projected
-  decode always matches a full decode on every possible wanted-set, and
-  end-to-end `GROUP BY`/`HAVING`/`ORDER BY`/filtered/nested-path/
-  no-group-by queries against a wide table compared byte-for-byte
-  against the same queries against a narrow table with no pruning to
-  do. **Lesson recorded for future OOM-shaped fixes:** validate against
-  the actual clustered `Coordinator`/`cluster_scan*` path on a live
-  cluster before declaring a memory fix complete — the standalone
+  **Part 2 — retire `cluster_scan`.** `cluster_scan` is deleted
+  outright; its two callers now go through `cluster_scan_collect`, the
+  already-bounded sibling used by every other broad gather (LIMIT
+  pushdown, candidate resolution, anti-entropy) — a page-at-a-time pull
+  per source with a sliding "seal" frontier that evicts finalized rows
+  every round, so the coordinator never holds more than roughly one
+  page window per source (`SCAN_PAGE_ROWS`, 2,000 rows) **regardless of
+  table size** — the actual fix for the OOM, since it turns an O(table)
+  buffer into an O(page). `prune_row_bytes` additionally prunes each row
+  down to its projected fields before it lands in the merge map, for a
+  further (optional, not load-bearing) reduction in what sits there.
+  **A shrink-the-page-when-projecting variant was tried and reverted.**
+  Reasoning at the time: a page is a fixed row count with no byte cap,
+  so a wide-row table still fully materializes a 2,000-row raw-byte page
+  per source, per round, before any pruning runs — so when projecting,
+  request a much smaller page (100 rows) to bound that too. This
+  measured well on the p225 bench fleet (8,000-row/62 MB table: ~59-74
+  MB → ~11.2 MB growth) — but the bench fleet's members are same-host
+  LXCs with sub-millisecond RPC latency, which hid the real cost: cutting
+  the page 20x multiplies round count 20x (183k prod rows / 100 ≈ 1,830
+  rounds), and each round pays a real, non-network-bound fixed cost
+  (lock acquisition, sequential-not-concurrent per-peer RPC, seal-frontier
+  bookkeeping). Tested directly against the live 3-node **production**
+  cluster (the only place this cost was visible): both the reported
+  crash query and a narrow `SELECT MIN(id), MAX(id) FROM gmail_emails`
+  (trivial per-row bytes — this confirms the cost was round *count*, not
+  row width) blew through the 120s statement timeout at 100 rows/page.
+  Not a crash (clean error, RSS settled back down afterward) but a real
+  regression nonetheless, so reverted back to a uniform `SCAN_PAGE_ROWS`
+  for all `cluster_scan_collect` callers, projected or not — retiring
+  `cluster_scan` alone was already the fix. **Final measurement, live
+  3-node p225 bench fleet**, `cluster_scan` retired + `prune_row_bytes`,
+  uniform 2,000-row pages: an 8,000-row/62 MB wide table's unfiltered
+  `GROUP BY` RSS growth ~59-74 MB (a wide margin under any node's
+  ceiling — the crash-causing table is 1.9 GB, and this cost does not
+  scale with table size). Deliberately does **not** apply to `TOP k BY`
+  (returns whole rows via `select_group_topk`, a different consumer with
+  unrestricted column needs), wildcards, joins, or set operations — none
+  of those gather shapes were audited for it. 197 engine tests + 86
+  cluster tests pass, including new targeted coverage: an exhaustive
+  (2⁹ field-subset) property test that the projected decode always
+  matches a full decode on every possible wanted-set, and end-to-end
+  `GROUP BY`/`HAVING`/`ORDER BY`/filtered/nested-path/no-group-by
+  queries against a wide table compared byte-for-byte against the same
+  queries against a narrow table with no pruning to do. **Two lessons
+  recorded for future OOM-shaped fixes:** (1) validate against the
+  actual clustered `Coordinator`/`cluster_scan*` path on a live cluster
+  before declaring a memory fix complete — the standalone
   `Session`/`Database` API does not exercise it and can show a
-  misleadingly clean result.
+  misleadingly clean result; (2) a same-host bench fleet has
+  near-zero internode latency and can hide a real round-trip-count
+  regression — a fix that changes round count needs a check against
+  actual production topology/load before shipping, not just a memory
+  measurement.
 
 ### Deliberately skipped (documented reasons)
 

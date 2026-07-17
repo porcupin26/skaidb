@@ -390,26 +390,29 @@ const MAINT_LOCK_CHUNK: usize = 32;
 /// Rows per `ScanPage` pulled from each member during a distributed
 /// full-table gather (`cluster_scan_collect`): bounds the coordinator's
 /// transient buffering to a few in-flight pages regardless of table size,
-/// instead of every peer's whole shard at once.
+/// instead of every peer's whole shard at once. Used uniformly whether or
+/// not a column projection is active — an earlier attempt (E-7) shrank
+/// this per-round when projecting, reasoning that a page is a fixed row
+/// count with no byte cap so a wide-row table still fully materializes a
+/// large page before per-row pruning runs. That reasoning was correct but
+/// the fix was unnecessary and actively harmful: `cluster_scan_collect`'s
+/// per-round buffering is already O(page), not O(table), so retiring the
+/// old whole-table `cluster_scan` already brings a 1.9 GB production table
+/// down to tens of MB of transient buffering regardless of this constant —
+/// nowhere near a 4 GB node's ceiling. Shrinking the page 20x instead
+/// multiplied round count 20x (183k rows / 100 ≈ 1,830 rounds), and each
+/// round's fixed per-round cost (lock acquisition, sequential per-peer RPC,
+/// seal-frontier bookkeeping) dominates at that scale: measured on the
+/// real 3-node production cluster, a plain unfiltered `GROUP BY` and even
+/// a narrow `MIN/MAX(id)` (tiny per-row projection, so NOT a byte-size
+/// issue) both blew through the 120s statement timeout at 100 rows/page —
+/// a real, self-inflicted regression a same-host low-latency bench fleet
+/// never surfaces. `prune_row_bytes` (below) still keeps what lands in the
+/// merge map small; that's sufficient.
 #[cfg(not(test))]
 const SCAN_PAGE_ROWS: usize = 2_000;
 #[cfg(test)]
 const SCAN_PAGE_ROWS: usize = 8;
-
-/// Rows per `ScanPage` when a column projection narrows what a gather needs
-/// (E-7): a page is a fixed ROW count with no wire-protocol byte cap, so a
-/// wide-row table (large `body_*`-style fields) still materializes a full
-/// `SCAN_PAGE_ROWS`-sized raw-byte page per source, per round, before any
-/// per-row pruning code runs — pruning after the fact can't shrink a buffer
-/// that's already fully allocated. Shrinking the row count itself is the
-/// only lever available without a protocol change, and it helps regardless
-/// of how large any individual row is. More, smaller round trips instead of
-/// fewer, larger ones — the right trade for a query that only needs a few
-/// columns out of a wide row.
-#[cfg(not(test))]
-const PROJECTED_SCAN_PAGE_ROWS: usize = 100;
-#[cfg(test)]
-const PROJECTED_SCAN_PAGE_ROWS: usize = 2;
 
 /// Rows per local scan page in the topology-change passes (rebalance,
 /// drain, reclaim): bounds the sender's transient memory to one page plus
@@ -6217,15 +6220,6 @@ impl Node {
         let mut out: Vec<(Vec<u8>, Document)> = Vec::new();
         let mut max_hlc: Option<Hlc> = None;
         let filled = |out: &Vec<(Vec<u8>, Document)>| limit.is_some_and(|l| out.len() >= l);
-        // A projection narrows the columns a caller needs, but the page pull
-        // itself is a fixed row count with no byte cap — shrink the row count
-        // when projecting so a wide-row table's raw page bytes stay bounded
-        // even though pruning only happens after the page is already in hand.
-        let page_rows = if project.is_some() {
-            PROJECTED_SCAN_PAGE_ROWS
-        } else {
-            SCAN_PAGE_ROWS
-        };
 
         loop {
             // 1. Pull the next page from every still-active source and merge it.
@@ -6234,8 +6228,8 @@ impl Node {
                     .local
                     .read()
                     .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
-                    .local_scan_versioned_page(table, local_cursor.as_deref(), page_rows)?;
-                local_done = rows.len() < page_rows;
+                    .local_scan_versioned_page(table, local_cursor.as_deref(), SCAN_PAGE_ROWS)?;
+                local_done = rows.len() < SCAN_PAGE_ROWS;
                 if let Some((k, ..)) = rows.last() {
                     local_cursor = Some(k.clone());
                 }
@@ -6253,7 +6247,7 @@ impl Node {
                 if peer_done[i] || !peer_ok[i] {
                     continue;
                 }
-                match self.scan_peer_page(addr, table, peer_cursor[i].as_deref(), page_rows) {
+                match self.scan_peer_page(addr, table, peer_cursor[i].as_deref()) {
                     Some((rows, exhausted)) => {
                         peer_done[i] = exhausted;
                         if let Some((k, ..)) = rows.last() {
@@ -6380,7 +6374,6 @@ impl Node {
         addr: &str,
         table: &str,
         after: Option<&[u8]>,
-        limit: usize,
     ) -> Option<(Vec<BatchRow>, bool)> {
         self.counters.peer_requests.fetch_add(1, Ordering::Relaxed);
         match self.pool.call(
@@ -6388,11 +6381,11 @@ impl Node {
             &Request::ScanPage {
                 table: table.to_string(),
                 after: after.map(<[u8]>::to_vec),
-                limit: limit as u32,
+                limit: SCAN_PAGE_ROWS as u32,
             },
         ) {
             Ok(Response::Scan { rows }) => {
-                let exhausted = rows.len() < limit;
+                let exhausted = rows.len() < SCAN_PAGE_ROWS;
                 Some((rows, exhausted))
             }
             _ => {
@@ -6786,19 +6779,19 @@ fn decode_row_projected(
 /// ever reaches the LWW merge map — re-encodes the pruned
 /// [`Value::decode_document_projected`] result rather than leaving the
 /// original (potentially much larger) bytes sitting in `merged`, even
-/// transiently. Keeps `merged` itself small once a row is in it, which is
-/// worth doing — but measured alone (a live 3-node cluster, 62 MB wide
-/// table) it did **not** fix the E-7 crash's RSS growth, because it isn't
-/// the dominant cost: `merged` was already bounded to about one page's
-/// worth by `cluster_scan_collect`'s per-round "seal" eviction, projected
-/// or not, and this function only prunes a row *after* it has already
-/// arrived. The actual dominant cost is the raw page itself — a full
-/// `SCAN_PAGE_ROWS`-sized `Vec` from `local_scan_versioned_page` and each
-/// peer's `ScanPage` RPC response — being fully materialized before this
-/// function, or any pruning, ever runs; see `PROJECTED_SCAN_PAGE_ROWS`
-/// for the fix that actually addresses that. This function still earns
-/// its keep for what it does control (merge-map residency), it's just not
-/// sufficient by itself.
+/// transiently. `cluster_scan_collect`'s per-round "seal" eviction already
+/// keeps the map to roughly one page window regardless of table size (the
+/// fix for E-7's actual crash: the retired `cluster_scan` held the *whole
+/// table's* raw bytes at once); this narrows that page window further, at
+/// no round-trip cost, since it doesn't change how many rows are pulled
+/// per page — only how much of each row's bytes stick around afterward.
+/// An earlier attempt paired this with also shrinking `SCAN_PAGE_ROWS`
+/// itself when projecting, reasoning the raw page arrival was the
+/// remaining dominant cost; that turned out to be true but not worth
+/// fixing this way — cutting the page 20x multiplied round count 20x, and
+/// on the real production cluster (183k-row table, real per-round RPC
+/// cost) that alone blew through the 120s statement timeout. Reverted;
+/// see `SCAN_PAGE_ROWS`'s doc comment for the full account.
 fn prune_row_bytes(bytes: &[u8], wanted: &HashSet<String>) -> EngineResult<Vec<u8>> {
     let doc = Value::decode_document_projected(bytes, wanted)
         .map_err(|e| EngineError::Cluster(format!("corrupt row: {e}")))?;
