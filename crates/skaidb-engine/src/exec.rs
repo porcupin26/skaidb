@@ -4041,10 +4041,11 @@ impl Database {
         &self,
         table: &str,
         filter: &Option<Expr>,
+        project: Option<&HashSet<String>>,
     ) -> Result<Vec<(Vec<u8>, Document)>> {
         let txn = self.txn.as_ref().expect("transaction active");
         let mut map: BTreeMap<Vec<u8>, Document> =
-            self.gather_rows_keyed(table, filter)?.into_iter().collect();
+            self.gather_rows_keyed(table, filter, project)?.into_iter().collect();
         for ((t, k), op) in &txn.writes {
             if t != table {
                 continue;
@@ -4079,9 +4080,29 @@ impl Database {
         filter: &Option<Expr>,
     ) -> Result<Vec<(Vec<u8>, Document)>> {
         if self.txn.is_some() {
-            return self.gather_with_overlay(table, filter);
+            return self.gather_with_overlay(table, filter, None);
         }
-        self.gather_rows_keyed(table, filter)
+        self.gather_rows_keyed(table, filter, None)
+    }
+
+    /// Like [`Database::local_matching_rows`], but only the fields named in
+    /// `project` are decoded from storage — used by `GROUP BY`/aggregate
+    /// gathers that can only ever read a known column subset (see
+    /// [`group_by_projection_columns`]). `project` must be a superset of
+    /// every column the caller will read; this function has no way to check
+    /// that itself. Correctness-neutral for the overlay path: buffered
+    /// transaction writes are already-decoded full documents, so pruning
+    /// only ever narrows what's read from storage, never the overlay.
+    fn local_matching_rows_projected(
+        &self,
+        table: &str,
+        filter: &Option<Expr>,
+        project: &HashSet<String>,
+    ) -> Result<Vec<(Vec<u8>, Document)>> {
+        if self.txn.is_some() {
+            return self.gather_with_overlay(table, filter, Some(project));
+        }
+        self.gather_rows_keyed(table, filter, Some(project))
     }
 
     /// Ordered/limited variant of [`Database::local_matching_rows`]; see
@@ -4146,9 +4167,9 @@ impl Database {
         fetch_limit: Option<usize>,
     ) -> Result<OrderedRows> {
         if self.txn.is_some() {
-            return Ok((self.gather_with_overlay(table, filter)?, false));
+            return Ok((self.gather_with_overlay(table, filter, None)?, false));
         }
-        self.gather_rows_planned(table, filter, order, fetch_limit)
+        self.gather_rows_planned(table, filter, order, fetch_limit, None)
     }
 
     /// This shard's top-`fetch` candidate keys for an ordered read — served
@@ -4169,7 +4190,7 @@ impl Database {
             return Ok(None);
         }
         let (rows, sorted) =
-            self.gather_rows_planned(table, filter, Some((col, desc, true)), Some(fetch))?;
+            self.gather_rows_planned(table, filter, Some((col, desc, true)), Some(fetch), None)?;
         if !sorted {
             return Ok(None);
         }
@@ -4294,8 +4315,26 @@ impl Database {
         &self,
         table: &str,
         filter: &Option<Expr>,
+        project: Option<&HashSet<String>>,
     ) -> Result<Vec<(Vec<u8>, Document)>> {
-        Ok(self.gather_rows_planned(table, filter, None, None)?.0)
+        Ok(self.gather_rows_planned(table, filter, None, None, project)?.0)
+    }
+
+    /// Decode one stored row's bytes into a `Document` — the full row when
+    /// `project` is `None`, or only the fields named in `project` when it
+    /// isn't (see [`skaidb_types::Value::decode_document_projected`]; the
+    /// caller is responsible for `project` being a true superset of every
+    /// column it will read — this function has no way to verify that).
+    fn decode_row(bytes: &[u8], project: Option<&HashSet<String>>) -> Result<Document> {
+        match project {
+            Some(wanted) => Value::decode_document_projected(bytes, wanted)
+                .map_err(|e| EngineError::Constraint(format!("corrupt row: {e}"))),
+            None => match Value::decode(bytes) {
+                Ok(Value::Document(doc)) => Ok(doc),
+                Ok(_) => Err(EngineError::Constraint("stored row is not a document".into())),
+                Err(e) => Err(EngineError::Constraint(format!("corrupt row: {e}"))),
+            },
+        }
     }
 
     /// Plan and execute a row gather, optionally using a secondary index to (a)
@@ -4303,12 +4342,14 @@ impl Database {
     /// path) and/or (b) return rows already sorted ascending by `order`. When the
     /// result is in `order` and `fetch_limit` is set, scanning stops early
     /// (top-N). Returns the rows and whether they are sorted by `order`.
+    /// `project`: see [`Database::decode_row`].
     fn gather_rows_planned(
         &self,
         table: &str,
         filter: &Option<Expr>,
         order: Option<(&str, bool, bool)>,
         fetch_limit: Option<usize>,
+        project: Option<&HashSet<String>>,
     ) -> Result<OrderedRows> {
         // Fast path: the whole filter is a primary-key equality — one point
         // read (memtable → read cache → SSTables with bloom filters) instead
@@ -4319,22 +4360,20 @@ impl Database {
                 .get(table)
                 .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
             let rows = match engine.get(&key)? {
-                Some(bytes) => match Value::decode(&bytes) {
+                Some(bytes) => {
+                    let doc = Self::decode_row(&bytes, project)?;
                     // Re-check the full filter: pk_point_key keys off the PK
-                    // equalities but a residual constraint on a non-PK column
-                    // could still exclude the row (the caller does not filter
-                    // a point-read result).
-                    Ok(Value::Document(doc)) if matches_filter(filter, &doc)? => {
+                    // equalities but a residual constraint on a non-PK
+                    // column could still exclude the row (the caller does
+                    // not filter a point-read result) — `project` already
+                    // covers the filter's own columns (see
+                    // group_by_projection_columns).
+                    if matches_filter(filter, &doc)? {
                         vec![(key, doc)]
+                    } else {
+                        Vec::new()
                     }
-                    Ok(Value::Document(_)) => Vec::new(),
-                    Ok(_) => {
-                        return Err(EngineError::Constraint(
-                            "stored row is not a document".into(),
-                        ))
-                    }
-                    Err(e) => return Err(EngineError::Constraint(format!("corrupt row: {e}"))),
-                },
+                }
                 None => Vec::new(),
             };
             return Ok((rows, true));
@@ -4351,20 +4390,12 @@ impl Database {
             for key in keys {
                 crate::scan_meter::tick(1)?;
                 let Some(bytes) = engine.get(&key)? else { continue };
-                match Value::decode(&bytes) {
-                    // Re-check the full filter: the key set covers the PK
-                    // pins, but residual predicates (other columns, NOT IN
-                    // exclusions) can still drop a fetched row.
-                    Ok(Value::Document(doc)) if matches_filter(filter, &doc)? => {
-                        rows.push((key, doc));
-                    }
-                    Ok(Value::Document(_)) => {}
-                    Ok(_) => {
-                        return Err(EngineError::Constraint(
-                            "stored row is not a document".into(),
-                        ))
-                    }
-                    Err(e) => return Err(EngineError::Constraint(format!("corrupt row: {e}"))),
+                let doc = Self::decode_row(&bytes, project)?;
+                // Re-check the full filter: the key set covers the PK pins,
+                // but residual predicates (other columns, NOT IN exclusions)
+                // can still drop a fetched row.
+                if matches_filter(filter, &doc)? {
+                    rows.push((key, doc));
                 }
             }
             // Keys were generated in ascending PK order; claim sorted only
@@ -4420,7 +4451,7 @@ impl Database {
                 let mut out = Vec::new();
                 for (key, bytes) in engine.scan_range(start.as_deref(), end.as_deref())? {
                     crate::scan_meter::tick(1)?;
-                    if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
+                    if let Ok(doc) = Self::decode_row(&bytes, project) {
                         if matches_filter(filter, &doc)? {
                             out.push((key, doc));
                             if order.is_none() && fetch_limit.is_some_and(|l| out.len() >= l)
@@ -4449,15 +4480,7 @@ impl Database {
             for item in engine.scan_iter() {
                 crate::scan_meter::tick(1)?;
                 let (key, bytes) = item?;
-                let doc = match Value::decode(&bytes) {
-                    Ok(Value::Document(doc)) => doc,
-                    Ok(_) => {
-                        return Err(EngineError::Constraint(
-                            "stored row is not a document".into(),
-                        ))
-                    }
-                    Err(e) => return Err(EngineError::Constraint(format!("corrupt row: {e}"))),
-                };
+                let doc = Self::decode_row(&bytes, project)?;
                 if matches_filter(filter, &doc)? {
                     out.push((key, doc));
                     if order.is_none() && fetch_limit.is_some_and(|lim| out.len() >= lim) {
@@ -4505,33 +4528,30 @@ impl Database {
             let Some(bytes) = table_engine.get(&row_key)? else {
                 continue; // index entry for a since-deleted row
             };
-            if let Value::Document(doc) =
-                Value::decode(&bytes).map_err(|e| EngineError::Constraint(format!("corrupt row: {e}")))?
-            {
-                if matches_filter(filter, &doc)? {
-                    if let (Some(boundary), Some((col, _, _))) = (&tie_boundary, order) {
-                        // Limit already met: keep only leading-key ties.
-                        if doc.get_path(col) != boundary.as_ref() {
-                            break;
-                        }
-                        out.push((row_key, doc));
-                        continue;
-                    }
-                    out.push((row_key, doc));
-                    // Stop early when the rows already arrive in `order`, or
-                    // when the query never asked for one.
-                    if (sorted || order.is_none())
-                        && fetch_limit.is_some_and(|lim| out.len() >= lim)
-                    {
-                        if sorted && !exact_order {
-                            if let Some((col, _, _)) = order {
-                                let (_, last) = out.last().expect("just pushed");
-                                tie_boundary = Some(last.get_path(col).cloned());
-                                continue;
-                            }
-                        }
+            let doc = Self::decode_row(&bytes, project)?;
+            if matches_filter(filter, &doc)? {
+                if let (Some(boundary), Some((col, _, _))) = (&tie_boundary, order) {
+                    // Limit already met: keep only leading-key ties.
+                    if doc.get_path(col) != boundary.as_ref() {
                         break;
                     }
+                    out.push((row_key, doc));
+                    continue;
+                }
+                out.push((row_key, doc));
+                // Stop early when the rows already arrive in `order`, or
+                // when the query never asked for one.
+                if (sorted || order.is_none())
+                    && fetch_limit.is_some_and(|lim| out.len() >= lim)
+                {
+                    if sorted && !exact_order {
+                        if let Some((col, _, _)) = order {
+                            let (_, last) = out.last().expect("just pushed");
+                            tie_boundary = Some(last.get_path(col).cloned());
+                            continue;
+                        }
+                    }
+                    break;
                 }
             }
         }
@@ -6902,6 +6922,27 @@ pub trait Cluster {
     ) -> Result<OrderedRows> {
         Ok((self.matching_rows(table, filter)?, false))
     }
+    /// Like [`Cluster::matching_rows`], but hints that only the document
+    /// fields named in `project` will ever be read from the result —
+    /// implementors MAY use this to skip decoding every other field
+    /// (see [`group_by_projection_columns`], the only current caller: a
+    /// `GROUP BY`/aggregate gather over a wide-row table otherwise decodes
+    /// every column of every matching row before discarding all but a
+    /// handful — the exact shape that OOM-killed a node on an unfiltered
+    /// `GROUP BY` over a 1.9 GB table, agencik wishlist E-7). The default
+    /// ignores the hint and defers to `matching_rows` (always correct,
+    /// just unoptimized). `project` must be a true superset of every
+    /// column the caller will read — an implementor that prunes anything
+    /// not in `project` is trusting the caller got that superset right.
+    fn matching_rows_projected(
+        &self,
+        table: &str,
+        filter: &Option<Expr>,
+        project: &HashSet<String>,
+    ) -> Result<Vec<(Vec<u8>, Document)>> {
+        let _ = project;
+        self.matching_rows(table, filter)
+    }
     /// Count rows matching `filter` without materializing them — the fallback
     /// for filtered `COUNT(*)` when no covering index applies. `None` = no
     /// streaming count available; the caller gathers (scan-meter bounded).
@@ -8201,15 +8242,29 @@ fn run_simple_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> {
         _ => None,
     };
 
-    let (keyed, presorted) = cluster.matching_rows_ordered(
-        &sel.from,
-        &sel.filter,
-        order_col
-            .as_ref()
-            .map(|(c, desc, exact)| (c.as_str(), *desc, *exact)),
-        fetch_limit,
-    )?;
-    let docs: Vec<Document> = keyed.into_iter().map(|(_k, doc)| doc).collect();
+    // GROUP BY/aggregate gathers never push order or a fetch limit (DISTINCT
+    // and grouping need every row — see the fetch_limit match above), so
+    // when a projection is safe (group_by_projection_columns, which only
+    // ever returns Some for a grouped, non-wildcard, non-TOP-k, join-free,
+    // set-op-free query) this is exactly equivalent to the call below, minus
+    // decoding columns nothing in the statement can read. `presorted` is
+    // meaningless here either way: it only reaches `select_rows` in the
+    // `!grouped` branch below, and this branch only runs when grouped.
+    let (docs, presorted): (Vec<Document>, bool) =
+        if let Some(project) = group_by_projection_columns(sel) {
+            let keyed = cluster.matching_rows_projected(&sel.from, &sel.filter, &project)?;
+            (keyed.into_iter().map(|(_k, doc)| doc).collect(), false)
+        } else {
+            let (keyed, presorted) = cluster.matching_rows_ordered(
+                &sel.from,
+                &sel.filter,
+                order_col
+                    .as_ref()
+                    .map(|(c, desc, exact)| (c.as_str(), *desc, *exact)),
+                fetch_limit,
+            )?;
+            (keyed.into_iter().map(|(_k, doc)| doc).collect(), presorted)
+        };
 
     if grouped {
         select_aggregate(sel, docs, true)
@@ -8226,7 +8281,13 @@ fn project_core(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> {
     if sel.from.is_empty() {
         return run_const_select(sel);
     }
-    let docs: Vec<Document> = if sel.joins.is_empty() {
+    let docs: Vec<Document> = if let Some(project_cols) = group_by_projection_columns(sel) {
+        cluster
+            .matching_rows_projected(&sel.from, &sel.filter, &project_cols)?
+            .into_iter()
+            .map(|(_, d)| d)
+            .collect()
+    } else if sel.joins.is_empty() {
         cluster
             .matching_rows(&sel.from, &sel.filter)?
             .into_iter()
@@ -8896,6 +8957,15 @@ impl Cluster for LocalCluster<'_> {
         self.db.local_matching_rows_ordered(table, filter, order, fetch_limit)
     }
 
+    fn matching_rows_projected(
+        &self,
+        table: &str,
+        filter: &Option<Expr>,
+        project: &HashSet<String>,
+    ) -> Result<Vec<(Vec<u8>, Document)>> {
+        self.db.local_matching_rows_projected(table, filter, project)
+    }
+
     fn count_rows(&self, table: &str) -> Result<Option<usize>> {
         self.db.local_count_rows(table)
     }
@@ -9063,6 +9133,15 @@ impl Cluster for LocalRead<'_> {
         fetch_limit: Option<usize>,
     ) -> Result<OrderedRows> {
         self.db.local_matching_rows_ordered(table, filter, order, fetch_limit)
+    }
+
+    fn matching_rows_projected(
+        &self,
+        table: &str,
+        filter: &Option<Expr>,
+        project: &HashSet<String>,
+    ) -> Result<Vec<(Vec<u8>, Document)>> {
+        self.db.local_matching_rows_projected(table, filter, project)
     }
 
     fn count_rows(&self, table: &str) -> Result<Option<usize>> {
@@ -10257,6 +10336,109 @@ fn contains_aggregate(expr: &Expr) -> bool {
     }
 }
 
+/// Collect every top-level document field an expression could read into
+/// `out` — the first path segment of every `Expr::Column("a.b.c")`, at any
+/// depth (including inside aggregate arguments: `SUM(amount)` needs
+/// `amount` just as much as a bare `amount` reference would). Nested-path
+/// precision (`a.b` vs `a`) isn't tracked — wanting any part of a top-level
+/// field means the whole field decodes, which is correct (if occasionally
+/// wider than strictly necessary) and keeps the projected-decode contract
+/// at the document-field level, matching what
+/// [`skaidb_types::Value::decode_document_projected`] actually offers.
+fn column_refs(expr: &Expr, out: &mut HashSet<String>) {
+    match expr {
+        Expr::Column(path) => {
+            let top = path.split_once('.').map_or(path.as_str(), |(first, _)| first);
+            out.insert(top.to_string());
+        }
+        Expr::Literal(_) | Expr::Parameter(_) => {}
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => column_refs(expr, out),
+        Expr::Binary { left, right, .. } => {
+            column_refs(left, out);
+            column_refs(right, out);
+        }
+        Expr::InList { expr, list, .. } => {
+            column_refs(expr, out);
+            for e in list {
+                column_refs(e, out);
+            }
+        }
+        Expr::Between { expr, lo, hi, .. } => {
+            column_refs(expr, out);
+            column_refs(lo, out);
+            column_refs(hi, out);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            column_refs(expr, out);
+            column_refs(pattern, out);
+        }
+        Expr::Func { args, .. } => {
+            for a in args {
+                column_refs(a, out);
+            }
+        }
+        Expr::Aggregate { arg, .. } => match arg {
+            AggArg::Star => {}
+            AggArg::Expr(e) | AggArg::Distinct(e) | AggArg::ApproxDistinct(e) => {
+                column_refs(e, out);
+            }
+        },
+    }
+}
+
+/// The set of top-level document fields a plain (non-`TOP k BY`) `GROUP
+/// BY`/aggregate query can possibly read — every column referenced in the
+/// `WHERE` filter (the same decoded document is filter-tested during the
+/// gather, before it ever reaches grouping — a column pruned from decode
+/// because it looked unused by the aggregate would make the filter
+/// evaluate against a field that silently isn't there), `group_by`, the
+/// select items (including inside aggregates: `SUM(amount)` needs
+/// `amount`), `HAVING`, and `ORDER BY` (all lowered/evaluated per group in
+/// [`select_aggregate`], so all their column needs apply too). `None` when
+/// pruning isn't safe to attempt: a wildcard needs every field by
+/// definition; `TOP k BY` returns whole rows via [`select_group_topk`], a
+/// different consumer with its own (unrestricted) column needs; joins and
+/// set operations have their own gather/merge shapes not audited for this.
+///
+/// Correctness of the whole column-pruning feature rests on this being a
+/// true superset — this is the ONE place that decides what's safe to
+/// discard during decode, so any expression form added to `Select` in the
+/// future that reads a column outside `filter`/`group_by`/`items`/`having`/
+/// `order_by` must extend this function or column-pruning silently returns
+/// wrong results instead of erroring. Deliberately returns the filter's
+/// columns bundled in (rather than leaving that union to each call site) so
+/// there is exactly one place that can get this wrong, not one per caller.
+fn group_by_projection_columns(sel: &Select) -> Option<HashSet<String>> {
+    if !is_grouped(sel)
+        || sel.group_top.is_some()
+        || has_wildcard(sel)
+        || !sel.joins.is_empty()
+        || !sel.set_ops.is_empty()
+        || sel.nearest.is_some()
+    {
+        return None;
+    }
+    let mut out = HashSet::new();
+    if let Some(filter) = &sel.filter {
+        column_refs(filter, &mut out);
+    }
+    for g in &sel.group_by {
+        column_refs(g, &mut out);
+    }
+    for item in &sel.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            column_refs(expr, &mut out);
+        }
+    }
+    if let Some(having) = &sel.having {
+        column_refs(having, &mut out);
+    }
+    for ok in &sel.order_by {
+        column_refs(&ok.expr, &mut out);
+    }
+    Some(out)
+}
+
 /// Default output column name for an expression.
 pub(crate) fn expr_name(expr: &Expr) -> String {
     match expr {
@@ -11207,5 +11389,143 @@ mod deferred_sync_tests {
         for (sync, commit) in pending {
             sync.sync_through(commit).unwrap(); // must not panic
         }
+    }
+}
+
+#[cfg(test)]
+mod group_by_projection_tests {
+    use super::*;
+
+    fn select_of(sql: &str) -> Select {
+        match skaidb_sql::parse(sql).unwrap() {
+            Statement::Select(sel) => sel,
+            other => panic!("expected a SELECT, got {other:?}"),
+        }
+    }
+
+    fn wanted(sql: &str) -> Option<HashSet<String>> {
+        group_by_projection_columns(&select_of(sql))
+    }
+
+    #[test]
+    fn plain_group_by_wants_group_and_agg_columns() {
+        let w = wanted("SELECT account, SUM(amount) FROM t GROUP BY account").unwrap();
+        assert_eq!(w, ["account".to_string(), "amount".to_string()].into_iter().collect());
+    }
+
+    #[test]
+    fn filter_columns_are_included_even_though_they_never_reach_select_aggregate() {
+        // The gather tests this same decoded document against the filter
+        // BEFORE it reaches select_aggregate — a column pruned because
+        // nothing downstream of grouping reads it would still break the
+        // WHERE clause itself if it were missing.
+        let w = wanted(
+            "SELECT account, COUNT(*) FROM gmail_emails \
+             WHERE status = 'active' GROUP BY account",
+        )
+        .unwrap();
+        assert!(w.contains("status"), "filter column must be wanted");
+        assert!(w.contains("account"));
+        assert!(!w.contains("body"));
+    }
+
+    #[test]
+    fn plain_count_star_wants_only_group_by_column() {
+        // COUNT(*) itself reads nothing — AggArg::Star contributes no column.
+        let w = wanted("SELECT account, COUNT(*) FROM gmail_emails GROUP BY account").unwrap();
+        assert_eq!(w, ["account".to_string()].into_iter().collect());
+        assert!(!w.contains("body"), "must not want the wide unreferenced column");
+    }
+
+    #[test]
+    fn having_and_order_by_columns_are_included() {
+        let w = wanted(
+            "SELECT account, COUNT(*) AS c FROM t GROUP BY account \
+             HAVING SUM(amount) > 10 ORDER BY last_seen DESC",
+        )
+        .unwrap();
+        assert!(w.contains("account"));
+        assert!(w.contains("amount"), "HAVING's aggregate arg must be wanted");
+        assert!(w.contains("last_seen"), "ORDER BY column must be wanted");
+    }
+
+    #[test]
+    fn non_aggregated_select_item_column_is_wanted() {
+        // MySQL-style "any value" semantics: `label` isn't grouped or
+        // aggregated, but select_aggregate reads it from the group's
+        // representative row — it MUST be in the wanted set or that read
+        // would silently come back missing.
+        let w = wanted("SELECT account, label, COUNT(*) FROM t GROUP BY account").unwrap();
+        assert!(w.contains("label"));
+    }
+
+    #[test]
+    fn nested_path_wants_only_the_top_level_field() {
+        let w = wanted("SELECT meta.region, COUNT(*) FROM t GROUP BY meta.region").unwrap();
+        assert_eq!(w, ["meta".to_string()].into_iter().collect());
+    }
+
+    #[test]
+    fn wildcard_disables_pruning() {
+        assert_eq!(wanted("SELECT * FROM t"), None);
+    }
+
+    #[test]
+    fn non_grouped_select_disables_pruning() {
+        // This function is GROUP-BY-specific; a plain row SELECT (even one
+        // with an aggregate-free projection) isn't its concern.
+        assert_eq!(wanted("SELECT account FROM t"), None);
+    }
+
+    #[test]
+    fn group_top_k_disables_pruning() {
+        // select_group_topk returns whole rows via select_rows — a
+        // different, unaudited consumer of the gathered documents.
+        assert_eq!(
+            wanted("SELECT * FROM t GROUP BY account TOP 3 BY amount DESC"),
+            None
+        );
+    }
+
+    #[test]
+    fn joins_disable_pruning() {
+        assert_eq!(
+            wanted(
+                "SELECT t.account, COUNT(*) FROM t JOIN u ON t.id = u.tid GROUP BY t.account"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn union_disables_pruning() {
+        assert_eq!(
+            wanted(
+                "SELECT account, COUNT(*) FROM t GROUP BY account \
+                 UNION SELECT account, COUNT(*) FROM t2 GROUP BY account"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn column_refs_walks_every_expr_shape() {
+        // Exercise every Expr variant's column-carrying position in one
+        // expression, via a WHERE clause parsed straight from SQL (simplest
+        // way to build every shape without hand-constructing the AST).
+        let sel = select_of(
+            "SELECT 1 FROM t WHERE \
+             (a = 1 AND b > 2) OR NOT c IS NULL \
+             OR d IN (e, 5) \
+             OR f BETWEEN g AND h \
+             OR i LIKE j \
+             OR upper(k) = 'X'",
+        );
+        let mut out = HashSet::new();
+        column_refs(sel.filter.as_ref().unwrap(), &mut out);
+        for col in ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"] {
+            assert!(out.contains(col), "missing column ref: {col}");
+        }
+        assert!(!out.contains("upper"), "function name must not be treated as a column");
     }
 }

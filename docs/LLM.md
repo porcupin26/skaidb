@@ -153,6 +153,14 @@ Key facts an agent must know:
   `APPROX_COUNT_DISTINCT(expr)` (opt-in HLL on the search pushdown, exact
   everywhere else), `SUM`, `AVG`, `MIN`, `MAX`; time-series only: `RATE`,
   `INCREASE`, `DELTA`, `FIRST`, `LAST`.
+- **`GROUP BY` memory**: a plain `GROUP BY`/aggregate query (no `TOP k
+  BY`, `*`, join, or set op) decodes only the columns the filter,
+  grouping, aggregates, `HAVING`, and `ORDER BY` actually reference — not
+  every column of every matching row — so grouping on one or two fields
+  of a wide/large-document table costs roughly what those fields alone
+  would, regardless of how large the other columns are. `GROUP BY ...
+  TOP k BY` returns whole rows per group and does not get this — it
+  still materializes every selected column.
 - **Bind parameters**: `?` in prepared `SELECT/INSERT/UPDATE/DELETE`
   (binary protocol / drivers), including `LIMIT ? OFFSET ?` (non-negative
   integer), `NEAREST`'s query/k, and `EXPLAIN <preparable>` (explain the

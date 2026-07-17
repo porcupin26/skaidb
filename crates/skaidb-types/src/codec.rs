@@ -62,6 +62,50 @@ impl Value {
         Ok(v)
     }
 
+    /// Deserialize a **top-level document**, materializing only the fields
+    /// named in `wanted` (a full document's field names — not paths into
+    /// nested documents; nested/array *values* under a wanted top-level key
+    /// still decode in full). Fields not in `wanted` are skip-parsed: their
+    /// bytes are walked to find the next field's boundary, but never
+    /// allocated into a `Value` — this is the whole point. `bytes` must be a
+    /// document encoding (as [`Value::encode_document`] produces); anything
+    /// else errors, matching [`Value::decode`]'s contract for non-document
+    /// top-level values.
+    ///
+    /// Correctness rests entirely on `wanted` being a superset of every
+    /// column the caller will actually read from the result — this function
+    /// has no way to know that on its own. A field missing from the
+    /// returned `Document` because it was never in `wanted` looks
+    /// indistinguishable from a field the source row never had.
+    pub fn decode_document_projected(
+        bytes: &[u8],
+        wanted: &std::collections::HashSet<String>,
+    ) -> Result<Document, ValueError> {
+        let mut cur = Cursor { bytes, pos: 0 };
+        let t = cur.u8()?;
+        if t != tag::DOCUMENT {
+            return Err(ValueError::UnrepresentableJson(
+                "decode_document_projected: not a document",
+            ));
+        }
+        let n = cur.u32()? as usize;
+        let mut doc = Document::new();
+        for _ in 0..n {
+            let key = cur.string()?;
+            if wanted.contains(&key) {
+                doc.insert(key, decode_value(&mut cur)?);
+            } else {
+                skip_value(&mut cur)?;
+            }
+        }
+        if cur.pos != bytes.len() {
+            return Err(ValueError::UnrepresentableJson(
+                "trailing bytes after value",
+            ));
+        }
+        Ok(doc)
+    }
+
     fn encode_value(&self, out: &mut Vec<u8>) {
         match self {
             Value::Null => out.push(tag::NULL),
@@ -211,6 +255,52 @@ fn decode_value(cur: &mut Cursor<'_>) -> Result<Value, ValueError> {
     })
 }
 
+/// Advance `cur` past one encoded value without allocating it — the same
+/// shape as [`decode_value`], but a fixed-size `take`/skip in place of each
+/// `Vec`/`String`/`Document` construction. Used by
+/// [`Value::decode_document_projected`] to walk past fields the caller
+/// doesn't want without paying their decode cost (the entire point: a large
+/// unwanted `String`/`Bytes` field skips in O(1) beyond reading its length).
+fn skip_value(cur: &mut Cursor<'_>) -> Result<(), ValueError> {
+    let t = cur.u8()?;
+    match t {
+        tag::NULL => {}
+        tag::BOOL => {
+            cur.u8()?;
+        }
+        tag::INT | tag::FLOAT | tag::TIMESTAMP => {
+            cur.i64()?;
+        }
+        tag::DECIMAL => {
+            cur.take(16)?;
+            cur.u32()?;
+        }
+        tag::STRING | tag::BYTES => {
+            let len = cur.u32()? as usize;
+            cur.take(len)?;
+        }
+        tag::UUID => {
+            cur.take(16)?;
+        }
+        tag::ARRAY => {
+            let n = cur.u32()? as usize;
+            for _ in 0..n {
+                skip_value(cur)?;
+            }
+        }
+        tag::DOCUMENT => {
+            let n = cur.u32()? as usize;
+            for _ in 0..n {
+                let len = cur.u32()? as usize; // key length prefix, no UTF-8
+                cur.take(len)?; // check/decode needed — the key is discarded
+                skip_value(cur)?;
+            }
+        }
+        _ => return Err(ValueError::UnrepresentableJson("unknown value tag")),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,5 +352,134 @@ mod tests {
     fn decode_rejects_truncated() {
         let bytes = Value::Int(1).encode();
         assert!(Value::decode(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    fn wide_doc() -> Document {
+        let mut doc = Document::new();
+        doc.insert("id", Value::Int(7));
+        doc.insert("account", Value::String("alice".into()));
+        doc.insert("body", Value::String("x".repeat(10_000))); // the field we want to skip
+        doc.insert("tags", Value::Array(vec![Value::String("a".into()), Value::Int(2)]));
+        doc.insert(
+            "meta",
+            Value::Document({
+                let mut m = Document::new();
+                m.insert("nested_big", Value::String("y".repeat(5_000)));
+                m.insert("nested_small", Value::Int(1));
+                m
+            }),
+        );
+        doc.insert("flag", Value::Bool(true));
+        doc.insert("amount", Value::Decimal(Decimal::new(12345, 2)));
+        doc.insert("when", Value::Timestamp(1_700_000_000_000));
+        doc.insert("nothing", Value::Null);
+        doc
+    }
+
+    #[test]
+    fn projected_decode_returns_only_wanted_fields() {
+        let doc = wide_doc();
+        let bytes = Value::encode_document(&doc);
+        let wanted: std::collections::HashSet<String> =
+            ["id".to_string(), "account".to_string()].into_iter().collect();
+        let got = Value::decode_document_projected(&bytes, &wanted).unwrap();
+        assert_eq!(got.get("id"), Some(&Value::Int(7)));
+        assert_eq!(got.get("account"), Some(&Value::String("alice".into())));
+        // Every skipped field is simply absent — not null, not present-but-empty.
+        assert_eq!(got.get("body"), None);
+        assert_eq!(got.get("tags"), None);
+        assert_eq!(got.get("meta"), None);
+        assert_eq!(got.get("flag"), None);
+        assert_eq!(got.0.len(), 2);
+    }
+
+    #[test]
+    fn projected_decode_wanted_set_covers_every_value_type() {
+        // Wanting every field must reproduce the exact full decode — proves
+        // the skip-path's cursor bookkeeping for every tag stays in sync
+        // with decode_value's (a single off-by-one here would corrupt every
+        // field after the first skipped one, not just the skipped one).
+        let doc = wide_doc();
+        let bytes = Value::encode_document(&doc);
+        let wanted: std::collections::HashSet<String> = doc.0.keys().cloned().collect();
+        let got = Value::decode_document_projected(&bytes, &wanted).unwrap();
+        assert_eq!(got, doc);
+    }
+
+    #[test]
+    fn projected_decode_wanting_nothing_returns_empty_document() {
+        let doc = wide_doc();
+        let bytes = Value::encode_document(&doc);
+        let wanted: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let got = Value::decode_document_projected(&bytes, &wanted).unwrap();
+        assert!(got.0.is_empty());
+    }
+
+    #[test]
+    fn projected_decode_wanting_a_field_the_doc_lacks_is_fine() {
+        let doc = wide_doc();
+        let bytes = Value::encode_document(&doc);
+        let wanted: std::collections::HashSet<String> =
+            ["id".to_string(), "does_not_exist".to_string()].into_iter().collect();
+        let got = Value::decode_document_projected(&bytes, &wanted).unwrap();
+        assert_eq!(got.get("id"), Some(&Value::Int(7)));
+        assert_eq!(got.0.len(), 1);
+    }
+
+    #[test]
+    fn projected_decode_skips_every_field_around_a_wanted_one() {
+        // The wanted field isn't first or last — proves skip correctly
+        // resumes the cursor so a middle field decodes correctly regardless
+        // of what was skipped before or after it.
+        let doc = wide_doc();
+        let bytes = Value::encode_document(&doc);
+        let wanted: std::collections::HashSet<String> = ["flag".to_string()].into_iter().collect();
+        let got = Value::decode_document_projected(&bytes, &wanted).unwrap();
+        assert_eq!(got.get("flag"), Some(&Value::Bool(true)));
+        assert_eq!(got.0.len(), 1);
+    }
+
+    #[test]
+    fn projected_decode_rejects_non_document_top_level() {
+        let bytes = Value::Int(1).encode();
+        let wanted: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert!(Value::decode_document_projected(&bytes, &wanted).is_err());
+    }
+
+    #[test]
+    fn projected_decode_rejects_truncated_skip_region() {
+        // Torn bytes inside a SKIPPED field's payload must still error, not
+        // silently succeed with a short skip — a truncated big text field
+        // must not be treated as an empty one.
+        let doc = wide_doc();
+        let bytes = Value::encode_document(&doc);
+        let truncated = &bytes[..bytes.len() - 20]; // cuts into the trailing fields
+        let wanted: std::collections::HashSet<String> = ["id".to_string()].into_iter().collect();
+        assert!(Value::decode_document_projected(truncated, &wanted).is_err());
+    }
+
+    #[test]
+    fn projected_decode_matches_full_decode_over_every_field_subset() {
+        // Exhaustive over every possible wanted-subset (2^9 for this doc's 9
+        // fields): whatever the projected path returns must be a byte-exact
+        // subset of the fully decoded document, for every combination of
+        // which fields get skipped around which — no subset-specific
+        // cursor-desync bug is invisible here.
+        let doc = wide_doc();
+        let bytes = Value::encode_document(&doc);
+        let all_keys: Vec<String> = doc.0.keys().cloned().collect();
+        for mask in 0..(1u32 << all_keys.len()) {
+            let wanted: std::collections::HashSet<String> = all_keys
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, k)| k.clone())
+                .collect();
+            let got = Value::decode_document_projected(&bytes, &wanted).unwrap();
+            for k in &wanted {
+                assert_eq!(got.get(k), doc.get(k), "mask {mask:#b} key {k}");
+            }
+            assert_eq!(got.0.len(), wanted.len(), "mask {mask:#b}");
+        }
     }
 }

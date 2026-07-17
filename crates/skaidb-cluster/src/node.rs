@@ -5112,7 +5112,7 @@ impl Node {
                 return Ok(None); // hot value: bounded scatter beats a huge resolve
             }
         }
-        Ok(Some(self.resolve_candidates(table, keys, oc)?))
+        Ok(Some(self.resolve_candidates(table, keys, oc, None)?))
     }
 
     /// Drive one GLOBAL index's cluster-wide backfill (this node coordinated
@@ -6130,6 +6130,7 @@ impl Node {
         &self,
         table: &str,
         oc: Option<Consistency>,
+        project: Option<&HashSet<String>>,
     ) -> EngineResult<Vec<(Vec<u8>, Document)>> {
         self.counters.reads_total.fetch_add(1, Ordering::Relaxed);
         // key -> (hlc, Some(encoded value) | None tombstone)
@@ -6213,11 +6214,7 @@ impl Node {
         let mut out = Vec::with_capacity(merged.len());
         for (key, (_hlc, value)) in merged {
             let Some(bytes) = value else { continue };
-            if let Value::Document(doc) = Value::decode(&bytes)
-                .map_err(|e| EngineError::Cluster(format!("corrupt row: {e}")))?
-            {
-                out.push((key, doc));
-            }
+            out.push((key, decode_row_projected(&bytes, project)?));
         }
         Ok(out)
     }
@@ -6244,7 +6241,7 @@ impl Node {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        self.cluster_scan_collect(table, oc, None, &None, CollectSink::Rows(Some(limit)))
+        self.cluster_scan_collect(table, oc, None, &None, CollectSink::Rows(Some(limit)), None)
     }
 
     /// Streamed, LWW-merged **count** of rows matching `filter`: the sliding
@@ -6257,7 +6254,7 @@ impl Node {
         filter: &Option<Expr>,
         n: &mut usize,
     ) -> EngineResult<()> {
-        self.cluster_scan_collect(table, oc, None, filter, CollectSink::Count(n))?;
+        self.cluster_scan_collect(table, oc, None, filter, CollectSink::Count(n), None)?;
         Ok(())
     }
 
@@ -6274,6 +6271,7 @@ impl Node {
         keep: Option<&BTreeMap<Vec<u8>, ()>>,
         filter: &Option<Expr>,
         mut sink: CollectSink<'_>,
+        project: Option<&HashSet<String>>,
     ) -> EngineResult<Vec<(Vec<u8>, Document)>> {
         let limit = match sink {
             CollectSink::Rows(l) => l,
@@ -6373,31 +6371,28 @@ impl Node {
                     continue; // not a candidate: merged for LWW, not returned
                 }
                 if let Some(bytes) = val {
-                    if let Value::Document(doc) = Value::decode(&bytes)
-                        .map_err(|e| EngineError::Cluster(format!("corrupt row: {e}")))?
-                    {
-                        if !skaidb_engine::matches_filter(filter, &doc)? {
+                    let doc = decode_row_projected(&bytes, project)?;
+                    if !skaidb_engine::matches_filter(filter, &doc)? {
+                        continue;
+                    }
+                    match &mut sink {
+                        CollectSink::Count(c) => {
+                            **c += 1; // nothing retained
                             continue;
                         }
-                        match &mut sink {
-                            CollectSink::Count(c) => {
-                                **c += 1; // nothing retained
-                                continue;
-                            }
-                            CollectSink::Distinct(col, set) => {
-                                if let Some(v) = doc.get_path(col) {
-                                    if !v.is_null() {
-                                        set.entry(v.encode_key()).or_insert_with(|| v.clone());
-                                    }
+                        CollectSink::Distinct(col, set) => {
+                            if let Some(v) = doc.get_path(col) {
+                                if !v.is_null() {
+                                    set.entry(v.encode_key()).or_insert_with(|| v.clone());
                                 }
-                                continue; // nothing retained
                             }
-                            CollectSink::Rows(_) => {}
+                            continue; // nothing retained
                         }
-                        out.push((k, doc));
-                        if filled(&out) {
-                            break;
-                        }
+                        CollectSink::Rows(_) => {}
+                    }
+                    out.push((k, doc));
+                    if filled(&out) {
+                        break;
                     }
                 }
             }
@@ -6528,7 +6523,7 @@ impl Node {
         oc: Option<Consistency>,
     ) -> EngineResult<Vec<(Vec<u8>, Document)>> {
         let keys = self.index_candidate_keys(table, index, start, end)?;
-        self.resolve_candidates(table, keys, oc)
+        self.resolve_candidates(table, keys, oc, None)
     }
 
     /// Gather the candidate row keys of one index byte range from the local
@@ -6581,8 +6576,12 @@ impl Node {
         table: &str,
         keys: BTreeMap<Vec<u8>, ()>,
         oc: Option<Consistency>,
+        project: Option<&HashSet<String>>,
     ) -> EngineResult<Vec<(Vec<u8>, Document)>> {
         if keys.len() <= INDEX_POINT_READ_MAX {
+            // Bounded set of per-key quorum reads: not the memory risk
+            // `project` exists for (that's the broad branch below), so
+            // point_get always returns full documents here regardless.
             let mut out = Vec::new();
             for key in keys.into_keys() {
                 skaidb_engine::scan_meter::tick(1)?;
@@ -6595,7 +6594,7 @@ impl Node {
         // materialized every row on the coordinator (4.6 GB allocated,
         // OOM-killed two production nodes, 2026-07-13); the sliding merge
         // holds one page window per source and keeps only matching rows.
-        self.cluster_scan_collect(table, oc, Some(&keys), &None, CollectSink::Rows(None))
+        self.cluster_scan_collect(table, oc, Some(&keys), &None, CollectSink::Rows(None), project)
     }
 
     /// Distributed **filter pushdown** for a non-indexed `WHERE`: scatter the
@@ -6610,6 +6609,7 @@ impl Node {
         table: &str,
         filter: &Expr,
         oc: Option<Consistency>,
+        project: Option<&HashSet<String>>,
     ) -> EngineResult<Vec<(Vec<u8>, Document)>> {
         let mut keys: BTreeMap<Vec<u8>, ()> = BTreeMap::new();
 
@@ -6640,7 +6640,7 @@ impl Node {
             }
         }
 
-        self.resolve_candidates(table, keys, oc)
+        self.resolve_candidates(table, keys, oc, project)
     }
 
     /// Distributed approximate nearest-neighbor search: scatter the query to
@@ -6863,6 +6863,28 @@ where
             .map(|h| h.join().expect("scatter worker panicked"))
             .collect()
     })
+}
+
+/// Decode one merged row's bytes into a `Document` — the full row when
+/// `project` is `None`, or only the fields named in `project` when it
+/// isn't. Mirrors `skaidb_engine`'s internal `Database::decode_row`; kept
+/// local since that one is private to its crate. `project`, when given,
+/// must be a true superset of every column the caller will read (see
+/// `skaidb_engine`'s `group_by_projection_columns`, the only builder of
+/// this set) — this function has no way to check that itself.
+fn decode_row_projected(
+    bytes: &[u8],
+    project: Option<&HashSet<String>>,
+) -> EngineResult<Document> {
+    match project {
+        Some(wanted) => Value::decode_document_projected(bytes, wanted)
+            .map_err(|e| EngineError::Cluster(format!("corrupt row: {e}"))),
+        None => match Value::decode(bytes) {
+            Ok(Value::Document(doc)) => Ok(doc),
+            Ok(_) => Err(EngineError::Cluster("stored row is not a document".into())),
+            Err(e) => Err(EngineError::Cluster(format!("corrupt row: {e}"))),
+        },
+    }
 }
 
 fn merge_row(
@@ -7375,7 +7397,7 @@ impl Coordinator {
                 _ => return Ok(None),
             }
         }
-        let rows = self.node.resolve_candidates(table, keys, self.oc)?;
+        let rows = self.node.resolve_candidates(table, keys, self.oc, None)?;
         let rows = filter_rows(filter, rows)?;
         if rows.len() < k {
             return Ok(None);
@@ -7666,7 +7688,7 @@ impl Cluster for Coordinator {
         // the page window plus the distinct set.
         let mut set: BTreeMap<Vec<u8>, Value> = BTreeMap::new();
         self.node
-            .cluster_scan_collect(table, self.oc, None, filter, CollectSink::Distinct(col, &mut set))?;
+            .cluster_scan_collect(table, self.oc, None, filter, CollectSink::Distinct(col, &mut set), None)?;
         Ok(Some(set.into_values().collect()))
     }
 
@@ -7714,7 +7736,7 @@ impl Cluster for Coordinator {
         if let Some(keys) = pk_point_keys(&pk, filter) {
             let set: std::collections::BTreeMap<Vec<u8>, ()> =
                 keys.into_iter().map(|k| (k, ())).collect();
-            let rows = self.node.resolve_candidates(table, set, self.oc)?;
+            let rows = self.node.resolve_candidates(table, set, self.oc, None)?;
             return filter_rows(filter, rows);
         }
         // Indexed non-PK predicate: push the index scan to every node to gather
@@ -7743,11 +7765,61 @@ impl Cluster for Coordinator {
         // matching candidate keys (then re-read at quorum), instead of shipping
         // every node's whole shard to the coordinator.
         if let Some(f) = filter {
-            let rows = self.node.filtered_lookup(table, f, self.oc)?;
+            let rows = self.node.filtered_lookup(table, f, self.oc, None)?;
             return filter_rows(filter, rows);
         }
         // No predicate at all: gather the whole table, LWW-merged.
-        let rows = self.node.cluster_scan(table, self.oc)?;
+        let rows = self.node.cluster_scan(table, self.oc, None)?;
+        filter_rows(filter, rows)
+    }
+
+    /// Like [`Self::matching_rows`], but the two whole-table-scale paths
+    /// (an unfiltered scan, and a non-indexed filter's broad candidate-set
+    /// resolution) decode only `project`'s fields instead of every column —
+    /// see [`Cluster::matching_rows_projected`]'s doc for why this exists
+    /// (agencik wishlist E-7: an unfiltered `GROUP BY` over a wide-row
+    /// table OOM-killed the node). The bounded paths (a PK point read, a
+    /// small PK/index candidate set) are left at their existing full-decode
+    /// behavior: they already return few enough rows that pruning buys
+    /// nothing worth the extra branch, and threading `project` through
+    /// `point_get`'s per-replica quorum resolution would touch the
+    /// internode wire path, out of scope for this fix.
+    fn matching_rows_projected(
+        &self,
+        table: &str,
+        filter: &Option<Expr>,
+        project: &HashSet<String>,
+    ) -> EngineResult<Vec<(Vec<u8>, Document)>> {
+        let pk = self.primary_key(table)?;
+        if let Some(key) = pk_point_key(&pk, filter) {
+            let rows = self.node.point_get(table, &key, self.oc)?;
+            return filter_rows(filter, rows);
+        }
+        if let Some(keys) = pk_point_keys(&pk, filter) {
+            let set: std::collections::BTreeMap<Vec<u8>, ()> =
+                keys.into_iter().map(|k| (k, ())).collect();
+            let rows = self.node.resolve_candidates(table, set, self.oc, Some(project))?;
+            return filter_rows(filter, rows);
+        }
+        if let Some((index, start, end)) = self.plan_index_scan(table, filter)? {
+            let rows = self.node.index_lookup(table, &index, start, end, self.oc)?;
+            return filter_rows(filter, rows);
+        }
+        if let Some((index, ranges)) = self.plan_global_probe(table, filter)? {
+            if ranges.is_empty() {
+                return Ok(Vec::new());
+            }
+            if let Some(rows) =
+                self.node.global_index_lookup(table, &index, &ranges, self.oc)?
+            {
+                return filter_rows(filter, rows);
+            }
+        }
+        if let Some(f) = filter {
+            let rows = self.node.filtered_lookup(table, f, self.oc, Some(project))?;
+            return filter_rows(filter, rows);
+        }
+        let rows = self.node.cluster_scan(table, self.oc, Some(project))?;
         filter_rows(filter, rows)
     }
 
@@ -7785,7 +7857,7 @@ impl Cluster for Coordinator {
             if let Some((index, start, end)) = self.plan_index_scan(table, filter)? {
                 let keys = self.node.index_candidate_keys(table, &index, start, end)?;
                 if keys.len() <= INDEX_POINT_READ_MAX {
-                    let rows = self.node.resolve_candidates(table, keys, self.oc)?;
+                    let rows = self.node.resolve_candidates(table, keys, self.oc, None)?;
                     let mut rows = filter_rows(&Some(f.clone()), rows)?;
                     rows.truncate(lim);
                     return Ok((rows, false));
@@ -7797,6 +7869,7 @@ impl Cluster for Coordinator {
                 None,
                 filter,
                 CollectSink::Rows(Some(lim)),
+                None,
             )?;
             return Ok((rows, false));
         }

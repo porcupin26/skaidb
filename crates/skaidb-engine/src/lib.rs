@@ -1607,6 +1607,190 @@ mod tests {
         );
     }
 
+    /// Column-pruned GROUP BY gathers (agencik wishlist E-7: an unfiltered
+    /// `GROUP BY` over a wide-row table OOM-killed the node — grouped
+    /// gathers decoded every column of every row before discarding all but
+    /// a handful). These prove the pruned path returns identical results to
+    /// the full-decode path across every shape `group_by_projection_columns`
+    /// claims to cover; they don't (can't, from a unit test) prove the
+    /// memory win, which is the storage-level `codec.rs` tests' job.
+    mod group_by_column_pruning {
+        use super::*;
+
+        fn wide_table(db: &mut Database) {
+            db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+            // `body` stands in for gmail_emails' large body_* fields: never
+            // referenced by any query below, so it must never affect a
+            // result — only (if the pruning is working) never get decoded.
+            db.execute(
+                "INSERT INTO t (id, account, amount, label, body) VALUES \
+                 (1,'a',10,'p','X'), (2,'a',20,'q','Y'), \
+                 (3,'b',5,'r','Z'), (4,'b',40,'s','W')",
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn count_star_matches_the_e7_repro_shape() {
+            let mut db = Database::open(tempdir()).unwrap();
+            wide_table(&mut db);
+            let rs = rows(
+                db.execute("SELECT account, COUNT(*) FROM t GROUP BY account ORDER BY account")
+                    .unwrap(),
+            );
+            assert_eq!(
+                rs.rows,
+                vec![
+                    vec![Value::String("a".into()), Value::Int(2)],
+                    vec![Value::String("b".into()), Value::Int(2)],
+                ]
+            );
+        }
+
+        #[test]
+        fn sum_and_having_and_order_by_and_non_aggregated_item() {
+            // Stresses every column source group_by_projection_columns
+            // unions: group_by (account), an aggregate arg (amount), HAVING
+            // (amount again), ORDER BY (account), and a non-aggregated
+            // select item read from the group's representative row (label
+            // — MySQL-style "any value" semantics; first-seen row per
+            // group is id order, so account 'a' group's rep is id=1).
+            let mut db = Database::open(tempdir()).unwrap();
+            wide_table(&mut db);
+            let rs = rows(
+                db.execute(
+                    "SELECT account, label, SUM(amount) FROM t GROUP BY account \
+                     HAVING SUM(amount) > 10 ORDER BY account",
+                )
+                .unwrap(),
+            );
+            assert_eq!(
+                rs.rows,
+                vec![
+                    vec![
+                        Value::String("a".into()),
+                        Value::String("p".into()),
+                        Value::Int(30)
+                    ],
+                    vec![
+                        Value::String("b".into()),
+                        Value::String("r".into()),
+                        Value::Int(45)
+                    ],
+                ]
+            );
+        }
+
+        #[test]
+        fn filtered_group_by_still_filters_correctly() {
+            // The filter's own column (amount) isn't in group_by/items/
+            // having/order_by at all here — proving group_by_projection_
+            // columns' explicit filter-column union (not left to callers)
+            // is actually wired through, not just unit-tested in isolation.
+            let mut db = Database::open(tempdir()).unwrap();
+            wide_table(&mut db);
+            let rs = rows(
+                db.execute(
+                    "SELECT account, COUNT(*) FROM t WHERE amount > 8 \
+                     GROUP BY account ORDER BY account",
+                )
+                .unwrap(),
+            );
+            assert_eq!(
+                rs.rows,
+                vec![
+                    vec![Value::String("a".into()), Value::Int(2)],
+                    vec![Value::String("b".into()), Value::Int(1)],
+                ]
+            );
+        }
+
+        #[test]
+        fn nested_path_group_by_still_correct() {
+            // meta.region: a nested path — group_by_projection_columns wants
+            // the whole top-level `meta` field (no sub-field precision), so
+            // this exercises decode_document_projected keeping a whole
+            // wanted document intact rather than also pruning inside it.
+            let mut db = Database::open(tempdir()).unwrap();
+            db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+            db.execute(
+                "INSERT INTO t (id, meta, body) VALUES \
+                 (1, {region: 'us'}, 'X'), (2, {region: 'us'}, 'Y'), \
+                 (3, {region: 'eu'}, 'Z')",
+            )
+            .unwrap();
+            let rs = rows(
+                db.execute(
+                    "SELECT meta.region, COUNT(*) FROM t GROUP BY meta.region ORDER BY meta.region",
+                )
+                .unwrap(),
+            );
+            assert_eq!(
+                rs.rows,
+                vec![
+                    vec![Value::String("eu".into()), Value::Int(1)],
+                    vec![Value::String("us".into()), Value::Int(2)],
+                ]
+            );
+        }
+
+        #[test]
+        fn plain_aggregate_without_group_by_is_also_pruned_correctly() {
+            // group_by.is_empty() is the single-group case inside
+            // select_aggregate — same code path, same column-need analysis.
+            let mut db = Database::open(tempdir()).unwrap();
+            wide_table(&mut db);
+            let rs = rows(db.execute("SELECT SUM(amount) FROM t").unwrap());
+            assert_eq!(rs.rows, vec![vec![Value::Int(75)]]);
+        }
+
+        #[test]
+        fn wildcard_and_top_k_and_joins_bypass_pruning_but_stay_correct() {
+            // These are the exact cases group_by_projection_columns returns
+            // None for — proving the bypass itself doesn't break anything
+            // (a regression here would mean the None-guard conditions
+            // themselves are wired wrong, e.g. inverted).
+            let mut db = Database::open(tempdir()).unwrap();
+            wide_table(&mut db);
+            let topk = rows(
+                db.execute("SELECT * FROM t GROUP BY account TOP 1 BY amount DESC ORDER BY account")
+                    .unwrap(),
+            );
+            assert_eq!(topk.rows.len(), 2);
+            let star = rows(db.execute("SELECT * FROM t WHERE account = 'a'").unwrap());
+            assert_eq!(star.rows.len(), 2);
+        }
+
+        #[test]
+        fn matches_full_decode_across_every_query_shape() {
+            // Same queries, twice: once against the wide table (pruning
+            // eligible), once against a table with the exact same rows but
+            // NO extra wide column (pruning is a no-op there — every column
+            // is wanted). Byte-identical results across both prove pruning
+            // changes nothing observable.
+            let mut wide = Database::open(tempdir()).unwrap();
+            wide_table(&mut wide);
+            let mut narrow = Database::open(tempdir()).unwrap();
+            narrow.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+            narrow
+                .execute(
+                    "INSERT INTO t (id, account, amount, label) VALUES \
+                     (1,'a',10,'p'), (2,'a',20,'q'), (3,'b',5,'r'), (4,'b',40,'s')",
+                )
+                .unwrap();
+            for sql in [
+                "SELECT account, COUNT(*) FROM t GROUP BY account ORDER BY account",
+                "SELECT account, SUM(amount) FROM t GROUP BY account HAVING SUM(amount) > 10 ORDER BY account",
+                "SELECT account, label FROM t WHERE amount > 8 GROUP BY account, label ORDER BY account, label",
+            ] {
+                let w = rows(wide.execute(sql).unwrap());
+                let n = rows(narrow.execute(sql).unwrap());
+                assert_eq!(w.rows, n.rows, "diverged on: {sql}");
+                assert_eq!(w.columns, n.columns, "diverged on: {sql}");
+            }
+        }
+    }
+
     // ---- JOIN ----
 
     fn join_db() -> Database {

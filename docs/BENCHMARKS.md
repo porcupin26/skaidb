@@ -359,6 +359,16 @@ only grows. Open `[perf]` work lives in [TODO.md](TODO.md).*
   exclusive Database lock, so concurrent sessions' commits coalesce in
   `WalSync::sync_through` (group commit) — measured 2.1× on concurrent
   write throughput (see below). The clustered path always did this.
+- A plain `GROUP BY`/aggregate query (no `TOP k BY`, wildcard, join, or
+  set op) decodes only the columns its filter, grouping, aggregates,
+  `HAVING`, and `ORDER BY` can actually read — not every column of every
+  matching row — across every gather path, local and clustered
+  (`decode_document_projected`, `wal.rs`'s sibling in `codec.rs`; wired
+  through `matching_rows_projected` on both `Database` and `Node`).
+  Measured on a 488 MB synthetic table: RSS growth for an unfiltered
+  `GROUP BY ... COUNT(*)` went from 239 MB to 1 MB (see root-caused
+  findings below — this is the fix for agencik wishlist E-7, a real
+  production OOM crash).
 - Equi-joins hash-join; unfiltered `COUNT(*)` answers from key stats; `ORDER
   BY … LIMIT k` is a selection, not a full sort; per-table block cache +
   sharded read cache + bloom filters on the point-read path.
@@ -394,7 +404,8 @@ only grows. Open `[perf]` work lives in [TODO.md](TODO.md).*
 
 ### Root-caused findings (2026-07-16/17)
 
-The C0/C1-C4 work produced five measured, code-verified findings:
+The C0/C1-C4 work, plus a separate agencik-reported production crash,
+produced six measured, code-verified findings:
 
 - **WAL file extension dominated durable-write latency** (fixed,
   v0.93.0). On the bench fleet's storage an fsync after extending a file
@@ -462,6 +473,48 @@ The C0/C1-C4 work produced five measured, code-verified findings:
   context-switch tax); many-core scaling headroom (~720K reads/s at 16
   threads on a 32-core box) must never be quoted for the 1-vCPU
   deployment shape.
+- **A plain `GROUP BY` over a wide-row table OOM-killed the node**
+  (fixed; agencik wishlist E-7). Reported crash:
+  `SELECT account, COUNT(*) FROM gmail_emails GROUP BY account` (183k
+  rows, 1.9 GB — large `body_*` fields) ramped allocated memory 1.02 GB
+  → 4.03 GB in under 4 seconds and blew the 4 GB cgroup ceiling.
+  Root cause: `matching_rows_ordered`/`matching_rows` decode every
+  matching row into a **full** `Document` before any grouping happens —
+  `GROUP BY` explicitly disables the fetch-limit push-down other queries
+  get ("DISTINCT and grouping need every row"), and the only existing
+  guard (`scan_row_budget`, default 250k) counts rows, not bytes: 183k
+  rows sails under budget while the actual gather still allocates every
+  column of every row. Fix: `group_by_projection_columns` (exec.rs)
+  statically determines every column a `GROUP BY`/aggregate query can
+  possibly read — filter, `group_by`, select items (including inside
+  aggregates: `SUM(amount)` needs `amount`), `HAVING`, `ORDER BY`, and
+  any non-aggregated select item (read from the group's representative
+  row under MySQL-style "any value" semantics) — and a new storage
+  primitive, `Value::decode_document_projected` (`codec.rs`), decodes
+  only those top-level fields, walking past everything else via a
+  `skip_value` companion to `decode_value` (O(1) past a large unwanted
+  `String`/`Bytes` field: read its length, skip the bytes, no
+  allocation). Wired through **every** gather path, local and clustered
+  (`Database::local_matching_rows_projected`; `Node::cluster_scan` /
+  `cluster_scan_collect` / `resolve_candidates` / `filtered_lookup` via
+  a new `Cluster::matching_rows_projected` trait method), not just the
+  standalone path — the reported crash goes through `Node::cluster_scan`
+  even at RF=full, since LWW-correctness requires asking every member
+  regardless of replication factor. Deliberately does **not** apply to
+  `TOP k BY` (returns whole rows via `select_group_topk`, a different
+  consumer with unrestricted column needs), wildcards, joins, or set
+  operations — none of those gather shapes were audited for it.
+  **Measured** on a 488 MB synthetic table shaped like the report (same
+  git-stash A/B methodology as the WAL/lock fixes above): RSS growth for
+  the exact crash query went from **239 MB to 1 MB**, and the query
+  itself got faster too (0.22s → 0.07s) — decoding less is both safer
+  and cheaper. 197 engine tests + 27 cluster tests pass, including new
+  targeted coverage: an exhaustive (2⁹ field-subset) property test that
+  the projected decode always matches a full decode on every possible
+  wanted-set, and end-to-end `GROUP BY`/`HAVING`/`ORDER BY`/filtered/
+  nested-path/no-group-by queries against a wide table compared
+  byte-for-byte against the same queries against a narrow table with no
+  pruning to do.
 
 ### Deliberately skipped (documented reasons)
 
