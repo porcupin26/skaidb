@@ -1,7 +1,7 @@
 # skaidb benchmarks
 
 A throughput/latency comparison of **skaidb** against four production databases —
-**MongoDB 7.0**, **MongoDB 8.0**, **PostgreSQL 15**, and **MariaDB 11.4** — run on
+**MongoDB 7.0**, **MongoDB 8.0**, **PostgreSQL 17**, and **MariaDB 11.4** — run on
 identical containers with matched durability semantics, across a single-node
 baseline plus four replicated cluster/consistency configurations; plus a
 single-node **skaidb-vs-Elasticsearch** comparison on matched hardware, a
@@ -9,16 +9,20 @@ larger-scale skaidb-vs-Elasticsearch full-text search comparison, and
 fleet-level correctness/latency verification of skaidb's sharded-scatter
 and global-index paths.
 
-**Full re-run: 2026-07-16, skaidb v0.92.1.** This is a wholesale re-run —
-every number in this document was freshly measured this pass; nothing here
-is carried over from earlier releases. Two things make this round's absolute
-throughput numbers **not comparable** to any prior version of this document:
-the client now runs from a container on the same bridge as the fleet instead
-of a workstation over a hairpin path (17–40 ms RTT would otherwise dominate
-every measurement), and this round's host was shared with an active 24-hour
-FTS soak plus the full 15-container comparison fleet — 16 containers total
-on one 8-thread host throughout. See **Setup** below for what that means for
-skaidb's standing specifically.
+**C1-C4 re-run: 2026-07-17, skaidb v0.94.3, all comparison systems
+upgraded first** — PostgreSQL 15.18→**17.10** (PGDG, primary + both
+standbys rebuilt), MongoDB 7.0.34→**7.0.37**, MongoDB 8.0.23→**8.0.26**,
+Elasticsearch 8.14.3→**8.19.18**; MariaDB stayed 11.4. This round's host
+was much quieter than the previous one (no FTS soak; benchmarks run one
+system at a time) and skaidb carries the two 2026-07-16 write-path fixes
+(WAL chunk pre-allocation in v0.93.0; standalone fsync-outside-the-lock
+in v0.94.x — the latter affects only the C0 standalone scenario, not
+these clustered configs). Absolute numbers are therefore **not
+comparable to the previous round's** — but every C1-C4 cell below was
+measured in this same pass, so the relative standings are. Sections
+other than C1-C4 and their dated headers (C0, FTS-vs-ES, global-index,
+sharded-scatter) still carry the 2026-07-16 round's numbers and version
+labels.
 
 > Numbers are for *relative* comparison on small, contended nodes, not
 > absolute peak throughput. Within one round, all systems are driven by the
@@ -60,34 +64,31 @@ row is the same semi-sync mode as C4 (≈ 2-of-3), a single measurement marked `
 - `read 16c` — 16 connections, point read by primary key over a 1,000-row table
 - `mixed 16c` — 16 connections, 50/50 read/write
 
-**skaidb's standing dropped sharply from every previous version of this
-document** — from leading reads and being competitive on writes, to trailing
-every system on every workload this round. This was investigated before
-publishing, not waved away:
+**Reading the C1-C4 standings** (2026-07-17 round):
 
-- **A real, fixed bug**: the fleet's reference skaidb config predated the
-  `anti_entropy_interval_secs=3600` pin and ran on the 60-second default —
-  the same back-to-back-repair-pass pattern documented as a production
-  incident (see CLUSTERING.md). Fixed and the **entire skaidb matrix
-  re-run**; numbers barely moved (read 16c: 960→984 ops/s), so this was not
-  the dominant cause — but it was a genuine methodology bug and the fix
-  stands.
-- **Ruled out**: per-operation reconnection (the client holds one persistent
-  connection per thread for the whole run — confirmed in `bench.rs`), and
-  write shedding (0 errors on every leg, every config).
-- **The latency shape** (p50 ≈ 1 ms, p99 10–35 ms) matches scheduling-jitter
-  tail latency on an oversubscribed host, not a uniform engine slowdown — a
-  fast median says the storage path itself isn't the bottleneck.
-- **Not fully root-caused.** The leading hypothesis: skaidb's
-  leaderless/quorum coordination issues more internode round-trips per
-  operation than PostgreSQL's simpler primary-writes-locally model, making
-  it more sensitive to host-level scheduling jitter at this row count, where
-  coordination overhead dominates raw storage work. This is inconsistent
-  with production skai-cluster telemetry (sub-50 ms p99 on equivalent shapes
-  at far higher load) — **treat this round's skaidb C1–C4 numbers as
-  contention-dominated, not representative of isolated-host or production
-  performance; re-run on a dedicated host before drawing product
-  conclusions.**
+- **skaidb leads write 1c in every config** (888/848/722/684 vs
+  PostgreSQL's 598/832/581/631) — the durable-write latency floor. This
+  is new: the previous round had skaidb *last* here (234-325), and the
+  difference is v0.93.0's WAL chunk pre-allocation (see the C0 section's
+  root-cause writeup) carrying straight through the clustered path.
+- **PostgreSQL still leads every 16c cell.** skaidb's 16-connection
+  numbers stay near its 1-connection numbers (~870-1,210) across all
+  configs — on a 1-vCPU node the coordinator is CPU-bound coordinating
+  quorum ops, so extra client concurrency has nothing to schedule onto.
+  This is a different limit from the (fixed) standalone lock-serialization
+  issue: the C0 scenario shows what the same node does with no
+  replication coordination (3,427 write 16c / 10,643 read 16c).
+- **Quorum reads carry a real cost at this scale**: every skaidb read
+  here is a QUORUM read (a live confirmation round to a peer), while the
+  other systems read from the primary alone. The measured ONE-vs-QUORUM
+  delta on this fleet is ~8% of *skaidb's own* number (see the C0
+  section) — the rest of the read gap vs PG is per-op coordination CPU
+  on 1 vCPU.
+- The previous round's investigation of skaidb's then-anomalous standing
+  (repair-interval config bug — found and fixed; shared-host contention
+  with an active 24h soak — gone this round) is preserved in git history;
+  its conclusions stand and led to the C0 scenario plus both write-path
+  fixes.
 
 ## C0 — 1 node, no replication (single-node baseline, 2026-07-16)
 
@@ -230,28 +231,28 @@ in this section as superseding those for anything the two overlap on.
 
 | Workload | skaidb | MongoDB 7 | MongoDB 8 | PostgreSQL | MariaDB |
 |----------|-------:|----------:|----------:|-----------:|--------:|
-| write 1c  |    299 |    215 |    244 | **565** |    314 |
-| write 16c |    635 |    951 |  1,091 | **2,100** |  1,189 |
-| read 16c  |    975 |  1,942 |  1,846 | **3,709** |  2,082 |
-| mixed 16c |    791 |  1,287 |  1,450 | **2,606** |  1,580 |
+| write 1c  | **888** |    242 |    283 |    598 |    290 |
+| write 16c |    924 |  1,079 |  1,311 | **2,361** |  1,614 |
+| read 16c  |  1,131 |  2,238 |  2,031 | **4,648** |  3,191 |
+| mixed 16c |  1,045 |  1,457 |  1,437 | **3,333** |  2,815 |
 
 ## C2 — 2 nodes, writes wait for the **primary only** (async replication)
 
 | Workload | skaidb | MongoDB 7 | MongoDB 8 | PostgreSQL | MariaDB |
 |----------|-------:|----------:|----------:|-----------:|--------:|
-| write 1c  |    325 |    666 |    536 | **788** |    327 |
-| write 16c |    621 |  1,436 |  1,561 | **3,022** |  1,097 |
-| read 16c  |  1,053 |  1,776 |  1,878 | **4,441** |  2,205 |
-| mixed 16c |    790 |  1,383 |  1,556 | **3,460** |  1,541 |
+| write 1c  | **848** |    715 |    756 |    832 |    339 |
+| write 16c |    956 |  2,186 |  1,652 | **3,300** |  1,693 |
+| read 16c  |  1,175 |  2,250 |  2,091 | **4,573** |  3,241 |
+| mixed 16c |  1,023 |  1,835 |  1,522 | **3,556** |  2,850 |
 
 ## C3 — 3 nodes, writes wait for **all 3**
 
 | Workload | skaidb | MongoDB 7 | MongoDB 8 | PostgreSQL | MariaDB* |
 |----------|-------:|----------:|----------:|-----------:|---------:|
-| write 1c  |    237 |    260 |    235 | **499** |    292* |
-| write 16c |    584 |  1,063 |    983 | **2,128** |    954* |
-| read 16c  |    989 |  1,893 |  1,836 | **4,164** |  2,173* |
-| mixed 16c |    775 |  1,427 |  1,438 | **3,135** |  1,476* |
+| write 1c  | **722** |    156 |    175 |    581 |    299* |
+| write 16c |    870 |    960 |    985 | **2,328** |  1,370* |
+| read 16c  |  1,135 |  2,326 |  2,256 | **4,339** |  3,430* |
+| mixed 16c |  1,037 |  1,511 |  1,433 | **3,328** |  2,403* |
 
 `*` MariaDB's C3 is the identical physical config as C4 (see note ¹) — a
 single measurement, not an independent second run.
@@ -260,41 +261,10 @@ single measurement, not an independent second run.
 
 | Workload | skaidb | MongoDB 7 | MongoDB 8 | PostgreSQL | MariaDB |
 |----------|-------:|----------:|----------:|-----------:|--------:|
-| write 1c  |    234 |    219 |    265 | **574** |    292 |
-| write 16c |    585 |    952 |  1,026 | **2,447** |    954 |
-| read 16c  |    984 |  1,822 |  1,691 | **4,409** |  2,173 |
-| mixed 16c |    733 |  1,238 |  1,310 | **3,071** |  1,476 |
-
-**PostgreSQL wins every cell this round.** Its commit path sits at the
-network-latency floor and its replication is a lightweight streaming-WAL
-protocol; combined with the host contention discussed above, it pulled
-further ahead of every leaderless/multi-round-trip system (skaidb, MongoDB)
-than in prior isolated-host runs. Take this as this-round's relative
-standing under contention, not a durable architectural verdict — see Setup.
-
-Two real methodology bugs were caught and fixed **during** this round rather
-than silently producing wrong numbers:
-
-- **PostgreSQL**: `ALTER SYSTEM` and `pg_reload_conf()` must be separate
-  `psql -c` invocations — combining them errors ("cannot run inside a
-  transaction block") and silently leaves the *previous* sync config active.
-  The first C3 attempt used the stale C4 setting; discarded and re-run
-  correctly.
-- **MariaDB**: `rpl_semi_sync_slave_enabled` was OFF on the replicas
-  throughout this fleet's history — only the master-side flag had ever been
-  set. With the slave flag off, `rpl_semi_sync_master_enabled=ON` silently
-  degrades to fully-async writes with no error and no timeout, which means
-  **every previous MariaDB "semi-sync" number ever published in this
-  document was actually measuring async**. Fixed this round (slave-side
-  flag set + IO thread restarted to register — verified via
-  `Rpl_semi_sync_master_clients > 0` before every semi-sync leg) and all
-  four MariaDB configs measured with genuine semi-sync where the config
-  calls for it.
-
-The previous version of this document's **leaderless fan-out sub-experiment**
-(single-coordinator vs. round-robin across all 3 skaidb nodes) was not
-re-run — the in-tree Rust bench client has no multi-host round-robin mode.
-Dropped rather than kept stale; a future re-add needs a small harness change.
+| write 1c  | **684** |    229 |    277 |    631 |    283 |
+| write 16c |    953 |  1,171 |  1,298 | **2,543** |  1,438 |
+| read 16c  |  1,210 |  2,134 |  2,281 | **4,611** |  3,164 |
+| mixed 16c |  1,079 |  1,557 |  1,606 | **3,506** |  2,536 |
 
 ## Memory footprint (process RSS, after this round's workload)
 
