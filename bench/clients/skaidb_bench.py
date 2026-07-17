@@ -130,8 +130,14 @@ per = ops // threads
 lat, err, lock = [], [0], threading.Lock()
 
 
+barrier = threading.Barrier(threads + 1)
+
+
 def worker(t):
+    # Connect + SCRAM handshake OUTSIDE the timed window; the main
+    # thread starts the clock at the barrier.
     sock = connect(addrs[t % len(addrs)], user, password)
+    barrier.wait()
     lats, e, rng = [], 0, random.Random(t)
     for i in range(per):
         if mode == "read" or (mode == "mixed" and rng.random() < 0.5):
@@ -153,9 +159,10 @@ def worker(t):
     sock.close()
 
 
-start = time.perf_counter()
 ts = [threading.Thread(target=worker, args=(t,)) for t in range(threads)]
 [t.start() for t in ts]
+barrier.wait()  # all workers connected; ops start now
+start = time.perf_counter()
 [t.join() for t in ts]
 el = time.perf_counter() - start
 lat.sort()

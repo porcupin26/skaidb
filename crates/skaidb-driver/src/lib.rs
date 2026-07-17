@@ -580,6 +580,43 @@ fn probe(endpoint: &str) -> Option<Duration> {
     Some(start.elapsed())
 }
 
+/// Process-global cache of derived SCRAM `SaltedPassword`s, keyed by
+/// (password, salt, iterations). The PBKDF2 derivation is deliberately
+/// expensive (15k HMAC iterations at the default — tens of ms on small
+/// CPUs) and its output is identical for every connection authenticating
+/// the same credential against the same stored salt, so pools and
+/// reconnects pay it once instead of per connection. The cache holds
+/// password-equivalent secrets, but so does the process (the password
+/// itself is in memory); bounded small since real processes use a handful
+/// of credentials.
+fn cached_salted_password(password: &str, salt: &[u8], iterations: u32) -> [u8; 32] {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    /// (password, salt, iterations) → derived SaltedPassword.
+    type SaltedCache = HashMap<(String, Vec<u8>, u32), [u8; 32]>;
+    static CACHE: Mutex<Option<SaltedCache>> = Mutex::new(None);
+
+    let key = (password.to_string(), salt.to_vec(), iterations);
+    if let Some(hit) = CACHE
+        .lock()
+        .ok()
+        .and_then(|c| c.as_ref().and_then(|m| m.get(&key).copied()))
+    {
+        return hit;
+    }
+    // Derive outside the lock: a herd of first connections computes it in
+    // parallel rather than serializing behind one derivation.
+    let salted = scram::salted_password(password, salt, iterations);
+    if let Ok(mut guard) = CACHE.lock() {
+        let map = guard.get_or_insert_with(HashMap::new);
+        if map.len() >= 64 {
+            map.clear(); // crude bound; real processes hold a handful of creds
+        }
+        map.insert(key, salted);
+    }
+    salted
+}
+
 /// Run the client side of the SCRAM handshake. When `password` is non-empty,
 /// the server's signature is verified for mutual authentication.
 fn handshake(stream: &mut TcpStream, username: &str, password: &str) -> Result<(), DriverError> {
@@ -604,7 +641,11 @@ fn handshake(stream: &mut TcpStream, username: &str, password: &str) -> Result<(
         &challenge.salt,
         challenge.iterations,
     );
-    let proof = scram::client_proof(password, &challenge.salt, challenge.iterations, &am);
+    // One PBKDF2 per (credential, salt) per process — not two per
+    // connection: the proof and the server-signature check share the
+    // derived key, and the cache shares it across connections.
+    let salted = cached_salted_password(password, &challenge.salt, challenge.iterations);
+    let proof = scram::client_proof_salted(&salted, &am);
     write_frame(
         stream,
         &AuthFinish {
@@ -616,8 +657,7 @@ fn handshake(stream: &mut TcpStream, username: &str, password: &str) -> Result<(
     match AuthOutcome::decode(&read_frame(stream)?)? {
         AuthOutcome::Ok { server_signature } => {
             if !password.is_empty() {
-                let expected =
-                    scram::server_signature(password, &challenge.salt, challenge.iterations, &am);
+                let expected = scram::server_signature_salted(&salted, &am);
                 if expected != server_signature {
                     return Err(DriverError::Auth("server signature mismatch".into()));
                 }

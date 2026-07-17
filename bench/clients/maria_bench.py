@@ -71,10 +71,17 @@ per = ops // threads
 lat, err, lock = [], [0], threading.Lock()
 
 
+barrier = threading.Barrier(threads + 1)
+
+
 def worker(t):
     c = conn()
     cur = c.cursor()
     lats, e, rng = [], 0, random.Random(t)
+    # Connection/prepare setup stays OUTSIDE the timed window (the
+    # barrier below is where the main thread starts the clock) —
+    # handshake cost must not be billed as op throughput.
+    barrier.wait()
     for i in range(per):
         if mode == "read" or (mode == "mixed" and rng.random() < 0.5):
             k = rng.randrange(read_span)
@@ -98,9 +105,10 @@ def worker(t):
     c.close()
 
 
-start = time.perf_counter()
 ts = [threading.Thread(target=worker, args=(t,)) for t in range(threads)]
 [t.start() for t in ts]
+barrier.wait()  # all workers connected; ops start now
+start = time.perf_counter()
 [t.join() for t in ts]
 el = time.perf_counter() - start
 lat.sort()

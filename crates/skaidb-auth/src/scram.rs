@@ -115,10 +115,19 @@ impl ScramCredential {
     }
 }
 
-/// Client-side: compute the `ClientProof` over `auth_message` for a password.
-pub fn client_proof(password: &str, salt: &[u8], iterations: u32, auth_message: &[u8]) -> [u8; 32] {
-    let salted = pbkdf2_hmac_sha256(password.as_bytes(), salt, iterations);
-    let client_key = hmac_sha256(&salted, b"Client Key");
+/// Client-side: derive the PBKDF2 `SaltedPassword` — the expensive step
+/// (15k HMAC iterations at the default). One handshake needs it for both
+/// the proof and the server-signature check, and it is identical across
+/// connections for the same (password, salt, iterations) — derive once,
+/// reuse (see the driver's cache).
+pub fn salted_password(password: &str, salt: &[u8], iterations: u32) -> [u8; 32] {
+    pbkdf2_hmac_sha256(password.as_bytes(), salt, iterations)
+}
+
+/// Client-side: the `ClientProof` over `auth_message`, from a pre-derived
+/// [`salted_password`]. Cheap (three HMAC/SHA passes).
+pub fn client_proof_salted(salted: &[u8; 32], auth_message: &[u8]) -> [u8; 32] {
+    let client_key = hmac_sha256(salted, b"Client Key");
     let stored_key = sha256(&client_key);
     let client_signature = hmac_sha256(&stored_key, auth_message);
     let mut proof = [0u8; 32];
@@ -128,6 +137,18 @@ pub fn client_proof(password: &str, salt: &[u8], iterations: u32, auth_message: 
     proof
 }
 
+/// Client-side: the expected `ServerSignature`, from a pre-derived
+/// [`salted_password`]. Cheap (two HMAC passes).
+pub fn server_signature_salted(salted: &[u8; 32], auth_message: &[u8]) -> [u8; 32] {
+    let server_key = hmac_sha256(salted, b"Server Key");
+    hmac_sha256(&server_key, auth_message)
+}
+
+/// Client-side: compute the `ClientProof` over `auth_message` for a password.
+pub fn client_proof(password: &str, salt: &[u8], iterations: u32, auth_message: &[u8]) -> [u8; 32] {
+    client_proof_salted(&salted_password(password, salt, iterations), auth_message)
+}
+
 /// Client-side: the expected `ServerSignature` for mutual authentication.
 pub fn server_signature(
     password: &str,
@@ -135,9 +156,7 @@ pub fn server_signature(
     iterations: u32,
     auth_message: &[u8],
 ) -> [u8; 32] {
-    let salted = pbkdf2_hmac_sha256(password.as_bytes(), salt, iterations);
-    let server_key = hmac_sha256(&salted, b"Server Key");
-    hmac_sha256(&server_key, auth_message)
+    server_signature_salted(&salted_password(password, salt, iterations), auth_message)
 }
 
 fn from_hex(s: &str) -> Option<Vec<u8>> {

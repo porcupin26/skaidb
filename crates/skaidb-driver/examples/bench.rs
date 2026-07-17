@@ -79,13 +79,25 @@ fn main() {
     }
 
     let per_thread = ops / threads;
-    let start = Instant::now();
+    // Connect (TCP + SCRAM handshake) BEFORE the clock starts, and hold every
+    // thread at a barrier until all are connected: the timed window measures
+    // operations only. With setup inside the window, N handshakes dominate
+    // short runs and understate throughput — this harness bug depressed
+    // skaidb's 16-connection numbers ~3-6x in earlier published rounds (the
+    // other systems' clients have cheap native-code handshakes, so the same
+    // timing placement barely skewed theirs).
+    let setup_start = Instant::now();
+    // threads + 1: the main thread joins the barrier too, so it can start
+    // the ops clock at the exact moment every worker is connected and released.
+    let barrier = Arc::new(std::sync::Barrier::new(threads + 1));
     let mut handles = Vec::new();
     for t in 0..threads {
         let cfg = Arc::clone(&cfg);
         let mode = mode.clone();
+        let barrier = Arc::clone(&barrier);
         handles.push(std::thread::spawn(move || {
             let mut client = connect(&cfg, t);
+            barrier.wait();
             let mut lat = Vec::with_capacity(per_thread);
             let mut errors = 0u64;
             let mut rng = 0x9e37_79b9_7f4a_7c15u64 ^ (t as u64).wrapping_mul(0x2545_f491_4f6c_dd1d);
@@ -130,6 +142,11 @@ fn main() {
         }));
     }
 
+    // Release the workers together and start the ops clock at that instant.
+    barrier.wait();
+    let setup = setup_start.elapsed().as_secs_f64();
+    let start = Instant::now();
+
     let mut all_lat = Vec::with_capacity(ops);
     let mut errors = 0u64;
     for h in handles {
@@ -146,7 +163,7 @@ fn main() {
 
     println!("--- {mode}: {} ops, {threads} threads ---", all_lat.len());
     println!("throughput : {:.0} ops/s", all_lat.len() as f64 / elapsed);
-    println!("wall time  : {elapsed:.2} s   errors: {errors}");
+    println!("wall time  : {elapsed:.2} s   errors: {errors}   (connect setup: {setup:.2} s, untimed)");
     println!(
         "latency ms : avg {avg:.2}  p50 {:.2}  p95 {:.2}  p99 {:.2}  max {:.2}",
         pct(0.50),

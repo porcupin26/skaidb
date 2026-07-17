@@ -268,3 +268,16 @@ mod tests {
         assert!(!ct_eq(b"abc", b"ab"));
     }
 }
+
+#[cfg(test)]
+mod timing_probe {
+    /// Not a correctness test — prints how long one 15k-iteration PBKDF2
+    /// takes on this machine. `--ignored --nocapture` to run.
+    #[test]
+    #[ignore]
+    fn pbkdf2_15k_wall_time() {
+        let t0 = std::time::Instant::now();
+        let _ = super::pbkdf2_hmac_sha256(b"skaidbClu5ter", b"somesalt16bytes!", 15_000);
+        eprintln!("15k iterations: {:?}", t0.elapsed());
+    }
+}

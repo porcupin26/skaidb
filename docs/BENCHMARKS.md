@@ -101,53 +101,59 @@ point-read latency: skaidb p50 ≈ 110 µs vs PostgreSQL ≈ 198 µs, MariaDB
 ≈ 301 µs, MongoDB ≈ 689 µs on this loopback setup. Both of skaidb's
 2026-07-16 write-path fixes are in these numbers — the root-cause record
 for each (WAL extension fsync cost; standalone lock serialization) is in
-the [notes](#root-caused-findings-2026-07-16).
+the [notes](#root-caused-findings-2026-07-1617).
 
 ## C1–C4 — replicated configs (2026-07-17)
 
-All five systems re-measured in one pass after upgrading everything (see
-the versions table above). Reading the standings:
+All five systems measured in one pass after upgrading everything (see the
+versions table above), with the **corrected harness**: every client
+connects and authenticates *before* the timed window opens (an earlier
+same-day pass timed connection setup inside the window, which depressed
+skaidb's 16-connection numbers 4-11× — the full root-cause record,
+including the driver-side SCRAM fix it prompted, is in the
+[notes](#root-caused-findings-2026-07-1617)). Reading the standings:
 
-- **skaidb leads write 1c in every config** — the durable-write latency
-  floor (v0.93.0's WAL pre-allocation carrying through the clustered
-  path; the previous round had skaidb last here).
-- **PostgreSQL leads every 16c cell.** skaidb's 16-connection numbers
-  sit near its 1-connection numbers across all configs: on a 1-vCPU node
-  the coordinator is CPU-bound on quorum coordination, so extra client
-  concurrency has nothing to schedule onto. A different limit from the
-  fixed standalone lock issue — C0 shows the same node without
-  coordination work (3,427 write 16c / 10,643 read 16c).
-- **Every skaidb read here is a QUORUM read** (a live confirmation round
-  to a peer) while the other systems read from the primary alone; the
-  measured ONE-vs-QUORUM delta on this fleet is ~8% of skaidb's own
-  number, the rest of the read gap is per-op coordination CPU.
+- **skaidb leads every cell of every config** — writes, reads, and mixed,
+  at 1 and 16 connections. Largest margins on reads (2.2× over
+  PostgreSQL at C4: 13,629 vs 6,153) and quorum writes (1.4×: 3,873 vs
+  2,768); narrowest on async-replication writes (C2 write 1c: 967 vs
+  846, inside the noise band).
+- **skaidb's reads scale with members**: 9,384-9,529 at 2 nodes →
+  13,108-13,629 at 3 (every node coordinates its share of clients
+  against its full local copy). The other systems read from a single
+  primary regardless of cluster size, and it shows.
+- **Durability level barely moves skaidb's throughput** (C1 ≈ C2 ≈ C3 ≈
+  C4 within noise at 16c) — the fsync is group-committed and the peer
+  round-trip is pipelined, so stricter acks cost latency headroom, not
+  throughput. MongoDB pays heavily for w:3 (write 1c drops ~4× from C2
+  to C3); PostgreSQL is comparatively flat like skaidb.
 
 ### C1 — 2 nodes, writes wait for **both**
 
 | Workload | skaidb | MongoDB 7 | MongoDB 8 | PostgreSQL | MariaDB |
 |----------|-------:|----------:|----------:|-----------:|--------:|
-| write 1c  | **888** |    242 |    283 |    598 |    290 |
-| write 16c |    924 |  1,079 |  1,311 | **2,361** |  1,614 |
-| read 16c  |  1,131 |  2,238 |  2,031 | **4,648** |  3,191 |
-| mixed 16c |  1,045 |  1,457 |  1,437 | **3,333** |  2,815 |
+| write 1c  | **1,008** |    225 |    296 |    609 |    312 |
+| write 16c | **3,903** |  1,092 |  1,428 |  2,870 |  1,450 |
+| read 16c  | **9,384** |  2,264 |  2,230 |  5,487 |  2,952 |
+| mixed 16c | **5,740** |  1,425 |  1,581 |  4,146 |  2,848 |
 
 ### C2 — 2 nodes, writes wait for the **primary only** (async replication)
 
 | Workload | skaidb | MongoDB 7 | MongoDB 8 | PostgreSQL | MariaDB |
 |----------|-------:|----------:|----------:|-----------:|--------:|
-| write 1c  | **848** |    715 |    756 |    832 |    339 |
-| write 16c |    956 |  2,186 |  1,652 | **3,300** |  1,693 |
-| read 16c  |  1,175 |  2,250 |  2,091 | **4,573** |  3,241 |
-| mixed 16c |  1,023 |  1,835 |  1,522 | **3,556** |  2,850 |
+| write 1c  | **967** |    749 |    735 |    846 |    332 |
+| write 16c | **3,730** |  2,010 |  1,750 |  3,565 |  1,682 |
+| read 16c  | **9,529** |  2,298 |  2,333 |  6,056 |  3,033 |
+| mixed 16c | **5,524** |  1,641 |  1,996 |  4,463 |  2,506 |
 
 ### C3 — 3 nodes, writes wait for **all 3**
 
 | Workload | skaidb | MongoDB 7 | MongoDB 8 | PostgreSQL | MariaDB* |
 |----------|-------:|----------:|----------:|-----------:|---------:|
-| write 1c  | **722** |    156 |    175 |    581 |    299* |
-| write 16c |    870 |    960 |    985 | **2,328** |  1,370* |
-| read 16c  |  1,135 |  2,326 |  2,256 | **4,339** |  3,430* |
-| mixed 16c |  1,037 |  1,511 |  1,433 | **3,328** |  2,403* |
+| write 1c  | **717** |    156 |    161 |    577 |    269* |
+| write 16c | **3,999** |    864 |    926 |  2,815 |  1,310* |
+| read 16c  | **13,108** |  2,189 |  2,338 |  6,034 |  2,644* |
+| mixed 16c | **5,564** |  1,255 |  1,222 |  3,919 |  2,271* |
 
 `*` identical physical config as C4 (see note ¹ under Environment) — a
 single measurement, not an independent second run.
@@ -156,10 +162,10 @@ single measurement, not an independent second run.
 
 | Workload | skaidb | MongoDB 7 | MongoDB 8 | PostgreSQL | MariaDB |
 |----------|-------:|----------:|----------:|-----------:|--------:|
-| write 1c  | **684** |    229 |    277 |    631 |    283 |
-| write 16c |    953 |  1,171 |  1,298 | **2,543** |  1,438 |
-| read 16c  |  1,210 |  2,134 |  2,281 | **4,611** |  3,164 |
-| mixed 16c |  1,079 |  1,557 |  1,606 | **3,506** |  2,536 |
+| write 1c  | **734** |    221 |    242 |    592 |    257 |
+| write 16c | **3,873** |  1,065 |  1,267 |  2,768 |  1,272 |
+| read 16c  | **13,629** |  2,186 |  2,286 |  6,153 |  2,691 |
+| mixed 16c | **6,500** |  1,380 |  1,452 |  4,148 |  2,176 |
 
 ### Memory footprint (process RSS, 2026-07-16 round)
 
@@ -386,9 +392,9 @@ only grows. Open `[perf]` work lives in [TODO.md](TODO.md).*
   value bytes (the `.stamps` sidecar) — a converged prod pass dropped from
   >240s to ~60s (measured post-v0.89.0 roll).
 
-### Root-caused findings (2026-07-16)
+### Root-caused findings (2026-07-16/17)
 
-The C0/C1-C4 work produced four measured, code-verified findings:
+The C0/C1-C4 work produced five measured, code-verified findings:
 
 - **WAL file extension dominated durable-write latency** (fixed,
   v0.93.0). On the bench fleet's storage an fsync after extending a file
@@ -423,6 +429,31 @@ The C0/C1-C4 work produced four measured, code-verified findings:
   One flagged risk for future work: **read-repair is synchronous** — a
   stale replica blocks the client response on its repair instead of
   repairing in the background.
+- **The published "16c coordinator bottleneck" was a harness artifact
+  plus a real driver inefficiency** (both fixed, 2026-07-17). The
+  original C1-C4 pass showed skaidb's 16-connection throughput stuck at
+  its 1-connection level (~950-1,210) and this document attributed it to
+  coordinator CPU — wrongly. Decomposition on a live 2-node cluster:
+  Node layer alone (single member) 10,269 reads/s; peers at ONE/ONE
+  6,765; QUORUM/QUORUM 7,293; client spread across both nodes 6,257 —
+  none of it reproduced the collapse. The suite's exact shape (4,000
+  ops / 16 threads) did: **the harness started its clock before the
+  worker threads connected**, and each skaidb connection paid ~190 ms of
+  setup — SCRAM PBKDF2 (15,000 scalar HMAC iterations) run **twice** per
+  handshake (once for the client proof, once for the server-signature
+  check), with nothing shared across connections. 16 handshakes ≈ 2.9 s
+  of a 3.7 s window; identical per-op latency in fast and slow runs was
+  the tell. Fixes: (1) harness — all clients (Rust and Python) now
+  connect before a barrier and the clock starts at the barrier, with
+  setup time reported separately; (2) driver — one PBKDF2 per handshake
+  (`client_proof_salted`/`server_signature_salted` share the derived
+  key) and a process-global `(password, salt, iterations)` →
+  SaltedPassword cache, making reconnects/pool-refills ~free. Re-measured
+  C1: read 16c 1,131 → 9,384; write 16c 924 → 3,903. The corrected
+  matrix flipped every 16c standing. Residual truth in the old claim:
+  quorum coordination does cost ~30-40% vs the bare Node layer
+  (10,269 → 6,257-7,293 reads) — real, but nowhere near the artifact's
+  magnitude.
 - **skaidb's per-op code cost is microseconds; coordination and I/O are
   everything at this scale.** In-process, no network: SQL parse ≈ 0.54 µs,
   full point-read execute ≈ 1.19 µs (`read_path_breakdown.rs`) — 50-100×
@@ -497,3 +528,9 @@ The C0/C1-C4 work produced four measured, code-verified findings:
   config-switch, not just the command that was supposed to set it.
 - The first run after a fleet restart is often an outlier — discard and
   re-run it before recording anything.
+- **Never time connection setup inside a throughput window.** Clients
+  must connect + authenticate before a barrier and the clock starts at
+  the barrier — N expensive handshakes (SCRAM PBKDF2) inside a short
+  window depressed published 16-connection numbers 4-11× while per-op
+  latency looked perfectly normal. Identical p50s between a fast and a
+  slow run are the tell that wall-clock, not ops, is being measured.
