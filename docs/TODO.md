@@ -169,6 +169,29 @@ lives in [BENCHMARKS.md](BENCHMARKS.md#performance-engineering-notes).)
   it to drop as compaction rewrites files. Re-measure in a few days, then
   re-tighten `anti_entropy_interval_secs` (3600 → 900 is safe at a 60 s
   pass; the 2026-07-10 lesson only forbids interval < pass time).
+- [ ] **[perf] Unfiltered `GROUP BY` over a large table times out instead
+  of completing (agencik E-7 residual)** — the OOM crash itself is fixed
+  and verified on prod (v0.95.3: retired the whole-table `cluster_scan`
+  for the already page-bounded `cluster_scan_collect`; RSS confirmed flat
+  through a full run against the real `gmail_emails` table, see
+  BENCHMARKS.md). But the same query still doesn't finish within
+  `storage.statement_timeout_secs` (120 s) on that table (183k rows,
+  1.9 GB) — a clean, safe failure, not a crash, but not a result either.
+  Root cause not isolated: ruled out row width and nested-array field
+  complexity via matched-scale synthetic tests on the same prod node
+  (both fast); a synthetic table scales roughly linearly and projects to
+  ~12 s at the real table's round count, yet the real table doesn't
+  finish. Suspects: disk I/O on a table not fully page-cache-resident, or
+  per-key MVCC/multi-SSTable-generation resolution cost specific to a
+  table with a long write history (every synthetic test was a single
+  fresh bulk load, never updated) — plausibly the same underlying cost
+  as repair passes' historical 60-240 s (see the digest entry above), now
+  exposed by a new code path (nothing previously ran an unbounded
+  `cluster_scan_collect` gather over a table this large). NEXT: reproduce
+  on a synthetic table that's been through genuine update/compaction
+  history (not just a bulk load) to test the MVCC hypothesis; profile a
+  real gather on `gmail_emails` directly (`perf`/`eu-stack`) to see where
+  time actually goes.
 - [ ] **[perf] Vector index memory: quantization + mmap** — persistence
   itself already exists (snapshot + watermark-delta replay at open; saved
   at create/rebuild/graceful shutdown, and since v0.88 checkpointed every
