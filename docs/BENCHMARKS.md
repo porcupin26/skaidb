@@ -474,7 +474,10 @@ produced six measured, code-verified findings:
   threads on a 32-core box) must never be quoted for the 1-vCPU
   deployment shape.
 - **A plain `GROUP BY` over a wide-row table OOM-killed the node**
-  (fixed; agencik wishlist E-7 — two-part fix, see below). Reported
+  (the OOM itself is fixed and verified on production; the query still
+  doesn't complete on the full table within the existing statement
+  timeout — see the production-validation note below. Agencik wishlist
+  E-7, three-round fix). Reported
   crash: `SELECT account, COUNT(*) FROM gmail_emails GROUP BY account`
   (183k rows, 1.9 GB — large `body_*` fields) ramped allocated memory
   1.02 GB → 4.03 GB in under 4 seconds and blew the 4 GB cgroup ceiling.
@@ -546,7 +549,37 @@ produced six measured, code-verified findings:
   uniform 2,000-row pages: an 8,000-row/62 MB wide table's unfiltered
   `GROUP BY` RSS growth ~59-74 MB (a wide margin under any node's
   ceiling — the crash-causing table is 1.9 GB, and this cost does not
-  scale with table size). Deliberately does **not** apply to `TOP k BY`
+  scale with table size).
+  **Production validation (v0.95.3, all 3 skai nodes, 2026-07-17):** ran
+  the actual reported crash query against the real `gmail_emails` table
+  (183k rows, 1.9 GB) with live `VmRSS` monitoring. RSS stayed
+  completely flat (~800 MB, zero growth) through a full 120-second run —
+  **the OOM is confirmed gone.** The query itself did not complete within
+  `storage.statement_timeout_secs` (120s) — a clean, safe error, not a
+  crash, but not the result agencik actually wants either. Root cause of
+  the remaining slowness is not fully isolated. Ruled out via matched
+  synthetic tests directly on the same prod node: (a) row width — a
+  20,000-row/160 MB synthetic table with the same 8 KB row size completed
+  in 1.4s; (b) nested-array field complexity (`gmail_emails` has
+  `images`/`links`/`labels` arrays up to ~36 elements) — a 20,000-row
+  synthetic table with matching array structure completed in 1.6s, no
+  meaningfully different from the simple-row case, so `skip_value`'s
+  per-element array recursion is not the bottleneck. A simple synthetic
+  table scaled roughly linearly through 40 rounds (5.5s at 80,000 rows)
+  and projects to ~12s at the real table's 92-round count (183k rows /
+  2,000) — nowhere near 120s — yet the real table doesn't finish. Likely
+  candidates not yet confirmed: disk I/O on a 2.3 GB on-disk table not
+  fully page-cache-resident, or per-key MVCC/multi-SSTable-generation
+  resolution cost specific to a table with a long write history (the
+  synthetic tables were single fresh bulk loads, never updated) — this
+  cluster's other full-table `ScanPage`-based operations are known to
+  cost similarly at this data scale — anti-entropy repair passes on this
+  same hardware historically ran 60-240s per pass before the v0.88.1/89.0
+  digest-cache and sidecar work (see "Repair digests skip a stamp scan"
+  above) — so this may be a pre-existing, now-exposed characteristic
+  rather than something introduced by this fix, but that is not yet
+  confirmed; flagged as an open follow-up. Deliberately does **not**
+  apply to `TOP k BY`
   (returns whole rows via `select_group_topk`, a different consumer with
   unrestricted column needs), wildcards, joins, or set operations — none
   of those gather shapes were audited for it. 197 engine tests + 86
@@ -555,7 +588,7 @@ produced six measured, code-verified findings:
   matches a full decode on every possible wanted-set, and end-to-end
   `GROUP BY`/`HAVING`/`ORDER BY`/filtered/nested-path/no-group-by
   queries against a wide table compared byte-for-byte against the same
-  queries against a narrow table with no pruning to do. **Two lessons
+  queries against a narrow table with no pruning to do. **Three lessons
   recorded for future OOM-shaped fixes:** (1) validate against the
   actual clustered `Coordinator`/`cluster_scan*` path on a live cluster
   before declaring a memory fix complete — the standalone
@@ -564,7 +597,12 @@ produced six measured, code-verified findings:
   near-zero internode latency and can hide a real round-trip-count
   regression — a fix that changes round count needs a check against
   actual production topology/load before shipping, not just a memory
-  measurement.
+  measurement; (3) memory-safety and query-latency are separate
+  properties that both need validating against real production data —
+  a synthetic table, however carefully scaled in row count and byte
+  size, may not reproduce a real table's on-disk/write-history
+  characteristics (this one's remaining >120s latency was not reproduced
+  by any synthetic test tried, matched row-count-for-row-count).
 
 ### Deliberately skipped (documented reasons)
 
