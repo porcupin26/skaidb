@@ -177,21 +177,32 @@ lives in [BENCHMARKS.md](BENCHMARKS.md#performance-engineering-notes).)
   BENCHMARKS.md). But the same query still doesn't finish within
   `storage.statement_timeout_secs` (120 s) on that table (183k rows,
   1.9 GB) — a clean, safe failure, not a crash, but not a result either.
-  Root cause not isolated: ruled out row width and nested-array field
-  complexity via matched-scale synthetic tests on the same prod node
-  (both fast); a synthetic table scales roughly linearly and projects to
-  ~12 s at the real table's round count, yet the real table doesn't
-  finish. Suspects: disk I/O on a table not fully page-cache-resident, or
-  per-key MVCC/multi-SSTable-generation resolution cost specific to a
-  table with a long write history (every synthetic test was a single
-  fresh bulk load, never updated) — plausibly the same underlying cost
-  as repair passes' historical 60-240 s (see the digest entry above), now
-  exposed by a new code path (nothing previously ran an unbounded
-  `cluster_scan_collect` gather over a table this large). NEXT: reproduce
-  on a synthetic table that's been through genuine update/compaction
-  history (not just a bulk load) to test the MVCC hypothesis; profile a
-  real gather on `gmail_emails` directly (`perf`/`eu-stack`) to see where
-  time actually goes.
+  Ruled out via matched-scale synthetic tests on the same prod node: row
+  width and nested-array field complexity (both fast regardless); a
+  synthetic table scales roughly linearly and projects to ~12 s at the
+  real table's round count (183k rows / 2,000 ≈ 92 rounds), yet the real
+  table doesn't finish. **Root-caused via live profiling (2026-07-17,
+  `strace -c -f` + per-thread `ps` sampling on skai1 during an active
+  run, against an idle baseline for comparison): lock contention on
+  `Node::local` (`RwLock<Database>`, node.rs), not disk I/O or decode
+  cost.** `pread64` is fast even under load (0.35 ms/call, ~0.2% of
+  syscall time); the busiest thread in the whole 65+-thread process
+  during an active run sits at ~3% CPU, blocked in `futex_do_wait` — the
+  process is barely computing, mostly waiting. `futex` and `recvfrom`
+  syscall time both jump sharply vs. an idle baseline (recvfrom: ~10
+  calls/20s idle → ~290 calls/20s during the query). `cluster_scan_collect`
+  takes `self.local.read()` fresh every round — ~92+ times for this
+  query — against the same lock every write on the node also takes;
+  Linux's default pthread_rwlock is writer-preferring, so a steady
+  trickle of live write traffic (agencik's continuous email/task sync)
+  can repeatedly queue this query's reader behind pending writers, and
+  the delay compounds across dozens of reacquisitions. This explains why
+  no synthetic test reproduced it: every synthetic table was tested
+  without genuine concurrent write load. NEXT: confirm by reproducing
+  with a synthetic table under concurrent writer load (not just bulk-load
+  then read); if confirmed, consider acquiring the lock once per larger
+  batch of rounds rather than per round, or a snapshot/MVCC read path
+  that doesn't contend with the writer lock at all.
 - [ ] **[perf] Vector index memory: quantization + mmap** — persistence
   itself already exists (snapshot + watermark-delta replay at open; saved
   at create/rebuild/graceful shutdown, and since v0.88 checkpointed every
