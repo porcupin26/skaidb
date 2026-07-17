@@ -388,13 +388,28 @@ const MAINT_BATCH_MAX: usize = 256;
 const MAINT_LOCK_CHUNK: usize = 32;
 
 /// Rows per `ScanPage` pulled from each member during a distributed
-/// full-table gather (`cluster_scan`): bounds the coordinator's transient
-/// buffering to a few in-flight pages regardless of table size, instead of
-/// every peer's whole shard at once.
+/// full-table gather (`cluster_scan_collect`): bounds the coordinator's
+/// transient buffering to a few in-flight pages regardless of table size,
+/// instead of every peer's whole shard at once.
 #[cfg(not(test))]
 const SCAN_PAGE_ROWS: usize = 2_000;
 #[cfg(test)]
 const SCAN_PAGE_ROWS: usize = 8;
+
+/// Rows per `ScanPage` when a column projection narrows what a gather needs
+/// (E-7): a page is a fixed ROW count with no wire-protocol byte cap, so a
+/// wide-row table (large `body_*`-style fields) still materializes a full
+/// `SCAN_PAGE_ROWS`-sized raw-byte page per source, per round, before any
+/// per-row pruning code runs — pruning after the fact can't shrink a buffer
+/// that's already fully allocated. Shrinking the row count itself is the
+/// only lever available without a protocol change, and it helps regardless
+/// of how large any individual row is. More, smaller round trips instead of
+/// fewer, larger ones — the right trade for a query that only needs a few
+/// columns out of a wide row.
+#[cfg(not(test))]
+const PROJECTED_SCAN_PAGE_ROWS: usize = 100;
+#[cfg(test)]
+const PROJECTED_SCAN_PAGE_ROWS: usize = 2;
 
 /// Rows per local scan page in the topology-change passes (rebalance,
 /// drain, reclaim): bounds the sender's transient memory to one page plus
@@ -6123,104 +6138,10 @@ impl Node {
         })
     }
 
-    /// Gather a table from all reachable members, merged by last-writer-wins.
-    /// Tombstones participate in the merge so a delete on one replica correctly
-    /// masks a stale `Put` gathered from another (quorum read ∩ quorum write).
-    fn cluster_scan(
-        &self,
-        table: &str,
-        oc: Option<Consistency>,
-        project: Option<&HashSet<String>>,
-    ) -> EngineResult<Vec<(Vec<u8>, Document)>> {
-        self.counters.reads_total.fetch_add(1, Ordering::Relaxed);
-        // key -> (hlc, Some(encoded value) | None tombstone)
-        let mut merged: BTreeMap<Vec<u8>, (Hlc, Option<Vec<u8>>)> = BTreeMap::new();
-        let mut responders = 0usize;
-
-        // Local shard (with tombstones), paged: the read lock is held one
-        // page at a time and no whole-shard `Vec` is built beside the merge
-        // map. Writes landing between pages resolve by last-writer-wins,
-        // like writes landing between two peers' scans always have.
-        {
-            let mut after: Option<Vec<u8>> = None;
-            loop {
-                let rows = self
-                    .local
-                    .read()
-                    .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
-                    .local_scan_versioned_page(table, after.as_deref(), SCAN_PAGE_ROWS)?;
-                let full = rows.len() == SCAN_PAGE_ROWS;
-                after = rows.last().map(|(k, ..)| k.clone());
-                for (key, value, hlc, is_put) in rows {
-                    merge_row(&mut merged, key, is_put.then_some(value), hlc);
-                }
-                if !full {
-                    break;
-                }
-            }
-            responders += 1;
-        }
-
-        // Peers: one worker per peer pages its shard concurrently, feeding
-        // pages into the merge as they arrive. Peak memory is the merge map
-        // plus a few in-flight pages — never every peer's whole shard at
-        // once (an unpaged gather held full shards and OOM-killed 512 MB
-        // nodes at 1M rows). A peer failing mid-scan may leave some of its
-        // rows merged; that is harmless (they are real replica data and LWW
-        // applies) and it is not counted as a responder.
-        let addrs = self.peer_addrs();
-        let peer_ok: Vec<bool> = thread::scope(|s| {
-            let (tx, rx) = mpsc::sync_channel::<Vec<BatchRow>>(addrs.len().max(1));
-            let handles: Vec<_> = addrs
-                .iter()
-                .map(|addr| {
-                    let tx = tx.clone();
-                    s.spawn(move || self.scan_peer_paged(addr, table, &tx))
-                })
-                .collect();
-            drop(tx);
-            for rows in rx {
-                for (key, value, hlc, is_put) in rows {
-                    merge_row(&mut merged, key, is_put.then_some(value), hlc);
-                }
-            }
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("scan worker panicked"))
-                .collect()
-        });
-        responders += peer_ok.into_iter().filter(|ok| *ok).count();
-
-        let needed = oc
-            .unwrap_or(self.cfg.read_consistency)
-            .required(self.member_count());
-        if responders < needed {
-            self.counters
-                .read_quorum_failures
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(EngineError::Cluster(format!(
-                "read quorum not met: {responders}/{needed} members responded"
-            )));
-        }
-
-        // Advance our clock past the newest row seen, so a read-then-write on
-        // this coordinator (e.g. a non-PK `UPDATE`/`DELETE`) is causally ordered
-        // after it under last-writer-wins.
-        if let Some(max) = merged.values().map(|(hlc, _)| *hlc).max() {
-            self.clock.observe(max);
-        }
-
-        // Decode surviving rows into documents, dropping tombstoned keys.
-        let mut out = Vec::with_capacity(merged.len());
-        for (key, (_hlc, value)) in merged {
-            let Some(bytes) = value else { continue };
-            out.push((key, decode_row_projected(&bytes, project)?));
-        }
-        Ok(out)
-    }
-
-    /// Like [`Node::cluster_scan`] but stops once `limit` surviving rows have
-    /// been produced — the push-down for an unfiltered, unordered `LIMIT n`.
+    /// Like [`Node::cluster_scan_collect`] with no filter/limit/candidate set
+    /// (an unfiltered whole-table gather) but stops once `limit` surviving
+    /// rows have been produced — the push-down for an unfiltered, unordered
+    /// `LIMIT n`.
     /// Without it a `SELECT … LIMIT 2` on a million-row table gathered and
     /// merged every shard in full before the executor threw all but two rows
     /// away (slow, and it re-materialised the whole table on the coordinator).
@@ -6296,6 +6217,15 @@ impl Node {
         let mut out: Vec<(Vec<u8>, Document)> = Vec::new();
         let mut max_hlc: Option<Hlc> = None;
         let filled = |out: &Vec<(Vec<u8>, Document)>| limit.is_some_and(|l| out.len() >= l);
+        // A projection narrows the columns a caller needs, but the page pull
+        // itself is a fixed row count with no byte cap — shrink the row count
+        // when projecting so a wide-row table's raw page bytes stay bounded
+        // even though pruning only happens after the page is already in hand.
+        let page_rows = if project.is_some() {
+            PROJECTED_SCAN_PAGE_ROWS
+        } else {
+            SCAN_PAGE_ROWS
+        };
 
         loop {
             // 1. Pull the next page from every still-active source and merge it.
@@ -6304,21 +6234,26 @@ impl Node {
                     .local
                     .read()
                     .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
-                    .local_scan_versioned_page(table, local_cursor.as_deref(), SCAN_PAGE_ROWS)?;
-                local_done = rows.len() < SCAN_PAGE_ROWS;
+                    .local_scan_versioned_page(table, local_cursor.as_deref(), page_rows)?;
+                local_done = rows.len() < page_rows;
                 if let Some((k, ..)) = rows.last() {
                     local_cursor = Some(k.clone());
                 }
                 skaidb_engine::scan_meter::tick(rows.len())?;
                 for (key, value, hlc, is_put) in rows {
-                    merge_row(&mut merged, key, is_put.then_some(value), hlc);
+                    let value = is_put.then_some(value);
+                    let value = match (project, value) {
+                        (Some(wanted), Some(bytes)) => Some(prune_row_bytes(&bytes, wanted)?),
+                        (_, v) => v,
+                    };
+                    merge_row(&mut merged, key, value, hlc);
                 }
             }
             for (i, addr) in addrs.iter().enumerate() {
                 if peer_done[i] || !peer_ok[i] {
                     continue;
                 }
-                match self.scan_peer_page(addr, table, peer_cursor[i].as_deref()) {
+                match self.scan_peer_page(addr, table, peer_cursor[i].as_deref(), page_rows) {
                     Some((rows, exhausted)) => {
                         peer_done[i] = exhausted;
                         if let Some((k, ..)) = rows.last() {
@@ -6326,7 +6261,14 @@ impl Node {
                         }
                         skaidb_engine::scan_meter::tick(rows.len())?;
                         for (key, value, hlc, is_put) in rows {
-                            merge_row(&mut merged, key, is_put.then_some(value), hlc);
+                            let value = is_put.then_some(value);
+                            let value = match (project, value) {
+                                (Some(wanted), Some(bytes)) => {
+                                    Some(prune_row_bytes(&bytes, wanted)?)
+                                }
+                                (_, v) => v,
+                            };
+                            merge_row(&mut merged, key, value, hlc);
                         }
                     }
                     // Peer failed mid-scan: stop reading it and drop it from the
@@ -6425,14 +6367,20 @@ impl Node {
 
     /// Fetch one `ScanPage`-sized page of `table` from `addr`, in key order
     /// after `after`. `(rows, exhausted)` where `exhausted` marks the peer's
-    /// last (short) page; `None` if the RPC failed. Used by the on-demand,
-    /// early-terminating [`Node::cluster_scan_limited`] (vs. the drain-to-a-
-    /// channel [`Node::scan_peer_paged`] a full gather uses).
+    /// last (short) page; `None` if the RPC failed. Used by every
+    /// [`Node::cluster_scan_collect`]-based gather (a peer this old is
+    /// simply treated as unreachable for this scan — no rolling-upgrade
+    /// fallback here, unlike the retired whole-table-in-one-map
+    /// `cluster_scan`'s `LocalScan` fallback; every other paged gather
+    /// already accepted this trade-off, so the E-7 fix (routing the
+    /// unfiltered-scan case through this function instead) doesn't
+    /// introduce a new one).
     fn scan_peer_page(
         &self,
         addr: &str,
         table: &str,
         after: Option<&[u8]>,
+        limit: usize,
     ) -> Option<(Vec<BatchRow>, bool)> {
         self.counters.peer_requests.fetch_add(1, Ordering::Relaxed);
         match self.pool.call(
@@ -6440,69 +6388,16 @@ impl Node {
             &Request::ScanPage {
                 table: table.to_string(),
                 after: after.map(<[u8]>::to_vec),
-                limit: SCAN_PAGE_ROWS as u32,
+                limit: limit as u32,
             },
         ) {
             Ok(Response::Scan { rows }) => {
-                let exhausted = rows.len() < SCAN_PAGE_ROWS;
+                let exhausted = rows.len() < limit;
                 Some((rows, exhausted))
             }
             _ => {
                 self.counters.peer_errors.fetch_add(1, Ordering::Relaxed);
                 None
-            }
-        }
-    }
-
-    /// Stream one peer's shard of `table` into `tx`, one `ScanPage` at a
-    /// time. Returns whether the peer supplied its complete shard (only then
-    /// does it count toward the read quorum). Peers that predate `ScanPage`
-    /// fall back to a single whole-table pull.
-    fn scan_peer_paged(&self, addr: &str, table: &str, tx: &mpsc::SyncSender<Vec<BatchRow>>) -> bool {
-        let mut after: Option<Vec<u8>> = None;
-        let mut first = true;
-        loop {
-            self.counters.peer_requests.fetch_add(1, Ordering::Relaxed);
-            match self.pool.call(
-                addr,
-                &Request::ScanPage {
-                    table: table.to_string(),
-                    after: after.clone(),
-                    limit: SCAN_PAGE_ROWS as u32,
-                },
-            ) {
-                Ok(Response::Scan { rows }) => {
-                    first = false;
-                    let full = rows.len() == SCAN_PAGE_ROWS;
-                    after = rows.last().map(|(k, ..)| k.clone());
-                    if tx.send(rows).is_err() {
-                        return false; // merge side gone; scan abandoned
-                    }
-                    if !full {
-                        return true;
-                    }
-                }
-                // Rolling upgrade: the peer predates ScanPage. Fall back to
-                // the old whole-shard pull for it.
-                Ok(Response::Err(e)) if first && e.contains("unknown request op") => {
-                    self.counters.peer_requests.fetch_add(1, Ordering::Relaxed);
-                    return match self.pool.call(
-                        addr,
-                        &Request::LocalScan {
-                            table: table.to_string(),
-                        },
-                    ) {
-                        Ok(Response::Scan { rows }) => tx.send(rows).is_ok(),
-                        _ => {
-                            self.counters.peer_errors.fetch_add(1, Ordering::Relaxed);
-                            false
-                        }
-                    };
-                }
-                _ => {
-                    self.counters.peer_errors.fetch_add(1, Ordering::Relaxed);
-                    return false;
-                }
             }
         }
     }
@@ -6885,6 +6780,29 @@ fn decode_row_projected(
             Err(e) => Err(EngineError::Cluster(format!("corrupt row: {e}"))),
         },
     }
+}
+
+/// Prune one row's raw bytes down to just `wanted`'s fields, **before** it
+/// ever reaches the LWW merge map — re-encodes the pruned
+/// [`Value::decode_document_projected`] result rather than leaving the
+/// original (potentially much larger) bytes sitting in `merged`, even
+/// transiently. Keeps `merged` itself small once a row is in it, which is
+/// worth doing — but measured alone (a live 3-node cluster, 62 MB wide
+/// table) it did **not** fix the E-7 crash's RSS growth, because it isn't
+/// the dominant cost: `merged` was already bounded to about one page's
+/// worth by `cluster_scan_collect`'s per-round "seal" eviction, projected
+/// or not, and this function only prunes a row *after* it has already
+/// arrived. The actual dominant cost is the raw page itself — a full
+/// `SCAN_PAGE_ROWS`-sized `Vec` from `local_scan_versioned_page` and each
+/// peer's `ScanPage` RPC response — being fully materialized before this
+/// function, or any pruning, ever runs; see `PROJECTED_SCAN_PAGE_ROWS`
+/// for the fix that actually addresses that. This function still earns
+/// its keep for what it does control (merge-map residency), it's just not
+/// sufficient by itself.
+fn prune_row_bytes(bytes: &[u8], wanted: &HashSet<String>) -> EngineResult<Vec<u8>> {
+    let doc = Value::decode_document_projected(bytes, wanted)
+        .map_err(|e| EngineError::Cluster(format!("corrupt row: {e}")))?;
+    Ok(Value::encode_document(&doc))
 }
 
 fn merge_row(
@@ -7768,8 +7686,25 @@ impl Cluster for Coordinator {
             let rows = self.node.filtered_lookup(table, f, self.oc, None)?;
             return filter_rows(filter, rows);
         }
-        // No predicate at all: gather the whole table, LWW-merged.
-        let rows = self.node.cluster_scan(table, self.oc, None)?;
+        // No predicate at all: gather the whole table, LWW-merged, paged so
+        // the coordinator never holds more than a few in-flight pages'
+        // worth of raw bytes regardless of table size (see
+        // cluster_scan_collect's doc — the plain-`cluster_scan` version of
+        // this used to hold the WHOLE table's raw encoded bytes in its
+        // merge map before any decode/projection ran, which meant a
+        // `GROUP BY` on a wide-row table blew through a node's memory
+        // limit even after column-projected decode landed: the projection
+        // only ever helped the decode step, and decode never ran until the
+        // entire table's bytes were already resident — agencik wishlist
+        // E-7, still crashing after the first fix attempt).
+        let rows = self.node.cluster_scan_collect(
+            table,
+            self.oc,
+            None,
+            &None,
+            CollectSink::Rows(None),
+            None,
+        )?;
         filter_rows(filter, rows)
     }
 
@@ -7819,7 +7754,17 @@ impl Cluster for Coordinator {
             let rows = self.node.filtered_lookup(table, f, self.oc, Some(project))?;
             return filter_rows(filter, rows);
         }
-        let rows = self.node.cluster_scan(table, self.oc, Some(project))?;
+        // See the identical comment in matching_rows: this must be the
+        // paged cluster_scan_collect, not a whole-table-in-one-map gather —
+        // that's the actual E-7 fix, the projected decode alone wasn't it.
+        let rows = self.node.cluster_scan_collect(
+            table,
+            self.oc,
+            None,
+            &None,
+            CollectSink::Rows(None),
+            Some(project),
+        )?;
         filter_rows(filter, rows)
     }
 

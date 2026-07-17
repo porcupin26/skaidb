@@ -474,47 +474,81 @@ produced six measured, code-verified findings:
   threads on a 32-core box) must never be quoted for the 1-vCPU
   deployment shape.
 - **A plain `GROUP BY` over a wide-row table OOM-killed the node**
-  (fixed; agencik wishlist E-7). Reported crash:
-  `SELECT account, COUNT(*) FROM gmail_emails GROUP BY account` (183k
-  rows, 1.9 GB — large `body_*` fields) ramped allocated memory 1.02 GB
-  → 4.03 GB in under 4 seconds and blew the 4 GB cgroup ceiling.
-  Root cause: `matching_rows_ordered`/`matching_rows` decode every
-  matching row into a **full** `Document` before any grouping happens —
-  `GROUP BY` explicitly disables the fetch-limit push-down other queries
-  get ("DISTINCT and grouping need every row"), and the only existing
-  guard (`scan_row_budget`, default 250k) counts rows, not bytes: 183k
-  rows sails under budget while the actual gather still allocates every
-  column of every row. Fix: `group_by_projection_columns` (exec.rs)
-  statically determines every column a `GROUP BY`/aggregate query can
-  possibly read — filter, `group_by`, select items (including inside
-  aggregates: `SUM(amount)` needs `amount`), `HAVING`, `ORDER BY`, and
-  any non-aggregated select item (read from the group's representative
-  row under MySQL-style "any value" semantics) — and a new storage
+  (fixed; agencik wishlist E-7 — two-part fix, see below). Reported
+  crash: `SELECT account, COUNT(*) FROM gmail_emails GROUP BY account`
+  (183k rows, 1.9 GB — large `body_*` fields) ramped allocated memory
+  1.02 GB → 4.03 GB in under 4 seconds and blew the 4 GB cgroup ceiling.
+  **Part 1 — column-projected decode.** `matching_rows_ordered`/
+  `matching_rows` decoded every matching row into a **full** `Document`
+  before any grouping happened — `GROUP BY` explicitly disables the
+  fetch-limit push-down other queries get, and the only existing guard
+  (`scan_row_budget`, default 250k) counts rows, not bytes: 183k rows
+  sails under budget while the gather still allocates every column of
+  every row. Fix: `group_by_projection_columns` (exec.rs) statically
+  determines every column a `GROUP BY`/aggregate query can possibly
+  read — filter, `group_by`, select items (including inside aggregates:
+  `SUM(amount)` needs `amount`), `HAVING`, `ORDER BY`, and any
+  non-aggregated select item (read from the group's representative row
+  under MySQL-style "any value" semantics) — and a new storage
   primitive, `Value::decode_document_projected` (`codec.rs`), decodes
   only those top-level fields, walking past everything else via a
   `skip_value` companion to `decode_value` (O(1) past a large unwanted
   `String`/`Bytes` field: read its length, skip the bytes, no
-  allocation). Wired through **every** gather path, local and clustered
-  (`Database::local_matching_rows_projected`; `Node::cluster_scan` /
-  `cluster_scan_collect` / `resolve_candidates` / `filtered_lookup` via
-  a new `Cluster::matching_rows_projected` trait method), not just the
-  standalone path — the reported crash goes through `Node::cluster_scan`
-  even at RF=full, since LWW-correctness requires asking every member
-  regardless of replication factor. Deliberately does **not** apply to
+  allocation). Standalone-path measurement (488 MB synthetic table):
+  RSS growth for the crash query went from 239 MB to 1 MB.
+  **This alone did not fix the reported crash.** The first release
+  (v0.95.1) validated only against the standalone `Session`/`Database`
+  API, which never touches the clustered gather path production
+  actually uses; a live retest on the real 3-node cluster (same
+  methodology as the C0/C1-C4 work — real binary, real service RSS, not
+  a synthetic harness) showed the crash still reproduced. Root cause:
+  the clustered "no predicate: gather the whole table" path ran through
+  `Node::cluster_scan`, a function that accumulated **every** row's raw
+  bytes for the **entire table** into one `BTreeMap` before any decode
+  step ran at all — column-projecting the final decode does nothing
+  when the thing being column-pruned was never the bottleneck. This is
+  the same failure mode already root-caused once before and tracked in
+  `cluster_scan_collect`'s own doc comment ("the old whole-table
+  `cluster_scan` here materialized every row on the coordinator — 4.6
+  GB allocated, OOM-killed two production nodes, 2026-07-13").
+  **Part 2 — retire `cluster_scan`, shrink the page.** `cluster_scan`
+  is deleted outright; its two callers now go through
+  `cluster_scan_collect`, the already-bounded sibling used by every
+  other broad gather (LIMIT pushdown, candidate resolution, anti-entropy)
+  — a page-at-a-time pull per source with a sliding "seal" frontier that
+  evicts finalized rows every round, so the coordinator never holds more
+  than roughly one page window per source. But a page is a fixed **row**
+  count (`SCAN_PAGE_ROWS`, 2,000) with no byte cap, so a wide-row table
+  still fully materializes a 2,000-row raw-byte page per source, per
+  round, before any pruning runs — pruning can't shrink a buffer that's
+  already allocated. Fix: when a projection is active, both the local
+  scan (`local_scan_versioned_page`) and the peer `ScanPage` RPC request
+  a much smaller page (`PROJECTED_SCAN_PAGE_ROWS`, 100 rows) — no
+  wire-protocol change, `Request::ScanPage.limit` already existed as a
+  runtime value. More, smaller round trips instead of fewer, larger
+  ones. **Measured on the live 3-node p225 bench fleet** (real
+  `skaidb` service, `VmRSS` from `/proc/<pid>/status`, not the
+  standalone API): an 8,000-row/62 MB wide table went from ~59-74 MB
+  growth (with `cluster_scan` retired but page size unchanged) to
+  **~11.2 MB growth**, stable across repeated trials and settling back
+  to baseline within seconds. Tripling the table to 24,000 rows/187 MB
+  grew RSS only ~26.6 MB (sub-linear vs. table size), the expected
+  signature of page-bounded rather than table-bounded memory. Correct
+  results verified at both scales. Deliberately does **not** apply to
   `TOP k BY` (returns whole rows via `select_group_topk`, a different
   consumer with unrestricted column needs), wildcards, joins, or set
-  operations — none of those gather shapes were audited for it.
-  **Measured** on a 488 MB synthetic table shaped like the report (same
-  git-stash A/B methodology as the WAL/lock fixes above): RSS growth for
-  the exact crash query went from **239 MB to 1 MB**, and the query
-  itself got faster too (0.22s → 0.07s) — decoding less is both safer
-  and cheaper. 197 engine tests + 27 cluster tests pass, including new
-  targeted coverage: an exhaustive (2⁹ field-subset) property test that
-  the projected decode always matches a full decode on every possible
-  wanted-set, and end-to-end `GROUP BY`/`HAVING`/`ORDER BY`/filtered/
-  nested-path/no-group-by queries against a wide table compared
-  byte-for-byte against the same queries against a narrow table with no
-  pruning to do.
+  operations — none of those gather shapes were audited for it. 197
+  engine tests + 86 cluster tests pass, including new targeted coverage:
+  an exhaustive (2⁹ field-subset) property test that the projected
+  decode always matches a full decode on every possible wanted-set, and
+  end-to-end `GROUP BY`/`HAVING`/`ORDER BY`/filtered/nested-path/
+  no-group-by queries against a wide table compared byte-for-byte
+  against the same queries against a narrow table with no pruning to
+  do. **Lesson recorded for future OOM-shaped fixes:** validate against
+  the actual clustered `Coordinator`/`cluster_scan*` path on a live
+  cluster before declaring a memory fix complete — the standalone
+  `Session`/`Database` API does not exercise it and can show a
+  misleadingly clean result.
 
 ### Deliberately skipped (documented reasons)
 
