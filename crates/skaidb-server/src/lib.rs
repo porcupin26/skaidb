@@ -1921,6 +1921,78 @@ pub(crate) mod tests {
         assert!(err.contains("witness"), "{err}");
     }
 
+    #[test]
+    fn pin_references_resolve_aliases_and_validate_membership() {
+        use skaidb_cluster::{Consistency as ClusterConsistency, Node, NodeConfig, NodeId};
+        use skaidb_driver::Client;
+        // Single-member cluster backend: the only real member id is its
+        // internode address.
+        let internode_addr = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let a = l.local_addr().unwrap().to_string();
+            drop(l);
+            a
+        };
+        let cfg = NodeConfig {
+            id: NodeId::new(&internode_addr),
+            internode_addr: internode_addr.clone(),
+            members: vec![(NodeId::new(&internode_addr), internode_addr.clone())],
+            replication_factor: 1,
+            vnodes_per_node: 64,
+            read_consistency: ClusterConsistency::Quorum,
+            write_consistency: ClusterConsistency::Quorum,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
+            anti_entropy_interval_secs: 0,
+        };
+        let node = Node::new(Database::open(temp_dir()).unwrap(), cfg);
+        node.serve_internode().unwrap();
+        let ctx: Shared = Arc::new(Context {
+            backend: Backend::Cluster(node),
+            metrics: Metrics::new(),
+            audit: RwLock::new(quiet_audit()),
+            authn: AuthState::disabled(),
+            superuser_role: "superuser".into(),
+            admin_lock: Mutex::new(()),
+            start: Instant::now(),
+            slow_log: crate::slowlog::SlowLog::new(),
+            config: RwLock::new(Config::default()),
+            config_path: None,
+            drivers_table_ensured: std::sync::atomic::AtomicBool::new(false),
+        });
+        let (addr, _h) = binary::spawn("127.0.0.1:0", ctx.clone()).unwrap();
+        crate::naming::bootstrap(&ctx, &internode_addr).unwrap();
+        let mut c = Client::connect(addr).unwrap();
+        c.execute("ALTER NODE '{ID}' SET NAME 'pin-me'".replace("{ID}", &internode_addr).as_str())
+            .unwrap();
+
+        // Pin by ALIAS: stored as the stable id, visible in SHOW TABLES.
+        c.execute("CREATE TABLE t1 (PRIMARY KEY (id)) WITH (nodes = ['pin-me'])")
+            .unwrap();
+        let rows = c.execute("SHOW TABLES").unwrap();
+        let shown = format!("{rows:?}");
+        assert!(shown.contains(&internode_addr), "pin stored as id: {shown}");
+        assert!(!shown.contains("pin-me"), "alias is sugar, not storage: {shown}");
+
+        // Unknown reference refused, error lists the membership.
+        let err = c
+            .execute("CREATE TABLE t2 (PRIMARY KEY (id)) WITH (nodes = ['ghost'])")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a current member"), "{err}");
+        assert!(err.contains(&internode_addr), "{err}");
+
+        // Standalone backend: pins are meaningless, refused outright.
+        let sctx = auth_ctx();
+        let (saddr, _sh) = binary::spawn("127.0.0.1:0", sctx).unwrap();
+        let mut sc = Client::connect_with(saddr, "ada", "pencil").unwrap();
+        let err = sc
+            .execute("CREATE TABLE t3 (PRIMARY KEY (id)) WITH (nodes = ['x'])")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("standalone"), "{err}");
+    }
+
     fn rbac_test_ctx() -> Shared {
         Arc::new(Context {
             backend: Backend::Local(Box::new(RwLock::new(Database::open(temp_dir()).unwrap()))),

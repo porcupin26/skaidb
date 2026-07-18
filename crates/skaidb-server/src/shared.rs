@@ -16,7 +16,7 @@ use skaidb_engine::{
     DEFAULT_DATABASE,
 };
 use skaidb_proto::{Consistency as ProtoConsistency, Response};
-use skaidb_sql::{ast::Statement, ParseError};
+use skaidb_sql::{ast::AlterAction, ast::Statement, ParseError};
 
 use crate::audit::AuditSettings;
 use crate::authn::AuthState;
@@ -807,6 +807,21 @@ pub fn execute_session_statement_as(
         }
     }
 
+    // Pin references accept aliases as sugar, but durable placement stores
+    // stable ids — resolve them here, before the engine sees the DDL, and
+    // refuse anything that isn't a current member (a typo'd pin would
+    // otherwise strand the table on a node that doesn't exist). DDL
+    // broadcasts the SQL TEXT, not the parsed statement, so the rewrite
+    // must produce both.
+    let (parsed, sql_override) = match parsed {
+        Ok(stmt) => match resolve_pin_refs(ctx, stmt, sql) {
+            Ok((stmt, ov)) => (Ok(stmt), ov),
+            Err(e) => return Response::Error(e),
+        },
+        err => (err, None),
+    };
+    let sql: &str = sql_override.as_deref().unwrap_or(sql);
+
     // Auth DDL is audit-logged (secret-free) after execution; summarize now,
     // before the parse moves into the backend.
     let auth_summary = parsed.as_ref().ok().and_then(auth_ddl_summary);
@@ -1130,6 +1145,91 @@ fn slow_query_rows(payload: &Json, limit: Option<u64>) -> Response {
         columns: vec!["seq".into(), "elapsed_ms".into(), "sql".into()],
         rows,
     }
+}
+
+/// Rewrite `nodes = [...]` pin references (CREATE TABLE / ALTER TABLE SET)
+/// from aliases to stable member ids, validating each against the current
+/// membership. Statements without pins pass through untouched; on a
+/// standalone (Local) backend pins are refused outright — there is no
+/// membership to pin to.
+fn resolve_pin_refs(
+    ctx: &Shared,
+    stmt: Statement,
+    sql: &str,
+) -> Result<(Statement, Option<String>), String> {
+    // (original, resolved) for every reference an alias lookup changed —
+    // applied to the SQL text as quoted-literal replacements, since the
+    // DDL broadcast replays the text on every member.
+    let mut renames: Vec<(String, String)> = Vec::new();
+    let mut resolve_list = |refs: &[String]| -> Result<Vec<String>, String> {
+        let members = match &ctx.backend {
+            Backend::Cluster(node) => node.member_ids(),
+            Backend::Local(_) => {
+                return Err("nodes = [...] needs a cluster: standalone has no members to pin to"
+                    .into())
+            }
+        };
+        let mut out = Vec::with_capacity(refs.len());
+        for r in refs {
+            let id = if members.iter().any(|m| m == r) {
+                r.clone()
+            } else {
+                match crate::naming::resolve_node_ref(ctx, r) {
+                    Ok(crate::naming::NodeRef::Member(id)) if members.iter().any(|m| m == &id) => {
+                        id
+                    }
+                    Ok(crate::naming::NodeRef::Witness(_)) => {
+                        return Err(format!(
+                            "cannot pin '{r}': witnesses mirror tables, they never own them                              (use WITH (witness = ...) to control mirroring)"
+                        ))
+                    }
+                    _ => {
+                        return Err(format!(
+                            "cannot pin '{r}': not a current member (members: {})",
+                            members.join(", ")
+                        ))
+                    }
+                }
+            };
+            if id != *r {
+                renames.push((r.clone(), id.clone()));
+            }
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        Ok(out)
+    };
+    let stmt = match stmt {
+        Statement::CreateTable(mut ct) if !ct.nodes.is_empty() => {
+            ct.nodes = resolve_list(&ct.nodes)?;
+            Statement::CreateTable(ct)
+        }
+        Statement::AlterTable(mut at) => {
+            if let AlterAction::SetOptions { options } = &mut at.action {
+                for (k, v) in options.iter_mut() {
+                    if k == "nodes" {
+                        let refs: Vec<String> =
+                            v.split(',').map(|s| s.trim().to_string()).collect();
+                        *v = resolve_list(&refs)?.join(",");
+                    }
+                }
+            }
+            Statement::AlterTable(at)
+        }
+        other => other,
+    };
+    if renames.is_empty() {
+        return Ok((stmt, None));
+    }
+    let mut text = sql.to_string();
+    for (from, to) in renames {
+        text = text.replace(
+            &format!("'{}'", from.replace('\'', "''")),
+            &format!("'{}'", to.replace('\'', "''")),
+        );
+    }
+    Ok((stmt, Some(text)))
 }
 
 fn required_privilege(
