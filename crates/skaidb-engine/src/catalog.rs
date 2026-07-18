@@ -182,6 +182,22 @@ pub struct TableDef {
     /// For short-lived bounded data (stats, caches) — pair with a TTL.
     #[serde(default)]
     pub memory: bool,
+    /// Per-table ring-placed replica count; `None` = cluster default.
+    /// Mutually exclusive with `pinned_nodes`.
+    #[serde(default)]
+    pub replication: Option<u32>,
+    /// Pinned placement: replicas live on exactly these members (stable
+    /// internode ids — aliases resolve at DDL time, so renames never move
+    /// data). Empty = ring placement. Each pin holds a full copy.
+    #[serde(default)]
+    pub pinned_nodes: Vec<String>,
+    /// Whether witnesses mirror this table (default true).
+    #[serde(default = "default_true")]
+    pub witness: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// A time-series table definition: label columns and optional retention.

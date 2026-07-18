@@ -185,7 +185,11 @@ embedding <-> [..]` (use `NEAREST`).
 
 ```sql
 -- DDL
-CREATE TABLE [IF NOT EXISTS] t (PRIMARY KEY (col [, col ...])) [WITH (ttl = dur)]
+CREATE TABLE [IF NOT EXISTS] t (PRIMARY KEY (col [, col ...]))
+  [WITH (ttl = dur, witness = bool)]
+--   witness = false: exclude the table from witness-node mirroring (and from
+--   the witness tombstone-GC floor). Toggle later: ALTER TABLE t SET (witness = true)
+--   System tables refuse the option. Default true.
 --   ttl: rows expire <dur> after their last write — immediately invisible to
 --   every read; space reclaimed lazily by compaction. Converges at any RF.
 DROP TABLE [IF EXISTS] t                    -- cascades to the table's

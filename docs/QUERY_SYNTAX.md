@@ -19,7 +19,8 @@ current database (see *Databases* below).
 ```sql
 -- DDL
 CREATE TABLE [IF NOT EXISTS] <table> (PRIMARY KEY (<col> [, <col> ...]))
-       [WITH (ttl = <duration>)]              -- rows expire after this age
+       [WITH (ttl = <duration>,               -- rows expire after this age
+              witness = <bool>)]              -- mirror to witness nodes (default true)
 CREATE TIMESERIES TABLE [IF NOT EXISTS] <table>
        (SERIES KEY (<label> [, <label> ...])
         [, RETENTION <duration>] [, OOO <duration>])
@@ -108,6 +109,9 @@ REPAIR CLUSTER                                -- one anti-entropy pass
 RECLAIM                                       -- drop unowned keys/series
 ALTER CLUSTER ADD    NODE '<host:port>'
 ALTER CLUSTER REMOVE NODE '<id>'
+ALTER CLUSTER SET NAME '<name>'               -- rename the cluster (ADMIN)
+ALTER NODE '<alias|dotted|id>' SET NAME '<n>' -- rename a member/witness alias (ADMIN)
+ALTER TABLE <table> SET (witness = <bool>)    -- toggle witness mirroring
 
 -- Session (binary-protocol connections)
 SET CONSISTENCY { ONE | QUORUM | ALL }        -- per-connection override
@@ -172,7 +176,17 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   every row (recomputing the primary key if it is a key column) and rebuilds any
   index that referenced it. The store is schema-less, so there is no
   `ADD`/`DROP COLUMN` — a field simply exists in the rows that set it.
-- **`SHOW TABLES`** lists catalog tables as `(table, primary_key)` rows;
+- `ALTER TABLE <t> SET (witness = <bool>)` toggles witness mirroring for an
+  existing table. `WITH (witness = false)` at CREATE (or the ALTER form)
+  excludes the table from witness pulls: witnesses skip it entirely (rows
+  already mirrored are kept but stop updating), and the table stops holding
+  back tombstone GC for lagging witnesses. Toggling back to `true` re-includes it on the next full sweep.
+  System/registry tables (`witnesses`, `drivers`, `node_aliases`, ...) refuse
+  placement/witness options — every node consults them locally.
+- **`SHOW TABLES`** lists catalog tables as
+  `(table, primary_key, replication, nodes, witness)` rows — `replication`
+  and `nodes` show per-table placement once the placement engine lands
+  (blank/default until then), `witness` the mirroring flag;
   **`SHOW INDEXES`** lists secondary, vector, and search indexes as
   `(index, table, kind, columns, local)` — `local` is **this node's** live
   state for the index: `ok` (open and serving), `building` (backfill or

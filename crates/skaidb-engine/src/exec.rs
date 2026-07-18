@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use skaidb_sql::ast::{
-    AggArg, AggFunc, AlterAction, AlterTable, BinaryOp, CreateSearchIndex, Delete, Expr, Insert,
-    JoinKind, OrderKey, Select, SelectItem, Statement, UnaryOp, Update,
+    AggArg, AggFunc, AlterAction, AlterTable, BinaryOp, CreateSearchIndex, CreateTable, Delete,
+    Expr, Insert, JoinKind, OrderKey, Select, SelectItem, Statement, UnaryOp, Update,
 };
 use skaidb_sql::parse;
 use std::sync::Arc;
@@ -2412,7 +2412,7 @@ impl Database {
         skaidb_sql::resolve_now(&mut stmt, now_ms());
         match stmt {
             Statement::CreateTable(ct) => {
-                self.create_table(&ct.name, ct.primary_key, ct.ttl_ms, ct.memory, ct.if_not_exists)
+                self.create_table(ct)
             }
             Statement::CreateTimeseriesTable(ct) => self.create_timeseries_table(
                 &ct.name,
@@ -2816,6 +2816,19 @@ impl Database {
                 vec![
                     Value::String(namespace::split(name).1.to_string()),
                     Value::String(def.primary_key.join(", ")),
+                    match def.replication {
+                        Some(n) => Value::Int(i64::from(n)),
+                        None if !def.pinned_nodes.is_empty() => {
+                            Value::Int(def.pinned_nodes.len() as i64)
+                        }
+                        None => Value::Null, // cluster default
+                    },
+                    if def.pinned_nodes.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::String(def.pinned_nodes.join(","))
+                    },
+                    Value::Bool(def.witness),
                 ]
             })
             .collect();
@@ -2824,12 +2837,21 @@ impl Database {
                 rows.push(vec![
                     Value::String(namespace::split(name).1.to_string()),
                     Value::String(format!("{}, ts", def.series_key.join(", "))),
+                    Value::Null,
+                    Value::Null,
+                    Value::Bool(true),
                 ]);
             }
         }
         rows.sort_by(|a, b| a[0].total_cmp(&b[0]));
         ResultSet {
-            columns: vec!["table".into(), "primary_key".into()],
+            columns: vec![
+                "table".into(),
+                "primary_key".into(),
+                "replication".into(),
+                "nodes".into(),
+                "witness".into(),
+            ],
             rows,
         }
     }
@@ -2933,17 +2955,41 @@ impl Database {
 
     // ---- DDL ----
 
-    fn create_table(
-        &mut self,
-        name: &str,
-        pk: Vec<String>,
-        ttl_ms: Option<i64>,
-        memory: bool,
-        if_not_exists: bool,
-    ) -> Result<QueryOutput> {
+    fn create_table(&mut self, ct: CreateTable) -> Result<QueryOutput> {
+        let CreateTable {
+            name,
+            if_not_exists,
+            primary_key: pk,
+            ttl_ms,
+            memory,
+            replication,
+            nodes,
+            witness,
+        } = ct;
+        let name = &name;
         if pk.is_empty() {
             return Err(EngineError::Constraint(
                 "primary key must have at least one column".into(),
+            ));
+        }
+        // System/registry tables stay cluster-default placement and
+        // witness-mirrored: every node consults them locally, so RF<members
+        // or pins would undermine the machinery that reads them.
+        if (replication.is_some() || !nodes.is_empty() || !witness)
+            && is_system_table(name)
+        {
+            return Err(EngineError::Constraint(format!(
+                "'{name}' is a system table: placement/witness options are not allowed"
+            )));
+        }
+        // Placement options are parsed and stored, but nothing routes by
+        // them yet — accepting them would silently keep cluster-default
+        // placement. Refuse until the placement engine lands.
+        if replication.is_some() || !nodes.is_empty() {
+            return Err(EngineError::Constraint(
+                "per-table placement (replication/nodes) needs the placement-transition \
+                 work; 'witness' is available now"
+                    .into(),
             ));
         }
         let hlc = self.ddl_stamp();
@@ -2970,6 +3016,9 @@ impl Database {
                 primary_key: pk,
                 ttl_ms,
                 memory,
+                replication,
+                pinned_nodes: nodes,
+                witness,
             },
         );
         self.record_schema(key, hlc, false);
@@ -3491,6 +3540,9 @@ impl Database {
                 primary_key: vec!["k".into()],
                 ttl_ms: None,
                 memory: false,
+                replication: None,
+                pinned_nodes: Vec::new(),
+                witness: true,
             });
             self.catalog.indexes.insert(
                 name.to_string(),
@@ -3704,7 +3756,77 @@ impl Database {
         match alt.action {
             AlterAction::RenameTable { new_name } => self.rename_table(&alt.name, &new_name),
             AlterAction::RenameColumn { from, to } => self.rename_column(&alt.name, &from, &to),
+            AlterAction::SetOptions { options } => self.set_table_options(&alt.name, &options),
         }
+    }
+
+    /// `ALTER TABLE t SET (...)`: `witness` toggles freely (pull-side only,
+    /// no placement transition); `nodes` may only SHRINK an existing pin
+    /// list (remaining pins already hold full copies — transition-free; the
+    /// dead-pin escape hatch); everything else waits for the
+    /// placement-transition work.
+    fn set_table_options(&mut self, table: &str, options: &[(String, String)]) -> Result<QueryOutput> {
+        if is_system_table(table) {
+            return Err(EngineError::Constraint(format!(
+                "'{table}' is a system table: placement/witness options are not allowed"
+            )));
+        }
+        for (opt, val) in options {
+            match opt.as_str() {
+                "witness" => {
+                    let flag = matches!(val.as_str(), "true" | "1");
+                    let def = self
+                        .catalog
+                        .tables
+                        .get_mut(table)
+                        .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+                    def.witness = flag;
+                }
+                "nodes" => {
+                    let new: Vec<String> = val
+                        .split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                    let def = self
+                        .catalog
+                        .tables
+                        .get_mut(table)
+                        .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+                    if def.pinned_nodes.is_empty() {
+                        return Err(EngineError::Unsupported(
+                            "SET (nodes = ...) requires an already-pinned table; \
+                             changing a ring-placed table's placement needs the \
+                             placement-transition work (not yet shipped)"
+                                .into(),
+                        ));
+                    }
+                    if new.is_empty() || !new.iter().all(|n| def.pinned_nodes.contains(n)) {
+                        return Err(EngineError::Unsupported(
+                            "SET (nodes = ...) may only SHRINK the existing pin list \
+                             (remaining pins already hold full copies); growing or \
+                             replacing pins needs the placement-transition work"
+                                .into(),
+                        ));
+                    }
+                    def.pinned_nodes = new;
+                }
+                "replication" => {
+                    return Err(EngineError::Unsupported(
+                        "changing replication needs the placement-transition work \
+                         (not yet shipped); set it at CREATE TABLE"
+                            .into(),
+                    ));
+                }
+                other => {
+                    return Err(EngineError::Unsupported(format!(
+                        "unknown ALTER TABLE option '{other}' (supported: witness, nodes)"
+                    )));
+                }
+            }
+        }
+        self.save_catalog()?;
+        Ok(QueryOutput::Ddl)
     }
 
     /// `ALTER TABLE old RENAME TO new`: move the on-disk table, repoint the
@@ -5949,8 +6071,12 @@ impl Database {
     /// this call start at 0 and pick the value up on the next push (the
     /// server re-pushes every minute).
     pub fn set_tombstone_retention_ms(&mut self, ms: u64) {
-        for engine in self.tables.values_mut() {
-            engine.set_tombstone_retention_ms(ms);
+        for (name, engine) in self.tables.iter_mut() {
+            // A table excluded from witness mirrors owes witnesses nothing:
+            // holding its tombstones would pay exactly the cost the
+            // exclusion exists to avoid.
+            let mirrored = self.catalog.tables.get(name).is_none_or(|d| d.witness);
+            engine.set_tombstone_retention_ms(if mirrored { ms } else { 0 });
         }
     }
 
@@ -11216,6 +11342,24 @@ fn sort_docs(docs: &mut Vec<Document>, order_by: &[OrderKey], top_k: Option<usiz
 }
 
 /// Compare two sort-key tuples honoring per-key direction; NULLs sort last.
+/// Tables the server machinery itself reads on every node — they must
+/// stay cluster-default placement and witness-mirrorable, so placement/
+/// witness DDL options are rejected on them. Matched on the BARE name
+/// (system tables live in the default database).
+pub fn is_system_table(name: &str) -> bool {
+    matches!(
+        name,
+        "node_stats"
+            | "drivers"
+            | "witnesses"
+            | "witness_gc_config"
+            | "witness_sync_state"
+            | "cluster_meta"
+            | "node_aliases"
+            | "metrics"
+    )
+}
+
 fn order_compare(a: &[Value], b: &[Value], order_by: &[OrderKey]) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     for ((x, y), ok) in a.iter().zip(b.iter()).zip(order_by.iter()) {

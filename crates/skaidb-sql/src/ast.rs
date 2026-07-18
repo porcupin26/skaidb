@@ -294,6 +294,11 @@ pub enum AlterAction {
     RenameTable { new_name: String },
     /// `RENAME COLUMN <from> TO <to>` — rewrites the field in every row.
     RenameColumn { from: String, to: String },
+    /// `SET (<option> = <value>, ...)` — placement/witness options. The
+    /// engine validates which options are mutable (witness: freely;
+    /// nodes: shrink-only until the placement-transition work lands;
+    /// replication: rejected until then).
+    SetOptions { options: Vec<(String, String)> },
 }
 
 /// `CREATE TABLE [IF NOT EXISTS] name (PRIMARY KEY (cols...))`.
@@ -309,6 +314,16 @@ pub struct CreateTable {
     pub ttl_ms: Option<i64>,
     /// `WITH (memory = true)`: RAM-resident, never flushed, empty on restart.
     pub memory: bool,
+    /// `WITH (replication = N)`: this table's ring-placed copy count
+    /// (None = cluster default). Mutually exclusive with `nodes`.
+    pub replication: Option<u32>,
+    /// `WITH (nodes = ['alias'|'id', ...])`: pinned placement — replicas
+    /// live on exactly these members (each a full copy). Aliases resolve
+    /// to stable ids at execution. Mutually exclusive with `replication`.
+    pub nodes: Vec<String>,
+    /// `WITH (witness = false)`: excluded from witness mirrors (default
+    /// mirrored).
+    pub witness: bool,
 }
 
 /// `CREATE TIMESERIES TABLE [IF NOT EXISTS] name (SERIES KEY (l1 [, ...])

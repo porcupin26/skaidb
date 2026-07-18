@@ -469,14 +469,24 @@ fn list_tables(sql: &mut Client, db: &str) -> Result<Vec<(String, Vec<String>)>,
     let (Some(t_i), Some(pk_i)) = (idx("table"), idx("primary_key")) else {
         return Err(format!("SHOW TABLES in {db}: missing columns"));
     };
+    // `witness = false` tables are excluded from mirrors by the primary's
+    // schema (absent column = old primary = mirror everything).
+    let w_i = idx("witness");
     Ok(rows
         .iter()
-        .filter_map(|r| match (r.get(t_i), r.get(pk_i)) {
-            (Some(Value::String(t)), Some(Value::String(pk))) => Some((
-                t.clone(),
-                pk.split(',').map(|c| c.trim().to_string()).collect(),
-            )),
-            _ => None,
+        .filter_map(|r| {
+            if let Some(i) = w_i {
+                if matches!(r.get(i), Some(Value::Bool(false))) {
+                    return None;
+                }
+            }
+            match (r.get(t_i), r.get(pk_i)) {
+                (Some(Value::String(t)), Some(Value::String(pk))) => Some((
+                    t.clone(),
+                    pk.split(',').map(|c| c.trim().to_string()).collect(),
+                )),
+                _ => None,
+            }
         })
         .collect())
 }

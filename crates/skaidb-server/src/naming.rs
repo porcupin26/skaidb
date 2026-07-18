@@ -180,8 +180,15 @@ pub enum NodeRef {
 /// witness registries. A dotted form's cluster segment must match this
 /// cluster's name; the bare form searches members first, then witnesses.
 pub fn resolve_node_ref(ctx: &Shared, reference: &str) -> Result<NodeRef, String> {
+    // Exact id/alias match FIRST: raw internode ids contain dots
+    // ("192.168.7.3:7100"), so dotted-notation parsing only applies when
+    // the direct lookup misses AND the middle segment is a valid function.
     let (want_fn, name) = match reference.splitn(3, '.').collect::<Vec<_>>()[..] {
-        [cluster, function, alias] => {
+        [cluster, function @ ("node" | "witness"), alias]
+            if !all_aliases(ctx)
+                .iter()
+                .any(|(id, a)| id == reference || a == reference) =>
+        {
             let ours = cluster_name(ctx).unwrap_or_default();
             if cluster != ours {
                 return Err(format!("unknown cluster '{cluster}' (this is '{ours}')"));
@@ -289,7 +296,14 @@ mod tests {
         assert_eq!(cluster_name(&ctx).as_deref(), Some("ember-lynx"));
         rename_node(&ctx, "n1:7100", "skai1").unwrap();
         assert_eq!(node_alias(&ctx, "n1:7100").as_deref(), Some("skai1"));
-        // Bare alias, dotted, and raw id all resolve to the member.
+        // Bare alias, dotted, and raw id all resolve to the member —
+        // including a raw id CONTAINING DOTS (the production shape that
+        // the dotted-notation parser must not misread as cluster.fn.node).
+        bootstrap(&ctx, "192.168.7.3:7100").unwrap();
+        assert!(matches!(
+            resolve_node_ref(&ctx, "192.168.7.3:7100"),
+            Ok(NodeRef::Member(id)) if id == "192.168.7.3:7100"
+        ));
         for r in ["skai1", "ember-lynx.node.skai1", "n1:7100"] {
             assert!(matches!(
                 resolve_node_ref(&ctx, r),

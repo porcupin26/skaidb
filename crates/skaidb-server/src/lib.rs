@@ -1698,7 +1698,10 @@ pub(crate) mod tests {
         let body = http_post(addr, "SHOW TABLES");
         assert!(body.contains("alpha"), "got: {body}");
         assert!(body.contains("beta"), "got: {body}");
-        assert!(body.contains("\"columns\":[\"table\",\"primary_key\"]"), "got: {body}");
+        assert!(
+            body.contains("\"columns\":[\"table\",\"primary_key\",\"replication\",\"nodes\",\"witness\"]"),
+            "got: {body}"
+        );
     }
 
     /// GET `path`, returning the HTTP status code.
@@ -2448,6 +2451,38 @@ pub(crate) mod tests {
             "the DELETE must propagate as a tombstone"
         );
         assert_eq!(got[0][1], Value::String("A2".into()), "the UPDATE must propagate");
+
+        // Witness targeting: a `witness = false` table never reaches the
+        // mirror, and flipping it back on picks it up next cycle.
+        exec_p("CREATE TABLE mirror.private (PRIMARY KEY (id)) WITH (witness = false)");
+        exec_p("INSERT INTO mirror.private (id) VALUES (1)");
+        let s2b = crate::witness_pull::run_cycle(&witness, &wcfg).unwrap();
+        assert!(
+            !s2b.tables.iter().any(|(n, ..)| n == "mirror.private"),
+            "excluded table must not appear in the cycle: {:?}",
+            s2b.tables
+        );
+        match crate::shared::execute_as(&witness, "superuser", "SELECT id FROM mirror.private") {
+            Response::Error(e) => assert!(e.contains("does not exist"), "{e}"),
+            other => panic!("excluded table must not exist on the witness: {other:?}"),
+        }
+        exec_p("ALTER TABLE mirror.private SET (witness = true)");
+        let s2c = crate::witness_pull::run_cycle(&witness, &wcfg).unwrap();
+        assert!(
+            s2c.tables.iter().any(|(n, _, _, rows)| n == "mirror.private" && *rows == 1),
+            "re-included table mirrors on the next cycle: {:?}",
+            s2c.tables
+        );
+        // System tables refuse placement/witness options.
+        if let Response::Error(e) = crate::shared::execute_as(&primary, "superuser",
+            "CREATE TABLE drivers2x (PRIMARY KEY (id)) WITH (witness = false)") {
+            panic!("non-system table must accept the option: {e}");
+        }
+        match crate::shared::execute_as(&primary, "superuser",
+            "ALTER TABLE witnesses SET (witness = false)") {
+            Response::Error(e) => assert!(e.contains("system table"), "{e}"),
+            other => panic!("system table must refuse: {other:?}"),
+        }
 
         // Cycle 3: nothing changed — the write_seq hint skips the table
         // without moving a byte (the near-live steady state).

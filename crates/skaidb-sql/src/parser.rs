@@ -602,16 +602,25 @@ impl Parser {
         }
         self.expect_keyword(Keyword::Table)?;
         let name = self.parse_table_name()?;
-        self.expect_keyword(Keyword::Rename)?;
-        let action = if self.eat_keyword(Keyword::Column) {
-            let from = self.parse_path()?;
-            self.expect_keyword(Keyword::To)?;
-            let to = self.parse_path()?;
-            AlterAction::RenameColumn { from, to }
+        // `ALTER TABLE t SET (<option> = <value>, ...)` — placement/witness
+        // options — or the RENAME forms.
+        let action = if self.eat_keyword(Keyword::Set) {
+            self.expect(&Token::LParen)?;
+            // parse_option_list consumes the closing paren.
+            let options = self.parse_option_list()?;
+            AlterAction::SetOptions { options }
         } else {
-            self.expect_keyword(Keyword::To)?;
-            let new_name = self.parse_table_name()?;
-            AlterAction::RenameTable { new_name }
+            self.expect_keyword(Keyword::Rename)?;
+            if self.eat_keyword(Keyword::Column) {
+                let from = self.parse_path()?;
+                self.expect_keyword(Keyword::To)?;
+                let to = self.parse_path()?;
+                AlterAction::RenameColumn { from, to }
+            } else {
+                self.expect_keyword(Keyword::To)?;
+                let new_name = self.parse_table_name()?;
+                AlterAction::RenameTable { new_name }
+            }
         };
         Ok(Statement::AlterTable(AlterTable { name, action }))
     }
@@ -631,6 +640,9 @@ impl Parser {
             // Optional `WITH (ttl = <duration>)`.
             let mut ttl_ms = None;
             let mut memory = false;
+            let mut replication = None;
+            let mut nodes: Vec<String> = Vec::new();
+            let mut witness = true;
             if self.eat_ident_ci("with") {
                 self.expect(&Token::LParen)?;
                 for (opt, val) in self.parse_option_list()? {
@@ -659,13 +671,57 @@ impl Parser {
                             }
                             ttl_ms = Some(ms);
                         }
+                        "replication" => {
+                            let n: u32 = val.parse().map_err(|_| {
+                                ParseError::Other(format!(
+                                    "replication must be a positive integer, got '{val}'"
+                                ))
+                            })?;
+                            if n == 0 {
+                                return Err(ParseError::Other(
+                                    "replication must be >= 1".into(),
+                                ));
+                            }
+                            replication = Some(n);
+                        }
+                        "nodes" => {
+                            nodes = val
+                                .split(',')
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string)
+                                .collect();
+                            if nodes.is_empty() {
+                                return Err(ParseError::Other(
+                                    "nodes needs at least one member".into(),
+                                ));
+                            }
+                        }
+                        "witness" => {
+                            witness = match val.as_str() {
+                                "true" | "1" => true,
+                                "false" | "0" => false,
+                                other => {
+                                    return Err(ParseError::Other(format!(
+                                        "witness must be true or false, got '{other}'"
+                                    )))
+                                }
+                            };
+                        }
                         other => {
                             return Err(ParseError::Other(format!(
-                                "unknown table option '{other}' (supported: ttl, memory)"
+                                "unknown table option '{other}' (supported: ttl, memory, \
+                                 replication, nodes, witness)"
                             )))
                         }
                     }
                 }
+            }
+            if replication.is_some() && !nodes.is_empty() {
+                return Err(ParseError::Other(
+                    "replication and nodes are mutually exclusive (pinned placement \
+                     IS the replica count)"
+                        .into(),
+                ));
             }
             Ok(Statement::CreateTable(CreateTable {
                 name,
@@ -673,6 +729,9 @@ impl Parser {
                 primary_key,
                 ttl_ms,
                 memory,
+                replication,
+                nodes,
+                witness,
             }))
         } else if self.eat_keyword(Keyword::Timeseries) {
             // CREATE TIMESERIES TABLE [IF NOT EXISTS] name
@@ -954,6 +1013,29 @@ impl Parser {
                 Token::Float(x) => x.to_string(),
                 Token::Keyword(Keyword::True) => "true".to_string(),
                 Token::Keyword(Keyword::False) => "false".to_string(),
+                // `['a', 'b']` — a string list (e.g. `nodes = [...]`),
+                // carried comma-joined (list items may not contain commas;
+                // node ids and aliases never legitimately do).
+                Token::LBracket => {
+                    let mut items = Vec::new();
+                    if !self.eat(&Token::RBracket) {
+                        loop {
+                            match self.advance() {
+                                Token::Str(s) => items.push(s),
+                                other => {
+                                    return Err(ParseError::Other(format!(
+                                        "expected a quoted string in {name} list, found {other:?}"
+                                    )))
+                                }
+                            }
+                            if self.eat(&Token::RBracket) {
+                                break;
+                            }
+                            self.expect(&Token::Comma)?;
+                        }
+                    }
+                    items.join(",")
+                }
                 other => {
                     return Err(ParseError::Other(format!(
                         "expected a literal value for option {name}, found {other:?}"
@@ -1821,6 +1903,9 @@ mod tests {
                 primary_key: vec!["id".into()],
                 ttl_ms: None,
                 memory: false,
+                replication: None,
+                nodes: Vec::new(),
+                witness: true,
             })
         );
     }
@@ -2155,6 +2240,9 @@ mod tests {
                 primary_key: vec!["use".into()],
                 ttl_ms: None,
                 memory: false,
+                replication: None,
+                nodes: Vec::new(),
+                witness: true,
             })
         );
         // A database genuinely named "database" is still selectable.
@@ -2209,6 +2297,9 @@ mod tests {
                 primary_key: vec!["id".into()],
                 ttl_ms: None,
                 memory: false,
+                replication: None,
+                nodes: Vec::new(),
+                witness: true,
             })
         );
         // Joins and the ON-table of an index can be qualified too.
