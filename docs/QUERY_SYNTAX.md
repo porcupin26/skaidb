@@ -216,8 +216,10 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   Shrinking a pin set needs no window (remaining pins already hold full
   copies) and applies immediately.
 - **`SHOW TABLES`** lists catalog tables as
-  `(table, primary_key, replication, nodes, witness)` rows —
-  `replication`/`nodes` per-table placement, `witness` the mirroring flag;
+  `(table, primary_key, replication, nodes, witness, transition)` rows —
+  `replication`/`nodes` per-table placement, `witness` the mirroring
+  flag, `transition` whether a placement change's dual-placement window
+  is currently open;
   **`SHOW INDEXES`** lists secondary, vector, and search indexes as
   `(index, table, kind, columns, local)` — `local` is **this node's** live
   state for the index: `ok` (open and serving), `building` (backfill or

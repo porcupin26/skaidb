@@ -19,10 +19,12 @@ how membership changes and data rebalances, see
   - [Three nodes on one machine (local test)](#three-nodes-on-one-machine-local-test)
   - [Config-file and env-var equivalents](#config-file-and-env-var-equivalents)
 - [Replication factor & consistency](#replication-factor--consistency)
+- [Per-table placement (RF overrides & pins)](#per-table-placement-rf-overrides--pins)
 - [Verify the cluster](#verify-the-cluster)
 - [Add or remove nodes at runtime (online resharding)](#add-or-remove-nodes-at-runtime-online-resharding)
 - [Anti-entropy: repair & space reclamation](#anti-entropy-repair--space-reclamation)
 - [Internode security](#internode-security)
+- [Witness nodes](#witness-nodes)
 - [Operational notes & limitations](#operational-notes--limitations)
 
 ## How a node decides it's clustered
@@ -160,6 +162,49 @@ Confirm the resolved settings on any node with `skaidb --print-config`.
   - Per session: `SET CONSISTENCY ONE|QUORUM|ALL` on a binary-protocol
     connection (or `\consistency` in `skaidbsh`) overrides the defaults for
     that session's statements. REST is stateless and rejects it.
+
+## Per-table placement (RF overrides & pins)
+
+The cluster RF is the default, not the law. Any table can override it at
+CREATE or later:
+
+```sql
+CREATE TABLE metrics_cold (PRIMARY KEY (id)) WITH (replication = 1)
+CREATE TABLE hot_config  (PRIMARY KEY (k))  WITH (nodes = ['skai2'])
+ALTER  TABLE metrics_cold SET (replication = 2)   -- online transition
+ALTER  TABLE hot_config   SET (nodes = ['skai3']) -- online pin move
+```
+
+- **`replication = n`** — ring placement at a per-table copy count
+  (`n >=` member count behaves as a full copy, like cluster-wide RF
+  does). Quorums for that table's reads and writes derive from *its*
+  replica count, not the cluster default.
+- **`nodes = ['<alias-or-id>', ...]`** — the whole table lives on
+  exactly those members (aliases resolve to stable internode ids at DDL
+  time; renames never move data). Every pin holds every row; a non-pin
+  coordinator routes reads and writes to the pins. Pins are a
+  durability trade the operator owns: a pinned node down means quorum
+  errors for that table until it returns, and
+  `ALTER CLUSTER REMOVE NODE` refuses to remove a pinned member until
+  it is re-pinned away. Mutually exclusive with `replication`.
+- **Changing placement is online.** The ALTER opens a *dual-placement
+  window*: the table's old and new placement are both live, and every
+  read/write addresses the union — the per-table twin of the
+  membership-change dual ring — so quorum reads stay correct while new
+  owners are still empty. A background driver (the sorted union's first
+  member) repairs until every member has completed a full anti-entropy
+  pass that began after the change, then finalizes automatically.
+  `SHOW TABLES` shows `transition = true` (the UI inventory tab shows
+  `→ moving`) while the window is open. One transition per table at a
+  time; if the driver node is down the window just stays open — safe,
+  merely wider than needed — and the operator escape is
+  `REPAIR CLUSTER` followed by
+  `ALTER TABLE t SET (placement_finalized = true)`. After finalize,
+  `RECLAIM` trims the copies the new placement no longer owns.
+- GLOBAL-index entry tables follow their base table's placement; system
+  tables refuse placement options; sharded tables (RF below member
+  count) are scatter-pulled and merged by witness nodes, so mirrors
+  stay complete for any placement.
 
 ## Verify the cluster
 
@@ -450,6 +495,25 @@ SCRAM on the binary endpoint and HTTP Basic on REST, plus RBAC; see the
   shard into memory first, so indexing a large table stays within a bounded
   footprint (the writer heap, sized from `memory_target`, plus one row) and
   does not OOM a small node. DB workload must never OOM a node.
+
+## Witness nodes
+
+A **witness** is a standalone node (never a ring member, never counted
+in quorums) that mirrors chosen databases from a primary cluster on its
+own schedule — a cross-region, pull-based backup. Configure `[witness]`
+in its toml (primary SQL + internode addresses, witness-scoped
+credentials, databases) and pair it with `server.read_only = true`
+(drivers may connect for read-only queries; every mutation is refused
+for non-superusers). Pulls ride the internode protocol near-live:
+per-table `write_seq` change hints gate incremental stamps-walked delta
+pages (`interval_secs`, default 60 s), with a full sweep every
+`full_sweep_interval_secs` (default 24 h) as the anti-entropy backstop;
+pulls self-pace to at most `witness.duty_pct` (default 50 %) of the
+serving member's capacity. The primary's `witnesses` registry drives
+the status-tab sync detail and holds tombstone GC back (up to
+`witness_gc_config.grace_period_secs`) until every live witness has
+pulled the deletes. Witness mirroring is per-table opt-out:
+`WITH (witness = false)` / `ALTER TABLE t SET (witness = false)`.
 
 ## Operational notes & limitations
 

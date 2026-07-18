@@ -276,7 +276,7 @@ GRANT ROLE r TO u  |  REVOKE ROLE r FROM u
 SHOW GRANTS [FOR r]
 
 -- Introspection (no privilege needed; names only, no data)
-SHOW TABLES        -- (table, primary_key)
+SHOW TABLES        -- (table, primary_key, replication, nodes, witness, transition)
 SHOW INDEXES       -- (index, table, kind, columns, local) — local is THIS
                    -- node's live state: ok / building / missing
 DESCRIBE t         -- (column, key, indexes): one row per PK/indexed column of
