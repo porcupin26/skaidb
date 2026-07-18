@@ -134,9 +134,15 @@ pub(crate) fn run_cycle(ctx: &Shared, cfg: &WitnessConfig) -> Result<CycleSummar
     Ok(summary)
 }
 
-/// Ensure the witness's registration row exists on the primary, preserving
-/// `registered_at` across restarts (INSERT overwrites on PK, so read first).
-fn register(sql: &mut Client, cfg: &WitnessConfig) -> Result<(), String> {
+/// Ensure the witness's registration row exists on the primary. An
+/// existing row is UPDATEd in place (last_seen + region only) — an
+/// INSERT would overwrite the whole row and wipe the previous cycle's
+/// `watermarks` until this cycle's closing heartbeat rewrites them,
+/// which made the primary's GC floor fall back to registration age
+/// mid-cycle (safe — more conservative, grace-capped — but needlessly
+/// coarse, and it blanked the status tab's sync detail while a cycle
+/// ran). INSERT only on first registration.
+pub(crate) fn register(sql: &mut Client, cfg: &WitnessConfig) -> Result<(), String> {
     let existing = sql
         .execute(&format!(
             "SELECT registered_at FROM witnesses WHERE witness_id = '{}'",
@@ -144,24 +150,25 @@ fn register(sql: &mut Client, cfg: &WitnessConfig) -> Result<(), String> {
         ))
         .map_err(|e| format!("witness registry read: {e}"))?;
     let now_ms = now_ms();
-    let registered_at = match existing {
-        skaidb_proto::Response::Rows { rows, .. } => rows
-            .first()
-            .and_then(|r| r.first())
-            .and_then(|v| match v {
-                Value::Int(n) => Some(*n),
-                _ => None,
-            })
-            .unwrap_or(now_ms),
-        _ => now_ms,
+    let exists =
+        matches!(&existing, skaidb_proto::Response::Rows { rows, .. } if !rows.is_empty());
+    let stmt = if exists {
+        format!(
+            "UPDATE witnesses SET last_seen_at = {now_ms}, region = '{}' \
+             WHERE witness_id = '{}'",
+            quote(&cfg.region),
+            quote(&cfg.witness_id),
+        )
+    } else {
+        format!(
+            "INSERT INTO witnesses (witness_id, region, registered_at, last_seen_at) \
+             VALUES ('{}', '{}', {now_ms}, {now_ms})",
+            quote(&cfg.witness_id),
+            quote(&cfg.region),
+        )
     };
-    sql.execute(&format!(
-        "INSERT INTO witnesses (witness_id, region, registered_at, last_seen_at) \
-         VALUES ('{}', '{}', {registered_at}, {now_ms})",
-        quote(&cfg.witness_id),
-        quote(&cfg.region),
-    ))
-    .map_err(|e| format!("witness registration: {e}"))?;
+    sql.execute(&stmt)
+        .map_err(|e| format!("witness registration: {e}"))?;
     Ok(())
 }
 

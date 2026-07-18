@@ -2346,6 +2346,18 @@ pub(crate) mod tests {
         assert_eq!(reg[0][1], Value::String("unit".into()));
         assert!(matches!(reg[0][2], Value::Int(n) if n > 0));
 
+        // A cycle-start registration must NOT clobber the previous cycle's
+        // watermarks (the INSERT-overwrites-the-row wart): re-register and
+        // confirm the sync detail survives.
+        let mut reg_sql = Client::connect(sql_addr).unwrap();
+        crate::witness_pull::register(&mut reg_sql, &wcfg).unwrap();
+        let wm = rows_of(exec_p("SELECT watermarks FROM witnesses"));
+        assert!(
+            matches!(&wm[0][0], Value::Document(d) if !d.0.is_empty()),
+            "watermarks wiped by re-registration: {:?}",
+            wm[0][0]
+        );
+
         // Mutate the primary: update, delete, insert — then cycle 2.
         exec_p("UPDATE mirror.items SET x = 'A2' WHERE id = 1");
         exec_p("DELETE FROM mirror.items WHERE id = 2");
