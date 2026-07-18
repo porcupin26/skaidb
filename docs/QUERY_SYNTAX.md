@@ -113,7 +113,10 @@ ALTER CLUSTER ADD    NODE '<host:port>'
 ALTER CLUSTER REMOVE NODE '<id>'
 ALTER CLUSTER SET NAME '<name>'               -- rename the cluster (ADMIN)
 ALTER NODE '<alias|dotted|id>' SET NAME '<n>' -- rename a member/witness alias (ADMIN)
-ALTER TABLE <table> SET (witness = <bool>)    -- toggle witness mirroring
+ALTER TABLE <table> SET (witness = <bool>     -- toggle witness mirroring
+                       | replication = <n>    -- online placement transition
+                       | nodes = ['<ref>',..] -- online pin change
+                       | placement_finalized = true)  -- operator escape hatch
 
 -- Session (binary-protocol connections)
 SET CONSISTENCY { ONE | QUORUM | ALL }        -- per-connection override
@@ -195,10 +198,23 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   writes to them. The two are mutually exclusive. Pins are a deliberate
   durability trade: a pinned node down means quorum errors for that table
   until it returns, and `ALTER CLUSTER REMOVE NODE` refuses to remove a
-  pinned member (re-pin first — `ALTER TABLE t SET (nodes = [...])` may
-  only SHRINK an existing pin set; growing or changing `replication`
-  after CREATE needs the placement-transition work, not yet shipped).
+  pinned member (re-pin first with `ALTER TABLE t SET (nodes = [...])`).
   GLOBAL-index entry tables follow their base table's placement.
+- **Placement transitions**: `ALTER TABLE t SET (replication = n)` /
+  `SET (nodes = [...])` change placement ONLINE. The old placement is
+  kept alongside the new one and every read/write addresses the UNION
+  of both (the per-table twin of the membership change's dual-ring
+  window), so quorum reads stay correct while new owners are still
+  empty. A background driver (the sorted union's first member) runs
+  repair until every member has completed a full anti-entropy pass that
+  started after the change, then finalizes automatically; `SHOW TABLES`
+  shows `transition = true` while the window is open. One transition
+  per table at a time. If the driver is down the window just stays open
+  (safe, wider than needed) — the operator escape is `REPAIR CLUSTER`
+  followed by `ALTER TABLE t SET (placement_finalized = true)`. After
+  finalize, `RECLAIM` trims copies the new placement no longer owns.
+  Shrinking a pin set needs no window (remaining pins already hold full
+  copies) and applies immediately.
 - **`SHOW TABLES`** lists catalog tables as
   `(table, primary_key, replication, nodes, witness)` rows —
   `replication`/`nodes` per-table placement, `witness` the mirroring flag;

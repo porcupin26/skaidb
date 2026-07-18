@@ -191,8 +191,14 @@ CREATE TABLE [IF NOT EXISTS] t (PRIMARY KEY (col [, col ...]))
 --   nodes = [...]: pin the whole table to those members; entries accept
 --   aliases, resolved to stable ids at DDL time; non-members refused (mutually exclusive
 --   with replication; every pin holds every row; non-pin coordinators route
---   to the pins; REMOVE NODE refuses while a table pins the node; ALTER can
---   only shrink a pin set).
+--   to the pins; REMOVE NODE refuses while a table pins the node).
+ALTER TABLE t SET (replication = n | nodes = ['ref', ...])
+--   ONLINE placement transition: reads/writes address the UNION of old+new
+--   placement until a background driver repairs to convergence and
+--   auto-finalizes (SHOW TABLES: transition = true while open). One per
+--   table at a time. Escape hatch if the driver died: REPAIR CLUSTER then
+--   ALTER TABLE t SET (placement_finalized = true). RECLAIM trims old
+--   copies after finalize. Pin-set SHRINK applies immediately (no window).
 --   witness = false: exclude the table from witness-node mirroring (and from
 --   the witness tombstone-GC floor). Toggle later: ALTER TABLE t SET (witness = true)
 --   System tables refuse the option. Default true.

@@ -194,6 +194,22 @@ pub struct TableDef {
     /// Whether witnesses mirror this table (default true).
     #[serde(default = "default_true")]
     pub witness: bool,
+    /// The PREVIOUS placement while a placement change transitions.
+    /// `Some` = in transition: reads and writes address the UNION of old
+    /// and new placement (the per-table twin of the membership change's
+    /// dual-ring window), until repair converges the new owners and a
+    /// finalize clears this. `None` = settled.
+    #[serde(default)]
+    pub prev_placement: Option<PrevPlacement>,
+}
+
+/// The placement being transitioned away from (see `TableDef::prev_placement`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrevPlacement {
+    #[serde(default)]
+    pub replication: Option<u32>,
+    #[serde(default)]
+    pub pinned_nodes: Vec<String>,
 }
 
 fn default_true() -> bool {

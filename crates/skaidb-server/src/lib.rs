@@ -1699,7 +1699,7 @@ pub(crate) mod tests {
         assert!(body.contains("alpha"), "got: {body}");
         assert!(body.contains("beta"), "got: {body}");
         assert!(
-            body.contains("\"columns\":[\"table\",\"primary_key\",\"replication\",\"nodes\",\"witness\"]"),
+            body.contains("\"columns\":[\"table\",\"primary_key\",\"replication\",\"nodes\",\"witness\",\"transition\"]"),
             "got: {body}"
         );
     }

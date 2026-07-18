@@ -277,6 +277,8 @@ pub enum Request {
     /// Run an anti-entropy pass: reconcile this node's replicas with its peers,
     /// copying the newer version of each key in both directions.
     Repair,
+    /// This node's completed-repair-pass counter (see `Response::RepairSeq`).
+    RepairSeq,
     /// Ask the peer for its full schema as idempotent `CREATE ... IF NOT EXISTS`
     /// statements, so a (re)joining node can converge its catalog.
     SchemaDdl,
@@ -318,6 +320,13 @@ pub enum Response {
     },
     /// Reply to [`Request::RepairDigest`]: the 4096 bucket accumulators.
     TableSeq { write_seq: u64 },
+    /// Reply to [`Request::RepairSeq`]: how many full anti-entropy passes
+    /// this node has COMPLETED since boot. Monotonic; a placement-
+    /// transition driver finalizes only once every member has completed
+    /// two passes past its baseline (the second is guaranteed to have
+    /// STARTED after the baseline was taken — and so after the transition
+    /// opened and its union placement became visible).
+    RepairSeq { passes: u64 },
     /// See [`Request::ScanSincePage`]: `cursor` resumes the stamps walk,
     /// `done` marks the final page.
     DeltaPage {
@@ -443,6 +452,7 @@ const REQ_KEYSPRESENT: u8 = 34;
 const REQ_GIDXPRODUCED: u8 = 35;
 const REQ_TABLESEQ: u8 = 36;
 const REQ_SCANSINCE: u8 = 37;
+const REQ_REPAIRSEQ: u8 = 38;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
@@ -464,6 +474,7 @@ const RES_HOSTSTATS: u8 = 16;
 const RES_DIGEST: u8 = 17;
 const RES_TABLESEQ: u8 = 18;
 const RES_DELTAPAGE: u8 = 19;
+const RES_REPAIRSEQ: u8 = 20;
 
 impl Request {
     pub fn encode(&self) -> Vec<u8> {
@@ -509,6 +520,7 @@ impl Request {
                 put_opt_bytes(o, after.as_deref());
                 o.extend_from_slice(&limit.to_le_bytes());
             }
+            Request::RepairSeq => o.push(REQ_REPAIRSEQ),
             Request::TableSeq { table } => {
                 o.push(REQ_TABLESEQ);
                 put_str(o, table);
@@ -774,6 +786,7 @@ impl Request {
                 limit: c.u32()?,
             },
             REQ_TABLESEQ => Request::TableSeq { table: c.string()? },
+            REQ_REPAIRSEQ => Request::RepairSeq,
             REQ_SCANSINCE => Request::ScanSincePage {
                 table: c.string()?,
                 since_physical: c.u64()?,
@@ -1027,6 +1040,10 @@ impl Response {
                     o.extend_from_slice(&b.to_le_bytes());
                 }
             }
+            Response::RepairSeq { passes } => {
+                o.push(RES_REPAIRSEQ);
+                o.extend_from_slice(&passes.to_le_bytes());
+            }
             Response::TableSeq { write_seq } => {
                 o.push(RES_TABLESEQ);
                 o.extend_from_slice(&write_seq.to_le_bytes());
@@ -1193,6 +1210,7 @@ impl Response {
                 Response::Digest { buckets }
             }
             RES_TABLESEQ => Response::TableSeq { write_seq: c.u64()? },
+            RES_REPAIRSEQ => Response::RepairSeq { passes: c.u64()? },
             RES_DELTAPAGE => Response::DeltaPage {
                 rows: c.rows()?,
                 cursor: c.opt_bytes()?,

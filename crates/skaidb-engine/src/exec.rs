@@ -2829,6 +2829,7 @@ impl Database {
                         Value::String(def.pinned_nodes.join(","))
                     },
                     Value::Bool(def.witness),
+                    Value::Bool(def.prev_placement.is_some()),
                 ]
             })
             .collect();
@@ -2840,6 +2841,7 @@ impl Database {
                     Value::Null,
                     Value::Null,
                     Value::Bool(true),
+                    Value::Bool(false),
                 ]);
             }
         }
@@ -2851,6 +2853,7 @@ impl Database {
                 "replication".into(),
                 "nodes".into(),
                 "witness".into(),
+                "transition".into(),
             ],
             rows,
         }
@@ -3009,6 +3012,7 @@ impl Database {
                 replication,
                 pinned_nodes: nodes,
                 witness,
+                prev_placement: None,
             },
         );
         self.record_schema(key, hlc, false);
@@ -3533,6 +3537,7 @@ impl Database {
                 replication: None,
                 pinned_nodes: Vec::new(),
                 witness: true,
+                prev_placement: None,
             });
             self.catalog.indexes.insert(
                 name.to_string(),
@@ -3772,45 +3777,99 @@ impl Database {
                         .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
                     def.witness = flag;
                 }
+                // Placement changes OPEN A TRANSITION: the old placement is
+                // stashed and every routing site addresses the union of old
+                // and new until repair converges the new owners and a
+                // finalize clears the stash (the per-table twin of the
+                // membership change's dual-ring window). One transition at a
+                // time — the union of three placements has no clear quorum
+                // story, and repair needs a stable target to converge to.
                 "nodes" => {
                     let new: Vec<String> = val
                         .split(',')
                         .filter(|s| !s.is_empty())
                         .map(str::to_string)
                         .collect();
+                    if new.is_empty() {
+                        return Err(EngineError::Constraint(
+                            "SET (nodes = ...) needs at least one member; to unpin, \
+                             transition to ring placement with SET (replication = n)"
+                                .into(),
+                        ));
+                    }
                     let def = self
                         .catalog
                         .tables
                         .get_mut(table)
                         .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
-                    if def.pinned_nodes.is_empty() {
-                        return Err(EngineError::Unsupported(
-                            "SET (nodes = ...) requires an already-pinned table; \
-                             changing a ring-placed table's placement needs the \
-                             placement-transition work (not yet shipped)"
-                                .into(),
-                        ));
+                    if def.prev_placement.is_some() {
+                        return Err(EngineError::Constraint(format!(
+                            "'{table}' already has a placement transition in progress; \
+                             wait for it to finalize (or run REPAIR CLUSTER, then \
+                             ALTER TABLE {table} SET (placement_finalized = true))"
+                        )));
                     }
-                    if new.is_empty() || !new.iter().all(|n| def.pinned_nodes.contains(n)) {
-                        return Err(EngineError::Unsupported(
-                            "SET (nodes = ...) may only SHRINK the existing pin list \
-                             (remaining pins already hold full copies); growing or \
-                             replacing pins needs the placement-transition work"
-                                .into(),
-                        ));
+                    // Pure shrink of an existing pin set needs no window:
+                    // every remaining pin already holds a full copy.
+                    let shrink = !def.pinned_nodes.is_empty()
+                        && new.iter().all(|n| def.pinned_nodes.contains(n));
+                    if !shrink && (def.pinned_nodes != new) {
+                        def.prev_placement = Some(crate::catalog::PrevPlacement {
+                            replication: def.replication,
+                            pinned_nodes: def.pinned_nodes.clone(),
+                        });
                     }
+                    def.replication = None;
                     def.pinned_nodes = new;
                 }
                 "replication" => {
-                    return Err(EngineError::Unsupported(
-                        "changing replication needs the placement-transition work \
-                         (not yet shipped); set it at CREATE TABLE"
-                            .into(),
-                    ));
+                    let n: u32 = val.parse().map_err(|_| {
+                        EngineError::Constraint(format!(
+                            "replication must be a positive integer, got '{val}'"
+                        ))
+                    })?;
+                    if n == 0 {
+                        return Err(EngineError::Constraint(
+                            "replication must be at least 1".into(),
+                        ));
+                    }
+                    let def = self
+                        .catalog
+                        .tables
+                        .get_mut(table)
+                        .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+                    if def.prev_placement.is_some() {
+                        return Err(EngineError::Constraint(format!(
+                            "'{table}' already has a placement transition in progress; \
+                             wait for it to finalize (or run REPAIR CLUSTER, then \
+                             ALTER TABLE {table} SET (placement_finalized = true))"
+                        )));
+                    }
+                    if def.replication != Some(n) || !def.pinned_nodes.is_empty() {
+                        def.prev_placement = Some(crate::catalog::PrevPlacement {
+                            replication: def.replication,
+                            pinned_nodes: std::mem::take(&mut def.pinned_nodes),
+                        });
+                        def.replication = Some(n);
+                    }
+                }
+                // The transition's closing bracket — broadcast by the ALTER
+                // coordinator once repair has converged the new owners, or
+                // run by an operator after a manual REPAIR CLUSTER if the
+                // coordinator died mid-transition (the union window is safe
+                // to sit in indefinitely, just wider than needed).
+                "placement_finalized" => {
+                    let def = self
+                        .catalog
+                        .tables
+                        .get_mut(table)
+                        .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+                    def.prev_placement = None;
                 }
                 other => {
                     return Err(EngineError::Unsupported(format!(
-                        "unknown ALTER TABLE option '{other}' (supported: witness, nodes)"
+                        "unknown ALTER TABLE option '{other}' \
+                         (supported: witness, nodes, replication, placement_finalized)"
                     )));
                 }
             }
@@ -6405,7 +6464,11 @@ impl Database {
     /// routed probe stays one replica-set round-trip). Unknown tables get
     /// cluster-default placement (`(None, [])`) — the safe answer for a
     /// table mid-drop or not yet synced.
-    pub fn table_placement(&self, table: &str) -> (Option<u32>, Vec<String>) {
+    #[allow(clippy::type_complexity)]
+    pub fn table_placement(
+        &self,
+        table: &str,
+    ) -> ((Option<u32>, Vec<String>), Option<(Option<u32>, Vec<String>)>) {
         let base;
         let name = if is_gidx_table(table) {
             let (db, bare) = namespace::split(table);
@@ -6415,7 +6478,7 @@ impl Database {
                     base = d.table.clone();
                     base.as_str()
                 }
-                _ => return (None, Vec::new()),
+                _ => return ((None, Vec::new()), None),
             }
         } else {
             table
@@ -6423,8 +6486,26 @@ impl Database {
         self.catalog
             .tables
             .get(name)
-            .map(|d| (d.replication, d.pinned_nodes.clone()))
-            .unwrap_or((None, Vec::new()))
+            .map(|d| {
+                (
+                    (d.replication, d.pinned_nodes.clone()),
+                    d.prev_placement
+                        .as_ref()
+                        .map(|p| (p.replication, p.pinned_nodes.clone())),
+                )
+            })
+            .unwrap_or(((None, Vec::new()), None))
+    }
+
+    /// Tables with an OPEN placement transition (prev stashed, finalize
+    /// pending) — the transition driver's work list.
+    pub fn tables_in_placement_transition(&self) -> Vec<String> {
+        self.catalog
+            .tables
+            .iter()
+            .filter(|(_, d)| d.prev_placement.is_some())
+            .map(|(n, _)| n.clone())
+            .collect()
     }
 
     /// Tables whose pinned placement names `node` — `remove_member`'s guard:
@@ -6434,7 +6515,15 @@ impl Database {
         self.catalog
             .tables
             .iter()
-            .filter(|(_, d)| d.pinned_nodes.iter().any(|n| n == node))
+            .filter(|(_, d)| {
+                d.pinned_nodes.iter().any(|n| n == node)
+                    // Mid-transition the OLD pins may hold the only
+                    // converged copies — they are as unremovable as
+                    // current pins until finalize.
+                    || d.prev_placement
+                        .as_ref()
+                        .is_some_and(|p| p.pinned_nodes.iter().any(|n| n == node))
+            })
             .map(|(name, _)| name.clone())
             .collect()
     }

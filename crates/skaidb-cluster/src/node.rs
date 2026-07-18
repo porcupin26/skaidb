@@ -184,6 +184,17 @@ pub struct Node {
     /// loop or an admin REPAIR). Served to peers in HostStats so they defer
     /// their own pass — concurrent passes dent write quorum.
     repairing: AtomicBool,
+    /// Completed anti-entropy passes since boot (monotonic). Placement-
+    /// transition drivers gate finalize on every member advancing this
+    /// by 2 past a baseline — see `drive_placement_transitions`.
+    repair_passes: AtomicU64,
+    /// Next time the maintenance loop may run the placement-transition
+    /// driver (it probes every member; the loop ticks every ~200ms).
+    placement_drive_at: Mutex<Instant>,
+    /// Per-table repair-pass baselines for open placement transitions
+    /// (in-memory: a driver restart just re-baselines; the union window
+    /// is safe to sit in while that costs one extra round).
+    placement_baselines: Mutex<std::collections::HashMap<String, Vec<(NodeId, u64)>>>,
     /// Repair-digest cache keyed by table: `(table version, digest)`, where
     /// the version is (schema stamp, write_seq) — see
     /// `Database::table_repair_version`. Only consulted for tables every
@@ -718,6 +729,9 @@ impl Node {
             maint_tx: Mutex::new(maint_tx),
             maint_pending: AtomicUsize::new(0),
             repairing: AtomicBool::new(false),
+            repair_passes: AtomicU64::new(0),
+            placement_drive_at: Mutex::new(Instant::now()),
+            placement_baselines: Mutex::new(std::collections::HashMap::new()),
             repair_digests: Mutex::new(HashMap::new()),
             pending_gidx: Mutex::new(Vec::new()),
             write_watermark: AtomicU64::new(0),
@@ -887,6 +901,24 @@ impl Node {
             };
             for name in pending {
                 node.drive_gidx_backfill(&name);
+            }
+            // Placement transitions: derived from CATALOG state, not a
+            // queue, so a coordinator crash resumes on any restart. The
+            // maintenance loop ticks every ~200ms — throttle the driver
+            // (it probes every member) to a slow cadence; transitions are
+            // minutes-scale anyway.
+            {
+                let due = node
+                    .placement_drive_at
+                    .lock()
+                    .map(|at| Instant::now() >= *at)
+                    .unwrap_or(false);
+                if due {
+                    if let Ok(mut at) = node.placement_drive_at.lock() {
+                        *at = Instant::now() + Duration::from_secs(30);
+                    }
+                    node.drive_placement_transitions();
+                }
             }
             // Vector backfills: same paged drain (searches on the index answer
             // "rebuilding — retry shortly" until the pages complete).
@@ -1597,17 +1629,30 @@ impl Node {
     /// table inside the engine. An unreadable engine (poisoned lock) degrades
     /// to cluster-default placement — the pre-feature behavior.
     fn table_placement(&self, table: &str) -> TablePlacement {
-        let (rf, pins) = match self.local.read() {
-            Ok(db) => db.table_placement(table),
-            Err(_) => (None, Vec::new()),
+        let (cur, _prev) = self.table_placement_full(table);
+        cur
+    }
+
+    /// Current AND previous placement (`prev` = a transition is open; every
+    /// routing decision must address the UNION of both until finalize).
+    fn table_placement_full(&self, table: &str) -> (TablePlacement, Option<TablePlacement>) {
+        let shape = |rf: Option<u32>, pins: Vec<String>| {
+            if !pins.is_empty() {
+                TablePlacement::Pinned(pins.into_iter().map(NodeId::new).collect())
+            } else if let Some(n) = rf {
+                TablePlacement::Rf(n as usize)
+            } else {
+                TablePlacement::Default
+            }
         };
-        if !pins.is_empty() {
-            TablePlacement::Pinned(pins.into_iter().map(NodeId::new).collect())
-        } else if let Some(n) = rf {
-            TablePlacement::Rf(n as usize)
-        } else {
-            TablePlacement::Default
-        }
+        let ((rf, pins), prev) = match self.local.read() {
+            Ok(db) => db.table_placement(table),
+            Err(_) => ((None, Vec::new()), None),
+        };
+        (
+            shape(rf, pins),
+            prev.map(|(prf, ppins)| shape(prf, ppins)),
+        )
     }
 
     /// Replica set for an already-placement-mapped key under `placement`.
@@ -1636,7 +1681,20 @@ impl Node {
     /// every call site must be THIS list's length (which, mid-reshard, is the
     /// dual-ring union — same shape the cluster-default path always had).
     fn effective_replicas(&self, table: &str, key: &[u8]) -> Vec<NodeId> {
-        self.placed_replicas(&self.table_placement(table), Self::placement(table, key))
+        let (cur, prev) = self.table_placement_full(table);
+        let key = Self::placement(table, key);
+        let mut reps = self.placed_replicas(&cur, key);
+        // Transition window: the union of new and old placement, exactly
+        // the dual-ring membership shape — writes reach both owner sets,
+        // quorums count the union, until repair converges and finalizes.
+        if let Some(prev) = prev {
+            for n in self.placed_replicas(&prev, key) {
+                if !reps.contains(&n) {
+                    reps.push(n);
+                }
+            }
+        }
+        reps
     }
 
     /// Whether this node holds every row of `table` — the per-table
@@ -1645,11 +1703,15 @@ impl Node {
     /// local search). A pin holds the whole table by definition; a non-pin
     /// holds none of it.
     fn holds_full_table(&self, table: &str) -> bool {
-        match self.table_placement(table) {
+        let full = |p: &TablePlacement| match p {
             TablePlacement::Pinned(pins) => pins.contains(&self.id),
-            TablePlacement::Rf(n) => n >= self.member_count(),
+            TablePlacement::Rf(n) => *n >= self.member_count(),
             TablePlacement::Default => self.cfg.replication_factor >= self.member_count(),
-        }
+        };
+        let (cur, prev) = self.table_placement_full(table);
+        // Mid-transition a "full" holder under the NEW placement may still
+        // be backfilling — only the intersection is safely complete.
+        full(&cur) && prev.as_ref().is_none_or(full)
     }
 
     /// Address of peer `id`, if it is a current peer (snapshot, cloned).
@@ -3219,9 +3281,23 @@ impl Node {
     /// key ranges instead of streaming the whole shard (future work). Returns the
     /// number of rows repaired (pulled + pushed).
     pub fn repair(&self) -> EngineResult<usize> {
-        self.repairing.store(true, Ordering::Relaxed);
+        // Serialize passes: two concurrent walks double load for near-zero
+        // extra convergence. A caller that arrives mid-pass WAITS and then
+        // runs its own — callers (REPAIR CLUSTER, the transition driver's
+        // pass counter) rely on "a full pass started after my call has
+        // completed by the time repair() returns Ok".
+        while self
+            .repairing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            thread::sleep(Duration::from_millis(250));
+        }
         let result = self.repair_inner();
         self.repairing.store(false, Ordering::Relaxed);
+        if result.is_ok() {
+            self.repair_passes.fetch_add(1, Ordering::Relaxed);
+        }
         result
     }
 
@@ -3886,6 +3962,109 @@ impl Node {
 
     /// Trigger [`Node::repair`] on this node and every peer (a cluster-wide
     /// anti-entropy pass). Returns the rows this node repaired.
+    /// Close any open placement transitions this node is elected to drive.
+    ///
+    /// Election: the first entry of the table's effective (union) replica
+    /// list — deterministic on every member, no coordination. The driver
+    /// runs one repair round covering every union owner (its own pass plus
+    /// `Request::Repair` to each), then broadcasts the finalize DDL. One
+    /// full round converges everything written BEFORE it started, and
+    /// writes DURING it already reach the new owners through the union
+    /// placement — the same argument membership-change finalize rests on.
+    /// If the elected driver is down the window simply stays open (safe,
+    /// just wider than needed); the operator escape is a manual
+    /// `REPAIR CLUSTER` + `ALTER ... SET (placement_finalized = true)`.
+    fn drive_placement_transitions(self: &Arc<Self>) {
+        let pending = match self.local.read() {
+            Ok(db) => db.tables_in_placement_transition(),
+            Err(_) => return,
+        };
+        // Drop baselines for tables no longer transitioning (finalized by
+        // us or an operator) so a LATER transition re-baselines fresh.
+        if let Ok(mut b) = self.placement_baselines.lock() {
+            b.retain(|t, _| pending.contains(t));
+        }
+        for table in pending {
+            // Election must be identical on every member: placed_replicas
+            // hoists SELF to the front of a pin list (each pinned node
+            // would elect itself), so sort before choosing.
+            let mut union = self.effective_replicas(&table, &[]);
+            union.sort();
+            if union.first() != Some(&self.id) {
+                continue;
+            }
+            // Convergence protocol: sample every member's completed-pass
+            // counter as a baseline, keep firing repairs (they coalesce on
+            // busy nodes), and finalize once EVERY member has completed
+            // baseline+2 passes — the +2nd pass provably STARTED after the
+            // baseline was taken, i.e. after the transition's union
+            // placement was visible, so one such full pass cluster-wide
+            // has converged everything written before it began (writes
+            // during it already reach the new owners through the union).
+            let mut seqs: Vec<(NodeId, u64)> = vec![(
+                self.id.clone(),
+                self.repair_passes.load(Ordering::Relaxed),
+            )];
+            let mut all_reachable = true;
+            for (pid, addr) in self.peers_with_ids() {
+                match self.pool.call(&addr, &Request::RepairSeq) {
+                    Ok(Response::RepairSeq { passes }) => seqs.push((pid, passes)),
+                    // Rolling upgrade: a peer without the verb can't be
+                    // gated on — skip driving until the fleet speaks it.
+                    _ => {
+                        all_reachable = false;
+                        break;
+                    }
+                }
+            }
+            if !all_reachable {
+                skaidb_types::slog!(
+                    "skaidb: placement transition on {table}: a member is unreachable \
+                     (or predates RepairSeq); the union window stays open until all \
+                     members answer"
+                );
+                continue;
+            }
+            let baseline = match self.placement_baselines.lock() {
+                Ok(mut b) => b.entry(table.clone()).or_insert_with(|| seqs.clone()).clone(),
+                Err(_) => continue,
+            };
+            let converged = seqs.iter().all(|(id, now)| {
+                baseline
+                    .iter()
+                    .find(|(bid, _)| bid == id)
+                    .is_some_and(|(_, base)| *now >= base + 2)
+            });
+            if converged {
+                let (db, bare) = skaidb_engine::namespace::split(&table);
+                let stmt = format!("ALTER TABLE {db}.{bare} SET (placement_finalized = true)");
+                match self.broadcast_ddl(skaidb_engine::DEFAULT_DATABASE, &stmt) {
+                    Ok(()) => {
+                        skaidb_types::slog!("skaidb: placement transition on {table}: finalized")
+                    }
+                    Err(e) => skaidb_types::slog!(
+                        "skaidb: placement transition on {table}: finalize broadcast \
+                         failed ({e}); retrying next pass"
+                    ),
+                }
+                continue;
+            }
+            // Not there yet: nudge every member. All fires are detached —
+            // a pass can take minutes and this runs on the maintenance
+            // thread, which also feeds flushes/compactions.
+            for (_, addr) in self.peers_with_ids() {
+                let node = Arc::clone(self);
+                thread::spawn(move || {
+                    let _ = node.pool.call(&addr, &Request::Repair);
+                });
+            }
+            let node = Arc::clone(self);
+            thread::spawn(move || {
+                let _ = node.repair();
+            });
+        }
+    }
+
     pub fn repair_cluster(&self) -> EngineResult<usize> {
         let local = self.repair()?;
         for addr in &self.peer_addrs() {
@@ -4924,6 +5103,9 @@ impl Node {
                 Ok(_) => Response::Ack,
                 Err(e) => Response::Err(e.to_string()),
             },
+            Request::RepairSeq => Response::RepairSeq {
+                passes: self.repair_passes.load(Ordering::Relaxed),
+            },
             Request::SchemaDdl => match self.schema_sync() {
                 Ok(entries) => Response::Schema { entries },
                 Err(e) => Response::Err(e.to_string()),
@@ -5171,7 +5353,7 @@ impl Node {
                         "global-index probe routed to the value's replica set".to_string()
                     } else {
                         // Per-table placement decides the scan shape.
-                        let (trf, pins) = db.table_placement(&sel.from);
+                        let ((trf, pins), _prev) = db.table_placement(&sel.from);
                         if !pins.is_empty() {
                             format!("pinned table — gathered from its {} pin(s)", pins.len())
                         } else if trf.map(|n| n as usize).unwrap_or(rf) >= members {
@@ -8659,6 +8841,130 @@ mod tests {
         assert!(!na.member_ids().contains(&"c".to_string()));
         let rs = rows(na.execute("SELECT id FROM hot").unwrap());
         assert_eq!(rs.rows.len(), 20, "pinned table intact after the removal");
+    }
+
+    #[test]
+    fn placement_transition_moves_a_pin_and_raises_rf() {
+        // a) pin move 'a' -> 'b': the union window keeps reads correct from
+        //    any coordinator before ANY data moved; the driver (elected
+        //    union head) repairs + finalizes; 'b' then holds everything.
+        // b) rf raise 1 -> 2: after the driven transition both members hold
+        //    every row.
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let mk = |id: &str, addr: &str| NodeConfig {
+            id: NodeId::new(id),
+            internode_addr: addr.to_string(),
+            members: members.clone(),
+            replication_factor: 3,
+            vnodes_per_node: 64,
+            read_consistency: Consistency::Quorum,
+            write_consistency: Consistency::Quorum,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
+            anti_entropy_interval_secs: 0,
+        };
+        let na = Node::new(Database::open(temp_dir("pt-a")).unwrap(), mk("a", &a));
+        let nb = Node::new(Database::open(temp_dir("pt-b")).unwrap(), mk("b", &b));
+        let nc = Node::new(Database::open(temp_dir("pt-c")).unwrap(), mk("c", &c));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        nc.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE mv (PRIMARY KEY (id)) WITH (nodes = ['a'])")
+            .unwrap();
+        for i in 0..25 {
+            na.execute(&format!("INSERT INTO mv (id, v) VALUES ({i}, 'v{i}')"))
+                .unwrap();
+        }
+        assert_eq!(local_keys(&na, "mv").len(), 25);
+        assert!(local_keys(&nb, "mv").is_empty());
+
+        // Open the transition: pins a -> b. Union = {b, a}: writes reach
+        // both, reads quorum over both — correct while b is still empty.
+        na.execute("ALTER TABLE mv SET (nodes = ['b'])").unwrap();
+        let rs = rows(nc.execute("SELECT v FROM mv WHERE id = 7").unwrap());
+        assert_eq!(
+            rs.rows,
+            vec![vec![Value::String("v7".into())]],
+            "mid-window read via a non-owner coordinator"
+        );
+        nc.execute("INSERT INTO mv (id, v) VALUES (100, 'new')")
+            .unwrap();
+        assert!(
+            !local_keys(&nb, "mv").is_empty(),
+            "mid-window write reaches the NEW pin (read-repair may add more)"
+        );
+
+        // Drive: election is deterministic (union head). Run the driver on
+        // every node — non-elected ones no-op.
+        let mut settled = false;
+        for _ in 0..30 {
+            for n in [&na, &nb, &nc] {
+                n.drive_placement_transitions();
+            }
+            let (_, prev) = na.with_local_read(|db| db.table_placement("mv")).unwrap();
+            if prev.is_none() {
+                settled = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert!(settled, "pin-move transition finalized");
+        assert_eq!(
+            local_keys(&nb, "mv").len(),
+            26,
+            "repair converged the new pin"
+        );
+        let ((rf_after, pins_after), _) =
+            na.with_local_read(|db| db.table_placement("mv")).unwrap();
+        assert_eq!(rf_after, None);
+        assert_eq!(pins_after, vec!["b".to_string()]);
+        // Old pin's copy is now unowned; reclaim trims it.
+        na.reclaim().unwrap();
+        assert!(
+            local_keys(&na, "mv").is_empty(),
+            "old pin reclaimed after finalize"
+        );
+        let rs = rows(nc.execute("SELECT v FROM mv WHERE id = 100").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::String("new".into())]]);
+
+        // b) rf raise: 1 -> 2.
+        na.execute("CREATE TABLE up (PRIMARY KEY (id)) WITH (replication = 1)")
+            .unwrap();
+        for i in 0..30 {
+            na.execute(&format!("INSERT INTO up (id, v) VALUES ({i}, 'u{i}')"))
+                .unwrap();
+        }
+        let total = |t: &str| {
+            local_keys(&na, t).len() + local_keys(&nb, t).len() + local_keys(&nc, t).len()
+        };
+        assert_eq!(total("up"), 30, "rf=1: one copy each");
+        na.execute("ALTER TABLE up SET (replication = 2)").unwrap();
+        // Drivers retry on busy peers (concurrent background repairs are
+        // normal); loop until the transition settles.
+        let mut settled = false;
+        for _ in 0..30 {
+            for n in [&na, &nb, &nc] {
+                n.drive_placement_transitions();
+            }
+            let (_, prev) = na.with_local_read(|db| db.table_placement("up")).unwrap();
+            if prev.is_none() {
+                settled = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert!(settled, "rf transition finalized");
+        assert_eq!(total("up"), 60, "rf=2 converged: two copies of each row");
+        // A second ALTER while settled works; while OPEN it is refused —
+        // covered by opening one and immediately altering again.
+        na.execute("ALTER TABLE up SET (replication = 3)").unwrap();
+        let err = na
+            .execute("ALTER TABLE up SET (replication = 1)")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("transition in progress"), "{err}");
     }
 
     /// Repair digests: equal on a converged pair (so the full compare is

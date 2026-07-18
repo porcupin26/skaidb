@@ -144,11 +144,24 @@ pub(crate) fn run_cycle(ctx: &Shared, cfg: &WitnessConfig) -> Result<CycleSummar
             // staleness guard makes application idempotent). Everything
             // else keeps the one-member-with-failover path.
             let members = &cfg.primary_internode_addrs;
-            let scatter = pt.pins.is_empty()
-                && pt
-                    .replication
-                    .is_some_and(|n| (n as usize) < members.len());
-            let sources: Vec<String> = if pt.pins.is_empty() {
+            // An open placement transition means NO single source is
+            // guaranteed complete (a new pin may still be backfilling):
+            // scatter over every candidate — configured members plus the
+            // current pins — and let the merge sort it out.
+            let scatter = pt.transition
+                || (pt.pins.is_empty()
+                    && pt
+                        .replication
+                        .is_some_and(|n| (n as usize) < members.len()));
+            let sources: Vec<String> = if pt.transition {
+                let mut all = members.clone();
+                for p in &pt.pins {
+                    if !all.contains(p) {
+                        all.push(p.clone());
+                    }
+                }
+                all
+            } else if pt.pins.is_empty() {
                 members.clone()
             } else {
                 pt.pins.clone()
@@ -531,6 +544,10 @@ struct PrimaryTable {
     /// Pinned members (internode ids — which ARE their addresses). A pin
     /// holds the whole table, so any one live pin can serve the pull.
     pins: Vec<String>,
+    /// A placement transition is open on the primary: NO single source is
+    /// guaranteed complete (a new pin may still be backfilling), so the
+    /// pull must scatter over every candidate and merge.
+    transition: bool,
 }
 
 /// Every table in `db` on the primary, with placement. Old primaries
@@ -577,6 +594,10 @@ fn list_tables(sql: &mut Client, db: &str) -> Result<Vec<PrimaryTable>, String> 
                             .collect(),
                         _ => Vec::new(),
                     },
+                    transition: matches!(
+                        idx("transition").and_then(|i| r.get(i)),
+                        Some(Value::Bool(true))
+                    ),
                 }),
                 _ => None,
             }
