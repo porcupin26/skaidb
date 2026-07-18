@@ -18,16 +18,21 @@ http://127.0.0.1:7080/ui
   discrepancies; a **drivers** table of live binary-protocol connections
   (node, endpoint, remote address, authenticated user, connected duration —
   `GET /ui/drivers`, reading the replicated `drivers` table; REST
-  connections aren't tracked here, since REST is one request per
-  connection and would just be table churn for no signal); and a
+  connections aren't tracked there, since REST is one request per
+  connection) with a **REST activity** table beside it — per request class
+  (query / insert / es / prom / ui / ops / admin / other): request count
+  and average response time, from
+  `skaidb_rest_requests_total{path=…}` + its duration companion (also
+  scrapable at `/metrics`); and a
   **witnesses** table of registered cross-region backup nodes (id, region,
   registered/last-seen duration, dimmed/flagged when a witness has gone
   quiet past the GC grace period — `GET /ui/witnesses`, reading the
   replicated `witnesses` table, shown alongside the grace period currently
-  in effect from `witness_gc_config`). A witness registers itself the same
-  way any client would, over an ordinary SQL connection with witness-scoped
-  credentials — see `.priv/witness-node-plan.md` for the design (not
-  committed; ask if you need it). Auto-refreshes every 5 s; the
+  in effect from `witness_gc_config`) — plus a per-witness **sync** column
+  from the heartbeat's watermarks: synced table count, total rows, oldest
+  sync age, with the full per-table list in the cell tooltip. A witness registers and
+  heartbeats itself over an ordinary SQL connection with witness-scoped
+  credentials (see the `[witness]` section in LLM.md). Auto-refreshes every 5 s; the
   drivers/witnesses fetches are independent of the core status fetch, so a
   failure there dims those two tables without breaking the rest of the tab.
 - **query** — SQL console with a **schema browser**: databases and tables

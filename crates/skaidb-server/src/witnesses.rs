@@ -122,6 +122,9 @@ pub struct WitnessRow {
     pub region: String,
     pub registered_at_ms: i64,
     pub last_seen_at_ms: i64,
+    /// Per-table sync state the witness heartbeats in: a document mapping
+    /// `db.table` → `{rows, synced_at}` (absent until the first cycle).
+    pub watermarks: Option<Value>,
 }
 
 /// Every registered witness. Empty on any error — callers should treat that
@@ -131,7 +134,7 @@ pub fn read_all(ctx: &Shared) -> Vec<WitnessRow> {
     let resp = exec(
         ctx,
         &format!(
-            "SELECT witness_id, region, registered_at, last_seen_at FROM {WITNESSES_TABLE}"
+            "SELECT witness_id, region, registered_at, last_seen_at, watermarks FROM {WITNESSES_TABLE}"
         ),
     );
     let Ok(Response::Rows { columns, rows }) = resp else {
@@ -154,12 +157,17 @@ pub fn read_all(ctx: &Shared) -> Vec<WitnessRow> {
     ) else {
         return Vec::new();
     };
+    let wm_i = idx("watermarks");
     rows.iter()
         .map(|row| WitnessRow {
             witness_id: as_s(row.get(id_i)),
             region: as_s(row.get(region_i)),
             registered_at_ms: as_i(row.get(reg_i)),
             last_seen_at_ms: as_i(row.get(seen_i)),
+            watermarks: wm_i
+                .and_then(|i| row.get(i))
+                .filter(|v| !v.is_null())
+                .cloned(),
         })
         .collect()
 }

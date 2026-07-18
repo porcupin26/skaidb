@@ -247,3 +247,11 @@ Categories pointed at the same path share one file handle, so their lines
 interleave safely. All of these keys are runtime-mutable (`config set`,
 `--*` flags, and `SKAIDB_*_LOG_FILE` env vars), and a path that can't be opened
 falls back to stderr with a one-line warning rather than failing startup.
+
+## REST request activity
+
+- `skaidb_rest_requests_total{path="query"|"insert"|"es"|"prom"|"ui"|"ops"|"admin"|"other"}`
+  — REST requests served, per path class, timed end to end.
+- `skaidb_rest_request_duration_us_total{path=…}` — total serving time in
+  microseconds; divide by `skaidb_rest_requests_total` for the average
+  response time (the status tab's REST-activity table shows exactly this).

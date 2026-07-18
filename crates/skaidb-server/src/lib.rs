@@ -1095,6 +1095,28 @@ pub(crate) mod tests {
         assert_eq!(witnesses.len(), 1, "{v}");
         assert_eq!(witnesses[0]["witness_id"], "witness-eu");
         assert_eq!(witnesses[0]["region"], "eu-central-1");
+        // No heartbeat yet: sync summary is explicitly empty, not missing.
+        assert_eq!(witnesses[0]["synced_tables"], 0, "{v}");
+
+        // A heartbeat with watermarks surfaces the per-table sync detail.
+        crate::shared::execute_as(
+            &ctx,
+            "superuser",
+            "UPDATE witnesses SET watermarks = {'mirror.items': {rows: 42, synced_at: 12345}}              WHERE witness_id = 'witness-eu'",
+        );
+        let v = json_body(&get("/ui/witnesses"));
+        let w = &v["witnesses"][0];
+        assert_eq!(w["synced_tables"], 1, "{v}");
+        assert_eq!(w["synced_rows"], 42, "{v}");
+        assert_eq!(w["tables"][0]["table"], "mirror.items", "{v}");
+
+        // REST activity: the /ui/* calls this test already made are counted
+        // with a usable average.
+        let v = json_body(&get("/ui/drivers"));
+        let rest = v["rest"].as_array().unwrap();
+        let ui = rest.iter().find(|r| r["path"] == "ui").expect("ui class present");
+        assert!(ui["requests"].as_u64().unwrap() >= 3, "{v}");
+        assert!(ui["avg_ms"].as_f64().unwrap() >= 0.0, "{v}");
     }
 
     /// An unwritable config file must not block a live-mutable key from

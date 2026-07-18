@@ -86,6 +86,83 @@ impl Default for Hist {
 // Hot-path label enums
 // ---------------------------------------------------------------------------
 
+/// REST request class, for `skaidb_rest_requests_total{path=…}` and the
+/// status tab's REST-activity table: every request the REST listener
+/// serves lands in exactly one class, timed end to end (read → response
+/// written), so count + duration-sum give the average response time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestPath {
+    /// `POST /query` (+ streaming variant).
+    Query,
+    /// `POST /insert` — the JSON document upsert.
+    Insert,
+    /// The ES-compatible subset (`/{index}/_search`, `_bulk`, …).
+    Es,
+    /// Prometheus `remote_write` + `/api/v1/*` reads.
+    Prom,
+    /// The web UI: static shell + `/ui/*` JSON.
+    Ui,
+    /// Unauthenticated ops probes: `/metrics`, `/health`, `/ready`, `/status`.
+    Ops,
+    /// `POST /admin/*` control plane.
+    Admin,
+    /// Everything else (404s included — they cost a request too).
+    Other,
+}
+
+impl RestPath {
+    pub const ALL: [RestPath; 8] = [
+        RestPath::Query,
+        RestPath::Insert,
+        RestPath::Es,
+        RestPath::Prom,
+        RestPath::Ui,
+        RestPath::Ops,
+        RestPath::Admin,
+        RestPath::Other,
+    ];
+
+    /// The UI-facing label.
+    pub fn label(self) -> &'static str {
+        match self {
+            RestPath::Query => "query",
+            RestPath::Insert => "insert",
+            RestPath::Es => "es",
+            RestPath::Prom => "prom",
+            RestPath::Ui => "ui",
+            RestPath::Ops => "ops",
+            RestPath::Admin => "admin",
+            RestPath::Other => "other",
+        }
+    }
+
+    fn count_series(self) -> &'static str {
+        match self {
+            RestPath::Query => "skaidb_rest_requests_total{path=\"query\"}",
+            RestPath::Insert => "skaidb_rest_requests_total{path=\"insert\"}",
+            RestPath::Es => "skaidb_rest_requests_total{path=\"es\"}",
+            RestPath::Prom => "skaidb_rest_requests_total{path=\"prom\"}",
+            RestPath::Ui => "skaidb_rest_requests_total{path=\"ui\"}",
+            RestPath::Ops => "skaidb_rest_requests_total{path=\"ops\"}",
+            RestPath::Admin => "skaidb_rest_requests_total{path=\"admin\"}",
+            RestPath::Other => "skaidb_rest_requests_total{path=\"other\"}",
+        }
+    }
+
+    fn duration_series(self) -> &'static str {
+        match self {
+            RestPath::Query => "skaidb_rest_request_duration_us_total{path=\"query\"}",
+            RestPath::Insert => "skaidb_rest_request_duration_us_total{path=\"insert\"}",
+            RestPath::Es => "skaidb_rest_request_duration_us_total{path=\"es\"}",
+            RestPath::Prom => "skaidb_rest_request_duration_us_total{path=\"prom\"}",
+            RestPath::Ui => "skaidb_rest_request_duration_us_total{path=\"ui\"}",
+            RestPath::Ops => "skaidb_rest_request_duration_us_total{path=\"ops\"}",
+            RestPath::Admin => "skaidb_rest_request_duration_us_total{path=\"admin\"}",
+            RestPath::Other => "skaidb_rest_request_duration_us_total{path=\"other\"}",
+        }
+    }
+}
+
 /// The `type` label of `skaidb_queries_total`/`skaidb_query_duration_seconds`,
 /// classifying a statement by its leading keyword.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,6 +406,8 @@ struct HotMetrics {
     connections_total: [Cell; Endpoint::ALL.len()],
     connections_active: [Cell; Endpoint::ALL.len()],
     queries_in_flight: Cell,
+    rest_requests_total: [Cell; RestPath::ALL.len()],
+    rest_request_duration_us: [Cell; RestPath::ALL.len()],
 }
 
 impl HotMetrics {
@@ -351,6 +430,10 @@ impl HotMetrics {
         out.push(("skaidb_authz_denied_total", &self.authz_denied_total));
         out.push(("skaidb_logins_total", &self.logins_total));
         out.push(("skaidb_login_failures_total", &self.login_failures_total));
+        for p in RestPath::ALL {
+            out.push((p.count_series(), &self.rest_requests_total[p as usize]));
+            out.push((p.duration_series(), &self.rest_request_duration_us[p as usize]));
+        }
         for e in Endpoint::ALL {
             out.push((
                 e.bytes_returned_series(),
@@ -503,6 +586,32 @@ impl Metrics {
     /// Count one statement slower than `slow_query_ms` (`skaidb_slow_queries_total`).
     pub fn incr_slow_query(&self) {
         self.hot.slow_queries_total.add(1);
+    }
+
+    /// Record one served REST request: count + duration (µs), per path class.
+    pub fn observe_rest(&self, path: RestPath, seconds: f64) {
+        self.hot.rest_requests_total[path as usize].add(1);
+        self.hot.rest_request_duration_us[path as usize]
+            .add((seconds * 1_000_000.0) as u64);
+    }
+
+    /// Per-class REST activity for the status tab:
+    /// `(label, requests, avg_ms)` for every class that has served at
+    /// least one request.
+    pub fn rest_stats(&self) -> Vec<(&'static str, u64, f64)> {
+        RestPath::ALL
+            .iter()
+            .filter_map(|p| {
+                let count = self.hot.rest_requests_total[*p as usize].read()?;
+                if count == 0 {
+                    return None;
+                }
+                let us = self.hot.rest_request_duration_us[*p as usize]
+                    .read()
+                    .unwrap_or(0);
+                Some((p.label(), count, us as f64 / count as f64 / 1_000.0))
+            })
+            .collect()
     }
 
     /// Count one RBAC denial (`skaidb_authz_denied_total`).
@@ -743,6 +852,17 @@ fn fmt_f64(v: f64) -> String {
 /// exposition carries correct types and documentation. The full contract lives
 /// in `docs/METRICS.md`.
 const KNOWN_METRICS: &[(&str, MetricType, &str)] = &[
+    (
+        "skaidb_rest_requests_total",
+        MetricType::Counter,
+        "REST requests served, by path class (query/insert/es/prom/ui/ops/admin/other).",
+    ),
+    (
+        "skaidb_rest_request_duration_us_total",
+        MetricType::Counter,
+        "Total time serving REST requests, microseconds, by path class (divide by \
+         skaidb_rest_requests_total for the average).",
+    ),
     ("skaidb_up", MetricType::Gauge, "1 if the server is up."),
     (
         "skaidb_build_info",

@@ -325,7 +325,10 @@ pub fn drivers_json(ctx: &Shared) -> (u16, String) {
         // Most likely: no connection has landed yet, so the table hasn't
         // been lazily created — an empty list, not an error, matches what
         // "nobody's connected right now" should look like.
-        return (200, json!({ "drivers": [] }).to_string());
+        return (
+            200,
+            json!({ "drivers": [], "rest": rest_stats_json(ctx) }).to_string(),
+        );
     };
     let idx = |name: &str| columns.iter().position(|c| c == name);
     let as_s = |v: Option<&Value>| match v {
@@ -361,7 +364,21 @@ pub fn drivers_json(ctx: &Shared) -> (u16, String) {
             })
         })
         .collect();
-    (200, json!({ "drivers": drivers }).to_string())
+    (200, json!({ "drivers": drivers, "rest": rest_stats_json(ctx) }).to_string())
+}
+
+/// REST request activity (`skaidb_rest_requests_total{path=…}` + average
+/// response time), shown beside the drivers table: REST connections are
+/// one-shot and deliberately not in the `drivers` registry, so this is
+/// where their traffic becomes visible.
+fn rest_stats_json(ctx: &Shared) -> Vec<Json> {
+    ctx.metrics
+        .rest_stats()
+        .into_iter()
+        .map(|(label, count, avg_ms)| {
+            json!({ "path": label, "requests": count, "avg_ms": (avg_ms * 100.0).round() / 100.0 })
+        })
+        .collect()
 }
 
 /// Registered witnesses, for the status tab, plus the current GC grace
@@ -374,6 +391,31 @@ pub fn witnesses_json(ctx: &Shared) -> (u16, String) {
     let witnesses: Vec<Json> = crate::witnesses::read_all(ctx)
         .into_iter()
         .map(|w| {
+            // Per-table sync detail from the heartbeat's watermarks doc:
+            // `db.table` → {rows, synced_at}. Summarized (table count +
+            // total rows + oldest sync age) with the full list attached.
+            let mut tables: Vec<Json> = Vec::new();
+            let (mut total_rows, mut oldest_sync_ms) = (0i64, i64::MAX);
+            if let Some(Value::Document(d)) = &w.watermarks {
+                for (name, entry) in &d.0 {
+                    let Value::Document(e) = entry else { continue };
+                    let rows = match e.0.get("rows") {
+                        Some(Value::Int(n)) => *n,
+                        _ => 0,
+                    };
+                    let synced = match e.0.get("synced_at") {
+                        Some(Value::Int(n)) => *n,
+                        _ => 0,
+                    };
+                    total_rows += rows;
+                    oldest_sync_ms = oldest_sync_ms.min(synced);
+                    tables.push(json!({
+                        "table": name,
+                        "rows": rows,
+                        "synced_secs_ago": ((now_ms - synced).max(0) / 1000),
+                    }));
+                }
+            }
             json!({
                 "witness_id": w.witness_id,
                 "region": w.region,
@@ -381,6 +423,11 @@ pub fn witnesses_json(ctx: &Shared) -> (u16, String) {
                 "last_seen_at_ms": w.last_seen_at_ms,
                 "registered_secs": ((now_ms - w.registered_at_ms).max(0) / 1000),
                 "stale_secs": ((now_ms - w.last_seen_at_ms).max(0) / 1000),
+                "tables": tables,
+                "synced_tables": tables.len(),
+                "synced_rows": total_rows,
+                "oldest_sync_secs": if oldest_sync_ms == i64::MAX { Json::Null }
+                    else { json!(((now_ms - oldest_sync_ms).max(0) / 1000)) },
             })
         })
         .collect();

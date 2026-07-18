@@ -8,12 +8,12 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value as Json};
 use skaidb_proto::Response;
 
-use crate::metrics::Endpoint;
+use crate::metrics::{Endpoint, RestPath};
 use crate::shared::{collect_runtime_metrics, execute_as, Shared};
 
 /// Socket timeouts for REST connections. A peer that stops reading (or a
@@ -71,6 +71,27 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) -> io::Result<()> {
         Err(_) => {
             return write_response(&mut stream, 400, &json!({"error": "malformed request"}));
         }
+    };
+
+    // Per-request activity accounting (`skaidb_rest_requests_total{path=…}`
+    // + duration, surfaced on the status tab): classify once, record on
+    // EVERY exit path via Drop — this handler returns from ~a dozen arms.
+    struct RestTimer<'a> {
+        ctx: &'a Shared,
+        path: crate::metrics::RestPath,
+        start: Instant,
+    }
+    impl Drop for RestTimer<'_> {
+        fn drop(&mut self) {
+            self.ctx
+                .metrics
+                .observe_rest(self.path, self.start.elapsed().as_secs_f64());
+        }
+    }
+    let _timer = RestTimer {
+        ctx: &ctx,
+        path: classify_rest(&req.method, &req.path),
+        start: Instant::now(),
     };
 
     // Unauthenticated read-only operational endpoints (SPEC §10). These exist so
@@ -458,6 +479,24 @@ struct HttpRequest {
 /// The gateway serves one request per connection (`Connection: close`), so a
 /// per-call `BufReader` is already per-connection; borrowing the stream avoids
 /// the `try_clone` (dup) syscall entirely.
+/// Which activity class a REST request lands in (see `RestPath`).
+fn classify_rest(method: &str, path: &str) -> RestPath {
+    let bare = path.split('?').next().unwrap_or(path);
+    match (method, bare) {
+        (_, p) if p.starts_with("/query") => RestPath::Query,
+        (_, p) if p.starts_with("/insert") => RestPath::Insert,
+        (_, "/api/v1/write") => RestPath::Prom,
+        (_, p) if p.starts_with("/api/v1/") => RestPath::Prom,
+        (_, p) if p == "/ui" || p.starts_with("/ui/") => RestPath::Ui,
+        (_, "/metrics" | "/health" | "/healthz" | "/ready" | "/readyz" | "/status") => {
+            RestPath::Ops
+        }
+        ("POST", p) if p.starts_with("/admin/") => RestPath::Admin,
+        (_, p) if crate::es::path_is_es(p) => RestPath::Es,
+        _ => RestPath::Other,
+    }
+}
+
 fn read_request(stream: &mut TcpStream) -> io::Result<Option<HttpRequest>> {
     let mut reader = BufReader::new(&mut *stream);
 

@@ -156,6 +156,15 @@ function renderDrivers(body) {
     );
     tbody.append(tr);
   }
+  // REST traffic is one-shot per request (not in the registry above) —
+  // its per-type counts + average latency live here instead.
+  const rbody = $("rest-activity").querySelector("tbody");
+  rbody.textContent = "";
+  for (const r of body.rest || []) {
+    const tr = document.createElement("tr");
+    tr.append(cell(r.path), cell(String(r.requests)), cell(`${r.avg_ms.toFixed(2)} ms`));
+    rbody.append(tr);
+  }
 }
 
 // Registered cross-region witnesses (see witnesses.rs) plus the GC grace
@@ -183,7 +192,22 @@ function renderWitnesses(body) {
     } else if (w.stale_secs > 3600) {
       lastSeen.className = "warn";
     }
-    tr.append(cell(w.witness_id), cell(w.region), cell(fmtDuration(w.registered_secs) + " ago"), lastSeen);
+    // Per-table sync summary from the heartbeat's watermarks: table count,
+    // total rows, and the oldest table's sync age; the full per-table list
+    // rides the tooltip.
+    const sync = cell(
+      w.synced_tables
+        ? `${w.synced_tables} tables · ${w.synced_rows} rows · oldest ${
+            w.oldest_sync_secs != null ? fmtDuration(w.oldest_sync_secs) + " ago" : "—"}`
+        : "no sync yet",
+    );
+    if (w.tables && w.tables.length) {
+      sync.title = w.tables
+        .map((t) => `${t.table}: ${t.rows} rows, ${fmtDuration(t.synced_secs_ago)} ago`)
+        .join("\n");
+    }
+    if (!w.synced_tables) sync.className = "warn";
+    tr.append(cell(w.witness_id), cell(w.region), cell(fmtDuration(w.registered_secs) + " ago"), lastSeen, sync);
     tbody.append(tr);
   }
 }
