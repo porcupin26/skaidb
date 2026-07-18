@@ -65,6 +65,26 @@ impl fmt::Debug for Stream {
     }
 }
 
+impl Drop for Stream {
+    /// Send a TLS `close_notify` and flush before the socket closes, so the
+    /// peer reads a clean end-of-stream instead of an "unexpected EOF" (which
+    /// rustls treats as an error — it otherwise breaks HTTP `Connection: close`
+    /// responses over TLS). No-op for plaintext.
+    fn drop(&mut self) {
+        match self {
+            Stream::ServerTls(s) => {
+                s.conn.send_close_notify();
+                let _ = s.flush();
+            }
+            Stream::ClientTls(s) => {
+                s.conn.send_close_notify();
+                let _ = s.flush();
+            }
+            Stream::Plain(_) => {}
+        }
+    }
+}
+
 impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
