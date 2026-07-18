@@ -2525,6 +2525,7 @@ impl Node {
                     })
                     .collect();
                 for chunk in pending.chunks(batch) {
+                    let chunk_started = Instant::now();
                     // One retry before erroring: transient slowness on the
                     // joiner shouldn't fail the join — and if it does, the
                     // checkpoint below makes a re-triggered join resume here.
@@ -2538,9 +2539,15 @@ impl Node {
                     if let Some((last_key, _, _, _)) = chunk.last() {
                         save_migrate_ckpt(&ckpt, &table, last_key);
                     }
-                    if pause > 0 {
-                        thread::sleep(Duration::from_millis(pause));
-                    }
+                    // A joining node's bootstrap must never take more than
+                    // half of this (serving) node's capacity: sleep at
+                    // least as long as the chunk took to produce and send,
+                    // so the migration's duty cycle is ≤ 50% by
+                    // construction — a fixed pause can't promise that (a
+                    // slow 100 ms chunk + 25 ms pause is an 80% duty
+                    // cycle). `migration_pause_ms` remains the floor for
+                    // operators who want it even gentler.
+                    thread::sleep(chunk_started.elapsed().max(Duration::from_millis(pause)));
                 }
                 if done {
                     break;

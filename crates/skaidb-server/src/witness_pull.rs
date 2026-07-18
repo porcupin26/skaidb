@@ -34,13 +34,15 @@ use crate::shared::{Backend, Shared};
 /// Rows per pulled page — matches the primary's own gather/repair paging.
 const PULL_PAGE_ROWS: u32 = 2_000;
 
-/// Pause between pulled pages, mirroring the primary's own repair pacing
-/// (`REPAIR_PAGE_PAUSE`): an unpaced pull is a firehose into the apply
-/// path — flush and compaction fall behind and memtables pile up faster
-/// than the background worker drains them (the first unpaced full sync
-/// OOM-killed the witness box twice). ~5% duty impact on wall time, whole
-/// cores and memory headroom handed back.
-const PULL_PAGE_PAUSE: std::time::Duration = std::time::Duration::from_millis(25);
+/// Minimum pause between pulled pages. The REAL pacing rule is adaptive —
+/// sleep at least as long as the previous page took to fetch and apply —
+/// which caps the pull at ≤ 50% of the serving primary's capacity (and of
+/// the witness's own apply path) BY CONSTRUCTION: a fixed pause can't
+/// promise that (a slow 100 ms page + 25 ms pause is an 80% duty cycle).
+/// The unpaced first deployment both OOM-killed the witness (apply
+/// outran background flush) and hammered the primary at full duty. This
+/// floor keeps even sub-millisecond pages from spinning.
+const PULL_PAGE_PAUSE_FLOOR: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// What one cycle did, for the log line and the heartbeat watermarks.
 #[derive(Debug, Default)]
@@ -231,6 +233,7 @@ fn pull_table(
     let (mut pulled, mut applied) = (0usize, 0usize);
     let mut after: Option<Vec<u8>> = None;
     loop {
+        let page_started = std::time::Instant::now();
         let page = scan_page_with_failover(cfg, &qualified, after.as_deref())?;
         let done = page.len() < PULL_PAGE_ROWS as usize;
         after = page.last().map(|(k, ..)| k.clone());
@@ -257,7 +260,8 @@ fn pull_table(
         if done {
             return Ok((pulled, applied));
         }
-        std::thread::sleep(PULL_PAGE_PAUSE);
+        // ≤ 50% duty on the primary: rest as long as the page cost.
+        std::thread::sleep(page_started.elapsed().max(PULL_PAGE_PAUSE_FLOOR));
     }
 }
 

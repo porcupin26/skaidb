@@ -597,7 +597,11 @@ log_format/log_file, per_table_metrics, prometheus_port, self_scrape,
 self_scrape_interval_secs, node_stats, node_stats_interval_secs; `[ui]` enabled;
 `[witness]` enabled, primary_sql_addrs, primary_internode_addrs, user,
 password (masked in `config show`), databases, interval_secs, witness_id,
-region — see Witness mode above.
+region — see Witness mode above. Bootstrap pacing: a joining node's
+rebalance push and a witness's pull both self-pace adaptively (each
+chunk/page is followed by a rest at least as long as it took), so
+bootstrap traffic never takes more than ~50% of the serving node's
+capacity by construction.
 **Live-mutable** (no restart): all `observability.*` log/slow-query keys,
 `observability.self_scrape*`, `observability.node_stats*`, `ui.enabled`,
 `server.read_only`.
