@@ -23,6 +23,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
+skaidb-net.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true

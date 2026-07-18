@@ -18,7 +18,7 @@ use clap::{Parser, Subcommand};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
-use skaidb_driver::Client;
+use skaidb_driver::{Client, TlsConfig, TlsVerify};
 use skaidb_engine::{QueryOutput, Session};
 use skaidb_proto::{Consistency, Response};
 use skaidb_types::Value;
@@ -53,6 +53,22 @@ struct Cli {
     /// Default SQL consistency: one | quorum | all.
     #[arg(long, default_value = "quorum")]
     consistency: String,
+
+    /// Connect over TLS (binary + REST). Implied by --tls-ca / --tls-insecure.
+    #[arg(long)]
+    tls: bool,
+
+    /// CA certificate file to verify the server's cert (the cluster `ca.crt`).
+    #[arg(long = "tls-ca")]
+    tls_ca: Option<String>,
+
+    /// Skip TLS certificate verification (self-signed/dev only; INSECURE).
+    #[arg(long = "tls-insecure")]
+    tls_insecure: bool,
+
+    /// TLS server name (SNI / cert SAN to verify). Default `skaidb`.
+    #[arg(long = "tls-server-name", default_value = "skaidb")]
+    tls_server_name: String,
 
     /// Run against an embedded engine on a local data directory instead of
     /// connecting to a server (offline/dev). Admin commands are unavailable.
@@ -308,6 +324,7 @@ struct Shell {
     rest_port: u16,
     user: Option<String>,
     password: Option<String>,
+    rest_tls: Option<http::TlsClient>,
 }
 
 impl Shell {
@@ -320,7 +337,7 @@ impl Shell {
             let endpoints = sql_endpoints(cli);
             let user = cli.user.as_deref().unwrap_or("anonymous");
             let pass = cli.password.as_deref().unwrap_or("");
-            let mut client = Client::connect_many(&endpoints, user, pass)
+            let mut client = Client::connect_many_tls(&endpoints, user, pass, build_tls(cli)?)
                 .map_err(|e| format!("could not connect: {e}"))?;
             if let Some(c) = parse_consistency(&cli.consistency) {
                 client.set_consistency(c);
@@ -328,7 +345,8 @@ impl Shell {
             // Discover the rest of the cluster from the seed so a single --host
             // still gives full failover: ask /status for the members' client
             // endpoints and add any new ones to the driver's failover pool.
-            let discovered = discover_peers(&rest_endpoints(cli));
+            let rest_tls = build_rest_tls(cli)?;
+            let discovered = discover_peers(&rest_endpoints(cli), rest_tls.as_ref());
             let new_peers = discovered.len();
             client.add_endpoints(&discovered);
             let total = client.endpoints().len();
@@ -349,6 +367,7 @@ impl Shell {
             rest_port: cli.rest_port,
             user: cli.user.clone(),
             password: cli.password.clone(),
+            rest_tls: build_rest_tls(cli)?,
         })
     }
 
@@ -581,7 +600,7 @@ impl Shell {
             return;
         }
         for target in self.rest_targets() {
-            let state = match http::get(std::slice::from_ref(&target), "/ui/meta", None) {
+            let state = match http::get(std::slice::from_ref(&target), "/ui/meta", None, self.rest_tls.as_ref()) {
                 Ok((200, _)) => "enabled",
                 Ok((404, _)) => "disabled (\\ui on to enable)",
                 Ok((code, _)) => return eprintln!("http://{target}/ui — unexpected HTTP {code}"),
@@ -599,7 +618,7 @@ impl Shell {
         if self.is_local() {
             return;
         }
-        match http::get(&self.rest_targets(), path, None) {
+        match http::get(&self.rest_targets(), path, None, self.rest_tls.as_ref()) {
             Ok((_, body)) if raw => print!("{body}"),
             Ok((_, body)) => http::print_body(&body),
             Err(e) => eprintln!("error: {e}"),
@@ -611,7 +630,7 @@ impl Shell {
         if self.is_local() {
             return;
         }
-        match http::post(&self.rest_targets(), path, &body, self.auth()) {
+        match http::post(&self.rest_targets(), path, &body, self.auth(), self.rest_tls.as_ref()) {
             Ok((_, resp)) => http::print_body(&resp),
             Err(e) => eprintln!("error: {e}"),
         }
@@ -623,7 +642,7 @@ impl Shell {
         if self.is_local() {
             return;
         }
-        match http::post(&self.rest_targets(), "/admin/status", "", self.auth()) {
+        match http::post(&self.rest_targets(), "/admin/status", "", self.auth(), self.rest_tls.as_ref()) {
             Ok((_, resp)) => cluster::render(&resp),
             Err(e) => eprintln!("error: {e}"),
         }
@@ -649,16 +668,66 @@ enum Flow {
 }
 
 /// Run a one-shot admin subcommand over REST and exit accordingly.
+/// Whether any TLS flag is set (any of `--tls`, `--tls-ca`, `--tls-insecure`).
+fn tls_requested(cli: &Cli) -> bool {
+    cli.tls || cli.tls_ca.is_some() || cli.tls_insecure
+}
+
+/// Resolve the client verification policy from the flags (shared by the SQL
+/// and REST TLS builders): a CA file, insecure skip, or — with a bare `--tls`
+/// and no CA — insecure (there is no bundled public-root store).
+fn tls_verify(cli: &Cli) -> skaidb_net::ClientVerify {
+    if let Some(ca) = &cli.tls_ca {
+        skaidb_net::ClientVerify::CaFile(ca.clone())
+    } else {
+        skaidb_net::ClientVerify::Insecure
+    }
+}
+
+/// Build the SQL-driver TLS config, or `None` when no TLS flag is set.
+fn build_tls(cli: &Cli) -> Result<Option<TlsConfig>, String> {
+    if !tls_requested(cli) {
+        return Ok(None);
+    }
+    let verify = match &cli.tls_ca {
+        Some(ca) => TlsVerify::CaFile(ca.clone()),
+        None => TlsVerify::Insecure,
+    };
+    Ok(Some(
+        TlsConfig::new(verify, &cli.tls_server_name).map_err(|e| e.to_string())?,
+    ))
+}
+
+/// Build the REST-control-plane TLS config, or `None` when no TLS flag is set.
+fn build_rest_tls(cli: &Cli) -> Result<Option<http::TlsClient>, String> {
+    if !tls_requested(cli) {
+        return Ok(None);
+    }
+    let cfg = skaidb_net::client_config(tls_verify(cli), None)?;
+    Ok(Some(http::TlsClient {
+        cfg,
+        server_name: cli.tls_server_name.clone(),
+    }))
+}
+
 fn run_admin(cli: &Cli, cmd: &Cmd) -> ExitCode {
     let endpoints = rest_endpoints(cli);
     let auth = match (&cli.user, &cli.password) {
         (Some(u), Some(p)) => Some((u.as_str(), p.as_str())),
         _ => None,
     };
+    let tls = match build_rest_tls(cli) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("skaidbsh: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let tls = tls.as_ref();
 
     let result = match cmd {
-        Cmd::Status => http::get(&endpoints, "/status", None),
-        Cmd::Metrics => http::get(&endpoints, "/metrics", None),
+        Cmd::Status => http::get(&endpoints, "/status", None, tls),
+        Cmd::Metrics => http::get(&endpoints, "/metrics", None, tls),
         Cmd::Cluster { op } => {
             let (path, body) = match op {
                 ClusterOp::Status => ("/admin/status", String::new()),
@@ -667,7 +736,7 @@ fn run_admin(cli: &Cli, cmd: &Cmd) -> ExitCode {
                 ClusterOp::AddNode { addr } => ("/admin/add-node", json_kv("addr", addr)),
                 ClusterOp::RemoveNode { id } => ("/admin/remove-node", json_kv("id", id)),
             };
-            http::post(&endpoints, path, &body, auth)
+            http::post(&endpoints, path, &body, auth, tls)
         }
         Cmd::Config { op } => {
             let (path, body) = match op {
@@ -677,7 +746,7 @@ fn run_admin(cli: &Cli, cmd: &Cmd) -> ExitCode {
                     ("/admin/config/set", json_kv2("key", key, "value", value))
                 }
             };
-            http::post(&endpoints, path, &body, auth)
+            http::post(&endpoints, path, &body, auth, tls)
         }
         // Export is intercepted in main() (it needs a SQL backend, not REST).
         Cmd::Export(_) => unreachable!("export is handled before run_admin"),
@@ -731,8 +800,8 @@ fn rest_endpoints(cli: &Cli) -> Vec<String> {
 /// Ask `/status` (unauthenticated) for the cluster members' client endpoints, so
 /// connecting to one seed yields the whole failover set. Best-effort: returns an
 /// empty list for a standalone node or any error.
-fn discover_peers(rest_endpoints: &[String]) -> Vec<String> {
-    let Ok((_, body)) = http::get(rest_endpoints, "/status", None) else {
+fn discover_peers(rest_endpoints: &[String], tls: Option<&http::TlsClient>) -> Vec<String> {
+    let Ok((_, body)) = http::get(rest_endpoints, "/status", None, tls) else {
         return Vec::new();
     };
     serde_json::from_str::<serde_json::Value>(&body)
@@ -1016,6 +1085,10 @@ mod tests {
             user: None,
             password: None,
             consistency: "quorum".into(),
+            tls: false,
+            tls_ca: None,
+            tls_insecure: false,
+            tls_server_name: "skaidb".into(),
             local: None,
             execute: None,
             file: None,

@@ -1134,10 +1134,12 @@ version = "0.105.1"
 dependencies = [
  "clap",
  "rcgen",
+ "rustls",
  "rustyline",
  "serde_json",
  "skaidb-driver",
  "skaidb-engine",
+ "skaidb-net",
  "skaidb-proto",
  "skaidb-sql",
  "skaidb-types",
@@ -1155,6 +1157,7 @@ dependencies = [
  "skaidb-auth",
  "skaidb-engine",
  "skaidb-fts",
+ "skaidb-net",
  "skaidb-proto",
  "skaidb-sql",
  "skaidb-storage",
@@ -1178,7 +1181,9 @@ dependencies = [
 name = "skaidb-driver"
 version = "0.105.1"
 dependencies = [
+ "rustls",
  "skaidb-auth",
+ "skaidb-net",
  "skaidb-proto",
  "skaidb-types",
  "thiserror",
@@ -1215,6 +1220,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "skaidb-net"
+version = "0.105.1"
+dependencies = [
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+]
+
+[[package]]
 name = "skaidb-proto"
 version = "0.105.1"
 dependencies = [
@@ -1227,6 +1241,8 @@ name = "skaidb-server"
 version = "0.105.1"
 dependencies = [
  "clap",
+ "rcgen",
+ "rustls",
  "serde_json",
  "signal-hook",
  "skaidb-auth",
@@ -1234,6 +1250,7 @@ dependencies = [
  "skaidb-config",
  "skaidb-driver",
  "skaidb-engine",
+ "skaidb-net",
  "skaidb-proto",
  "skaidb-sql",
  "skaidb-tsdb",

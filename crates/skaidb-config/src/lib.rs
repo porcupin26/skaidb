@@ -71,6 +71,23 @@ pub enum KekSource {
     Kms,
 }
 
+/// Client-facing TLS mode for the binary + REST ports.
+///
+/// - `Off` — plaintext only (default; back-compat).
+/// - `Opportunistic` — serve BOTH on the same port: a TLS ClientHello is
+///   wrapped, anything else stays plaintext (smooth migration).
+/// - `Required` — TLS only; plaintext connections are refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientTlsMode {
+    #[serde(alias = "disabled")]
+    Off,
+    #[serde(alias = "opt")]
+    Opportunistic,
+    #[serde(alias = "require")]
+    Required,
+}
+
 /// Top-level configuration mirroring SPEC §9.1.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -254,6 +271,8 @@ pub struct AuthConfig {
 pub struct EncryptionConfig {
     pub tls_cert_file: String,
     pub tls_key_file: String,
+    /// Client-facing TLS mode (binary + REST ports). Default `off`.
+    pub client_tls: ClientTlsMode,
     pub at_rest_enabled: bool,
     pub at_rest_kek_source: KekSource,
     pub at_rest_keyfile: String,
@@ -535,6 +554,7 @@ impl Default for EncryptionConfig {
         EncryptionConfig {
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
+            client_tls: ClientTlsMode::Off,
             at_rest_enabled: false,
             at_rest_kek_source: KekSource::Keyfile,
             at_rest_keyfile: String::new(),

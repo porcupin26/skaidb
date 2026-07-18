@@ -1,5 +1,5 @@
 [package]
-name = "skaidb-driver"
+name = "skaidb-net"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,9 +10,8 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-skaidb-types.workspace = true
-skaidb-proto.workspace = true
-skaidb-auth.workspace = true
-skaidb-net.workspace = true
 rustls.workspace = true
-thiserror.workspace = true
+rustls-pemfile.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true

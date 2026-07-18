@@ -10,6 +10,7 @@ members = [
     "crates/skaidb-fts",
     "crates/skaidb-engine",
     "crates/skaidb-cluster",
+    "crates/skaidb-net",
     "crates/skaidb-proto",
     "crates/skaidb-server",
     "crates/skaidb-driver",
@@ -33,6 +34,7 @@ skaidb-sql = { path = "crates/skaidb-sql" }
 skaidb-fts = { path = "crates/skaidb-fts" }
 skaidb-engine = { path = "crates/skaidb-engine" }
 skaidb-cluster = { path = "crates/skaidb-cluster" }
+skaidb-net = { path = "crates/skaidb-net" }
 skaidb-proto = { path = "crates/skaidb-proto" }
 skaidb-driver = { path = "crates/skaidb-driver" }
 

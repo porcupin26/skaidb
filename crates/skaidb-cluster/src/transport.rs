@@ -20,7 +20,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned};
 use skaidb_auth::crypto::{ct_eq, hmac_sha256};
 use skaidb_proto::{read_frame, write_frame};
@@ -185,9 +185,9 @@ impl Authenticator {
         // Install the ring crypto provider for this process (idempotent).
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let certs = load_certs(cert_path)?;
-        let key = load_key(key_path)?;
-        let ca = load_certs(ca_path)?;
+        let certs = skaidb_net::load_certs(cert_path)?;
+        let key = skaidb_net::load_key(key_path)?;
+        let ca = skaidb_net::load_certs(ca_path)?;
 
         let mut roots = RootCertStore::empty();
         for c in ca {
@@ -342,25 +342,6 @@ fn random_nonce() -> [u8; 32] {
         ^ (std::process::id() as u64).rotate_left(32)
         ^ CTR.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
     hmac_sha256(&seed.to_le_bytes(), b"skaidb-nonce")
-}
-
-fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, String> {
-    let f = File::open(path).map_err(|e| format!("open {path}: {e}"))?;
-    let mut r = BufReader::new(f);
-    let certs: Result<Vec<_>, _> = rustls_pemfile::certs(&mut r).collect();
-    let certs = certs.map_err(|e| format!("parse certs {path}: {e}"))?;
-    if certs.is_empty() {
-        return Err(format!("no certificates in {path}"));
-    }
-    Ok(certs)
-}
-
-fn load_key(path: &str) -> Result<PrivateKeyDer<'static>, String> {
-    let f = File::open(path).map_err(|e| format!("open {path}: {e}"))?;
-    let mut r = BufReader::new(f);
-    rustls_pemfile::private_key(&mut r)
-        .map_err(|e| format!("parse key {path}: {e}"))?
-        .ok_or_else(|| format!("no private key in {path}"))
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 //! Binary (raw-TCP fast-path) endpoint (SPEC §11).
 
-use std::io::{self, BufReader};
+use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::thread::{self, JoinHandle};
 
@@ -42,45 +42,46 @@ struct PreparedStmt {
 pub fn spawn(addr: &str, ctx: Shared) -> io::Result<(std::net::SocketAddr, JoinHandle<()>)> {
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
-    let handle = thread::spawn(move || serve(listener, ctx));
+    // Build the client-TLS acceptor once; a misconfiguration fails startup here
+    // (loud) instead of silently serving plaintext.
+    let acceptor = crate::tls::build(&ctx)?;
+    let handle = thread::spawn(move || serve(listener, ctx, acceptor));
     Ok((local, handle))
 }
 
 /// Accept connections forever, handling each on its own thread.
-pub fn serve(listener: TcpListener, ctx: Shared) {
+pub fn serve(listener: TcpListener, ctx: Shared, acceptor: Option<crate::tls::Acceptor>) {
     for stream in listener.incoming().flatten() {
         let ctx = ctx.clone();
+        let acceptor = acceptor.clone();
         thread::spawn(move || {
             ctx.metrics.connection_opened(Endpoint::Binary);
-            handle_connection(stream, ctx.clone());
+            handle_connection(stream, ctx.clone(), acceptor.as_ref());
             ctx.metrics.connection_closed(Endpoint::Binary);
         });
     }
 }
 
 /// Serve requests on one connection until the peer disconnects.
-fn handle_connection(stream: TcpStream, ctx: Shared) {
-    stream.set_nodelay(true).ok();
-
-    // Split the socket once per connection: the read side goes behind a
-    // `BufReader` so each frame costs one read syscall instead of two
-    // (length prefix + payload). The write side stays unbuffered —
-    // `write_frame` already coalesces header and payload into a single
-    // write, so flush semantics are unchanged.
-    let mut writer = match stream.try_clone() {
-        Ok(w) => w,
-        Err(_) => return,
+fn handle_connection(stream: TcpStream, ctx: Shared, acceptor: Option<&crate::tls::Acceptor>) {
+    // Wrap in TLS per the acceptor policy (or refuse a plaintext peer under
+    // `required`). A rustls session can't be split into separate reader/writer
+    // handles, so the whole connection runs on one buffered `Conn`: reads go
+    // through its buffer (one syscall per frame), writes go straight to the
+    // stream (`write_frame` already coalesces header + payload).
+    let Some(net_stream) = crate::tls::wrap(stream, acceptor) else {
+        return; // plaintext refused, or TLS handshake failed
     };
-    let remote_addr = writer
+    let mut conn = skaidb_net::Conn::new(net_stream);
+    let remote_addr = conn
         .peer_addr()
         .map(|a| a.to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
-    let mut reader = BufReader::new(stream);
+        .unwrap_or_else(|| "unknown".to_string());
 
     // SCRAM handshake first; the resolved role authorizes every later
-    // statement. The handshake shares this connection's `BufReader`, so bytes
+    // statement. The handshake shares this connection's read buffer, so bytes
     // it buffered ahead are still available to the request loop below.
-    let role = match authenticate(&mut reader, &mut writer, &ctx) {
+    let role = match authenticate(&mut conn, &ctx) {
         Ok(role) => role,
         Err(()) => return, // denied or framing error → drop the connection
     };
@@ -110,7 +111,7 @@ fn handle_connection(stream: TcpStream, ctx: Shared) {
     let mut outbuf = Vec::new();
     let mut prepared: Vec<Option<PreparedStmt>> = Vec::new();
     loop {
-        if read_frame_into(&mut reader, &mut inbuf).is_err() {
+        if read_frame_into(&mut conn, &mut inbuf).is_err() {
             return; // disconnect or framing error
         }
         // Pipelining: a tagged request's id is echoed on every frame the
@@ -136,7 +137,7 @@ fn handle_connection(stream: TcpStream, ctx: Shared) {
                 let c = session_consistency.unwrap_or(consistency);
                 let response =
                     execute_session_as(&ctx, &role, &mut current_db, &sql, Some(c));
-                if write_streamed(&mut writer, &mut outbuf, response, &ctx, tag).is_err() {
+                if write_streamed(&mut conn, &mut outbuf, response, &ctx, tag).is_err() {
                     return;
                 }
                 continue;
@@ -234,7 +235,7 @@ fn handle_connection(stream: TcpStream, ctx: Shared) {
         }
         ctx.metrics
             .add_bytes_returned(Endpoint::Binary, (outbuf.len() - 4) as u64);
-        if finish_frame(&mut writer, &mut outbuf).is_err() {
+        if finish_frame(&mut conn, &mut outbuf).is_err() {
             return;
         }
     }
@@ -246,8 +247,8 @@ fn handle_connection(stream: TcpStream, ctx: Shared) {
 /// cost is the materialized rows plus one chunk — never a second full encoded
 /// copy of the result. Non-row results go out as one ordinary frame. Under
 /// pipelining (`tag`), every frame of the stream carries the request id.
-fn write_streamed(
-    writer: &mut TcpStream,
+fn write_streamed<W: io::Write>(
+    writer: &mut W,
     outbuf: &mut Vec<u8>,
     response: Response,
     ctx: &Shared,
@@ -259,7 +260,7 @@ fn write_streamed(
             tag_response(outbuf, id);
         }
     };
-    let send = |writer: &mut TcpStream, outbuf: &mut Vec<u8>| {
+    let send = |writer: &mut W, outbuf: &mut Vec<u8>| {
         ctx.metrics
             .add_bytes_returned(Endpoint::Binary, (outbuf.len() - 4) as u64);
         finish_frame(writer, outbuf)
@@ -331,12 +332,8 @@ fn prepare(prepared: &mut Vec<Option<PreparedStmt>>, sql: String) -> Response {
 }
 
 /// Run the server side of the SCRAM handshake, returning the authorized role.
-fn authenticate(
-    reader: &mut BufReader<TcpStream>,
-    writer: &mut TcpStream,
-    ctx: &Shared,
-) -> Result<String, ()> {
-    let start = AuthStart::decode(&read_frame(reader).map_err(|_| ())?).map_err(|_| ())?;
+fn authenticate<C: io::Read + io::Write>(conn: &mut C, ctx: &Shared) -> Result<String, ()> {
+    let start = AuthStart::decode(&read_frame(conn).map_err(|_| ())?).map_err(|_| ())?;
 
     let account = ctx.lookup_account(&start.username);
     let (salt, iterations) = ctx.authn.salt_for(account.as_ref());
@@ -346,9 +343,9 @@ fn authenticate(
         iterations,
         server_nonce: server_nonce.clone(),
     };
-    write_frame(writer, &challenge.encode()).map_err(|_| ())?;
+    write_frame(conn, &challenge.encode()).map_err(|_| ())?;
 
-    let finish = AuthFinish::decode(&read_frame(reader).map_err(|_| ())?).map_err(|_| ())?;
+    let finish = AuthFinish::decode(&read_frame(conn).map_err(|_| ())?).map_err(|_| ())?;
     let am = auth_message(
         &start.username,
         &start.client_nonce,
@@ -367,13 +364,13 @@ fn authenticate(
             role,
             server_signature,
         } => {
-            write_frame(writer, &AuthOutcome::Ok { server_signature }.encode()).map_err(|_| ())?;
+            write_frame(conn, &AuthOutcome::Ok { server_signature }.encode()).map_err(|_| ())?;
             ctx.metrics.incr_login();
             ctx.audit().log_login(&start.username, Some(&role), true);
             Ok(role)
         }
         AuthResult::Denied(reason) => {
-            let _ = write_frame(writer, &AuthOutcome::Denied { reason }.encode());
+            let _ = write_frame(conn, &AuthOutcome::Denied { reason }.encode());
             ctx.metrics.incr_login_failure();
             ctx.audit().log_login(&start.username, None, false);
             Err(())

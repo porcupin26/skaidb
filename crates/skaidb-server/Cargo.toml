@@ -22,6 +22,8 @@ skaidb-config.workspace = true
 skaidb-engine.workspace = true
 skaidb-tsdb.workspace = true
 skaidb-cluster.workspace = true
+skaidb-net.workspace = true
+rustls.workspace = true
 skaidb-proto.workspace = true
 skaidb-types.workspace = true
 skaidb-auth.workspace = true
@@ -49,4 +51,7 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 # the iterator API doesn't exist on Windows.
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"
+
+[dev-dependencies]
+rcgen.workspace = true
 

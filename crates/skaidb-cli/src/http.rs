@@ -5,7 +5,19 @@
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::sync::Arc;
 use std::time::Duration;
+
+/// Client-side TLS for the REST control plane (mirrors the SQL driver's).
+#[derive(Clone)]
+pub struct TlsClient {
+    pub cfg: Arc<rustls::ClientConfig>,
+    pub server_name: String,
+}
+
+/// A read+write byte stream, so `request` can hold either plaintext or TLS.
+trait ReadWrite: Read + Write {}
+impl<T: Read + Write> ReadWrite for T {}
 
 /// Basic-auth credentials for authenticated (`/admin/*`) routes.
 pub type Auth<'a> = Option<(&'a str, &'a str)>;
@@ -17,13 +29,19 @@ pub fn post(
     path: &str,
     body: &str,
     auth: Auth,
+    tls: Option<&TlsClient>,
 ) -> io::Result<(u16, String)> {
-    try_each(endpoints, |addr| request(addr, "POST", path, body, auth))
+    try_each(endpoints, |addr| request(addr, "POST", path, body, auth, tls))
 }
 
 /// `GET path` from the first reachable endpoint.
-pub fn get(endpoints: &[String], path: &str, auth: Auth) -> io::Result<(u16, String)> {
-    try_each(endpoints, |addr| request(addr, "GET", path, "", auth))
+pub fn get(
+    endpoints: &[String],
+    path: &str,
+    auth: Auth,
+    tls: Option<&TlsClient>,
+) -> io::Result<(u16, String)> {
+    try_each(endpoints, |addr| request(addr, "GET", path, "", auth, tls))
 }
 
 /// Run `f` against each endpoint until one succeeds; return the last error.
@@ -48,10 +66,15 @@ fn request(
     path: &str,
     body: &str,
     auth: Auth,
+    tls: Option<&TlsClient>,
 ) -> io::Result<(u16, String)> {
-    let mut stream = TcpStream::connect(addr)?;
-    stream.set_read_timeout(Some(Duration::from_secs(300)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    let tcp = TcpStream::connect(addr)?;
+    tcp.set_read_timeout(Some(Duration::from_secs(300)))?;
+    tcp.set_write_timeout(Some(Duration::from_secs(30)))?;
+    let mut stream: Box<dyn ReadWrite> = match tls {
+        Some(t) => Box::new(skaidb_net::connect_tls(tcp, t.cfg.clone(), &t.server_name)?),
+        None => Box::new(tcp),
+    };
 
     let mut head = format!(
         "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\

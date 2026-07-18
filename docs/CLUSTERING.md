@@ -446,10 +446,46 @@ node that silently came up unauthenticated. Client auth is separate — SCRAM on
 the binary endpoint and HTTP Basic on REST, plus RBAC; see the
 [README](../README.md).
 
-> **Encryption note:** only `cert` mode encrypts the channel. `none` and
-> `token` are plaintext on the wire (`token` authenticates but does not
-> encrypt). At-rest data and client↔cluster traffic are separate concerns —
-> at-rest encryption and client TLS are tracked features, not yet shipped.
+> **Encryption note:** only `cert` mode encrypts the internode channel.
+> `none` and `token` are plaintext on the wire (`token` authenticates but does
+> not encrypt).
+
+### Client TLS (driver ↔ cluster)
+
+The binary (7000) and REST (7080) ports can be TLS-wrapped independently of
+internode mode. Set `[encryption]`:
+
+```toml
+[encryption]
+client_tls = "opportunistic"   # off | opportunistic | required
+tls_cert_file = "/etc/skaidb/server.crt"
+tls_key_file  = "/etc/skaidb/server.key"
+```
+
+- **`off`** (default) — plaintext only.
+- **`opportunistic`** — one port serves both: a TLS ClientHello is wrapped, a
+  plaintext connection is served as before. Use this to migrate — point every
+  client at TLS, confirm, then switch to `required`.
+- **`required`** — plaintext connections (including probes on the REST port)
+  are refused. TLS only.
+
+Clients authenticate with SCRAM/HTTP-Basic **inside** the TLS channel (client
+certs are not required — this is one-way server TLS). A misconfiguration
+(`client_tls` on but cert/key unset) fails the listener startup **loud**,
+never silently plaintext; the effective mode shows at `GET /status` as
+`client_tls`. The server cert can be any TLS cert; the cluster CA from
+`skaidbsh certs gen` works (its node certs carry SAN `skaidb`). Connect with:
+
+```bash
+skaidbsh -H node --tls --tls-ca ca.crt          # verify against the cluster CA
+skaidbsh -H node --tls --tls-insecure           # self-signed / dev (INSECURE)
+# --tls-server-name <name>  overrides the verified SAN (default: skaidb)
+```
+
+The driver takes `Client::connect_many_tls(endpoints, user, pw, Some(tls))`.
+
+> **Not yet shipped:** at-rest encryption (`encryption.at_rest_*` config
+> exists but is inert).
 
 ## Resilience
 

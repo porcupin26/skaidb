@@ -652,7 +652,14 @@ memory_target (`"auto"`, `"1GB"` — budgets memtable + read cache + FTS
 writer heaps + TS heads; set explicitly in containers), memtable_size_mb,
 read_cache_entries, scan_row_budget (rows one statement may examine,
 default 250000, 0 = off), statement_timeout_secs (default 120, 0 = off);
-`[observability]` slow_query_ms, query_log_*,
+`[encryption]` client_tls (`off`/`opportunistic`/`required` — client-facing
+TLS for the binary + REST ports; `opportunistic` serves TLS and plaintext on
+one port [ClientHello sniff], `required` refuses plaintext) with
+tls_cert_file + tls_key_file. Effective mode shows at `/status` as
+`client_tls`. Clients pass `--tls --tls-ca <ca.crt>` (or `--tls-insecure` for
+self-signed; `--tls-server-name`, default `skaidb`) to `skaidbsh`; the driver
+takes `Client::connect_many_tls(...)`. (at_rest_* config exists but at-rest
+encryption is not yet implemented.) `[observability]` slow_query_ms, query_log_*,
 log_format/log_file, per_table_metrics, prometheus_port, self_scrape,
 self_scrape_interval_secs, node_stats, node_stats_interval_secs; `[ui]` enabled;
 `[witness]` enabled, primary_sql_addrs, primary_internode_addrs, user,

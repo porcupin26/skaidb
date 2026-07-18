@@ -21,6 +21,7 @@ pub mod metrics;
 pub mod rest;
 pub mod shared;
 pub mod slowlog;
+pub mod tls;
 mod ui;
 mod witness_pull;
 mod witnesses;
@@ -1752,6 +1753,76 @@ pub(crate) mod tests {
         assert!(Client::connect_with(addr, "ada", "WRONG").is_err());
         assert!(Client::connect_with(addr, "ghost", "x").is_err());
         assert!(Client::connect(addr).is_err());
+    }
+
+    /// Client TLS on the binary port: a `required`-TLS server refuses a
+    /// plaintext driver, accepts a CA-verifying TLS driver (SCRAM still
+    /// enforced inside TLS), and rejects a wrong password over TLS.
+    #[test]
+    fn client_tls_required_rejects_plaintext_accepts_tls() {
+        use skaidb_config::ClientTlsMode;
+        use skaidb_driver::{Client, TlsConfig, TlsVerify};
+        // Mint a server cert (SAN `skaidb`) + CA into a temp dir.
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let (ca, crt, key) = {
+            use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+            let mut ca_p = CertificateParams::new(Vec::new()).unwrap();
+            ca_p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            let ca_key = KeyPair::generate().unwrap();
+            let ca = ca_p.self_signed(&ca_key).unwrap();
+            let leaf_p = CertificateParams::new(vec!["skaidb".to_string()]).unwrap();
+            let leaf_key = KeyPair::generate().unwrap();
+            let leaf = leaf_p.signed_by(&leaf_key, &ca, &ca_key).unwrap();
+            let ca_path = dir.join("ca.crt");
+            let crt = dir.join("s.crt");
+            let key = dir.join("s.key");
+            std::fs::write(&ca_path, ca.pem()).unwrap();
+            std::fs::write(&crt, leaf.pem()).unwrap();
+            std::fs::write(&key, leaf_key.serialize_pem()).unwrap();
+            (
+                ca_path.to_str().unwrap().to_string(),
+                crt.to_str().unwrap().to_string(),
+                key.to_str().unwrap().to_string(),
+            )
+        };
+        let ctx = auth_ctx();
+        {
+            let mut cfg = ctx.config.write().unwrap();
+            cfg.encryption.tls_cert_file = crt;
+            cfg.encryption.tls_key_file = key;
+            cfg.encryption.client_tls = ClientTlsMode::Required;
+        }
+        let (addr, _h) = binary::spawn("127.0.0.1:0", ctx).unwrap();
+
+        // Plaintext driver is refused under `required`.
+        assert!(
+            Client::connect_with(addr, "ada", "pencil").is_err(),
+            "plaintext must be refused when client_tls = required"
+        );
+
+        // TLS driver verifying the cluster CA connects and runs statements;
+        // SCRAM is still enforced (a wrong password fails inside TLS).
+        let tls = || TlsConfig::new(TlsVerify::CaFile(ca.clone()), "skaidb").unwrap();
+        let mut c =
+            Client::connect_many_tls(&[addr.to_string()], "ada", "pencil", Some(tls()))
+                .expect("CA-verifying TLS client must connect");
+        assert_eq!(
+            c.execute("CREATE TABLE tls_t (PRIMARY KEY (id))").unwrap(),
+            Response::Ddl
+        );
+        assert!(
+            Client::connect_many_tls(&[addr.to_string()], "ada", "WRONG", Some(tls()))
+                .is_err(),
+            "wrong password must be rejected even over TLS"
+        );
+
+        // Insecure verification (self-signed acceptance) also connects.
+        let ins = TlsConfig::new(TlsVerify::Insecure, "skaidb").unwrap();
+        assert!(
+            Client::connect_many_tls(&[addr.to_string()], "ada", "pencil", Some(ins)).is_ok(),
+            "insecure TLS client must connect to the self-signed server"
+        );
     }
 
     #[test]

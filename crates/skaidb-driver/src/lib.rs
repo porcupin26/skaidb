@@ -9,6 +9,7 @@
 
 use std::io;
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -59,8 +60,53 @@ pub struct Client {
     password: String,
     /// The endpoint the live `stream` is connected to.
     connected: String,
-    stream: TcpStream,
+    stream: skaidb_net::Stream,
+    /// Client-TLS settings applied to every (re)connect; `None` = plaintext.
+    tls: Option<TlsConfig>,
     default_consistency: Consistency,
+}
+
+/// Client-side TLS settings for a [`Client`]: the built rustls config plus the
+/// SNI/verification name. Build with [`TlsConfig::new`].
+#[derive(Clone)]
+pub struct TlsConfig {
+    cfg: Arc<rustls::ClientConfig>,
+    server_name: String,
+}
+
+impl std::fmt::Debug for TlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsConfig")
+            .field("server_name", &self.server_name)
+            .finish_non_exhaustive()
+    }
+}
+
+/// How the driver verifies the server's certificate.
+#[derive(Debug, Clone)]
+pub enum TlsVerify {
+    /// Trust server certs chaining to this CA file (the cluster CA).
+    CaFile(String),
+    /// Skip verification — self-signed/dev only. INSECURE.
+    Insecure,
+}
+
+impl TlsConfig {
+    /// Build a client-TLS config. `server_name` is the SNI/verification name
+    /// (the SAN on the server's cert — `skaidb` for certs from
+    /// `skaidbsh certs gen`).
+    pub fn new(verify: TlsVerify, server_name: &str) -> Result<TlsConfig, DriverError> {
+        let v = match verify {
+            TlsVerify::CaFile(p) => skaidb_net::ClientVerify::CaFile(p),
+            TlsVerify::Insecure => skaidb_net::ClientVerify::Insecure,
+        };
+        let cfg = skaidb_net::client_config(v, None)
+            .map_err(|e| DriverError::Io(io::Error::new(io::ErrorKind::InvalidInput, e)))?;
+        Ok(TlsConfig {
+            cfg,
+            server_name: server_name.to_string(),
+        })
+    }
 }
 
 impl Client {
@@ -96,13 +142,25 @@ impl Client {
         username: &str,
         password: &str,
     ) -> Result<Client, DriverError> {
+        Client::connect_many_tls(endpoints, username, password, None)
+    }
+
+    /// [`Client::connect_many`] with client-side TLS. `tls = None` is plaintext
+    /// (identical to `connect_many`); `Some(cfg)` wraps every connection —
+    /// including failover reconnects — in TLS.
+    pub fn connect_many_tls(
+        endpoints: &[String],
+        username: &str,
+        password: &str,
+        tls: Option<TlsConfig>,
+    ) -> Result<Client, DriverError> {
         let ordered = order_by_latency(&dedup(endpoints));
         if ordered.is_empty() {
             return Err(DriverError::NoEndpoint("no endpoints given".into()));
         }
         let mut last = String::new();
         for ep in &ordered {
-            match dial(ep, username, password) {
+            match dial(ep, username, password, tls.as_ref()) {
                 Ok(stream) => {
                     let connected = ep.clone();
                     return Ok(Client {
@@ -111,6 +169,7 @@ impl Client {
                         password: password.to_string(),
                         connected,
                         stream,
+                        tls,
                         default_consistency: Consistency::Quorum,
                     });
                 }
@@ -448,7 +507,7 @@ impl Client {
         ordered.sort_by_key(|e| *e == self.connected);
         let mut last = String::new();
         for ep in &ordered {
-            match dial(ep, &self.username, &self.password) {
+            match dial(ep, &self.username, &self.password, self.tls.as_ref()) {
                 Ok(stream) => {
                     self.stream = stream;
                     self.connected = ep.clone();
@@ -534,9 +593,18 @@ impl Drop for RowStream<'_> {
 }
 
 /// Open a TCP connection to `endpoint` and run the SCRAM handshake.
-fn dial(endpoint: &str, username: &str, password: &str) -> Result<TcpStream, DriverError> {
-    let mut stream = TcpStream::connect(endpoint)?;
-    stream.set_nodelay(true).ok();
+fn dial(
+    endpoint: &str,
+    username: &str,
+    password: &str,
+    tls: Option<&TlsConfig>,
+) -> Result<skaidb_net::Stream, DriverError> {
+    let tcp = TcpStream::connect(endpoint)?;
+    tcp.set_nodelay(true).ok();
+    let mut stream = match tls {
+        Some(t) => skaidb_net::connect_tls(tcp, t.cfg.clone(), &t.server_name)?,
+        None => skaidb_net::Stream::Plain(tcp),
+    };
     handshake(&mut stream, username, password)?;
     Ok(stream)
 }
@@ -619,7 +687,11 @@ fn cached_salted_password(password: &str, salt: &[u8], iterations: u32) -> [u8; 
 
 /// Run the client side of the SCRAM handshake. When `password` is non-empty,
 /// the server's signature is verified for mutual authentication.
-fn handshake(stream: &mut TcpStream, username: &str, password: &str) -> Result<(), DriverError> {
+fn handshake<S: io::Read + io::Write>(
+    stream: &mut S,
+    username: &str,
+    password: &str,
+) -> Result<(), DriverError> {
     static NONCE: AtomicU64 = AtomicU64::new(0);
     let client_nonce = format!(
         "c{}.{}",

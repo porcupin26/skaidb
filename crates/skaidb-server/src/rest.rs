@@ -5,7 +5,7 @@
 //! an error. A minimal HTTP/1.1 implementation keeps the dependency surface
 //! small; it serves one request per connection (`Connection: close`).
 
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read};
 use std::net::{TcpListener, TcpStream};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -34,27 +34,40 @@ const MAX_BODY_LEN: usize = skaidb_proto::MAX_FRAME_LEN as usize;
 pub fn spawn(addr: &str, ctx: Shared) -> io::Result<(std::net::SocketAddr, JoinHandle<()>)> {
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
-    let handle = thread::spawn(move || serve(listener, ctx));
+    let acceptor = crate::tls::build(&ctx)?;
+    let handle = thread::spawn(move || serve(listener, ctx, acceptor));
     Ok((local, handle))
 }
 
 /// Accept connections forever, handling each on its own thread.
-pub fn serve(listener: TcpListener, ctx: Shared) {
+pub fn serve(listener: TcpListener, ctx: Shared, acceptor: Option<crate::tls::Acceptor>) {
     for stream in listener.incoming().flatten() {
         // Best-effort: a socket that rejects the option still gets served,
         // it just keeps the old unbounded behavior.
         let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
         let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
         let ctx = ctx.clone();
+        let acceptor = acceptor.clone();
         thread::spawn(move || {
             ctx.metrics.connection_opened(Endpoint::Rest);
-            let _ = handle_connection(stream, ctx.clone());
+            let _ = handle_connection(stream, ctx.clone(), acceptor.as_ref());
             ctx.metrics.connection_closed(Endpoint::Rest);
         });
     }
 }
 
-fn handle_connection(mut stream: TcpStream, ctx: Shared) -> io::Result<()> {
+fn handle_connection(
+    tcp: TcpStream,
+    ctx: Shared,
+    acceptor: Option<&crate::tls::Acceptor>,
+) -> io::Result<()> {
+    // Wrap per the client-TLS policy (or drop a plaintext peer under
+    // `required`). Probes (`/health` etc.) share this port, so under
+    // `required` they must speak TLS too.
+    let Some(net_stream) = crate::tls::wrap(tcp, acceptor) else {
+        return Ok(()); // plaintext refused, or handshake failed
+    };
+    let mut stream = net_stream;
     let req = match read_request(&mut stream) {
         Ok(Some(req)) => req,
         Ok(None) => return Ok(()),
@@ -424,8 +437,8 @@ fn handle_connection(mut stream: TcpStream, ctx: Shared) -> io::Result<()> {
 /// serializing ~64 KiB at a time. Returns the body bytes written. The
 /// socket's write timeout bounds each chunk, so a stalled reader aborts the
 /// handler instead of pinning the buffers.
-fn write_rows_chunked(
-    stream: &mut TcpStream,
+fn write_rows_chunked<W: io::Write>(
+    stream: &mut W,
     columns: &[String],
     rows: &[Vec<skaidb_types::Value>],
 ) -> io::Result<u64> {
@@ -435,7 +448,7 @@ fn write_rows_chunked(
     )?;
     let mut sent: u64 = 0;
     let mut buf = String::with_capacity(FLUSH_AT + 8 * 1024);
-    fn flush_chunk(stream: &mut TcpStream, buf: &mut String) -> io::Result<u64> {
+    fn flush_chunk<W: io::Write>(stream: &mut W, buf: &mut String) -> io::Result<u64> {
         if buf.is_empty() {
             return Ok(0);
         }
@@ -497,7 +510,7 @@ fn classify_rest(method: &str, path: &str) -> RestPath {
     }
 }
 
-fn read_request(stream: &mut TcpStream) -> io::Result<Option<HttpRequest>> {
+fn read_request<R: io::Read>(stream: &mut R) -> io::Result<Option<HttpRequest>> {
     let mut reader = BufReader::new(&mut *stream);
 
     let mut request_line = String::new();
@@ -559,7 +572,7 @@ fn basic_auth_role(ctx: &Shared, authorization: Option<&str>) -> Option<String> 
     crate::authn::AuthState::verify_password(ctx.lookup_account(user).as_ref(), pass)
 }
 
-fn write_unauthorized(stream: &mut TcpStream) -> io::Result<()> {
+fn write_unauthorized<W: io::Write>(stream: &mut W) -> io::Result<()> {
     let body = json!({"error": "authentication required"}).to_string();
     let head = format!(
         "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"skaidb\"\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -723,6 +736,17 @@ fn extract_sql(body: &str) -> (String, Option<String>) {
 /// the default consistency levels, and the members' client (SQL) endpoints so a
 /// client that reached one seed can discover its peers for failover. Carries no
 /// credentials or data, so it can be handed to a monitoring scraper.
+/// The effective client-facing TLS mode (`off`/`opportunistic`/`required`)
+/// from config, for `/status`.
+fn client_tls_mode(ctx: &Shared) -> &'static str {
+    use skaidb_config::ClientTlsMode;
+    match ctx.config_snapshot().encryption.client_tls {
+        ClientTlsMode::Off => "off",
+        ClientTlsMode::Opportunistic => "opportunistic",
+        ClientTlsMode::Required => "required",
+    }
+}
+
 fn status_json(ctx: &Shared) -> Json {
     match ctx.backend.cluster_stats() {
         Some(c) => {
@@ -785,13 +809,14 @@ fn status_json(ctx: &Shared) -> Json {
                 "read_consistency": c.read_consistency,
                 "write_consistency": c.write_consistency,
                 // Security posture — surfaced so a plaintext/unauthenticated
-                // internode (a silent misconfiguration) is visible. Extends
-                // to client-TLS + at-rest as those land.
+                // internode or client port (a silent misconfiguration) is
+                // visible. `at_rest` joins these when it lands.
                 "internode_auth": ctx.backend.internode_auth_mode().unwrap_or("none"),
+                "client_tls": client_tls_mode(ctx),
                 "ready": ctx.backend.is_ready(),
             })
         }
-        None => json!({ "clustered": false, "ready": ctx.backend.is_ready() }),
+        None => json!({ "clustered": false, "client_tls": client_tls_mode(ctx), "ready": ctx.backend.is_ready() }),
     }
 }
 
@@ -858,13 +883,13 @@ fn response_to_json(response: Response) -> (u16, Json) {
     }
 }
 
-fn write_response(stream: &mut TcpStream, status: u16, body: &Json) -> io::Result<()> {
+fn write_response<W: io::Write>(stream: &mut W, status: u16, body: &Json) -> io::Result<()> {
     write_json_body(stream, status, &body.to_string())
 }
 
 /// Write an already-serialized JSON body (callers that also meter the body
 /// size pass the one serialization here instead of re-serializing).
-fn write_json_body(stream: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
+fn write_json_body<W: io::Write>(stream: &mut W, status: u16, body: &str) -> io::Result<()> {
     let reason = http_reason(status);
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -876,7 +901,7 @@ fn write_json_body(stream: &mut TcpStream, status: u16, body: &str) -> io::Resul
 }
 
 /// Write a plain-text response (used by `/metrics`, `/health`, `/ready`).
-fn write_text(stream: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
+fn write_text<W: io::Write>(stream: &mut W, status: u16, body: &str) -> io::Result<()> {
     let reason = http_reason(status);
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -888,7 +913,7 @@ fn write_text(stream: &mut TcpStream, status: u16, body: &str) -> io::Result<()>
 }
 
 /// Write an embedded UI asset with the UI's Content-Security-Policy header.
-fn write_asset(stream: &mut TcpStream, asset: &crate::ui::Asset) -> io::Result<()> {
+fn write_asset<W: io::Write>(stream: &mut W, asset: &crate::ui::Asset) -> io::Result<()> {
     let reason = http_reason(asset.status);
     // `no-cache` = the browser may keep a copy but must revalidate before use,
     // so a server upgrade always serves the new UI instead of a stale cached
