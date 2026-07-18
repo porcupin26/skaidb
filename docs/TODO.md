@@ -143,6 +143,26 @@ lives in [BENCHMARKS.md](BENCHMARKS.md#performance-engineering-notes).)
   the full gather-then-sort; (c) `EXPLAIN` doesn't yet report the
   PK-ordered walk or the bounded top-k (shows "full table scan"), the
   same under-reporting E-8 notes for PK-prefix plans.
+- [ ] **[perf] Standalone deployments have NO memory-pressure release
+  loop** — surfaced by the witness's first sync (2026-07-18, five OOM
+  iterations): the engine's bulk-apply path (`apply_batch_buffered` and
+  kin) leaves flushing to its caller, and only cluster mode has the
+  Node-level shedding/release tier (v0.70.15) that provides it. A
+  standalone node bulk-ingesting therefore accumulates memtables (and,
+  if the caller forgets, unsynced WAL buffers) until the cgroup kill.
+  The witness now self-manages (per-page WAL sync, flush every 32
+  pages), but the underlying asymmetry remains for any standalone bulk
+  writer. Consider: `apply_*_buffered` self-triggering flush at the
+  memtable cap, or porting a minimal release tier to `Backend::Local`.
+- [ ] **[perf] The point-read cache is entry-capped, byte-blind** —
+  `read_cache_entries` counts entries, so a workload of multi-KB rows
+  (the 181k × ~6 KB vector rows) occupies an order of magnitude more
+  RAM than the `memory_target` budget assumed; mass point reads of
+  large rows ramped the witness to its ceiling even with memtables
+  flat (fixed on the witness by switching its staleness guard to the
+  value-free stamps walk — but any client doing bulk point reads of
+  large rows can still blow the cache budget). Consider a byte-cap
+  (weight-based eviction) alongside the entry cap.
 - [ ] **[perf] Active memory release at the cgroup ceiling (skai2 #8)** —
   three production wedges in five days (2026-07-11/13/15): RSS ratchets to
   the 4 GB cgroup limit and stays there, starving file cache into an IO
