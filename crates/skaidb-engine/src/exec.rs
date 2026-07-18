@@ -5943,6 +5943,17 @@ impl Database {
     /// trigger it and the node deadlocks (sheds → no write → no flush → stays
     /// shedding). Returns bytes reclaimed; trivially small memtables are skipped
     /// so this doesn't litter tiny SSTables.
+    /// Push the deepest-level tombstone-retention window to every TABLE
+    /// engine (indexes are local derived data — never pulled by a witness —
+    /// so their tombstones keep dropping immediately). Tables created after
+    /// this call start at 0 and pick the value up on the next push (the
+    /// server re-pushes every minute).
+    pub fn set_tombstone_retention_ms(&mut self, ms: u64) {
+        for engine in self.tables.values_mut() {
+            engine.set_tombstone_retention_ms(ms);
+        }
+    }
+
     pub fn flush_memtables_under_pressure(&mut self) -> usize {
         self.release_memory_under_pressure(false)
     }

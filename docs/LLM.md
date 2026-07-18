@@ -462,7 +462,14 @@ WHERE ts >= now() - 6h GROUP BY t;
   layer, so read-only never blocks it). The single-row
   `witness_gc_config` table holds `grace_period_secs` (default 7 days) —
   cluster-consistent because it is a table row, settable with a plain
-  `UPDATE`. Registered witnesses + live drivers appear on the UI status
+  `UPDATE` — and it is ACTIVE: every minute each node sizes a deepest-
+  level tombstone-retention window from the registry (how far back the
+  least-caught-up live witness is, from its heartbeat watermarks, capped
+  at the grace period) so a delete marker is never purged before every
+  live witness has pulled it — the delete would otherwise resurrect on
+  the backup. A witness quiet past the grace period stops holding GC
+  (it must full-resync, and for missed deletes be rebuilt); with no
+  registered witnesses tombstones drop immediately, as always. Registered witnesses + live drivers appear on the UI status
   tab.
 - **Read-only mode** (`server.read_only`, default false, **live-mutable**:
   `SET CONFIG server.read_only = 'true'`): rejects every client mutation —

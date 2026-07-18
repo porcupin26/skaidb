@@ -421,6 +421,31 @@ pub fn run(
     // with a logged refusal, otherwise — see witness_pull.rs).
     witness_pull::spawn_if_enabled(ctx.clone());
 
+    // Witness-aware garbage collection: every minute, size the deepest-
+    // level tombstone-retention window from the witness registry (how far
+    // back the least-caught-up live witness is, capped at the grace
+    // period) and push it into the storage engines — a tombstone purged
+    // before a witness pulls it would resurrect the deleted row on the
+    // backup forever. With no registered witnesses the floor is 0 and
+    // tombstones drop immediately, exactly as before.
+    {
+        let ctx = ctx.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            let floor = crate::witnesses::tombstone_retention_floor_ms(&ctx);
+            match &ctx.backend {
+                crate::shared::Backend::Local(db) => {
+                    if let Ok(mut db) = db.write() {
+                        db.set_tombstone_retention_ms(floor);
+                    }
+                }
+                crate::shared::Backend::Cluster(node) => {
+                    node.with_local_write(|db| db.set_tombstone_retention_ms(floor));
+                }
+            }
+        });
+    }
+
     // Ensure the witness-registry tables exist. Unlike `node_stats`, nothing
     // here self-publishes on a tick — rows arrive from witness processes
     // registering themselves over ordinary SQL connections (see

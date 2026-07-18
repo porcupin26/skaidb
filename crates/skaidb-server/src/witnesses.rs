@@ -172,6 +172,46 @@ pub fn read_all(ctx: &Shared) -> Vec<WitnessRow> {
         .collect()
 }
 
+/// The tombstone-retention floor (ms) this node should hold: how far back
+/// the LEAST-CAUGHT-UP live witness is. For every witness seen within the
+/// grace period, its catch-up point is the oldest per-table `synced_at`
+/// from its watermarks (or its `registered_at` before the first sync);
+/// the floor is `now − min(catch-up points)`, capped at the grace period
+/// (a witness that lapses the cap must full-resync — and, for deletes,
+/// be rebuilt — rather than hold the primary's garbage collection
+/// hostage forever). No live witnesses → 0, tombstones drop immediately,
+/// the historical behavior.
+pub fn tombstone_retention_floor_ms(ctx: &Shared) -> u64 {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let grace_ms = grace_period_secs(ctx).saturating_mul(1000);
+    let mut floor: i64 = 0;
+    for w in read_all(ctx) {
+        if now_ms - w.last_seen_at_ms > grace_ms {
+            continue; // lapsed: stops holding GC, full-resync territory
+        }
+        let catch_up = match &w.watermarks {
+            Some(Value::Document(d)) => d
+                .0
+                .values()
+                .filter_map(|e| match e {
+                    Value::Document(t) => match t.0.get("synced_at") {
+                        Some(Value::Int(n)) => Some(*n),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .min()
+                .unwrap_or(w.registered_at_ms),
+            _ => w.registered_at_ms,
+        };
+        floor = floor.max(now_ms - catch_up);
+    }
+    (floor.max(0) as u64).min(grace_ms.max(0) as u64)
+}
+
 /// Test/tooling helper: register or heartbeat a witness exactly the way a
 /// real witness process would over an ordinary SQL connection (this module
 /// doesn't otherwise write to `witnesses` — that's the witness's job, not
@@ -234,6 +274,55 @@ mod tests {
             .find(|w| w.witness_id == "witness-1")
             .unwrap();
         assert_eq!(updated.last_seen_at_ms, 5_000);
+    }
+
+    /// The GC floor holds tombstones back to the least-caught-up LIVE
+    /// witness, ignores lapsed ones, and caps at the grace period.
+    #[test]
+    fn tombstone_retention_floor_follows_the_registry() {
+        let ctx = temp_ctx();
+        ensure_tables(&ctx).unwrap();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap();
+
+        // No witnesses: floor 0 — tombstones drop immediately, as always.
+        assert_eq!(tombstone_retention_floor_ms(&ctx), 0);
+
+        // A live witness whose oldest table sync was ~2h ago holds ~2h.
+        let two_h = 2 * 3600 * 1000;
+        exec(&ctx, &format!(
+            "INSERT INTO witnesses (witness_id, region, registered_at, last_seen_at, watermarks)              VALUES ('w1', 'r', {reg}, {seen}, {{'db.a': {{rows: 5, synced_at: {old}}},              'db.b': {{rows: 5, synced_at: {newer}}}}})",
+            reg = now_ms - 10 * two_h,
+            seen = now_ms - 60_000,
+            old = now_ms - two_h,
+            newer = now_ms - 60_000,
+        )).unwrap();
+        let floor = tombstone_retention_floor_ms(&ctx);
+        assert!(
+            (floor as i64 - two_h).abs() < 30_000,
+            "floor ≈ oldest synced_at age, got {floor}"
+        );
+
+        // A witness lapsed past the grace period stops holding GC.
+        exec(&ctx, "UPDATE witness_gc_config SET grace_period_secs = 3600 WHERE id = 'default'")
+            .unwrap();
+        exec(&ctx, &format!(
+            "UPDATE witnesses SET last_seen_at = {} WHERE witness_id = 'w1'",
+            now_ms - 2 * 3600 * 1000,
+        )).unwrap();
+        assert_eq!(tombstone_retention_floor_ms(&ctx), 0, "lapsed witness ignored");
+
+        // A live witness with NO watermarks yet holds back to registration,
+        // capped at the grace period.
+        exec(&ctx, &format!(
+            "INSERT INTO witnesses (witness_id, region, registered_at, last_seen_at)              VALUES ('w2', 'r', {reg}, {seen})",
+            reg = now_ms - 100 * 3600 * 1000,
+            seen = now_ms - 30_000,
+        )).unwrap();
+        let floor = tombstone_retention_floor_ms(&ctx);
+        assert_eq!(floor, 3600 * 1000, "capped at the 1h grace period");
     }
 
     #[test]

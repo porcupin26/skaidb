@@ -3763,6 +3763,13 @@ impl Node {
         self.local.read().ok().map(|db| f(&db))
     }
 
+    /// Run `f` under the exclusive lock on the local database (`None` if
+    /// poisoned). For cheap server-layer maintenance writes (e.g. pushing
+    /// the tombstone-retention window) — not a statement execution path.
+    pub fn with_local_write<T>(&self, f: impl FnOnce(&mut Database) -> T) -> Option<T> {
+        self.local.write().ok().map(|mut db| f(&mut db))
+    }
+
     pub fn prepare_shutdown(&self) {
         // Deferred maintenance first: a clean shutdown should leave the
         // watermarks current so the next open skips replay entirely.

@@ -169,6 +169,14 @@ pub struct CompactJob {
     pub deepest: bool,
     pub codec: Codec,
     pub expire_before: Option<u64>,
+    /// Deepest-level tombstone drop cutoff (wall ms): a delete marker
+    /// stamped at-or-after this instant SURVIVES the merge. Cutoff =
+    /// now − the engine's tombstone retention; retention 0 (default) →
+    /// cutoff = now → every existing tombstone drops, the historical
+    /// behavior. Retention exists for witness-bearing deployments: a
+    /// tombstone purged before a witness pulls it resurrects the deleted
+    /// row on the backup forever.
+    pub tombstone_keep_after: u64,
 }
 
 /// A single-node, single-keyspace LSM storage engine.
@@ -195,6 +203,11 @@ pub struct Engine {
     /// pure read-visibility rule (the raw stamped data still replicates, so
     /// expiry converges across replicas as each applies the same TTL).
     ttl_ms: Option<u64>,
+    /// Deepest-level tombstone retention (wall ms, default 0 = drop
+    /// immediately as always): markers younger than this survive
+    /// compaction so a witness can still pull the delete. Pushed
+    /// periodically by the server from the witness registry.
+    tombstone_retention_ms: u64,
     opts: EngineOptions,
     /// Level-0 tables, newest first.
     l0: Vec<SsTable>,
@@ -323,6 +336,7 @@ impl Engine {
             mem,
             clock,
             ttl_ms: None,
+            tombstone_retention_ms: 0,
             opts,
             l0,
             levels,
@@ -445,6 +459,11 @@ impl Engine {
     /// compaction reclaims expired rows on its next pass.
     pub fn set_ttl(&mut self, ttl_ms: Option<u64>) {
         self.ttl_ms = ttl_ms;
+    }
+
+    /// Set the deepest-level tombstone retention window (see the field).
+    pub fn set_tombstone_retention_ms(&mut self, ms: u64) {
+        self.tombstone_retention_ms = ms;
     }
 
     /// Whether a row stamped at `hlc` has outlived the table's TTL.
@@ -1010,6 +1029,7 @@ impl Engine {
             return None;
         }
         let expire_before = self.ttl_ms.map(|ttl| now_wall_ms().saturating_sub(ttl));
+        let tombstone_keep_after = now_wall_ms().saturating_sub(self.tombstone_retention_ms);
         if self.l0.len() >= self.opts.l0_compaction_trigger {
             let deepest = self.levels.len() <= 1;
             let mut inputs: Vec<PathBuf> =
@@ -1023,6 +1043,7 @@ impl Engine {
                 deepest,
                 codec: self.codec_for(deepest),
                 expire_before,
+                tombstone_keep_after,
             });
         }
         for level in 0..self.levels.len() {
@@ -1052,6 +1073,7 @@ impl Engine {
                 deepest: level + 1 == self.levels.len() - 1,
                 codec: self.codec_for(level + 1 == self.levels.len() - 1),
                 expire_before,
+                tombstone_keep_after,
             });
         }
         None
@@ -1066,7 +1088,14 @@ impl Engine {
             .map(SsTable::open)
             .collect::<Result<_>>()?;
         let refs: Vec<&SsTable> = inputs.iter().collect();
-        merge_write(&job.output, &refs, job.deepest, job.codec, job.expire_before)
+        merge_write(
+            &job.output,
+            &refs,
+            job.deepest,
+            job.codec,
+            job.expire_before,
+            job.tombstone_keep_after,
+        )
     }
 
     /// Install a built compaction. Discards the output (returning `false`)
@@ -1376,7 +1405,8 @@ impl Engine {
         }
         let old_paths = collect_paths(&self.l0, self.levels.first());
         let expire_before = self.ttl_ms.map(|ttl| now_wall_ms().saturating_sub(ttl));
-        let new_l1 = merge_write(&path, &sources, deepest, codec, expire_before)?;
+        let tombstone_keep_after = now_wall_ms().saturating_sub(self.tombstone_retention_ms);
+        let new_l1 = merge_write(&path, &sources, deepest, codec, expire_before, tombstone_keep_after)?;
         self.compactions += 1;
         self.compaction_bytes += new_l1.disk_len();
         self.l0.clear();
@@ -1414,7 +1444,8 @@ impl Engine {
                 old_paths.push(self.levels[level + 1].path().to_path_buf());
             }
 
-            let new_run = merge_write(&path, &sources, deepest, codec, expire_before)?;
+            let new_run =
+                merge_write(&path, &sources, deepest, codec, expire_before, tombstone_keep_after)?;
             self.compactions += 1;
             self.compaction_bytes += new_run.disk_len();
             if has_next {
@@ -1543,6 +1574,7 @@ fn merge_write(
     drop_tombstones: bool,
     codec: Codec,
     expire_before: Option<u64>,
+    tombstone_keep_after: u64,
 ) -> Result<SsTable> {
     let approx: u64 = sources.iter().map(|s| s.len()).sum();
     let iters: Vec<MergeSource<'_>> = sources
@@ -1552,7 +1584,15 @@ fn merge_write(
         })
         .collect();
     let entries = KWayMerge::new(iters).filter_map(move |item| match item {
-        Ok((_, _, VersionValue::Delete)) if drop_tombstones => None,
+        // Deepest-level tombstone drop, gated by the retention cutoff: a
+        // marker stamped at-or-after `tombstone_keep_after` is retained so
+        // a registered witness still pulls the delete (keeping longer is
+        // always safe — there is nothing below the deepest level).
+        Ok((_, hlc, VersionValue::Delete))
+            if drop_tombstones && hlc.physical < tombstone_keep_after =>
+        {
+            None
+        }
         // TTL reclaim: a row whose stamp predates the cutoff is dropped
         // outright (it is already invisible on every read path).
         Ok((_, hlc, _)) if expire_before.is_some_and(|c| hlc.physical < c) => None,
@@ -1957,6 +1997,52 @@ mod tests {
         let e = Engine::open_with_options(&dir, small_opts()).unwrap();
         assert_eq!(e.scan().unwrap().len(), 60);
         assert!(count >= 1);
+    }
+
+    #[test]
+    fn tombstone_retention_gates_the_deepest_drop() {
+        let dir = tempdir();
+        let mut e = Engine::open_with_options(&dir, small_opts()).unwrap();
+        for i in 0..30u32 {
+            e.put(format!("k{i:04}").as_bytes(), vec![1u8; 40]).unwrap();
+        }
+        // Retention 0 (default): the deepest merge purges the marker. The
+        // churn after the delete guarantees enough L0 tables that the
+        // cascade actually reaches the deepest level (one lone flush
+        // leaves the marker in an upper level, correctly retained).
+        e.delete(b"k0005").unwrap();
+        for i in 30..60u32 {
+            e.put(format!("k{i:04}").as_bytes(), vec![1u8; 40]).unwrap();
+        }
+        e.flush().unwrap();
+        let markers = |e: &Engine| -> usize {
+            e.scan_versioned_with_tombstones()
+                .unwrap()
+                .into_iter()
+                .filter(|(_, _, value)| value.is_none())
+                .count()
+        };
+        assert_eq!(markers(&e), 0, "default behavior: tombstones drop at deepest");
+
+        // With a retention window, a fresh marker SURVIVES compaction —
+        // a witness that hasn't pulled it yet can still learn the delete.
+        e.set_tombstone_retention_ms(60 * 60 * 1000);
+        e.delete(b"k0007").unwrap();
+        for i in 60..90u32 {
+            e.put(format!("k{i:04}").as_bytes(), vec![1u8; 40]).unwrap();
+        }
+        e.flush().unwrap();
+        assert_eq!(markers(&e), 1, "retained marker survives the deepest merge");
+        assert_eq!(e.get(b"k0007").unwrap(), None, "reads still see the delete");
+
+        // Retention back to 0: the next deepest merge purges it.
+        e.set_tombstone_retention_ms(0);
+        for i in 90..120u32 {
+            e.put(format!("k{i:04}").as_bytes(), vec![1u8; 40]).unwrap();
+        }
+        e.flush().unwrap();
+        assert_eq!(markers(&e), 0, "lapsed retention purges on the next merge");
+        assert_eq!(e.scan().unwrap().len(), 118, "118 live keys (120 - 2 deleted)");
     }
 
     #[test]
