@@ -274,9 +274,13 @@ async function loadInventory() {
   for (const db of inv.databases || []) {
     for (const t of db.tables || []) {
       const tr = document.createElement("tr");
+      const placement = cell(t.placement || "cluster");
+      if ((t.placement || "").includes("moving")) placement.className = "warn";
       tr.append(
         cell(db.name), cell(t.name), cell(t.kind),
-        cell((t.key || []).join(", ")), cell(fmtTtl(t.ttl_ms)),
+        cell((t.key || []).join(", ")), placement,
+        cell(t.witness === false ? "excluded" : "mirrored"),
+        cell(fmtTtl(t.ttl_ms)),
         cell(t.live_keys ?? "—"), cell(t.tombstones ?? "—"),
         cell(fmtBytes(t.disk_bytes ?? 0)), cell(t.files ?? "—"),
       );

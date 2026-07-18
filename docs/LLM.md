@@ -193,6 +193,7 @@ CREATE TABLE [IF NOT EXISTS] t (PRIMARY KEY (col [, col ...]))
 --   with replication; every pin holds every row; non-pin coordinators route
 --   to the pins; REMOVE NODE refuses while a table pins the node).
 ALTER TABLE t SET (replication = n | nodes = ['ref', ...])
+--   Placement + witness flag also shown in the UI inventory tab (pins as aliases).
 --   ONLINE placement transition: reads/writes address the UNION of old+new
 --   placement until a background driver repairs to convergence and
 --   auto-finalizes (SHOW TABLES: transition = true while open). One per

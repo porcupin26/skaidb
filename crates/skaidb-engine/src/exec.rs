@@ -328,6 +328,14 @@ pub struct InventoryTable {
     pub tombstones: u64,
     pub disk_bytes: u64,
     pub sstables: u64,
+    /// Per-table RF override (`None` = cluster default).
+    pub replication: Option<u32>,
+    /// Pinned members (stable ids; empty = ring placement).
+    pub pinned_nodes: Vec<String>,
+    /// Witness mirroring flag.
+    pub witness: bool,
+    /// A placement transition is open (dual-placement union window).
+    pub transition: bool,
 }
 
 #[derive(Debug)]
@@ -2244,6 +2252,10 @@ impl Database {
                 tombstones: ks.tombstones as u64,
                 disk_bytes: st.disk_bytes,
                 sstables: st.sstable_count as u64,
+                replication: def.replication,
+                pinned_nodes: def.pinned_nodes.clone(),
+                witness: def.witness,
+                transition: def.prev_placement.is_some(),
             });
         }
         for (name, def) in &self.catalog.timeseries {

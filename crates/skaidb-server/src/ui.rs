@@ -153,17 +153,41 @@ pub fn inventory_json(ctx: &Shared, role: &str) -> (u16, String) {
         ctx.allowed_on_table(role, skaidb_auth::Privilege::Select, bare, db)
     };
     use std::collections::BTreeMap;
+    // Pin ids render as aliases where one exists — the UI speaks names,
+    // durable state speaks ids.
+    let aliases: std::collections::HashMap<String, String> =
+        crate::naming::all_aliases(ctx).into_iter().collect();
     let mut dbs: BTreeMap<String, (Vec<Json>, Vec<Json>)> = BTreeMap::new();
     for t in &inv.tables {
         let (db, bare) = split(&t.name);
         if !visible(&db, &bare) {
             continue;
         }
+        // One human-readable placement summary: "rf 2", "pinned: skai2",
+        // or "" for cluster default; "→ moving" appended mid-transition.
+        let mut placement = if !t.pinned_nodes.is_empty() {
+            format!(
+                "pinned: {}",
+                t.pinned_nodes
+                    .iter()
+                    .map(|id| aliases.get(id).unwrap_or(id).as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        } else if let Some(n) = t.replication {
+            format!("rf {n}")
+        } else {
+            String::new()
+        };
+        if t.transition {
+            placement = format!("{placement} → moving").trim().to_string();
+        }
         dbs.entry(db).or_default().0.push(json!({
             "name": bare, "kind": if t.memory { "memory" } else { "table" },
             "key": t.primary_key, "ttl_ms": t.ttl_ms,
             "live_keys": t.live_keys, "tombstones": t.tombstones,
             "disk_bytes": t.disk_bytes, "files": t.sstables,
+            "placement": placement, "witness": t.witness,
         }));
     }
     for t in &inv.timeseries {

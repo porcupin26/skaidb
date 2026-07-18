@@ -66,7 +66,10 @@ http://127.0.0.1:7080/ui
   the **inventory** tab.)
 - **inventory** — the consolidated schema-and-storage view
   (`GET /ui/inventory`, RBAC-filtered like the schema browser): every
-  database's tables (type — table / memory / timeseries —, key, TTL,
+  database's tables (type — table / memory / timeseries —, key,
+  **placement** — `cluster` default, `rf n` override, or `pinned: <alias>`
+  with a highlighted `→ moving` marker while a placement transition is
+  open — **witness** mirroring (`mirrored`/`excluded`), TTL,
   approximate row count, tombstones, disk, file count) and indexes
   (secondary / vector / search, with paths, vector dim·metric·ef,
   entry/doc counts, disk). Usage numbers are the serving node's; counts
