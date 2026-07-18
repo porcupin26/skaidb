@@ -232,6 +232,7 @@ fn pull_table(
     };
     let (mut pulled, mut applied) = (0usize, 0usize);
     let mut after: Option<Vec<u8>> = None;
+    let mut pages_since_flush = 0usize;
     loop {
         let page_started = std::time::Instant::now();
         let page = scan_page_with_failover(cfg, &qualified, after.as_deref())?;
@@ -266,6 +267,19 @@ fn pull_table(
                     sync.sync_through(commit)
                         .map_err(|e| format!("wal sync {qualified}: {e}"))?;
                 }
+            }
+        }
+        // Mid-table flush every ~64k rows: a standalone witness has none
+        // of the Node-level memory-pressure machinery replicas rely on
+        // (the shedding/release tier), and per-TABLE flushing leaves a
+        // 1.9 GB table's whole ingest accumulating between flushes — the
+        // fourth OOM's shape after WAL sync bounded the third's. A flush
+        // every 32 pages is deterministic and cheap at this cadence.
+        pages_since_flush += 1;
+        if pages_since_flush >= 32 {
+            pages_since_flush = 0;
+            if let Ok(mut dbw) = local.write() {
+                dbw.flush_memtables_under_pressure();
             }
         }
         if done {
