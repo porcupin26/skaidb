@@ -242,14 +242,50 @@ fn pull_table(
         if !page.is_empty() {
             // Staleness guard + apply, one write-lock acquisition per page
             // (2000 rows — same tenure the replica appliers accept).
+            //
+            // The guard compares against the VALUE-FREE stamps range, not
+            // per-row point reads: `local_get_versioned` pulls each full
+            // row through the read cache, and an entry-capped cache fed
+            // 2000 multi-KB rows per page ramped RSS to the cgroup
+            // ceiling on large-row tables (the fifth and final OOM shape
+            // of the first deployment — flat 114 MB all sweep, then the
+            // vectors table killed the box). One sorted stamps walk over
+            // the page's own key span reads zero values, pollutes
+            // nothing, and is ~2000× fewer storage reads per page.
             let mut dbw = local.write().map_err(|_| "local lock poisoned".to_string())?;
+            let span_first = page.first().map(|(k, ..)| k.clone()).unwrap_or_default();
+            let span_last = page.last().map(|(k, ..)| k.clone()).unwrap_or_default();
+            let mut local_stamps: std::collections::HashMap<Vec<u8>, skaidb_engine::Hlc> =
+                std::collections::HashMap::new();
+            // Start strictly BEFORE the span's first key so it is included
+            // (`after` is exclusive); an empty `after` covers it.
+            let mut cursor: Option<Vec<u8>> = span_first
+                .len()
+                .checked_sub(1)
+                .map(|n| span_first[..n].to_vec());
+            'stamps: loop {
+                let stamps = dbw
+                    .local_scan_stamps_page(&qualified, cursor.as_deref(), 4096)
+                    .map_err(|e| format!("stamps {qualified}: {e}"))?;
+                let done = stamps.len() < 4096;
+                cursor = stamps.last().map(|(k, ..)| k.clone());
+                for (key, hlc, _is_put) in stamps {
+                    if key > span_last {
+                        break 'stamps;
+                    }
+                    if key >= span_first {
+                        local_stamps.insert(key, hlc);
+                    }
+                }
+                if done {
+                    break;
+                }
+            }
             let fresh: Vec<_> = page
                 .into_iter()
-                .filter(|(key, _, hlc, _)| {
-                    match dbw.local_get_versioned(&qualified, key) {
-                        Ok(Some((_, cur, _))) => cur < *hlc,
-                        _ => true,
-                    }
+                .filter(|(key, _, hlc, _)| match local_stamps.get(key) {
+                    Some(cur) => cur < hlc,
+                    None => true,
                 })
                 .collect();
             applied += fresh.len();
