@@ -65,6 +65,9 @@ fn build_backend(db: Database, config: &Config) -> Result<Backend, Box<dyn std::
         anti_entropy_interval_secs: config.cluster.anti_entropy_interval_secs,
     };
     let node = Node::new(db, node_cfg);
+    // Config-file seed for the live-mutable duty ceiling (SET CONFIG
+    // updates it at runtime through the same setter).
+    node.set_bootstrap_duty_pct(config.cluster.bootstrap_duty_pct);
     node.serve_internode()?;
     Ok(Backend::Cluster(node))
 }
@@ -2285,6 +2288,7 @@ pub(crate) mod tests {
             password: String::new(),
             databases: vec!["mirror".into()],
             interval_secs: 3600,
+            duty_pct: 90, // tests want speed, not politeness
             witness_id: "w-test".into(),
             region: "unit".into(),
         };

@@ -224,6 +224,10 @@ pub struct Node {
     hint_flush_queued: AtomicBool,
     /// Rows pushed per migration batch before a checkpoint + throttle pause.
     migration_batch: AtomicUsize,
+    /// Bootstrap duty ceiling percent (1–90, default 50): the rebalance
+    /// push rests `work × (100 − pct) / pct` after each chunk. Fed live
+    /// from `cluster.bootstrap_duty_pct` by the server's SET CONFIG.
+    bootstrap_duty_pct: AtomicU64,
     /// Pause (ms) between migration batches — throttles a reshard so it doesn't
     /// saturate the cluster. `0` = no throttle.
     migration_pause_ms: AtomicU64,
@@ -707,6 +711,7 @@ impl Node {
             mem: MemoryGuard::new(),
             hint_flush_queued: AtomicBool::new(false),
             migration_batch: AtomicUsize::new(1024),
+            bootstrap_duty_pct: AtomicU64::new(50),
             migration_pause_ms: AtomicU64::new(0),
             counters: Counters::default(),
             cfg,
@@ -1214,6 +1219,14 @@ impl Node {
     /// Tune migration throttling: push at most `batch` rows between checkpoints,
     /// pausing `pause_ms` between batches (0 = no throttle). Lets a reshard of a
     /// large shard proceed without saturating the cluster.
+    /// Live-set the bootstrap duty ceiling (`cluster.bootstrap_duty_pct`),
+    /// clamped to 1–90: 0 would divide by zero, and >90 is a firehose with
+    /// extra steps — an operator wanting no pacing can say 90.
+    pub fn set_bootstrap_duty_pct(&self, pct: u32) {
+        self.bootstrap_duty_pct
+            .store(u64::from(pct.clamp(1, 90)), Ordering::Relaxed);
+    }
+
     pub fn set_migration_throttle(&self, batch: usize, pause_ms: u64) {
         self.migration_batch.store(batch.max(1), Ordering::Relaxed);
         self.migration_pause_ms.store(pause_ms, Ordering::Relaxed);
@@ -2539,15 +2552,20 @@ impl Node {
                     if let Some((last_key, _, _, _)) = chunk.last() {
                         save_migrate_ckpt(&ckpt, &table, last_key);
                     }
-                    // A joining node's bootstrap must never take more than
-                    // half of this (serving) node's capacity: sleep at
-                    // least as long as the chunk took to produce and send,
-                    // so the migration's duty cycle is ≤ 50% by
+                    // A joining node's bootstrap must never exceed the
+                    // configured share of this (serving) node's capacity
+                    // (`cluster.bootstrap_duty_pct`, default 50, live via
+                    // SET CONFIG): rest `work × (100 − pct) / pct` after
+                    // each chunk, so the duty cycle is bounded by
                     // construction — a fixed pause can't promise that (a
                     // slow 100 ms chunk + 25 ms pause is an 80% duty
                     // cycle). `migration_pause_ms` remains the floor for
                     // operators who want it even gentler.
-                    thread::sleep(chunk_started.elapsed().max(Duration::from_millis(pause)));
+                    let pct = self.bootstrap_duty_pct.load(Ordering::Relaxed).clamp(1, 90) as u32;
+                    let rest = chunk_started
+                        .elapsed()
+                        .mul_f64(f64::from(100 - pct) / f64::from(pct));
+                    thread::sleep(rest.max(Duration::from_millis(pause)));
                 }
                 if done {
                     break;

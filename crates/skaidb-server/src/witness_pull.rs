@@ -260,8 +260,11 @@ fn pull_table(
         if done {
             return Ok((pulled, applied));
         }
-        // ≤ 50% duty on the primary: rest as long as the page cost.
-        std::thread::sleep(page_started.elapsed().max(PULL_PAGE_PAUSE_FLOOR));
+        // Bounded duty on the primary (`witness.duty_pct`, default 50,
+        // live via SET CONFIG): rest `work × (100 − pct) / pct`.
+        let pct = f64::from(cfg.duty_pct.clamp(1, 90));
+        let rest = page_started.elapsed().mul_f64((100.0 - pct) / pct);
+        std::thread::sleep(rest.max(PULL_PAGE_PAUSE_FLOOR));
     }
 }
 

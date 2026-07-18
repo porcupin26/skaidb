@@ -468,6 +468,13 @@ impl Context {
             *self.audit.write().unwrap_or_else(|e| e.into_inner()) =
                 AuditSettings::from(&updated.observability);
         }
+        // The bootstrap duty ceiling lives in a Node atomic (the rebalance
+        // loop can't read the server's config lock) — push it through.
+        if key == "cluster.bootstrap_duty_pct" {
+            if let Backend::Cluster(node) = &self.backend {
+                node.set_bootstrap_duty_pct(updated.cluster.bootstrap_duty_pct);
+            }
+        }
         *self.config.write().unwrap_or_else(|e| e.into_inner()) = updated.clone();
         // Persist to disk when we know where the config lives.
         let (persisted, persist_error) = match &self.config_path {

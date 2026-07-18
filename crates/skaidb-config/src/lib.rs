@@ -122,6 +122,11 @@ pub struct WitnessConfig {
     /// Seconds between pull cycles. A witness does not need to keep up —
     /// default one hour.
     pub interval_secs: u64,
+    /// Ceiling, in percent (1–90), on how much of the serving primary's
+    /// capacity the pull may take (same rest rule as
+    /// `cluster.bootstrap_duty_pct`). **Live-mutable**:
+    /// `SET CONFIG witness.duty_pct = '25'`.
+    pub duty_pct: u32,
     /// Identity registered in the primary's `witnesses` table.
     pub witness_id: String,
     pub region: String,
@@ -137,6 +142,7 @@ impl Default for WitnessConfig {
             password: String::new(),
             databases: Vec::new(),
             interval_secs: 3600,
+            duty_pct: 50,
             witness_id: "witness".to_string(),
             region: String::new(),
         }
@@ -194,6 +200,13 @@ pub struct ClusterConfig {
     /// How often (seconds) each node runs a background anti-entropy repair pass
     /// so missed DDL/writes converge without operator action. `0` disables it.
     pub anti_entropy_interval_secs: u64,
+    /// Ceiling, in percent (1–90), on how much of THIS node's capacity a
+    /// joining node's bootstrap push may take: each sent chunk is followed
+    /// by a rest sized `work × (100 − pct) / pct`, so at the default 50 the
+    /// sync never exceeds half duty. **Live-mutable** per node:
+    /// `SET CONFIG cluster.bootstrap_duty_pct = '30'` (set it on the
+    /// members that will serve the bootstrap).
+    pub bootstrap_duty_pct: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -403,6 +416,8 @@ pub const RUNTIME_MUTABLE_KEYS: &[&str] = &[
     "observability.login_log_file",
     "ui.enabled",
     "server.read_only",
+    "cluster.bootstrap_duty_pct",
+    "witness.duty_pct",
 ];
 
 /// Whether changing `key` takes effect live (see [`RUNTIME_MUTABLE_KEYS`]).
@@ -474,6 +489,7 @@ impl Default for ClusterConfig {
             default_read_consistency: Consistency::Quorum,
             default_write_consistency: Consistency::Quorum,
             anti_entropy_interval_secs: 60,
+            bootstrap_duty_pct: 50,
         }
     }
 }
