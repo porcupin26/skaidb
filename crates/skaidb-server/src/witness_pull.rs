@@ -253,8 +253,19 @@ fn pull_table(
                 .collect();
             applied += fresh.len();
             if !fresh.is_empty() {
-                dbw.apply_batch_buffered(&qualified, &fresh)
-                    .map_err(|e| format!("apply {qualified}: {e}"))?;
+                // Sync the page's WAL commits like the replica applier does
+                // (one fsync per page): dropping the handles unsynced lets
+                // buffered WAL data accumulate in memory for the whole
+                // table — a 1.9 GB table's pull OOM-killed the witness
+                // three times before this landed. Durability per page is
+                // the bonus; bounded memory is the point.
+                if let Some((commit, sync)) = dbw
+                    .apply_batch_buffered(&qualified, &fresh)
+                    .map_err(|e| format!("apply {qualified}: {e}"))?
+                {
+                    sync.sync_through(commit)
+                        .map_err(|e| format!("wal sync {qualified}: {e}"))?;
+                }
             }
         }
         if done {
