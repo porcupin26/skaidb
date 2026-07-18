@@ -34,6 +34,14 @@ use crate::shared::{Backend, Shared};
 /// Rows per pulled page — matches the primary's own gather/repair paging.
 const PULL_PAGE_ROWS: u32 = 2_000;
 
+/// Pause between pulled pages, mirroring the primary's own repair pacing
+/// (`REPAIR_PAGE_PAUSE`): an unpaced pull is a firehose into the apply
+/// path — flush and compaction fall behind and memtables pile up faster
+/// than the background worker drains them (the first unpaced full sync
+/// OOM-killed the witness box twice). ~5% duty impact on wall time, whole
+/// cores and memory headroom handed back.
+const PULL_PAGE_PAUSE: std::time::Duration = std::time::Duration::from_millis(25);
+
 /// What one cycle did, for the log line and the heartbeat watermarks.
 #[derive(Debug, Default)]
 pub struct CycleSummary {
@@ -107,6 +115,16 @@ pub(crate) fn run_cycle(ctx: &Shared, cfg: &WitnessConfig) -> Result<CycleSummar
             ensure_local_table(ctx, db, table, pk_cols)?;
             let (pulled, applied) = pull_table(ctx, cfg, db, table)?;
             summary.tables.push((format!("{db}.{table}"), pulled, applied));
+            // A finished table's memtable would otherwise sit resident
+            // until organic pressure — across a 30-table sync those piles
+            // are exactly what OOM'd the first deployment. Flush eagerly:
+            // the witness is idle-by-design between cycles, so trading a
+            // few small SSTables for a flat memory profile is free.
+            if let Backend::Local(local) = &ctx.backend {
+                if let Ok(mut db) = local.write() {
+                    db.flush_memtables_under_pressure();
+                }
+            }
         }
     }
 
@@ -239,6 +257,7 @@ fn pull_table(
         if done {
             return Ok((pulled, applied));
         }
+        std::thread::sleep(PULL_PAGE_PAUSE);
     }
 }
 
