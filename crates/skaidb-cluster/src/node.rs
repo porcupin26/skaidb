@@ -711,7 +711,12 @@ impl Node {
             mem: MemoryGuard::new(),
             hint_flush_queued: AtomicBool::new(false),
             migration_batch: AtomicUsize::new(1024),
-            bootstrap_duty_pct: AtomicU64::new(50),
+            // Tests default to near-full speed: the ≤50% pacing DOUBLES a
+            // join's wall time, which pushed the timing-sensitive reshard/
+            // join tests past their windows on loaded CI runners (observed
+            // twice within an hour of the pacing landing). Production keeps
+            // the polite default.
+            bootstrap_duty_pct: AtomicU64::new(if cfg!(test) { 90 } else { 50 }),
             migration_pause_ms: AtomicU64::new(0),
             counters: Counters::default(),
             cfg,
