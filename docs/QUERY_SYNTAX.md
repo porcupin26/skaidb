@@ -20,7 +20,9 @@ current database (see *Databases* below).
 -- DDL
 CREATE TABLE [IF NOT EXISTS] <table> (PRIMARY KEY (<col> [, <col> ...]))
        [WITH (ttl = <duration>,               -- rows expire after this age
-              witness = <bool>)]              -- mirror to witness nodes (default true)
+              witness = <bool>,               -- mirror to witness nodes (default true)
+              replication = <n>,              -- per-table RF override
+              nodes = ['<id>', ...])]         -- pin the whole table to these members
 CREATE TIMESERIES TABLE [IF NOT EXISTS] <table>
        (SERIES KEY (<label> [, <label> ...])
         [, RETENTION <duration>] [, OOO <duration>])
@@ -183,10 +185,21 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   back tombstone GC for lagging witnesses. Toggling back to `true` re-includes it on the next full sweep.
   System/registry tables (`witnesses`, `drivers`, `node_aliases`, ...) refuse
   placement/witness options — every node consults them locally.
+- **Per-table placement**: `replication = <n>` overrides the cluster
+  replication factor for one table (n above the member count = full copy,
+  the same semantics cluster-wide RF has); `nodes = ['<id>', ...]` pins
+  the WHOLE table to an explicit member set — every pin holds every row,
+  quorum math counts the pins, and a non-pin coordinator routes reads and
+  writes to them. The two are mutually exclusive. Pins are a deliberate
+  durability trade: a pinned node down means quorum errors for that table
+  until it returns, and `ALTER CLUSTER REMOVE NODE` refuses to remove a
+  pinned member (re-pin first — `ALTER TABLE t SET (nodes = [...])` may
+  only SHRINK an existing pin set; growing or changing `replication`
+  after CREATE needs the placement-transition work, not yet shipped).
+  GLOBAL-index entry tables follow their base table's placement.
 - **`SHOW TABLES`** lists catalog tables as
-  `(table, primary_key, replication, nodes, witness)` rows — `replication`
-  and `nodes` show per-table placement once the placement engine lands
-  (blank/default until then), `witness` the mirroring flag;
+  `(table, primary_key, replication, nodes, witness)` rows —
+  `replication`/`nodes` per-table placement, `witness` the mirroring flag;
   **`SHOW INDEXES`** lists secondary, vector, and search indexes as
   `(index, table, kind, columns, local)` — `local` is **this node's** live
   state for the index: `ok` (open and serving), `building` (backfill or

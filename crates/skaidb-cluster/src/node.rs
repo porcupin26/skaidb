@@ -186,8 +186,10 @@ pub struct Node {
     repairing: AtomicBool,
     /// Repair-digest cache keyed by table: `(table version, digest)`, where
     /// the version is (schema stamp, write_seq) — see
-    /// `Database::table_repair_version`. Only consulted on full-copy
-    /// clusters (the pair-ownership filter is peer-independent there). A
+    /// `Database::table_repair_version`. Only consulted for tables every
+    /// member fully holds (the pair-ownership filter is peer-independent
+    /// there) — per-table placement means pinned / RF<members tables skip
+    /// the cache rather than poison it. A
     /// hit means the table's data has not changed since the digest was
     /// computed, so serving it can never mask real divergence: any real
     /// change bumps write_seq on the node that has it, forcing a fresh
@@ -354,6 +356,19 @@ enum CollectSink<'a> {
     Count(&'a mut usize),
     /// Distinct values of one column across matches; rows are discarded.
     Distinct(&'a str, &'a mut BTreeMap<Vec<u8>, Value>),
+}
+
+/// A table's placement class, from the replicated catalog (see
+/// [`Node::table_placement`]). Resolved per call — never cached — so DDL
+/// visibility matches every other catalog read.
+enum TablePlacement {
+    /// Ring placement at the cluster replication factor (no options declared).
+    Default,
+    /// Ring placement at a per-table factor (`WITH (replication = n)`).
+    Rf(usize),
+    /// Pinned: every listed member holds the whole table; the ring is
+    /// bypassed and the key is irrelevant to placement.
+    Pinned(Vec<NodeId>),
 }
 
 /// Candidate-key count up to which a gathered index range is resolved by
@@ -1548,12 +1563,21 @@ impl Node {
         }
     }
 
-    /// Replica set for `key` at the configured replication factor (snapshot).
-    /// During a membership change this is the **union** of the key's owners on
-    /// the new and previous rings, so a migrating key is written to (and read
-    /// from) both its old and new owner until the change is finalized.
+    /// Replica set for `key` at the CLUSTER-DEFAULT replication factor
+    /// (snapshot). During a membership change this is the **union** of the
+    /// key's owners on the new and previous rings, so a migrating key is
+    /// written to (and read from) both its old and new owner until the change
+    /// is finalized. Only for callers with no per-table placement: time-series
+    /// data (per-table placement does not cover TS tables yet) and system
+    /// tables (which cannot declare placement options). Everything else must
+    /// go through [`Node::effective_replicas`].
     fn replicas_for(&self, key: &[u8]) -> Vec<NodeId> {
-        let rf = self.cfg.replication_factor;
+        self.replicas_for_rf(key, self.cfg.replication_factor)
+    }
+
+    /// Ring replica set for `key` at an explicit factor — the dual-ring union
+    /// semantics of [`Node::replicas_for`], parameterized for per-table RF.
+    fn replicas_for_rf(&self, key: &[u8], rf: usize) -> Vec<NodeId> {
         let topo = self.topo.read().expect("topo lock");
         let mut reps = topo.ring.replicas_for(key, rf);
         if let Some(prev) = &topo.prev {
@@ -1564,6 +1588,68 @@ impl Node {
             }
         }
         reps
+    }
+
+    /// A table's placement class, resolved once from the replicated catalog
+    /// (an in-memory map read — cheap enough per call, and hoistable in
+    /// per-table loops; nothing is cached, so a DDL change is visible on the
+    /// next lookup). GLOBAL-index entry tables resolve through their base
+    /// table inside the engine. An unreadable engine (poisoned lock) degrades
+    /// to cluster-default placement — the pre-feature behavior.
+    fn table_placement(&self, table: &str) -> TablePlacement {
+        let (rf, pins) = match self.local.read() {
+            Ok(db) => db.table_placement(table),
+            Err(_) => (None, Vec::new()),
+        };
+        if !pins.is_empty() {
+            TablePlacement::Pinned(pins.into_iter().map(NodeId::new).collect())
+        } else if let Some(n) = rf {
+            TablePlacement::Rf(n as usize)
+        } else {
+            TablePlacement::Default
+        }
+    }
+
+    /// Replica set for an already-placement-mapped key under `placement`.
+    /// Pinned tables return the pinned set regardless of key (every pin holds
+    /// the whole table), with self hoisted to the front when pinned so the
+    /// coordinator-local fast paths (`first()`/local-write checks) stay local;
+    /// the others keep catalog order, which is what elected-sender logic keys
+    /// on.
+    fn placed_replicas(&self, placement: &TablePlacement, key: &[u8]) -> Vec<NodeId> {
+        match placement {
+            TablePlacement::Pinned(pins) => {
+                let mut reps = pins.clone();
+                if let Some(i) = reps.iter().position(|p| *p == self.id) {
+                    let me = reps.remove(i);
+                    reps.insert(0, me);
+                }
+                reps
+            }
+            TablePlacement::Rf(n) => self.replicas_for_rf(key, *n),
+            TablePlacement::Default => self.replicas_for_rf(key, self.cfg.replication_factor),
+        }
+    }
+
+    /// The effective replica set of (`table`, `key`): the table's catalog
+    /// placement applied to the key's placement bytes. The quorum divisor at
+    /// every call site must be THIS list's length (which, mid-reshard, is the
+    /// dual-ring union — same shape the cluster-default path always had).
+    fn effective_replicas(&self, table: &str, key: &[u8]) -> Vec<NodeId> {
+        self.placed_replicas(&self.table_placement(table), Self::placement(table, key))
+    }
+
+    /// Whether this node holds every row of `table` — the per-table
+    /// generalization of the old `replication_factor >= member_count` gate
+    /// behind the local-serving fast paths (counts, DISTINCT, ordered reads,
+    /// local search). A pin holds the whole table by definition; a non-pin
+    /// holds none of it.
+    fn holds_full_table(&self, table: &str) -> bool {
+        match self.table_placement(table) {
+            TablePlacement::Pinned(pins) => pins.contains(&self.id),
+            TablePlacement::Rf(n) => n >= self.member_count(),
+            TablePlacement::Default => self.cfg.replication_factor >= self.member_count(),
+        }
     }
 
     /// Address of peer `id`, if it is a current peer (snapshot, cloned).
@@ -1876,7 +1962,7 @@ impl Node {
             ));
         };
         let key = skaidb_types::Value::Array(vec![pk_value.clone()]).encode_key();
-        let replicas = self.replicas_for(&key);
+        let replicas = self.effective_replicas(table, &key);
         if replicas.contains(&self.id) {
             return self
                 .local
@@ -2512,6 +2598,21 @@ impl Node {
         tables.sort();
 
         for table in tables {
+            // Per-table placement, hoisted for the whole page walk. A pinned
+            // table never rebalances to a non-pinned joiner (pins are
+            // explicit); when the joiner IS a pin (rejoin after an unclean
+            // exit), the elected sender is the first *other* pin in catalog
+            // order — the ring-primary election below would pick a member
+            // that holds nothing.
+            let placement = self.table_placement(&table);
+            if let TablePlacement::Pinned(pins) = &placement {
+                if !pins.contains(joiner) {
+                    continue;
+                }
+                if pins.iter().find(|p| *p != joiner) != Some(&self.id) {
+                    continue; // another pin is this table's sender (or none exists)
+                }
+            }
             // Resume handling: a table sorting before the checkpoint's table
             // is already done; within the checkpoint's table, the page cursor
             // starts after the last key sent.
@@ -2536,10 +2637,15 @@ impl Node {
                 cursor = page.last().map(|(k, _, _, _)| k.clone());
                 let pending: Vec<BatchRow> = page
                     .into_iter()
-                    .filter(|(key, _, _, _)| {
-                        let pkey = Self::placement(&table, key);
-                        self.replicas_for(pkey).contains(joiner)
-                            && old_ring.primary_for(pkey) == Some(self.id.clone())
+                    .filter(|(key, _, _, _)| match &placement {
+                        // Pinned: table-level election above already made
+                        // this node the sender for every row.
+                        TablePlacement::Pinned(_) => true,
+                        _ => {
+                            let pkey = Self::placement(&table, key);
+                            self.placed_replicas(&placement, pkey).contains(joiner)
+                                && old_ring.primary_for(pkey) == Some(self.id.clone())
+                        }
                     })
                     .collect();
                 for chunk in pending.chunks(batch) {
@@ -2612,6 +2718,19 @@ impl Node {
             .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
             .persistent_table_names();
         for table in tables {
+            // Per-table placement, hoisted per table. Pinned tables have
+            // nothing to drain: their owners are the pins, which a membership
+            // change does not move (and `remove_member` refuses to remove a
+            // pin, so the leaving node is never one — any stale rows it holds
+            // are reclaim territory).
+            let placement = self.table_placement(&table);
+            if matches!(placement, TablePlacement::Pinned(_)) {
+                continue;
+            }
+            let table_rf = match placement {
+                TablePlacement::Rf(n) => n,
+                _ => rf,
+            };
             // Page through the shard so drain memory is one page + the
             // per-destination groups of that page, independent of shard size.
             let mut cursor: Option<Vec<u8>> = None;
@@ -2629,8 +2748,8 @@ impl Node {
                 let mut per_dest: BTreeMap<NodeId, Vec<BatchRow>> = BTreeMap::new();
                 for (key, value, hlc, is_put) in page {
                     let pkey = Self::placement(&table, &key);
-                    let old = self.replicas_for(pkey); // current ring (includes self)
-                    for replica in new_ring.replicas_for(pkey, rf) {
+                    let old = self.placed_replicas(&placement, pkey); // current ring (includes self)
+                    for replica in new_ring.replicas_for(pkey, table_rf) {
                         if old.contains(&replica) {
                             continue; // that node already holds this row
                         }
@@ -2834,6 +2953,22 @@ impl Node {
                 "cannot remove the last node in the cluster".into(),
             ));
         }
+        // A pinned node may hold a table's only copies; draining cannot move
+        // a pin (pins are explicit placement, not ring territory). Refuse
+        // until the operator re-pins — `ALTER TABLE ... SET (nodes = [...])`
+        // shrink is the escape hatch.
+        let pinning = self
+            .local
+            .read()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .tables_pinning(id);
+        if !pinning.is_empty() {
+            return Err(EngineError::Cluster(format!(
+                "cannot remove {id}: pinned by table(s) {}; re-pin first \
+                 (ALTER TABLE ... SET (nodes = [...]))",
+                pinning.join(", ")
+            )));
+        }
         let new_members: Vec<(NodeId, String)> =
             members.into_iter().filter(|(m, _)| *m != leaving).collect();
         let wire: Vec<(String, String)> = new_members
@@ -2910,6 +3045,11 @@ impl Node {
 
         let mut total = 0;
         for table in tables {
+            // Per-table placement, hoisted for the page walk: ownership is
+            // the table's effective replica set, so a non-pin drops a pinned
+            // table's rows (once a pin confirms holding them) and pins keep
+            // theirs.
+            let placement = self.table_placement(&table);
             // Collect unowned keys whose owners confirm a copy at >= our
             // version, paging the scan so only keys under consideration (not
             // whole rows) accumulate.
@@ -2924,7 +3064,7 @@ impl Node {
                 let done = page.len() < MIGRATE_PAGE_ROWS;
                 cursor = page.last().map(|(k, _, _, _)| k.clone());
                 for (key, _value, hlc, _is_put) in page {
-                    let owners = self.replicas_for(Self::placement(&table, &key));
+                    let owners = self.placed_replicas(&placement, Self::placement(&table, &key));
                     if owners.contains(&self.id) {
                         continue; // we still own it
                     }
@@ -3146,10 +3286,9 @@ impl Node {
     ///   verification needs cross-node reads — deferred (orphans stay
     ///   harmless; the crash window stays bounded by write consistency).
     fn gidx_repair(&self) -> usize {
-        let (indexes, full_copy) = {
+        let indexes = {
             let Ok(db) = self.local.read() else { return 0 };
-            let full_copy = self.cfg.replication_factor >= self.member_count();
-            (db.all_global_indexes(), full_copy)
+            db.all_global_indexes()
         };
         let mut fixed = 0usize;
         for (name, building) in indexes {
@@ -3164,7 +3303,14 @@ impl Node {
                 }
                 continue;
             }
-            if !full_copy {
+            // Full-copy is per table now: entries resolve placement through
+            // their base, so one check covers both sides of the verify. A
+            // node that holds the whole table (every row AND every entry —
+            // the same set, by construction) verifies locally; anyone else
+            // takes the sharded cross-node exchange. A non-pin of a pinned
+            // base holds neither rows nor entries and contributes nothing
+            // there — the pins drive the verification.
+            if !self.holds_full_table(&skaidb_engine::gidx_table(&name)) {
                 fixed += self.gidx_verify_sharded(&name);
                 continue;
             }
@@ -3237,13 +3383,18 @@ impl Node {
         let entry_table = skaidb_engine::gidx_table(index);
         let empty = Value::Document(Document::new()).encode();
         let mut fixed = 0usize;
+        // Rows and entries share the base table's placement (entries resolve
+        // through it), so one hoisted lookup serves every ownership check in
+        // the pass.
+        let placement = self.table_placement(&base_table);
 
         // Deliver one entry-key batch (put or tombstone) to the entry's full
         // replica set.
         let deliver = |keys: &[Vec<u8>], is_put: bool| -> usize {
             let mut per_set: HashMap<Vec<NodeId>, Vec<BatchRow>> = HashMap::new();
             for k in keys {
-                let owners = self.replicas_for(skaidb_engine::gidx_placement_prefix(k));
+                let owners =
+                    self.placed_replicas(&placement, skaidb_engine::gidx_placement_prefix(k));
                 let value = if is_put { empty.clone() } else { Vec::new() };
                 per_set
                     .entry(owners)
@@ -3305,7 +3456,7 @@ impl Node {
             cursor = page.last().map(|(k, _, _, _)| k.clone());
             let mut per_owner: HashMap<NodeId, Vec<Vec<u8>>> = HashMap::new();
             for (row_key, value, _hlc, is_put) in &page {
-                if !is_put || self.replicas_for(row_key).first() != Some(&self.id) {
+                if !is_put || self.placed_replicas(&placement, row_key).first() != Some(&self.id) {
                     continue;
                 }
                 let Ok(Value::Document(doc)) = Value::decode(value) else { continue };
@@ -3313,7 +3464,7 @@ impl Node {
                     skaidb_engine::global_entry_delta(&paths, row_key, None, Some(&doc));
                 for ekey in puts {
                     let owner = self
-                        .replicas_for(skaidb_engine::gidx_placement_prefix(&ekey))
+                        .placed_replicas(&placement, skaidb_engine::gidx_placement_prefix(&ekey))
                         .first()
                         .cloned();
                     if let Some(owner) = owner {
@@ -3362,7 +3513,7 @@ impl Node {
                     continue;
                 }
                 if self
-                    .replicas_for(skaidb_engine::gidx_placement_prefix(ekey))
+                    .placed_replicas(&placement, skaidb_engine::gidx_placement_prefix(ekey))
                     .first()
                     != Some(&self.id)
                 {
@@ -3372,7 +3523,7 @@ impl Node {
                     fixed += deliver(std::slice::from_ref(ekey), false); // malformed
                     continue;
                 };
-                if let Some(owner) = self.replicas_for(row_key).first().cloned() {
+                if let Some(owner) = self.placed_replicas(&placement, row_key).first().cloned() {
                     per_owner.entry(owner).or_default().push(ekey.clone());
                 }
             }
@@ -3413,12 +3564,20 @@ impl Node {
     /// write site missed an update; see TODO). One sequential page walk,
     /// paced like the repair scan.
     pub(crate) fn repair_digest(&self, table: &str, peer: &NodeId) -> EngineResult<Vec<u64>> {
-        // Full-copy clusters: the pair-ownership filter passes every row for
+        // Full-copy tables: the pair-ownership filter passes every row for
         // every peer, so digests are peer-independent — serve from the
         // versioned cache when the table has not changed. Idle converged
         // tables then cost NOTHING per pass (no scan at all), for the
-        // requester and the responder alike.
-        let full_copy = self.cfg.replication_factor >= self.member_count();
+        // requester and the responder alike. Per-table now: only a table
+        // every member fully holds qualifies (ring placement at effective
+        // RF >= members); pinned and RF<members tables have peer-dependent
+        // digests and simply never see the cache — they never qualified.
+        let placement = self.table_placement(table);
+        let full_copy = match &placement {
+            TablePlacement::Pinned(_) => false,
+            TablePlacement::Rf(n) => *n >= self.member_count(),
+            TablePlacement::Default => self.cfg.replication_factor >= self.member_count(),
+        };
         let version = if full_copy {
             let v = self
                 .local
@@ -3447,7 +3606,7 @@ impl Node {
             let Some((last_key, _, _)) = rows.last() else { break };
             after = Some(last_key.clone());
             for (key, hlc, is_put) in &rows {
-                let owners = self.replicas_for(Self::placement(table, key));
+                let owners = self.placed_replicas(&placement, Self::placement(table, key));
                 if !(owners.contains(&self.id) || owners.contains(peer)) {
                     continue; // neither side is responsible: reclaim territory
                 }
@@ -3508,6 +3667,10 @@ impl Node {
         if self.repair_digests_match(table, pid, addr) {
             return Ok(0);
         }
+        // Per-table placement, hoisted for the merge-join: repair ownership
+        // is the effective replica set, so a pinned table reconciles only
+        // among its pins (a pair with neither side pinned matches nothing).
+        let placement = self.table_placement(table);
         let mut repaired = 0usize;
         let mut local: PageCursor = PageCursor::new();
         let mut remote: PageCursor = PageCursor::new();
@@ -3553,26 +3716,38 @@ impl Node {
                 (None, None) => break,
                 (Some(_), None) => {
                     let (key, value, hlc, is_put) = local.pop();
-                    if self.replicas_for(Self::placement(table, &key)).contains(pid) {
+                    if self
+                        .placed_replicas(&placement, Self::placement(table, &key))
+                        .contains(pid)
+                    {
                         push.push((key, value, hlc, is_put));
                     }
                 }
                 (None, Some(_)) => {
                     let (key, value, hlc, is_put) = remote.pop();
-                    if self.replicas_for(Self::placement(table, &key)).contains(&self.id) {
+                    if self
+                        .placed_replicas(&placement, Self::placement(table, &key))
+                        .contains(&self.id)
+                    {
                         pull.push((key, value, hlc, is_put));
                     }
                 }
                 (Some(l), Some(r)) => match l.0.cmp(&r.0) {
                     std::cmp::Ordering::Less => {
                         let (key, value, hlc, is_put) = local.pop();
-                        if self.replicas_for(Self::placement(table, &key)).contains(pid) {
+                        if self
+                            .placed_replicas(&placement, Self::placement(table, &key))
+                            .contains(pid)
+                        {
                             push.push((key, value, hlc, is_put));
                         }
                     }
                     std::cmp::Ordering::Greater => {
                         let (key, value, hlc, is_put) = remote.pop();
-                        if self.replicas_for(Self::placement(table, &key)).contains(&self.id) {
+                        if self
+                            .placed_replicas(&placement, Self::placement(table, &key))
+                            .contains(&self.id)
+                        {
                             pull.push((key, value, hlc, is_put));
                         }
                     }
@@ -3584,14 +3759,14 @@ impl Node {
                         match lh.cmp(&rh) {
                             std::cmp::Ordering::Greater
                                 if self
-                                    .replicas_for(Self::placement(table, &lrow.0))
+                                    .placed_replicas(&placement, Self::placement(table, &lrow.0))
                                     .contains(pid) =>
                             {
                                 push.push(lrow);
                             }
                             std::cmp::Ordering::Less
                                 if self
-                                    .replicas_for(Self::placement(table, &rrow.0))
+                                    .placed_replicas(&placement, Self::placement(table, &rrow.0))
                                     .contains(&self.id) =>
                             {
                                 pull.push(rrow);
@@ -3649,6 +3824,7 @@ impl Node {
     /// pulling its whole shard in one response — O(table) memory, kept only
     /// for rolling upgrades against peers that don't know the paged scan.
     fn repair_table_unpaged(&self, table: &str, pid: &NodeId, addr: &str) -> usize {
+        let placement = self.table_placement(table);
         let mut repaired = 0usize;
         let Ok(local_rows) = self
             .local
@@ -3675,7 +3851,10 @@ impl Node {
         let mut pull: Vec<BatchRow> = Vec::new();
         for (key, value, hlc, is_put) in &remote {
             remote_hlc.insert(key.clone(), *hlc);
-            if !self.replicas_for(Self::placement(table, key)).contains(&self.id) {
+            if !self
+                .placed_replicas(&placement, Self::placement(table, key))
+                .contains(&self.id)
+            {
                 continue;
             }
             if local_map.get(key).is_some_and(|(lh, _, _)| *lh >= *hlc) {
@@ -3688,7 +3867,10 @@ impl Node {
         }
         let mut push: Vec<BatchRow> = Vec::new();
         for (key, (lh, is_put, value)) in &local_map {
-            if !self.replicas_for(Self::placement(table, key)).contains(pid) {
+            if !self
+                .placed_replicas(&placement, Self::placement(table, key))
+                .contains(pid)
+            {
                 continue;
             }
             if remote_hlc.get(key).is_some_and(|rh| rh >= lh) {
@@ -4987,11 +5169,17 @@ impl Node {
                         )
                     } else if db.plan_global_probe(&sel.from, &sel.filter).is_some() {
                         "global-index probe routed to the value's replica set".to_string()
-                    } else if rf >= members {
-                        "every member holds all data — served without fan-out".to_string()
                     } else {
-                        "scatter to all members, gather + LWW-merge at the coordinator"
-                            .to_string()
+                        // Per-table placement decides the scan shape.
+                        let (trf, pins) = db.table_placement(&sel.from);
+                        if !pins.is_empty() {
+                            format!("pinned table — gathered from its {} pin(s)", pins.len())
+                        } else if trf.map(|n| n as usize).unwrap_or(rf) >= members {
+                            "every member holds all data — served without fan-out".to_string()
+                        } else {
+                            "scatter to all members, gather + LWW-merge at the coordinator"
+                                .to_string()
+                        }
                     }
                 }
                 Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
@@ -5157,7 +5345,9 @@ impl Node {
         for (start, end) in ranges {
             // `start` is exactly the placement prefix (length header ‖
             // values): the same bytes every entry in the range hashes to.
-            let replicas = self.replicas_for(start);
+            // Placement resolves through the base table (a pinned base pins
+            // its entries too).
+            let replicas = self.effective_replicas(&entry_table, start);
             let needed = oc
                 .unwrap_or(self.cfg.read_consistency)
                 .required(replicas.len().max(1));
@@ -5249,6 +5439,10 @@ impl Node {
         };
         let entry_table = skaidb_engine::gidx_table(index);
         let empty = Value::Document(Document::new()).encode();
+        // Hoisted per drive: row ownership below is the base table's
+        // effective placement (a pinned base contributes rows only from its
+        // pins' shards — which hold the whole table).
+        let placement = self.table_placement(&base_table);
         let members: Vec<Option<(NodeId, String)>> = std::iter::once(None)
             .chain(self.peer_addrs_with_ids().into_iter().map(Some))
             .collect();
@@ -5292,7 +5486,7 @@ impl Node {
                     }
                     // Exactly-once across members: only the row's primary
                     // owner's shard contributes it.
-                    if self.replicas_for(&key).first() != Some(&member_id) {
+                    if self.placed_replicas(&placement, &key).first() != Some(&member_id) {
                         continue;
                     }
                     let Ok(Value::Document(doc)) = Value::decode(&value) else {
@@ -5384,7 +5578,9 @@ impl Node {
         }
         self.counters.writes_total.fetch_add(1, Ordering::Relaxed);
         self.note_local_write(hlc);
-        let replicas = self.replicas_for(Self::placement(table, key));
+        // Per-table placement; the quorum divisor is the effective list's
+        // length (mid-reshard that is the dual-ring union, as it always was).
+        let replicas = self.effective_replicas(table, key);
         let needed = oc
             .unwrap_or(self.cfg.write_consistency)
             .required(replicas.len().max(1));
@@ -5554,10 +5750,12 @@ impl Node {
         }
         // Group rows by replica set. With members == RF every key maps to the
         // same set (one group, one batch); larger clusters get one batch per
-        // distinct set.
+        // distinct set. Placement is hoisted once per statement — pinned
+        // tables collapse to a single group by construction.
+        let placement = self.table_placement(table);
         let mut groups: Vec<(Vec<NodeId>, Vec<BatchRow>)> = Vec::new();
         for (key, value, hlc) in rows {
-            let replicas = self.replicas_for(Self::placement(table, &key));
+            let replicas = self.placed_replicas(&placement, Self::placement(table, &key));
             let row: BatchRow = (key, value, hlc, true);
             match groups.iter_mut().find(|(r, _)| *r == replicas) {
                 Some((_, group)) => group.push(row),
@@ -5889,7 +6087,7 @@ impl Node {
         oc: Option<Consistency>,
     ) -> EngineResult<Vec<(Vec<u8>, Document)>> {
         self.counters.reads_total.fetch_add(1, Ordering::Relaxed);
-        let replicas = self.replicas_for(Self::placement(table, key));
+        let replicas = self.effective_replicas(table, key);
         let needed = oc
             .unwrap_or(self.cfg.read_consistency)
             .required(replicas.len().max(1));
@@ -6289,16 +6487,32 @@ impl Node {
             _ => None,
         };
         self.counters.reads_total.fetch_add(1, Ordering::Relaxed);
-        let needed = oc
-            .unwrap_or(self.cfg.read_consistency)
-            .required(self.member_count());
+        // Source set + quorum divisor are per-table: a pinned table gathers
+        // from its pins only — a non-pin coordinator routes to the pins
+        // instead of scanning its own empty shard or scattering to every
+        // member — while ring-placed tables keep the scatter-to-all shape
+        // (their shards spread over all members at any RF).
+        let (addrs, local_active, divisor) = match self.table_placement(table) {
+            TablePlacement::Pinned(pins) => {
+                let local_active = pins.contains(&self.id);
+                let addrs: Vec<String> = pins
+                    .iter()
+                    .filter(|p| **p != self.id)
+                    .filter_map(|p| self.peer_addr(p))
+                    .collect();
+                (addrs, local_active, pins.len())
+            }
+            _ => (self.peer_addrs(), true, self.member_count()),
+        };
+        let needed = oc.unwrap_or(self.cfg.read_consistency).required(divisor);
 
-        let addrs = self.peer_addrs();
-        // Per-source paging state. Index 0 is the local shard; the rest track
-        // `addrs`. `done` = this source has delivered its whole shard; `ok` = it
+        // Per-source paging state. Index 0 is the local shard (inactive when
+        // this node is not a replica of a pinned table — it must neither
+        // contribute rows nor count as a responder); the rest track `addrs`.
+        // `done` = this source has delivered its whole shard; `ok` = it
         // has never errored (only `ok` sources count toward the read quorum).
         let mut local_cursor: Option<Vec<u8>> = None;
-        let mut local_done = false;
+        let mut local_done = !local_active;
         let mut peer_cursor: Vec<Option<Vec<u8>>> = vec![None; addrs.len()];
         let mut peer_done: Vec<bool> = vec![false; addrs.len()];
         let mut peer_ok: Vec<bool> = vec![true; addrs.len()];
@@ -6426,9 +6640,10 @@ impl Node {
             }
         }
 
-        // Read quorum over the scanned prefix: the local shard always responds;
-        // require a quorum of members to have contributed without error.
-        let responders = 1 + peer_ok.iter().filter(|ok| **ok).count();
+        // Read quorum over the scanned prefix: the local shard responds when
+        // it is a source; require a quorum of sources to have contributed
+        // without error.
+        let responders = usize::from(local_active) + peer_ok.iter().filter(|ok| **ok).count();
         if responders < needed {
             self.counters
                 .read_quorum_failures
@@ -7593,9 +7808,15 @@ impl Cluster for Coordinator {
         // One index holding every row serves locally; a sharded corpus
         // scatters per-shard sorted top-k over ownership arcs and merges —
         // declining (to the coordinator's gather-and-sort) when a residual
-        // filter is present or any member cannot answer.
+        // filter is present or any member cannot answer. Both gates are
+        // per-table: a pin serves its pinned table locally, and a non-pin
+        // declines outright (the arc-sharded scatter assumes ring placement,
+        // which pinned tables bypass).
         let members = self.node.member_count();
-        if members > 1 && self.node.cfg.replication_factor < members {
+        if members > 1 && !self.node.holds_full_table(table) {
+            if matches!(self.node.table_placement(table), TablePlacement::Pinned(_)) {
+                return Ok(None);
+            }
             return self
                 .node
                 .search_sorted_sharded(table, query, sort, k, filter, highlights);
@@ -7619,8 +7840,13 @@ impl Cluster for Coordinator {
         // filter over the `_ring` fast field) and the partials merge —
         // exact-or-decline throughout, so any wobble (epoch change, silent
         // peer, unmergeable metric) falls back to the deduped row gather.
+        // Per-table gates as in `search_sorted`: pins serve locally, non-pins
+        // of a pinned table decline (arc sharding assumes ring placement).
         let members = self.node.member_count();
-        if members > 1 && self.node.cfg.replication_factor < members {
+        if members > 1 && !self.node.holds_full_table(table) {
+            if matches!(self.node.table_placement(table), TablePlacement::Pinned(_)) {
+                return Ok(None);
+            }
             return self.node.search_aggregate_sharded(table, query, agg);
         }
         self.node
@@ -7636,8 +7862,10 @@ impl Cluster for Coordinator {
         // gather materialized the whole merged table on the coordinator, and
         // a plain count(*) OOM-killed a production node (2026-07-11). Same
         // freshness trade the search-index paths already make at RF >=
-        // members: the count may lag an in-flight write by a beat.
-        if self.node.cfg.replication_factor >= self.node.member_count() {
+        // members: the count may lag an in-flight write by a beat. Per-table
+        // now: "full copy" means THIS node holds every row of THIS table (a
+        // pin qualifies; a non-pin of a pinned table never does).
+        if self.node.holds_full_table(table) {
             if let Some(db) = self.node.local_read_bounded() {
                 return db.local_count_rows(table);
             }
@@ -7655,8 +7883,9 @@ impl Cluster for Coordinator {
         // filtered count without a cluster gather (which materializes every
         // matching row on the coordinator — a count_documents-shaped query
         // on a 183k-row table wedged two production coordinators,
-        // 2026-07-13). Same freshness trade as `count_rows`.
-        if self.node.cfg.replication_factor >= self.node.member_count() {
+        // 2026-07-13). Same freshness trade — and the same per-table
+        // full-copy gate — as `count_rows`.
+        if self.node.holds_full_table(table) {
             if let Some(db) = self.node.local_read_bounded() {
                 return db.local_count_filtered(table, filter);
             }
@@ -7674,9 +7903,7 @@ impl Cluster for Coordinator {
         // streamed distinct answers in one table scan — the quorum merge
         // below pulls every replica's pages over the wire and cannot be
         // interactive on large tables.
-        if self.oc == Some(Consistency::One)
-            && self.node.cfg.replication_factor >= self.node.member_count()
-        {
+        if self.oc == Some(Consistency::One) && self.node.holds_full_table(table) {
             if let Some(db) = self.node.local_read_bounded() {
                 return db.local_distinct_values(table, col, filter).map(Some);
             }
@@ -7696,9 +7923,7 @@ impl Cluster for Coordinator {
         // ignored the caller's consistency and always ran the cross-replica
         // merge below — the tag-view pagination count asked for "one" and
         // still died at the statement timeout (124 s, 2026-07-14).
-        if self.oc == Some(Consistency::One)
-            && self.node.cfg.replication_factor >= self.node.member_count()
-        {
+        if self.oc == Some(Consistency::One) && self.node.holds_full_table(table) {
             if let Some(db) = self.node.local_read_bounded() {
                 return db.local_count_matching(table, filter).map(Some);
             }
@@ -7905,9 +8130,7 @@ impl Cluster for Coordinator {
         // `ORDER BY <col> DESC LIMIT 1` over a 183k-row table must read one
         // row, not the table. Local-only is exactly what ONE means; the
         // default (quorum) keeps the divergence-merging gather.
-        if order.is_some()
-            && self.oc == Some(Consistency::One)
-            && self.node.cfg.replication_factor >= self.node.member_count()
+        if order.is_some() && self.oc == Some(Consistency::One) && self.node.holds_full_table(table)
         {
             if let Some(db) = self.node.local_read_bounded() {
                 return db.local_matching_rows_ordered(table, filter, order, fetch_limit);
@@ -8302,6 +8525,140 @@ mod tests {
         nc.execute("DELETE FROM t WHERE id = 2").unwrap();
         let rs = rows(na.execute("SELECT id FROM t ORDER BY id").unwrap());
         assert_eq!(rs.rows, vec![vec![Value::Int(1)], vec![Value::Int(3)]]);
+    }
+
+    /// Rows a node physically holds in `table` (live puts only).
+    fn local_keys(node: &Node, table: &str) -> Vec<Vec<u8>> {
+        node.local
+            .read()
+            .unwrap()
+            .local_scan_versioned_page(table, None, 10_000)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, _, _, is_put)| *is_put)
+            .map(|(k, _, _, _)| k)
+            .collect()
+    }
+
+    #[test]
+    fn rf_override_table_places_each_key_on_exactly_one_owner() {
+        // Cluster default rf=3 (full copy on 3 members); the table opts down
+        // to replication = 1, so each key must land on exactly one member and
+        // quorum over its single-replica set is 1 — while reads from any
+        // coordinator still see every row (the ring-placed gather).
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let na = Node::new(
+            Database::open(temp_dir("rf1-a")).unwrap(),
+            cfg("a", &a, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("rf1-b")).unwrap(),
+            cfg("b", &b, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nc = Node::new(
+            Database::open(temp_dir("rf1-c")).unwrap(),
+            cfg("c", &c, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        nc.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE r1 (PRIMARY KEY (id)) WITH (replication = 1)")
+            .unwrap();
+        for i in 0..30 {
+            na.execute(&format!("INSERT INTO r1 (id, v) VALUES ({i}, 'v{i}')"))
+                .unwrap();
+        }
+
+        // Exactly one physical copy per key, spread over the ring.
+        let mut all: Vec<Vec<u8>> = Vec::new();
+        for node in [&na, &nb, &nc] {
+            all.extend(local_keys(node, "r1"));
+        }
+        assert_eq!(
+            all.len(),
+            30,
+            "each key on exactly one owner (no extra copies)"
+        );
+        let distinct: HashSet<&Vec<u8>> = all.iter().collect();
+        assert_eq!(distinct.len(), 30, "no key duplicated across members");
+
+        // Any coordinator reads the full table (and single-key point reads
+        // reach the key's sole owner at quorum 1-of-1).
+        for coord in [&na, &nb, &nc] {
+            let rs = rows(coord.execute("SELECT id FROM r1").unwrap());
+            assert_eq!(rs.rows.len(), 30, "full view from any coordinator");
+            let rs = rows(coord.execute("SELECT v FROM r1 WHERE id = 7").unwrap());
+            assert_eq!(rs.rows, vec![vec![Value::String("v7".into())]]);
+        }
+    }
+
+    #[test]
+    fn pinned_table_lands_on_pin_and_pin_removal_is_refused() {
+        // A table pinned to one member: every row lands only on the pin, a
+        // non-pin coordinator reads via routing (not its own empty shard),
+        // removing the pin is refused naming the table, and removing a
+        // non-pin still works.
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let na = Node::new(
+            Database::open(temp_dir("pin-a")).unwrap(),
+            cfg("a", &a, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("pin-b")).unwrap(),
+            cfg("b", &b, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nc = Node::new(
+            Database::open(temp_dir("pin-c")).unwrap(),
+            cfg("c", &c, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        nc.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE hot (PRIMARY KEY (id)) WITH (nodes = ['b'])")
+            .unwrap();
+        // Written through a NON-pin coordinator: quorum is 1-of-1 (the pin).
+        for i in 0..20 {
+            na.execute(&format!("INSERT INTO hot (id, v) VALUES ({i}, 'v{i}')"))
+                .unwrap();
+        }
+
+        assert_eq!(local_keys(&nb, "hot").len(), 20, "the pin holds every row");
+        assert!(local_keys(&na, "hot").is_empty(), "non-pin a holds nothing");
+        assert!(local_keys(&nc, "hot").is_empty(), "non-pin c holds nothing");
+
+        // Non-pin coordinators serve reads by routing to the pin: the full
+        // gather, a point read, and an update+read round-trip.
+        for coord in [&na, &nc] {
+            let rs = rows(coord.execute("SELECT id FROM hot").unwrap());
+            assert_eq!(rs.rows.len(), 20, "routed gather sees the pinned rows");
+            let rs = rows(coord.execute("SELECT v FROM hot WHERE id = 3").unwrap());
+            assert_eq!(rs.rows, vec![vec![Value::String("v3".into())]]);
+        }
+        nc.execute("UPDATE hot SET v = 'X' WHERE id = 3").unwrap();
+        let rs = rows(na.execute("SELECT v FROM hot WHERE id = 3").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::String("X".into())]]);
+
+        // The pin is unremovable while pinned — the error names the table.
+        let err = na.remove_member("b").unwrap_err().to_string();
+        assert!(err.contains("hot"), "error names the pinning table: {err}");
+        assert!(
+            err.contains("re-pin"),
+            "error tells the operator what to do: {err}"
+        );
+        assert!(
+            na.member_ids().contains(&"b".to_string()),
+            "b still a member"
+        );
+
+        // A non-pin removes fine; the pinned table survives untouched.
+        na.remove_member("c").unwrap();
+        assert!(!na.member_ids().contains(&"c".to_string()));
+        let rs = rows(na.execute("SELECT id FROM hot").unwrap());
+        assert_eq!(rs.rows.len(), 20, "pinned table intact after the removal");
     }
 
     /// Repair digests: equal on a converged pair (so the full compare is

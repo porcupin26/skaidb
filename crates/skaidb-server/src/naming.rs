@@ -92,7 +92,15 @@ pub fn bootstrap(ctx: &Shared, self_id: &str) -> Result<(), String> {
         ctx,
         &format!("CREATE TABLE IF NOT EXISTS {NODE_ALIASES_TABLE} (PRIMARY KEY (node_id))"),
     )?;
-    if cluster_name(ctx).is_none() {
+    // Seed only on a CONFIRMED-empty read: an error (cluster not ready,
+    // quorum unavailable during a rolling restart) must propagate so the
+    // caller retries — mapping it to "absent" re-seeds a random name over
+    // an operator-chosen one with a newer LWW stamp.
+    let have_name = exec(
+        ctx,
+        &format!("SELECT name FROM {CLUSTER_META_TABLE} WHERE id = 'cluster'"),
+    )?;
+    if one_string(have_name).is_none() {
         exec(
             ctx,
             &format!(

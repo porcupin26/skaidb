@@ -2982,16 +2982,6 @@ impl Database {
                 "'{name}' is a system table: placement/witness options are not allowed"
             )));
         }
-        // Placement options are parsed and stored, but nothing routes by
-        // them yet — accepting them would silently keep cluster-default
-        // placement. Refuse until the placement engine lands.
-        if replication.is_some() || !nodes.is_empty() {
-            return Err(EngineError::Constraint(
-                "per-table placement (replication/nodes) needs the placement-transition \
-                 work; 'witness' is available now"
-                    .into(),
-            ));
-        }
         let hlc = self.ddl_stamp();
         let key = format!("t:{name}");
         if !self.schema_advances(&key, hlc) {
@@ -6406,6 +6396,47 @@ impl Database {
             .get(index)
             .filter(|d| d.global)
             .map(|d| (d.table.clone(), d.paths.clone()))
+    }
+
+    /// The placement-relevant slice of a table's definition:
+    /// `(replication override, pinned nodes)`. GLOBAL-index entry tables
+    /// resolve through their BASE table — an entry's durability follows the
+    /// row's, and a pinned base places its entries on the same pins (the
+    /// routed probe stays one replica-set round-trip). Unknown tables get
+    /// cluster-default placement (`(None, [])`) — the safe answer for a
+    /// table mid-drop or not yet synced.
+    pub fn table_placement(&self, table: &str) -> (Option<u32>, Vec<String>) {
+        let base;
+        let name = if is_gidx_table(table) {
+            let (db, bare) = namespace::split(table);
+            let index = namespace::qualify(db, bare.strip_prefix("__gidx__").unwrap_or(bare));
+            match self.catalog.indexes.get(&index) {
+                Some(d) if d.global => {
+                    base = d.table.clone();
+                    base.as_str()
+                }
+                _ => return (None, Vec::new()),
+            }
+        } else {
+            table
+        };
+        self.catalog
+            .tables
+            .get(name)
+            .map(|d| (d.replication, d.pinned_nodes.clone()))
+            .unwrap_or((None, Vec::new()))
+    }
+
+    /// Tables whose pinned placement names `node` — `remove_member`'s guard:
+    /// a pinned node may hold a table's only copies, so removal must be
+    /// refused until the operator re-pins.
+    pub fn tables_pinning(&self, node: &str) -> Vec<String> {
+        self.catalog
+            .tables
+            .iter()
+            .filter(|(_, d)| d.pinned_nodes.iter().any(|n| n == node))
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     /// Flip a GLOBAL index out of `building` (the backfill driver finished).
