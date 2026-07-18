@@ -3348,7 +3348,15 @@ impl Database {
             .grants(role)
             .into_iter()
             .map(|(r, p, o)| {
-                vec![Value::String(r), Value::String(p), Value::String(o)]
+                // Table objects are stored in internal `db\x1ftable` form;
+                // render them back to `db.table` (bare for the default db)
+                // so the separator never surfaces to the user.
+                let object = if o.contains('\u{1f}') {
+                    namespace::display_name(&o, namespace::DEFAULT_DATABASE)
+                } else {
+                    o
+                };
+                vec![Value::String(r), Value::String(p), Value::String(object)]
             })
             .collect();
         ResultSet {

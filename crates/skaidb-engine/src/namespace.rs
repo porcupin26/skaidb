@@ -68,6 +68,19 @@ pub fn resolve_table_ref(reference: &str, current_db: &str) -> String {
 pub fn resolve_statement(stmt: &mut Statement, current_db: &str) {
     stmt.for_each_table_mut(|t| *t = resolve_table_ref(t, current_db));
     stmt.for_each_local_name_mut(|n| *n = qualify(current_db, n));
+    // A table-scoped GRANT/REVOKE resolves its object to the SAME internal
+    // identity as the queries it authorizes, so a grant matches a query
+    // regardless of whether either spelled the table bare or `db.`-qualified
+    // — and a bare grant binds to the session database, never a
+    // cross-database wildcard. Without this, `GRANT ON db.t` never matched a
+    // `USE db; ... t` query, and a bare `GRANT ON t` matched `t` in EVERY
+    // database (a cross-database over-grant).
+    use skaidb_sql::ast::GrantObject;
+    if let Statement::Grant { object, .. } | Statement::Revoke { object, .. } = stmt {
+        if let GrantObject::Table(t) = object {
+            *t = resolve_table_ref(t, current_db);
+        }
+    }
 }
 
 /// The user-facing form of an internal name, relative to `current_db`: bare if

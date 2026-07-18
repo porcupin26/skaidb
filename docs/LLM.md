@@ -320,6 +320,10 @@ SET CONSISTENCY ONE | QUORUM | ALL
 **RBAC**: privileges are `SELECT INSERT UPDATE DELETE CREATE DROP GRANT
 MONITOR ADMIN`. `ADMIN ON *` = superuser; a database grant covers its
 tables; a user acts as its own-named role and inherits granted roles.
+Table grants are matched by the table's **canonical `db.table` identity**,
+not the raw name: `GRANT ON t` in session db `d` means `d.t` (never a
+cross-database wildcard), and `GRANT ON d.t` authorizes the natural
+`USE d; ... t` query — both spellings resolve to the same table.
 Management statements need `GRANT`; `SHOW GRANTS FOR <own role>` is always
 allowed. `MONITOR ON *` = read-only control plane (SHOW CLUSTER/CONFIG/
 SLOW QUERIES + read-only admin HTTP), never mutations. **Index DDL is

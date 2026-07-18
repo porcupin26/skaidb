@@ -2222,6 +2222,100 @@ pub(crate) mod tests {
         }
     }
 
+    /// TABLE-scoped grants authorize by the table's canonical `db.table`
+    /// identity, not by the raw name string. Regression for two bugs found
+    /// in the 2026-07-18 bench security test, both from matching grant
+    /// objects by literal name instead of the internal identity:
+    /// (1) cross-database over-grant — a bare `GRANT ON orders` authorized
+    /// `orders` in EVERY database (read another db's same-named table);
+    /// (2) qualified-grant lockout — `GRANT ON db.orders` did NOT authorize
+    /// the natural `USE db; SELECT ... orders` (only a fully-qualified query
+    /// matched).
+    #[test]
+    fn rbac_table_grants_are_database_scoped() {
+        use crate::shared::{execute, execute_session_as};
+        let ctx: Shared = rbac_test_ctx();
+        for sql in [
+            "CREATE DATABASE appdb",
+            "CREATE DATABASE secretdb",
+            "CREATE TABLE appdb.orders (PRIMARY KEY (id))",
+            "CREATE TABLE secretdb.orders (PRIMARY KEY (id))",
+        ] {
+            assert_eq!(execute(&ctx, sql), Response::Ddl, "setup: {sql}");
+        }
+        for sql in [
+            "INSERT INTO appdb.orders (id, v) VALUES (1, 'app')",
+            "INSERT INTO secretdb.orders (id, v) VALUES (1, 'TOPSECRET')",
+        ] {
+            assert!(
+                matches!(execute(&ctx, sql), Response::Mutation { .. }),
+                "setup: {sql}"
+            );
+        }
+        // Run `sql` as `role` with the session already in `sess_db`.
+        let as_in = |role: &str, sess_db: &str, sql: &str| -> Response {
+            let mut db = sess_db.to_string();
+            execute_session_as(&ctx, role, &mut db, sql, None)
+        };
+        let denied =
+            |r: &Response| matches!(r, Response::Error(m) if m.contains("permission denied"));
+        let rows = |r: &Response| matches!(r, Response::Rows { .. });
+
+        // Fix 1: a QUALIFIED grant authorizes the natural bare query.
+        assert_eq!(execute(&ctx, "CREATE ROLE q_reader"), Response::Ddl);
+        assert_eq!(
+            execute(&ctx, "GRANT SELECT ON appdb.orders TO q_reader"),
+            Response::Ddl
+        );
+        assert!(
+            rows(&as_in("q_reader", "appdb", "SELECT * FROM orders")),
+            "qualified grant must authorize `USE appdb; SELECT orders`"
+        );
+        assert!(rows(&as_in("q_reader", "default", "SELECT * FROM appdb.orders")));
+        assert!(
+            denied(&as_in("q_reader", "secretdb", "SELECT * FROM orders")),
+            "grant on appdb.orders must not reach secretdb.orders"
+        );
+
+        // Fix 2: a BARE grant binds to the session db, not a wildcard.
+        assert_eq!(execute(&ctx, "CREATE ROLE b_reader"), Response::Ddl);
+        assert_eq!(
+            as_in("superuser", "appdb", "GRANT SELECT ON orders TO b_reader"),
+            Response::Ddl
+        );
+        assert!(
+            rows(&as_in("b_reader", "appdb", "SELECT * FROM orders")),
+            "bare grant reaches its own (session) database's table"
+        );
+        assert!(
+            denied(&as_in("b_reader", "secretdb", "SELECT * FROM orders")),
+            "bare grant must not leak across databases"
+        );
+        assert!(denied(&as_in(
+            "b_reader",
+            "default",
+            "SELECT * FROM secretdb.orders"
+        )));
+        assert!(denied(&as_in(
+            "b_reader",
+            "appdb",
+            "INSERT INTO orders (id) VALUES (9)"
+        )));
+
+        // SHOW GRANTS renders the internal identity as `db.table`.
+        match execute(&ctx, "SHOW GRANTS FOR q_reader") {
+            Response::Rows { rows, .. } => {
+                let obj = rows.iter().find_map(|r| match &r[2] {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                });
+                assert_eq!(obj.as_deref(), Some("appdb.orders"), "got: {rows:?}");
+                assert!(!obj.unwrap().contains('\u{1f}'), "separator must not surface");
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
     /// Auth DDL leaves secret-free audit entries in the identity log.
     #[test]
     fn auth_ddl_is_audit_logged_without_secrets() {

@@ -517,18 +517,20 @@ impl Context {
     /// store matches objects exactly; this is where a table check widens to
     /// its database.)
     ///
-    /// A `db.table` reference belongs to its **qualifier's** database, not
-    /// the session's `db`. Widening to the session database instead would
-    /// let a role holding a database-level grant reach a *different*
-    /// database's tables via a `db.table` reference — a privilege
-    /// escalation across the database boundary the grant was meant to fix.
+    /// The check resolves the reference to the table's **canonical internal
+    /// identity** (`namespace::resolve_table_ref` — the same `db\x1ftable`
+    /// the engine stores and that grants resolve to), so authorization
+    /// matches by identity, not by how the query or the grant happened to
+    /// spell the name. A bare reference binds to the session database; a
+    /// `db.table` reference to its qualifier's database. Widening to the
+    /// owning database (derived from the resolved identity) then lets a
+    /// database-level grant cover the table without ever reaching a
+    /// *different* database's same-named table.
     pub fn allowed_on_table(&self, role: &str, privilege: Privilege, table: &str, db: &str) -> bool {
-        let owning_db = match table.split_once('.') {
-            Some((qualifier, _)) => qualifier,
-            None => db,
-        };
-        self.allowed(role, privilege, &Object::Table(table.to_string()))
-            || self.allowed(role, privilege, &Object::Database(owning_db.to_string()))
+        let canonical = skaidb_engine::namespace::resolve_table_ref(table, db);
+        let owning_db = skaidb_engine::namespace::split(&canonical).0.to_string();
+        self.allowed(role, privilege, &Object::Table(canonical))
+            || self.allowed(role, privilege, &Object::Database(owning_db))
     }
 
     /// Resolve a username to its SCRAM credential and acting role: the
