@@ -163,6 +163,16 @@ impl fmt::Debug for Authenticator {
 }
 
 impl Authenticator {
+    /// The configured mode as a stable lowercase string (`none`/`token`/
+    /// `cert`) — for surfacing the internode security posture in `/status`.
+    pub fn mode(&self) -> &'static str {
+        match self {
+            Authenticator::None => "none",
+            Authenticator::Token(_) => "token",
+            Authenticator::Cert { .. } => "cert",
+        }
+    }
+
     /// Build the token-mode authenticator from a shared secret.
     pub fn token(secret: Vec<u8>) -> Self {
         Authenticator::Token(secret)
@@ -393,5 +403,115 @@ mod tests {
     fn cert_authenticator_errors_on_missing_files() {
         let err = Authenticator::cert("/no/such/cert", "/no/such/key", "/no/such/ca");
         assert!(err.is_err(), "missing cert material must be an error");
+    }
+
+    /// Mint a self-signed CA and one leaf cert (SAN `skaidb`) into `dir`,
+    /// writing `ca.crt` + `<name>.crt` + `<name>.key`. Returns the CA cert PEM
+    /// so a caller can build an authenticator trusting a DIFFERENT CA.
+    fn mint(dir: &std::path::Path, name: &str) -> String {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        let mut ca_p = CertificateParams::new(Vec::new()).unwrap();
+        ca_p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_key = KeyPair::generate().unwrap();
+        let ca = ca_p.self_signed(&ca_key).unwrap();
+        let leaf_p = CertificateParams::new(vec!["skaidb".to_string()]).unwrap();
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf = leaf_p.signed_by(&leaf_key, &ca, &ca_key).unwrap();
+        std::fs::write(dir.join("ca.crt"), ca.pem()).unwrap();
+        std::fs::write(dir.join(format!("{name}.crt")), leaf.pem()).unwrap();
+        std::fs::write(dir.join(format!("{name}.key")), leaf_key.serialize_pem()).unwrap();
+        ca.pem()
+    }
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("skaidb-tls-{tag}-{:?}", std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn cert_auth(dir: &std::path::Path, name: &str) -> Authenticator {
+        Authenticator::cert(
+            dir.join(format!("{name}.crt")).to_str().unwrap(),
+            dir.join(format!("{name}.key")).to_str().unwrap(),
+            dir.join("ca.crt").to_str().unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// End-to-end mutual TLS: two nodes issued by the SAME cluster CA complete
+    /// the handshake and exchange a frame; the connection is real TLS.
+    #[test]
+    fn cert_mutual_tls_handshake_succeeds_same_ca() {
+        let dir = tmpdir("same");
+        mint(&dir, "node1");
+        // A second leaf under the same CA (the connecting peer). Reuse node1's
+        // CA by minting node2 into a temp dir sharing the CA is overkill —
+        // both sides can present node1's leaf; the trust check is CA-based.
+        let server_auth = cert_auth(&dir, "node1");
+        let client_auth = cert_auth(&dir, "node1");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let srv = thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let mut conn = server_auth.accept(sock).expect("server TLS accept");
+            let msg = read_frame(&mut conn).unwrap();
+            write_frame(&mut conn, &msg).unwrap(); // echo
+        });
+        let mut conn = client_auth.connect(&addr, None).expect("client TLS connect");
+        write_frame(&mut conn, b"ping").unwrap();
+        let echo = read_frame(&mut conn).unwrap();
+        assert_eq!(echo, b"ping", "data flows over the TLS channel");
+        assert!(
+            format!("{conn:?}").contains("ClientTls"),
+            "must be TLS, not plaintext"
+        );
+        srv.join().unwrap();
+    }
+
+    /// A peer whose certificate is signed by a DIFFERENT CA is rejected — the
+    /// mutual-CA trust is what gates cluster membership.
+    #[test]
+    fn cert_rejects_foreign_ca() {
+        let good = tmpdir("good");
+        mint(&good, "node1");
+        let evil = tmpdir("evil");
+        mint(&evil, "rogue"); // its own CA — not trusted by `good`
+
+        let server_auth = cert_auth(&good, "node1");
+        let rogue_auth = cert_auth(&evil, "rogue");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let srv = thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            // The server must reject the rogue's untrusted client cert.
+            server_auth.accept(sock).is_err()
+        });
+        let rogue_ok = rogue_auth.connect(&addr, Some(Duration::from_secs(2))).is_ok();
+        let server_rejected = srv.join().unwrap();
+        assert!(server_rejected, "server must reject a foreign-CA client cert");
+        assert!(!rogue_ok, "rogue must not complete the handshake");
+    }
+
+    /// A plaintext/token peer cannot speak to a cert-mode server (no TLS
+    /// ClientHello) — so a `none`/`token` node can't join a `cert` cluster.
+    #[test]
+    fn cert_server_rejects_plaintext_peer() {
+        let dir = tmpdir("plain");
+        mint(&dir, "node1");
+        let server_auth = cert_auth(&dir, "node1");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let srv = thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            server_auth.accept(sock).is_err()
+        });
+        let plain_ok = Authenticator::None.connect(&addr, Some(Duration::from_secs(2))).is_ok();
+        // The plaintext connect "succeeds" at TCP but the server drops it; the
+        // point is the server side rejects (no valid TLS handshake).
+        let _ = plain_ok;
+        assert!(srv.join().unwrap(), "cert server must reject a plaintext peer");
     }
 }

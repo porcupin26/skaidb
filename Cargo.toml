@@ -48,6 +48,7 @@ brotli = "7"
 rustyline = "18"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
 
 [profile.release]
 lto = "thin"

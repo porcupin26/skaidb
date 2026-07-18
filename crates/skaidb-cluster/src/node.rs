@@ -1442,6 +1442,13 @@ impl Node {
     }
 
     /// The current membership as node ids (for diagnostics).
+    /// The internode security mode (`none`/`token`/`cert`) — surfaced in
+    /// `/status` so a misconfigured (silently unauthenticated/unencrypted)
+    /// cluster is visible instead of a hidden footgun.
+    pub fn internode_auth_mode(&self) -> &'static str {
+        self.auth.mode()
+    }
+
     pub fn member_ids(&self) -> Vec<String> {
         self.topo
             .read()

@@ -415,20 +415,41 @@ and the channel is encrypted. Node certificates must carry the SAN `DNS:skaidb`
 (how peers verify each other without per-node hostnames) and
 `extendedKeyUsage = serverAuth, clientAuth`.
 
+Generate the CA and per-node leaf certs with the built-in helper (no OpenSSL
+incantations, no locale footguns):
+
+```bash
+skaidbsh certs gen --out ./skaidb-certs --nodes 3
+# writes ca.crt, ca.key, and node1..node3.{crt,key}, all 0600
+```
+
+Give each node its own leaf (`node<i>.crt`/`node<i>.key`) plus the shared
+`ca.crt`; keep `ca.key` **off** the nodes (it's the issuing root — store it
+offline for future cert minting). Then:
+
 ```toml
 [auth]
 internode_auth = "cert"
-internode_tls_cert = "/etc/skaidb/node.pem"   # this node's cert (SAN: skaidb)
+internode_tls_cert = "/etc/skaidb/node.crt"   # this node's leaf (SAN: skaidb)
 internode_tls_key  = "/etc/skaidb/node.key"
-internode_tls_ca   = "/etc/skaidb/ca.pem"     # CA that signs every node's cert
+internode_tls_ca   = "/etc/skaidb/ca.crt"     # CA that signs every node's cert
 ```
 
 Both are also settable via flags/env (`--internode-auth`, `SKAIDB_INTERNODE_*`).
 A node that can't satisfy the configured mode is dropped at the handshake, before
-any RPC. **Rollout:** there's no mixed-mode window — turn the mode on with the
-same material on every node and restart them together. Client auth is separate —
-SCRAM on the binary endpoint and HTTP Basic on REST, plus RBAC; see the
+any RPC. **Rollout:** there's no mixed-mode window — a `cert` node and a
+`none`/`token` node cannot talk, so turn the mode on with the same material on
+every node and restart them together (a brief flag-day; clients fail over and
+retry). The effective mode is surfaced at **`GET /status`** as
+`"internode_auth": "none" | "token" | "cert"`, so a monitoring check can catch a
+node that silently came up unauthenticated. Client auth is separate — SCRAM on
+the binary endpoint and HTTP Basic on REST, plus RBAC; see the
 [README](../README.md).
+
+> **Encryption note:** only `cert` mode encrypts the channel. `none` and
+> `token` are plaintext on the wire (`token` authenticates but does not
+> encrypt). At-rest data and client↔cluster traffic are separate concerns —
+> at-rest encryption and client TLS are tracked features, not yet shipped.
 
 ## Resilience
 

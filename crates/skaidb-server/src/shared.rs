@@ -365,6 +365,15 @@ impl Backend {
     /// Members are tracked by internode address (`host:internode_port`); we keep
     /// the host and apply `quic_port`, assuming a homogeneous client port across
     /// the cluster. Empty when standalone.
+    /// Internode security posture (`none`/`token`/`cert`), or `None` when
+    /// standalone (no internode listener).
+    pub fn internode_auth_mode(&self) -> Option<&'static str> {
+        match self {
+            Backend::Local(_) => None,
+            Backend::Cluster(node) => Some(node.internode_auth_mode()),
+        }
+    }
+
     pub fn member_client_endpoints(&self, quic_port: u16) -> Vec<String> {
         match self {
             Backend::Local(_) => Vec::new(),

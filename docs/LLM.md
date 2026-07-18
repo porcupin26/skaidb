@@ -643,7 +643,11 @@ rest_port, data_dir, node_role, read_only (reject client mutations,
 superuser exempt — witness/maintenance mode); `[cluster]` seeds, internode_port,
 replication_factor, vnodes_per_node, default_read/write_consistency,
 anti_entropy_interval_secs; `[auth]` scram_enabled, superuser,
-superuser_password, internode_auth (none/token/mtls); `[storage]`
+superuser_password, internode_auth (`none`/`token`/`cert` — `cert` is mutual
+TLS and the only mode that ENCRYPTS internode traffic; `token` authenticates
+only. `internode_tls_{cert,key,ca}` for cert mode; mint them with
+`skaidbsh certs gen --out DIR --nodes N`. Effective mode shows at `/status` as
+`internode_auth`); `[storage]`
 memory_target (`"auto"`, `"1GB"` — budgets memtable + read cache + FTS
 writer heaps + TS heads; set explicitly in containers), memtable_size_mb,
 read_cache_entries, scan_row_budget (rows one statement may examine,

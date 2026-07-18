@@ -5,6 +5,7 @@
 //! operations use the REST control plane. An embedded engine is still available
 //! offline via `--local <dir>`.
 
+mod certs;
 mod cluster;
 mod dump;
 mod http;
@@ -88,6 +89,24 @@ enum Cmd {
     },
     /// Dump schema + data to JSON or CSV (chosen tables, databases, or all).
     Export(dump::ExportArgs),
+    /// Generate TLS material for internode mutual TLS (offline; no server).
+    Certs {
+        #[command(subcommand)]
+        op: CertsOp,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CertsOp {
+    /// Mint a cluster CA + per-node leaf certs for `internode_auth = cert`.
+    Gen {
+        /// Output directory for ca.crt/ca.key and node*.crt/node*.key.
+        #[arg(long, default_value = "./skaidb-certs")]
+        out: String,
+        /// Number of node certificates to mint (one per cluster member).
+        #[arg(long, default_value_t = 3)]
+        nodes: usize,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -118,6 +137,30 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     if let Some(cmd) = &cli.cmd {
+        // Cert generation is fully offline — no server, no backend.
+        if let Cmd::Certs { op } = cmd {
+            let CertsOp::Gen { out, nodes } = op;
+            match certs::generate(out, *nodes) {
+                Ok(paths) => {
+                    println!("wrote {} files to {out}:", paths.len());
+                    for p in &paths {
+                        if let Some(name) = p.file_name() {
+                            println!("  {}", name.to_string_lossy());
+                        }
+                    }
+                    println!(
+                        "\nConfigure each node with its own leaf: internode_auth = \"cert\",\n\
+                         internode_tls_cert = node<i>.crt, internode_tls_key = node<i>.key,\n\
+                         internode_tls_ca = ca.crt. Keep ca.key OFF the nodes (issuing root)."
+                    );
+                    return ExitCode::SUCCESS;
+                }
+                Err(e) => {
+                    eprintln!("skaidbsh: certs gen: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
         // Export runs SQL, so it uses a full backend (works against a server or
         // `--local`), not the REST control plane.
         if let Cmd::Export(args) = cmd {
@@ -638,6 +681,8 @@ fn run_admin(cli: &Cli, cmd: &Cmd) -> ExitCode {
         }
         // Export is intercepted in main() (it needs a SQL backend, not REST).
         Cmd::Export(_) => unreachable!("export is handled before run_admin"),
+        // Certs is intercepted in main() (fully offline, no server).
+        Cmd::Certs { .. } => unreachable!("certs is handled before run_admin"),
     };
 
     match result {

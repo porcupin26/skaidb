@@ -784,6 +784,10 @@ fn status_json(ctx: &Shared) -> Json {
                     .collect::<Vec<_>>(),
                 "read_consistency": c.read_consistency,
                 "write_consistency": c.write_consistency,
+                // Security posture — surfaced so a plaintext/unauthenticated
+                // internode (a silent misconfiguration) is visible. Extends
+                // to client-TLS + at-rest as those land.
+                "internode_auth": ctx.backend.internode_auth_mode().unwrap_or("none"),
                 "ready": ctx.backend.is_ready(),
             })
         }

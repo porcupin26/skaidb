@@ -21,6 +21,7 @@ skaidb-proto.workspace = true
 clap.workspace = true
 rustyline.workspace = true
 serde_json.workspace = true
+rcgen.workspace = true
 
 [dev-dependencies]
 skaidb-sql.workspace = true
