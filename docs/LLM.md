@@ -446,6 +446,19 @@ WHERE ts >= now() - 6h GROUP BY t;
   connections are not tracked (one request per connection — churn, not
   signal). Shown on the UI status tab; query it:
   `SELECT node, remote_addr, auth_user FROM drivers`.
+- **Cluster & node names**: every deployment self-names at first boot —
+  a random `adjective-animal` cluster name (replicated `cluster_meta`
+  table) and a random per-node alias (replicated `node_aliases`, keyed
+  by the stable internode id). Dotted form `<cluster>.<function>.<alias>`
+  with function `node` or `witness` (a witness's alias lives in the
+  `witnesses` registry; its stable witness_id never changes). Rename
+  with `ALTER CLUSTER SET NAME '<name>'` / `ALTER NODE '<alias|dotted|id>'
+  SET NAME '<name>'` (Admin privilege) from ANY member — but never from
+  a witness node, which mirrors identity one-way from its primary and
+  refuses both statements. Names surface in `/status`
+  (`cluster_name`, `node_aliases`), the UI header badge, and the
+  witnesses table. Aliases are sugar; ids are truth — durable references
+  (future table pins, membership) store ids, so renames never move data.
 - **Witness mode** (`[witness]` config on a STANDALONE node): the node
   periodically pulls a full copy of the configured databases from a
   primary cluster it is not a member of — a cross-region backup that

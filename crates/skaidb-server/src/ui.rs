@@ -418,6 +418,7 @@ pub fn witnesses_json(ctx: &Shared) -> (u16, String) {
             }
             json!({
                 "witness_id": w.witness_id,
+                "alias": w.alias,
                 "region": w.region,
                 "registered_at_ms": w.registered_at_ms,
                 "last_seen_at_ms": w.last_seen_at_ms,
@@ -442,8 +443,20 @@ pub fn witnesses_json(ctx: &Shared) -> (u16, String) {
 /// Nothing here is secret (same trust level as `/health` and `/status`).
 fn meta_json(ctx: &Shared) -> String {
     let cluster = ctx.backend.cluster_stats();
+    // The badge's dotted display name: cluster.function.alias — witness
+    // nodes mirror these from their primary; blank until bootstrapped.
+    let self_id = cluster
+        .as_ref()
+        .map(|c| c.node_id.clone())
+        .unwrap_or_else(|| "local".to_string());
+    let function = if ctx.config_snapshot().witness.enabled { "witness" } else { "node" };
+    let dotted = match (crate::naming::cluster_name(ctx), crate::naming::node_alias(ctx, &self_id)) {
+        (Some(c), Some(a)) => format!("{c}.{function}.{a}"),
+        _ => String::new(),
+    };
     json!({
         "version": env!("CARGO_PKG_VERSION"),
+        "display_name": dotted,
         "node_id": cluster.as_ref().map(|c| c.node_id.clone()).unwrap_or_default(),
         "clustered": cluster.is_some(),
         "auth_required": ctx.authn.required,

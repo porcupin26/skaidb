@@ -86,6 +86,12 @@ pub enum Statement {
     /// `ALTER CLUSTER ADD NODE '<addr>'` / `ALTER CLUSTER REMOVE NODE
     /// '<id>'` (ADMIN).
     AlterCluster { add: bool, node: String },
+    /// `ALTER CLUSTER SET NAME '<name>'` — rename the cluster (Admin;
+    /// refused on witness nodes, whose identity mirrors the primary).
+    AlterClusterName { name: String },
+    /// `ALTER NODE '<alias|dotted|id>' SET NAME '<name>'` — rename a
+    /// member or witness (Admin; refused on witness nodes).
+    AlterNodeName { node: String, name: String },
     /// `BACKUP TO '<path>'` — a crash-consistent copy of this node's data
     /// directory (tables + WALs + catalog + search/time-series stores)
     /// taken under the exclusive lock (ADMIN).

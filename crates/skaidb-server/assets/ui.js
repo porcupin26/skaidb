@@ -207,7 +207,7 @@ function renderWitnesses(body) {
         .join("\n");
     }
     if (!w.synced_tables) sync.className = "warn";
-    tr.append(cell(w.witness_id), cell(w.region), cell(fmtDuration(w.registered_secs) + " ago"), lastSeen, sync);
+    tr.append(cell(w.alias || w.witness_id), cell(w.region), cell(fmtDuration(w.registered_secs) + " ago"), lastSeen, sync);
     tbody.append(tr);
   }
 }
@@ -1143,7 +1143,7 @@ let refreshTimer = null;
 
 async function enterApp() {
   show("app");
-  $("node-badge").textContent = `${meta.node_id || "standalone"} · v${meta.version}`;
+  $("node-badge").textContent = `${meta.display_name || meta.node_id || "standalone"} · v${meta.version}`;
   probeAdmin().catch(() => {});
   const tick = () =>
     refreshStatus().catch((e) => {

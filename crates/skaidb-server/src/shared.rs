@@ -994,6 +994,32 @@ fn admin_statement_response(ctx: &Shared, role: &str, stmt: &Statement) -> Optio
         },
         Statement::ShowSlowQueries { .. } => AdminCmd::Slow,
         Statement::ShowConfig { .. } => AdminCmd::ConfigShow,
+        Statement::AlterClusterName { name } => {
+            if ctx.config_snapshot().witness.enabled {
+                return Some(Response::Error(
+                    "names are managed by the primary cluster — a witness mirrors \
+                     identity and cannot rename; run this on a member"
+                        .into(),
+                ));
+            }
+            return Some(match crate::naming::rename_cluster(ctx, name) {
+                Ok(()) => Response::Ddl,
+                Err(e) => Response::Error(e),
+            });
+        }
+        Statement::AlterNodeName { node, name } => {
+            if ctx.config_snapshot().witness.enabled {
+                return Some(Response::Error(
+                    "names are managed by the primary cluster — a witness mirrors \
+                     identity and cannot rename; run this on a member"
+                        .into(),
+                ));
+            }
+            return Some(match crate::naming::rename_node(ctx, node, name) {
+                Ok(()) => Response::Ddl,
+                Err(e) => Response::Error(e),
+            });
+        }
         Statement::SetConsistency { .. } => {
             return Some(Response::Error(
                 "SET CONSISTENCY is per-connection session state: it works on \
@@ -1208,7 +1234,9 @@ fn required_privilege(
         Statement::SetConfig { .. }
         | Statement::RepairCluster
         | Statement::Reclaim
-        | Statement::AlterCluster { .. } => (Privilege::Admin, Object::Global),
+        | Statement::AlterCluster { .. }
+        | Statement::AlterClusterName { .. }
+        | Statement::AlterNodeName { .. } => (Privilege::Admin, Object::Global),
         Statement::Backup { .. } | Statement::Restore { .. } => {
             (Privilege::Admin, Object::Global)
         }

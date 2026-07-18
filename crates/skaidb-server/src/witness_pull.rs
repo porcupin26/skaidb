@@ -123,6 +123,7 @@ pub(crate) fn run_cycle(ctx: &Shared, cfg: &WitnessConfig) -> Result<CycleSummar
         .map_err(|e| format!("primary SQL connect: {e}"))?;
 
     register(&mut sql, cfg)?;
+    mirror_names(ctx, &mut sql, cfg);
 
     ensure_sync_state_table(ctx)?;
     let now = now_ms() as u64;
@@ -397,8 +398,8 @@ pub(crate) fn register(sql: &mut Client, cfg: &WitnessConfig) -> Result<(), Stri
         )
     } else {
         format!(
-            "INSERT INTO witnesses (witness_id, region, registered_at, last_seen_at) \
-             VALUES ('{}', '{}', {now_ms}, {now_ms})",
+            "INSERT INTO witnesses (witness_id, alias, region, registered_at, last_seen_at) \
+             VALUES ('{0}', '{0}', '{1}', {now_ms}, {now_ms})",
             quote(&cfg.witness_id),
             quote(&cfg.region),
         )
@@ -406,6 +407,52 @@ pub(crate) fn register(sql: &mut Client, cfg: &WitnessConfig) -> Result<(), Stri
     sql.execute(&stmt)
         .map_err(|e| format!("witness registration: {e}"))?;
     Ok(())
+}
+
+/// Mirror the PRIMARY's cluster name and this witness's current alias
+/// into the LOCAL naming tables, so the witness's own UI/status show the
+/// identity the primary assigned — one-way by design (witness nodes
+/// refuse ALTER ... SET NAME; renames happen on a member and arrive here
+/// on the next cycle). Best-effort: naming is display, not correctness.
+fn mirror_names(ctx: &Shared, sql: &mut Client, cfg: &WitnessConfig) {
+    let get_one = |sql: &mut Client, q: &str| -> Option<String> {
+        match sql.execute(q) {
+            Ok(skaidb_proto::Response::Rows { rows, .. }) => {
+                rows.first().and_then(|r| match r.first() {
+                    Some(Value::String(s)) => Some(s.clone()),
+                    _ => None,
+                })
+            }
+            _ => None,
+        }
+    };
+    let cname = get_one(sql, "SELECT name FROM cluster_meta WHERE id = 'cluster'");
+    let alias = get_one(
+        sql,
+        &format!(
+            "SELECT alias FROM witnesses WHERE witness_id = '{}'",
+            quote(&cfg.witness_id)
+        ),
+    );
+    let role = ctx.superuser_role.clone();
+    let mut db = skaidb_engine::DEFAULT_DATABASE.to_string();
+    let mut run = |stmt: String| {
+        let _ = crate::shared::execute_session_as(ctx, &role, &mut db, &stmt, None);
+    };
+    run("CREATE TABLE IF NOT EXISTS cluster_meta (PRIMARY KEY (id))".into());
+    run("CREATE TABLE IF NOT EXISTS node_aliases (PRIMARY KEY (node_id))".into());
+    if let Some(c) = cname {
+        run(format!(
+            "INSERT INTO cluster_meta (id, name) VALUES ('cluster', '{}')",
+            quote(&c)
+        ));
+    }
+    if let Some(a) = alias {
+        run(format!(
+            "INSERT INTO node_aliases (node_id, alias, function) VALUES ('local', '{}', 'witness')",
+            quote(&a)
+        ));
+    }
 }
 
 /// `(table, pk columns)` for every table in `db` on the primary.

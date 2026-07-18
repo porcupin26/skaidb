@@ -119,6 +119,10 @@ pub fn grace_period_secs(ctx: &Shared) -> i64 {
 #[derive(Debug, Clone, Default)]
 pub struct WitnessRow {
     pub witness_id: String,
+    /// Mutable display name (dotted form: `<cluster>.witness.<alias>`);
+    /// defaults to the stable witness_id. Renamed FROM a member via
+    /// `ALTER NODE ... SET NAME` — witness nodes refuse renames.
+    pub alias: String,
     pub region: String,
     pub registered_at_ms: i64,
     pub last_seen_at_ms: i64,
@@ -134,7 +138,7 @@ pub fn read_all(ctx: &Shared) -> Vec<WitnessRow> {
     let resp = exec(
         ctx,
         &format!(
-            "SELECT witness_id, region, registered_at, last_seen_at, watermarks FROM {WITNESSES_TABLE}"
+            "SELECT witness_id, alias, region, registered_at, last_seen_at, watermarks FROM {WITNESSES_TABLE}"
         ),
     );
     let Ok(Response::Rows { columns, rows }) = resp else {
@@ -158,9 +162,14 @@ pub fn read_all(ctx: &Shared) -> Vec<WitnessRow> {
         return Vec::new();
     };
     let wm_i = idx("watermarks");
+    let alias_i = idx("alias");
     rows.iter()
         .map(|row| WitnessRow {
             witness_id: as_s(row.get(id_i)),
+            alias: {
+                let a = alias_i.map(|i| as_s(row.get(i))).unwrap_or_default();
+                if a.is_empty() { as_s(row.get(id_i)) } else { a }
+            },
             region: as_s(row.get(region_i)),
             registered_at_ms: as_i(row.get(reg_i)),
             last_seen_at_ms: as_i(row.get(seen_i)),

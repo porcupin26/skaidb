@@ -534,12 +534,22 @@ impl Parser {
         self.expect_keyword(Keyword::Alter)?;
         // `ALTER CLUSTER ADD NODE '<addr>'` / `REMOVE NODE '<id>'`.
         if self.eat_ident_ci("cluster") {
+            // `ALTER CLUSTER SET NAME '<name>'`.
+            if self.eat_keyword(Keyword::Set) {
+                if !self.eat_ident_ci("name") {
+                    return Err(self.unexpected("NAME after ALTER CLUSTER SET".into()));
+                }
+                let name = self.expect_string().map_err(|_| {
+                    ParseError::Other("ALTER CLUSTER SET NAME takes a quoted name".into())
+                })?;
+                return Ok(Statement::AlterClusterName { name });
+            }
             let add = if self.eat_ident_ci("add") {
                 true
             } else if self.eat_ident_ci("remove") {
                 false
             } else {
-                return Err(self.unexpected("ADD or REMOVE after ALTER CLUSTER".into()));
+                return Err(self.unexpected("ADD, REMOVE, or SET after ALTER CLUSTER".into()));
             };
             if !self.eat_ident_ci("node") {
                 return Err(self.unexpected("NODE after ALTER CLUSTER ADD/REMOVE".into()));
@@ -550,6 +560,20 @@ impl Parser {
                 )
             })?;
             return Ok(Statement::AlterCluster { add, node });
+        }
+        // `ALTER NODE '<ref>' SET NAME '<name>'`.
+        if self.eat_ident_ci("node") {
+            let node = self.expect_string().map_err(|_| {
+                ParseError::Other("ALTER NODE takes a quoted alias / dotted name / id".into())
+            })?;
+            self.expect_keyword(Keyword::Set)?;
+            if !self.eat_ident_ci("name") {
+                return Err(self.unexpected("NAME after ALTER NODE ... SET".into()));
+            }
+            let name = self.expect_string().map_err(|_| {
+                ParseError::Other("ALTER NODE ... SET NAME takes a quoted name".into())
+            })?;
+            return Ok(Statement::AlterNodeName { node, name });
         }
         if self.eat_keyword(Keyword::User) {
             let name = self.expect_ident()?;

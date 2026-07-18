@@ -13,6 +13,7 @@ mod es;
 pub mod binary;
 mod drivers;
 pub mod memory;
+mod naming;
 mod nodestats;
 mod promql;
 mod promwrite;
@@ -413,6 +414,27 @@ pub fn run(
                 // Best-effort: a shedding/degraded tick is skipped, and the
                 // row's age surfaces exactly that on the dashboard.
                 let _ = crate::nodestats::publish_tick(&ctx);
+            }
+        });
+    }
+
+    // Cluster + node naming: seed a random cluster name (first member to
+    // find none wins the benign LWW race) and self-register this node's
+    // random alias, keyed by the stable internode id. Witness-mode nodes
+    // SKIP local bootstrap — their identity mirrors the primary (the pull
+    // cycle writes the learned names into the local tables instead).
+    if !ctx.config_snapshot().witness.enabled {
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let self_id = ctx
+                .backend
+                .cluster_stats()
+                .map_or_else(|| "local".to_string(), |c| c.node_id);
+            loop {
+                if crate::naming::bootstrap(&ctx, &self_id).is_ok() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
             }
         });
     }
@@ -1844,6 +1866,56 @@ pub(crate) mod tests {
         // snappy decode instead — proving the gate didn't fire.
         let err = crate::promwrite::ingest(&ctx, "superuser", &[]).unwrap_err();
         assert!(err.contains("snappy"), "{err}");
+    }
+
+    /// Phase-0 naming end to end: rename statements over SQL, Admin
+    /// gating, and the witness one-way rule (a witness-mode node refuses
+    /// renames outright, even with admin credentials).
+    #[test]
+    fn naming_renames_over_sql_and_witness_refuses() {
+        use skaidb_driver::Client;
+        let ctx = auth_ctx();
+        let (addr, _h) = binary::spawn("127.0.0.1:0", ctx.clone()).unwrap();
+        crate::naming::bootstrap(&ctx, "local").unwrap();
+        let mut su = Client::connect_with(addr, "ada", "pencil").unwrap();
+        su.execute("ALTER CLUSTER SET NAME 'ember-lynx'").unwrap();
+        su.execute("ALTER NODE 'local' SET NAME 'skai1'").unwrap();
+        assert_eq!(crate::naming::cluster_name(&ctx).as_deref(), Some("ember-lynx"));
+        assert_eq!(crate::naming::node_alias(&ctx, "local").as_deref(), Some("skai1"));
+        // Dotted resolution works through the SQL-set names.
+        su.execute("ALTER NODE 'ember-lynx.node.skai1' SET NAME 'primary-1'")
+            .unwrap();
+        assert_eq!(
+            crate::naming::node_alias(&ctx, "local").as_deref(),
+            Some("primary-1")
+        );
+        // Non-admin denied (Admin on Global).
+        su.execute("CREATE USER bob PASSWORD 'hunter2'").unwrap();
+        let mut bob = Client::connect_with(addr, "bob", "hunter2").unwrap();
+        let err = bob
+            .execute("ALTER CLUSTER SET NAME 'nope'")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("permission denied"), "{err}");
+
+        // Witness-mode node: refused even for the superuser.
+        let wctx = temp_ctx();
+        {
+            let mut c = wctx.config.write().unwrap();
+            c.witness.enabled = true;
+        }
+        let (waddr, _wh) = binary::spawn("127.0.0.1:0", wctx).unwrap();
+        let mut w = Client::connect(waddr).unwrap();
+        let err = w
+            .execute("ALTER CLUSTER SET NAME 'forked'")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("witness"), "{err}");
+        let err = w
+            .execute("ALTER NODE 'x' SET NAME 'y'")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("witness"), "{err}");
     }
 
     fn rbac_test_ctx() -> Shared {

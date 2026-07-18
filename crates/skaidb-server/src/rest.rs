@@ -746,6 +746,12 @@ fn status_json(ctx: &Shared) -> Json {
             json!({
                 "clustered": true,
                 "node_id": c.node_id,
+                // Human identity: `<cluster>.<function>.<alias>` (dotted
+                // form; empty strings until the naming bootstrap runs).
+                "cluster_name": crate::naming::cluster_name(ctx).unwrap_or_default(),
+                "node_aliases": crate::naming::all_aliases(ctx)
+                    .into_iter()
+                    .collect::<std::collections::BTreeMap<_, _>>(),
                 "epoch": c.epoch,
                 "members": c.members,
                 // Client SQL endpoints (host:quic_port) of every member.
