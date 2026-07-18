@@ -4,9 +4,11 @@
 //! copy of chosen databases from a primary cluster it is NOT a member of:
 //! never in the primary's ring, never counted toward its quorums, pulling
 //! on its own schedule. Data moves over the INTERNODE protocol — the
-//! witness pages `Request::ScanPage` from one primary member (failover
-//! across the configured list; a full-copy primary serves whole tables
-//! from any member) and applies the pages locally through
+//! witness pages `Request::ScanPage` per table from wherever a complete
+//! copy lives: one member with failover for full-copy tables, the pinned
+//! members for pinned tables, and a SCATTER over every member for tables
+//! whose per-table RF shards them (no single member holds it all — the
+//! per-member pulls LWW-merge locally) — applying pages through
 //! `Database::apply_batch_buffered`: byte-exact row values with their HLC
 //! stamps and tombstones, so re-pulls converge by last-writer-wins and
 //! deletes propagate without any diffing. A staleness guard (mirroring the
@@ -130,58 +132,63 @@ pub(crate) fn run_cycle(ctx: &Shared, cfg: &WitnessConfig) -> Result<CycleSummar
     let mut summary = CycleSummary::default();
     for db in &cfg.databases {
         let tables = list_tables(&mut sql, db)?;
-        for (table, pk_cols) in &tables {
-            ensure_local_table(ctx, db, table, pk_cols)?;
+        for pt in &tables {
+            let table = &pt.table;
+            ensure_local_table(ctx, db, table, &pt.pk_cols)?;
             let qualified = skaidb_engine::namespace::qualify(db, table);
-            let state = load_sync_state(ctx, &qualified);
-            // Cheap change hint: the serving member's per-table write_seq.
-            // Unknown verb (old primary) → None → full-sweep behavior.
-            let seq = table_seq_with_failover(cfg, &qualified);
-            let backstop_due = now.saturating_sub(state.last_full_ms)
-                >= cfg.full_sweep_interval_secs.saturating_mul(1000);
-            let (pulled, applied) = match &seq {
-                // Same member, same seq, a watermark exists, backstop not
-                // due: nothing changed — skip without moving a byte.
-                Some((addr, seq_v))
-                    if *addr == state.member
-                        && *seq_v == state.seq
-                        && state.watermark_ms > 0
-                        && !backstop_due =>
-                {
-                    (0, 0)
-                }
-                // Changed (or first contact with this member) with a
-                // watermark: pull only the delta since it.
-                Some((addr, seq_v)) if state.watermark_ms > 0 && !backstop_due => {
-                    let since = state.watermark_ms.saturating_sub(DELTA_MARGIN_MS);
-                    let (pulled, applied, max_hlc) =
-                        pull_table_delta(ctx, cfg, addr, &qualified, since)?;
-                    save_sync_state(
-                        ctx,
-                        &qualified,
-                        addr,
-                        *seq_v,
-                        state.watermark_ms.max(max_hlc),
-                        state.last_full_ms,
-                    )?;
-                    (pulled, applied)
-                }
-                // First sync, an old primary without the verbs, or the
-                // backstop is due: full sweep.
-                _ => {
-                    let (pulled, applied, max_hlc) = pull_table(ctx, cfg, db, table)?;
-                    let (member, seq_v) = seq.unwrap_or_default();
-                    save_sync_state(
-                        ctx,
-                        &qualified,
-                        &member,
-                        seq_v,
-                        state.watermark_ms.max(max_hlc),
-                        now,
-                    )?;
-                    (pulled, applied)
-                }
+            // Where a complete copy of this table can come from. A pinned
+            // table lives whole on each pin (any one live pin serves the
+            // pull); a table whose RF override is below the primary's
+            // member count is SHARDED — no single member has it all, so
+            // the pull scatters over every member and LWW-merges (the
+            // staleness guard makes application idempotent). Everything
+            // else keeps the one-member-with-failover path.
+            let members = &cfg.primary_internode_addrs;
+            let scatter = pt.pins.is_empty()
+                && pt
+                    .replication
+                    .is_some_and(|n| (n as usize) < members.len());
+            let sources: Vec<String> = if pt.pins.is_empty() {
+                members.clone()
+            } else {
+                pt.pins.clone()
             };
+            let (mut pulled, mut applied) = (0usize, 0usize);
+            if scatter {
+                // Per-member sync state (seq spaces are per-member); a
+                // down member degrades that member's shard until it
+                // returns instead of failing the whole cycle — but say so.
+                for addr in &sources {
+                    match sync_from_member(ctx, cfg, db, table, &qualified, addr, true, now) {
+                        Ok((p, a)) => {
+                            pulled += p;
+                            applied += a;
+                        }
+                        Err(e) => skaidb_types::slog!(
+                            "witness: {qualified} shard @{addr} unavailable this cycle                              (sharded table, rf={:?}): {e}",
+                            pt.replication
+                        ),
+                    }
+                }
+            } else {
+                // One complete source suffices; try them in order.
+                let mut last_err = String::new();
+                let mut synced = false;
+                for addr in &sources {
+                    match sync_from_member(ctx, cfg, db, table, &qualified, addr, false, now) {
+                        Ok((p, a)) => {
+                            pulled = p;
+                            applied = a;
+                            synced = true;
+                            break;
+                        }
+                        Err(e) => last_err = e,
+                    }
+                }
+                if !synced {
+                    return Err(format!("{qualified}: no source reachable: {last_err}"));
+                }
+            }
             let rows_now = rows_now(ctx, &qualified);
             summary
                 .tables
@@ -203,6 +210,69 @@ pub(crate) fn run_cycle(ctx: &Shared, cfg: &WitnessConfig) -> Result<CycleSummar
 
     heartbeat(&mut sql, cfg, &summary)?;
     Ok(summary)
+}
+
+/// Sync `qualified` from ONE primary member: TableSeq change-gate, delta
+/// pull when a watermark exists, full sweep on first sync / unknown verb /
+/// due backstop — the same ladder the single-source cycle always ran, with
+/// the sync-state row keyed per member (`per_member`) when the table is
+/// sharded across the primary (seq spaces are only comparable within one
+/// member). Returns `(pulled, applied)`.
+#[allow(clippy::too_many_arguments)]
+fn sync_from_member(
+    ctx: &Shared,
+    cfg: &WitnessConfig,
+    db: &str,
+    table: &str,
+    qualified: &str,
+    addr: &str,
+    per_member: bool,
+    now: u64,
+) -> Result<(usize, usize), String> {
+    let state_key = if per_member {
+        format!("{qualified}|{addr}")
+    } else {
+        qualified.to_string()
+    };
+    let state = load_sync_state(ctx, &state_key);
+    let seq = table_seq_at(addr, qualified);
+    let backstop_due = now.saturating_sub(state.last_full_ms)
+        >= cfg.full_sweep_interval_secs.saturating_mul(1000);
+    match seq {
+        Some(seq_v)
+            if addr == state.member
+                && seq_v == state.seq
+                && state.watermark_ms > 0
+                && !backstop_due =>
+        {
+            Ok((0, 0))
+        }
+        Some(seq_v) if state.watermark_ms > 0 && !backstop_due => {
+            let since = state.watermark_ms.saturating_sub(DELTA_MARGIN_MS);
+            let (pulled, applied, max_hlc) = pull_table_delta(ctx, cfg, addr, qualified, since)?;
+            save_sync_state(
+                ctx,
+                &state_key,
+                addr,
+                seq_v,
+                state.watermark_ms.max(max_hlc),
+                state.last_full_ms,
+            )?;
+            Ok((pulled, applied))
+        }
+        _ => {
+            let (pulled, applied, max_hlc) = pull_table(ctx, cfg, db, table, addr)?;
+            save_sync_state(
+                ctx,
+                &state_key,
+                addr,
+                seq.unwrap_or_default(),
+                state.watermark_ms.max(max_hlc),
+                now,
+            )?;
+            Ok((pulled, applied))
+        }
+    }
 }
 
 /// The witness's own persistent per-table sync bookkeeping (local only,
@@ -303,22 +373,19 @@ fn rows_now(ctx: &Shared, qualified: &str) -> i64 {
         .unwrap_or(0)
 }
 
-/// The serving member's per-table write_seq: `(addr, seq)` from the first
-/// primary that answers; `None` if none do or the verb is unknown (old
-/// primary mid-rolling-upgrade) — callers then take the full-sweep path.
-fn table_seq_with_failover(cfg: &WitnessConfig, qualified: &str) -> Option<(String, u64)> {
-    for addr in &cfg.primary_internode_addrs {
-        match internode::call(
-            addr,
-            &Request::TableSeq {
-                table: qualified.to_string(),
-            },
-        ) {
-            Ok(Response::TableSeq { write_seq }) => return Some((addr.clone(), write_seq)),
-            _ => continue,
-        }
+/// One member's per-table write_seq; `None` when unreachable or the verb
+/// is unknown (old primary mid-rolling-upgrade) — callers then take the
+/// full-sweep path.
+fn table_seq_at(addr: &str, qualified: &str) -> Option<u64> {
+    match internode::call(
+        addr,
+        &Request::TableSeq {
+            table: qualified.to_string(),
+        },
+    ) {
+        Ok(Response::TableSeq { write_seq }) => Some(write_seq),
+        _ => None,
     }
-    None
 }
 
 /// Incremental pull: page the primary's stamps-walked delta since
@@ -455,8 +522,21 @@ fn mirror_names(ctx: &Shared, sql: &mut Client, cfg: &WitnessConfig) {
     }
 }
 
-/// `(table, pk columns)` for every table in `db` on the primary.
-fn list_tables(sql: &mut Client, db: &str) -> Result<Vec<(String, Vec<String>)>, String> {
+/// One mirrored table's schema + placement as the primary lists it.
+struct PrimaryTable {
+    table: String,
+    pk_cols: Vec<String>,
+    /// Per-table RF override on the primary (None = cluster default).
+    replication: Option<u32>,
+    /// Pinned members (internode ids — which ARE their addresses). A pin
+    /// holds the whole table, so any one live pin can serve the pull.
+    pins: Vec<String>,
+}
+
+/// Every table in `db` on the primary, with placement. Old primaries
+/// without the placement columns list as cluster-default (the previous
+/// behavior exactly).
+fn list_tables(sql: &mut Client, db: &str) -> Result<Vec<PrimaryTable>, String> {
     sql.execute(&format!("USE {db}"))
         .map_err(|e| format!("USE {db}: {e}"))?;
     let resp = sql
@@ -472,6 +552,7 @@ fn list_tables(sql: &mut Client, db: &str) -> Result<Vec<(String, Vec<String>)>,
     // `witness = false` tables are excluded from mirrors by the primary's
     // schema (absent column = old primary = mirror everything).
     let w_i = idx("witness");
+    let (r_i, n_i) = (idx("replication"), idx("nodes"));
     Ok(rows
         .iter()
         .filter_map(|r| {
@@ -481,10 +562,22 @@ fn list_tables(sql: &mut Client, db: &str) -> Result<Vec<(String, Vec<String>)>,
                 }
             }
             match (r.get(t_i), r.get(pk_i)) {
-                (Some(Value::String(t)), Some(Value::String(pk))) => Some((
-                    t.clone(),
-                    pk.split(',').map(|c| c.trim().to_string()).collect(),
-                )),
+                (Some(Value::String(t)), Some(Value::String(pk))) => Some(PrimaryTable {
+                    table: t.clone(),
+                    pk_cols: pk.split(',').map(|c| c.trim().to_string()).collect(),
+                    replication: match r_i.and_then(|i| r.get(i)) {
+                        Some(Value::Int(n)) => Some(*n as u32),
+                        _ => None,
+                    },
+                    pins: match n_i.and_then(|i| r.get(i)) {
+                        Some(Value::String(list)) => list
+                            .split(',')
+                            .map(|p| p.trim().to_string())
+                            .filter(|p| !p.is_empty())
+                            .collect(),
+                        _ => Vec::new(),
+                    },
+                }),
                 _ => None,
             }
         })
@@ -525,6 +618,7 @@ fn pull_table(
     cfg: &WitnessConfig,
     db: &str,
     table: &str,
+    addr: &str,
 ) -> Result<(usize, usize, u64), String> {
     let qualified = skaidb_engine::namespace::qualify(db, table);
     let Backend::Local(local) = &ctx.backend else {
@@ -535,7 +629,7 @@ fn pull_table(
     let mut pages_since_flush = 0usize;
     loop {
         let page_started = std::time::Instant::now();
-        let page = scan_page_with_failover(cfg, &qualified, after.as_deref())?;
+        let page = scan_page_at(addr, &qualified, after.as_deref())?;
         let done = page.len() < PULL_PAGE_ROWS as usize;
         after = page.last().map(|(k, ..)| k.clone());
         pulled += page.len();
@@ -637,28 +731,20 @@ fn apply_rows_guarded(
 /// One `ScanPage` against the first reachable primary internode endpoint.
 type PulledRow = (Vec<u8>, Vec<u8>, skaidb_engine::Hlc, bool);
 
-fn scan_page_with_failover(
-    cfg: &WitnessConfig,
-    qualified: &str,
-    after: Option<&[u8]>,
-) -> Result<Vec<PulledRow>, String> {
-    let mut last_err = String::new();
-    for addr in &cfg.primary_internode_addrs {
-        match internode::call(
-            addr,
-            &Request::ScanPage {
-                table: qualified.to_string(),
-                after: after.map(<[u8]>::to_vec),
-                limit: PULL_PAGE_ROWS,
-            },
-        ) {
-            Ok(Response::Scan { rows }) => return Ok(rows),
-            Ok(Response::Err(e)) => last_err = format!("{addr}: {e}"),
-            Ok(other) => last_err = format!("{addr}: unexpected {other:?}"),
-            Err(e) => last_err = format!("{addr}: {e}"),
-        }
+fn scan_page_at(addr: &str, qualified: &str, after: Option<&[u8]>) -> Result<Vec<PulledRow>, String> {
+    match internode::call(
+        addr,
+        &Request::ScanPage {
+            table: qualified.to_string(),
+            after: after.map(<[u8]>::to_vec),
+            limit: PULL_PAGE_ROWS,
+        },
+    ) {
+        Ok(Response::Scan { rows }) => Ok(rows),
+        Ok(Response::Err(e)) => Err(format!("ScanPage {qualified} @{addr}: {e}")),
+        Ok(other) => Err(format!("ScanPage {qualified} @{addr}: unexpected {other:?}")),
+        Err(e) => Err(format!("ScanPage {qualified} @{addr}: {e}")),
     }
-    Err(format!("ScanPage {qualified}: no primary reachable ({last_err})"))
 }
 
 /// Update the witness's heartbeat + per-table watermarks on the primary.

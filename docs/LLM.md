@@ -475,7 +475,12 @@ WHERE ts >= now() - 6h GROUP BY t;
   never joins the primary's ring or quorums and sets its own pace
   (`interval_secs`, default 1h). Data moves over the internode protocol
   (`ScanPage` pages: byte-exact rows with HLC stamps and tombstones —
-  re-pulls converge by last-writer-wins, deletes propagate); schema
+  re-pulls converge by last-writer-wins, deletes propagate). Placement
+  aware: full-copy tables pull from one member with failover, pinned
+  tables from their pins, and sharded tables (per-table replication
+  below the primary's member count) SCATTER over every configured
+  member and merge — the witness stays complete for any placement. A
+  down member only stales that member's shards, loudly logged; schema
   listing and the registration/heartbeat/watermark row in the primary's
   `witnesses` table (PK=witness_id: region, registered_at, last_seen_at,
   watermarks) go over SQL with witness-scoped credentials on the primary

@@ -2394,6 +2394,130 @@ pub(crate) mod tests {
         (status, body)
     }
 
+    /// Phase-2 witness correctness: a table SHARDED across the primary
+    /// (per-table rf = 1 on a 2-member cluster) is scatter-pulled from
+    /// EVERY member and LWW-merged — no single member holds it all — and
+    /// a PINNED table is pulled whole from its pin. The witness mirror
+    /// must equal the union either way.
+    #[test]
+    fn witness_scatter_pulls_sharded_and_pinned_tables() {
+        let free = || {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let a = l.local_addr().unwrap().to_string();
+            drop(l);
+            a
+        };
+        let (a_addr, b_addr) = (free(), free());
+        let members = vec![
+            (NodeId::new(&a_addr), a_addr.clone()),
+            (NodeId::new(&b_addr), b_addr.clone()),
+        ];
+        let mk = |id: &str, members: &[(NodeId, String)]| NodeConfig {
+            id: NodeId::new(id),
+            internode_addr: id.to_string(),
+            members: members.to_vec(),
+            replication_factor: 2, // cluster default: full copy on both
+            vnodes_per_node: 64,
+            read_consistency: ClusterConsistency::Quorum,
+            write_consistency: ClusterConsistency::Quorum,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
+            anti_entropy_interval_secs: 0,
+        };
+        let na = Arc::new(Node::new(
+            Database::open(temp_dir()).unwrap(),
+            mk(&a_addr, &members),
+        ));
+        let nb = Arc::new(Node::new(
+            Database::open(temp_dir()).unwrap(),
+            mk(&b_addr, &members),
+        ));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        let ctx_for = |node: &Arc<Node>| -> Shared {
+            Arc::new(Context {
+                backend: Backend::Cluster(node.clone()),
+                metrics: Metrics::new(),
+                audit: RwLock::new(quiet_audit()),
+                authn: AuthState::disabled(),
+                superuser_role: "superuser".into(),
+                admin_lock: Mutex::new(()),
+                start: Instant::now(),
+                slow_log: crate::slowlog::SlowLog::new(),
+                config: RwLock::new(Config::default()),
+                config_path: None,
+                drivers_table_ensured: std::sync::atomic::AtomicBool::new(false),
+            })
+        };
+        let pa = ctx_for(&na);
+        let (sql_addr, _h) = binary::spawn("127.0.0.1:0", pa.clone()).unwrap();
+        crate::witnesses::ensure_tables(&pa).unwrap();
+        let exec_p = |sql: &str| match crate::shared::execute_as(&pa, "superuser", sql) {
+            Response::Error(e) => panic!("primary {sql}: {e}"),
+            other => other,
+        };
+        exec_p("CREATE DATABASE mirror");
+        exec_p("CREATE TABLE mirror.sharded (PRIMARY KEY (id)) WITH (replication = 1)");
+        exec_p(&format!(
+            "CREATE TABLE mirror.pinned (PRIMARY KEY (id)) WITH (nodes = ['{b_addr}'])"
+        ));
+        for i in 0..40 {
+            exec_p(&format!(
+                "INSERT INTO mirror.sharded (id, v) VALUES ({i}, 'v{i}')"
+            ));
+        }
+        for i in 0..10 {
+            exec_p(&format!(
+                "INSERT INTO mirror.pinned (id, v) VALUES ({i}, 'p{i}')"
+            ));
+        }
+        // Preconditions: genuinely sharded (neither member whole), pin whole.
+        let local_count = |node: &Arc<Node>, t: &str| {
+            node.with_local_read(|db| {
+                db.local_count_rows(&skaidb_engine::namespace::qualify("mirror", t))
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+        };
+        let (sa, sb) = (local_count(&na, "sharded"), local_count(&nb, "sharded"));
+        assert_eq!(sa + sb, 40, "rf=1: the union is the table");
+        assert!(sa < 40 && sb < 40, "rf=1 must shard: a={sa} b={sb}");
+        assert_eq!(local_count(&nb, "pinned"), 10, "pin holds all");
+        assert_eq!(local_count(&na, "pinned"), 0, "non-pin holds none");
+
+        let witness = temp_ctx();
+        let wcfg = skaidb_config::WitnessConfig {
+            enabled: true,
+            primary_sql_addrs: vec![sql_addr.to_string()],
+            primary_internode_addrs: vec![a_addr.clone(), b_addr.clone()],
+            user: "anonymous".into(),
+            password: String::new(),
+            databases: vec!["mirror".into()],
+            interval_secs: 3600,
+            full_sweep_interval_secs: 86_400,
+            duty_pct: 90,
+            witness_id: "w-scatter".into(),
+            region: "unit".into(),
+        };
+        let s1 = crate::witness_pull::run_cycle(&witness, &wcfg).unwrap();
+        let rows_of = |t: &str| {
+            s1.tables
+                .iter()
+                .find(|(n, ..)| n == t)
+                .map(|&(_, _, _, now)| now)
+                .unwrap_or(-1)
+        };
+        assert_eq!(rows_of("mirror.sharded"), 40, "scatter merged both shards");
+        assert_eq!(rows_of("mirror.pinned"), 10, "pinned pulled from its pin");
+
+        // Idempotency across sources: a second cycle applies nothing.
+        let s2 = crate::witness_pull::run_cycle(&witness, &wcfg).unwrap();
+        let applied: usize = s2.tables.iter().map(|&(_, _, a, _)| a).sum();
+        assert_eq!(applied, 0, "second cycle applies nothing: {:?}", s2.tables);
+    }
+
     /// A single-node cluster `Context`: superuser has `Admin`, `reader` does not.
     /// Witness pull, end to end in-process: a real single-member primary
     /// (internode served — the pull's data path) with a binary SQL endpoint
