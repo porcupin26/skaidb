@@ -188,7 +188,8 @@ embedding <-> [..]` (use `NEAREST`).
 CREATE TABLE [IF NOT EXISTS] t (PRIMARY KEY (col [, col ...]))
   [WITH (ttl = dur, witness = bool, replication = n, nodes = ['id', ...])]
 --   replication = n: per-table RF override (n >= members = full copy).
---   nodes = [...]: pin the whole table to those members (mutually exclusive
+--   nodes = [...]: pin the whole table to those members; entries accept
+--   aliases, resolved to stable ids at DDL time; non-members refused (mutually exclusive
 --   with replication; every pin holds every row; non-pin coordinators route
 --   to the pins; REMOVE NODE refuses while a table pins the node; ALTER can
 --   only shrink a pin set).

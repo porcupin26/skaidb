@@ -22,7 +22,7 @@ CREATE TABLE [IF NOT EXISTS] <table> (PRIMARY KEY (<col> [, <col> ...]))
        [WITH (ttl = <duration>,               -- rows expire after this age
               witness = <bool>,               -- mirror to witness nodes (default true)
               replication = <n>,              -- per-table RF override
-              nodes = ['<id>', ...])]         -- pin the whole table to these members
+              nodes = ['<alias-or-id>', ...])] -- pin the whole table to these members
 CREATE TIMESERIES TABLE [IF NOT EXISTS] <table>
        (SERIES KEY (<label> [, <label> ...])
         [, RETENTION <duration>] [, OOO <duration>])
@@ -187,8 +187,10 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   placement/witness options — every node consults them locally.
 - **Per-table placement**: `replication = <n>` overrides the cluster
   replication factor for one table (n above the member count = full copy,
-  the same semantics cluster-wide RF has); `nodes = ['<id>', ...]` pins
-  the WHOLE table to an explicit member set — every pin holds every row,
+  the same semantics cluster-wide RF has); `nodes = ['<alias-or-id>', ...]`
+  pins the WHOLE table to an explicit member set (entries accept node
+  aliases as sugar, resolved to stable ids at DDL time; a reference that
+  is not a current member is refused, and witnesses can never be pinned) — every pin holds every row,
   quorum math counts the pins, and a non-pin coordinator routes reads and
   writes to them. The two are mutually exclusive. Pins are a deliberate
   durability trade: a pinned node down means quorum errors for that table
