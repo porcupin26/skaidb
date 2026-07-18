@@ -353,7 +353,15 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   (SCRAM on the binary protocol, HTTP Basic on REST) and acts as its
   own-named role; `GRANT ROLE r TO u` adds inherited roles. A grant
   `ON DATABASE db` covers every table in that database (checked against the
-  session's current database; shown by `SHOW GRANTS` as `db:<name>`). All
+  session's current database; shown by `SHOW GRANTS` as `db:<name>`).
+  **A table grant is scoped to the table's canonical `<database>.<table>`
+  identity, not the raw name.** A bare `GRANT … ON t` issued while the
+  session is in database `d` grants `d.t` — never a wildcard that would
+  match a same-named `t` in another database — and a qualified
+  `GRANT … ON d.t` authorizes the natural `USE d; … t` query just as it
+  authorizes `… FROM d.t` (both resolve to the same table). `SHOW GRANTS`
+  renders the object as `<database>.<table>` (bare for the default
+  database). All
   management statements (and `SHOW GRANTS`) require the `GRANT` privilege
   cluster-wide — except `SHOW GRANTS FOR <your own role>`, which any
   authenticated role may run to inspect itself. Auth DDL (user/role/grant
