@@ -4382,6 +4382,30 @@ impl Node {
                 }
                 None => Response::Err("busy: engine write-locked, retry".into()),
             },
+            Request::TableSeq { table } => match self.local_read_bounded() {
+                Some(db) => match db.table_write_seq(&table) {
+                    Ok(write_seq) => Response::TableSeq { write_seq },
+                    Err(e) => Response::Err(e.to_string()),
+                },
+                None => Response::Err("busy: engine write-locked, retry".into()),
+            },
+            Request::ScanSincePage {
+                table,
+                since_physical,
+                after,
+                limit,
+            } => match self.local_read_bounded() {
+                Some(db) => match db.local_scan_since_page(
+                    &table,
+                    since_physical,
+                    after.as_deref(),
+                    limit as usize,
+                ) {
+                    Ok((rows, cursor, done)) => Response::DeltaPage { rows, cursor, done },
+                    Err(e) => Response::Err(e.to_string()),
+                },
+                None => Response::Err("busy: engine write-locked, retry".into()),
+            },
             Request::RepairDigest { table, requester } => {
                 // The requester's id plays the "peer" role so both sides
                 // apply the identical pair-ownership row filter.

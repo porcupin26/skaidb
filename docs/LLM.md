@@ -459,7 +459,17 @@ WHERE ts >= now() - 6h GROUP BY t;
   (`CREATE ROLE witness_role; GRANT INSERT, UPDATE ON witnesses TO
   witness_role`). Pair with `server.read_only = true`: drivers can read
   the copy, nothing can diverge it (the pull applies beneath the session
-  layer, so read-only never blocks it). The single-row
+  layer, so read-only never blocks it). Cycles are NEAR-LIVE cheap
+  (default `interval_secs` 60): unchanged tables are skipped via a
+  per-table `write_seq` hint (one tiny RPC each), and changed tables
+  pull only their delta — the primary walks its value-free stamps
+  sidecar and returns rows stamped since the witness's watermark, so
+  steady-state traffic is proportional to change, not data size. A
+  periodic FULL sweep per table (`full_sweep_interval_secs`, default
+  24h) backstops the one delta blind spot (a delayed hint-replay
+  landing an old-stamped row behind the watermark); primaries without
+  the delta verbs (rolling upgrade) degrade gracefully to full sweeps.
+  The single-row
   `witness_gc_config` table holds `grace_period_secs` (default 7 days) —
   cluster-consistent because it is a table row, settable with a plain
   `UPDATE` — and it is ACTIVE: every minute each node sizes a deepest-

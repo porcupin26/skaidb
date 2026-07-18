@@ -2313,6 +2313,7 @@ pub(crate) mod tests {
             password: String::new(),
             databases: vec!["mirror".into()],
             interval_secs: 3600,
+            full_sweep_interval_secs: 86_400,
             duty_pct: 90, // tests want speed, not politeness
             witness_id: "w-test".into(),
             region: "unit".into(),
@@ -2320,7 +2321,7 @@ pub(crate) mod tests {
 
         // Cycle 1: full copy arrives, registration lands on the primary.
         let s1 = crate::witness_pull::run_cycle(&witness, &wcfg).unwrap();
-        assert_eq!(s1.tables, vec![("mirror.items".to_string(), 3, 3)]);
+        assert_eq!(s1.tables, vec![("mirror.items".to_string(), 3, 3, 3)]);
         let exec_w = |sql: &str| match crate::shared::execute_as(&witness, "superuser", sql) {
             Response::Error(e) => panic!("witness {sql}: {e}"),
             other => other,
@@ -2362,7 +2363,12 @@ pub(crate) mod tests {
         exec_p("UPDATE mirror.items SET x = 'A2' WHERE id = 1");
         exec_p("DELETE FROM mirror.items WHERE id = 2");
         exec_p("INSERT INTO mirror.items (id, x) VALUES (4, 'd')");
-        crate::witness_pull::run_cycle(&witness, &wcfg).unwrap();
+        let s2 = crate::witness_pull::run_cycle(&witness, &wcfg).unwrap();
+        // Incremental: only the 3-row delta crosses the wire, not the table.
+        let (_n, pulled2, applied2, rows_now2) = &s2.tables[0];
+        assert!(*pulled2 <= 4, "delta pull, not a sweep: pulled {pulled2}");
+        assert_eq!(*applied2, 3, "update + tombstone + insert applied");
+        assert_eq!(*rows_now2, 3, "heartbeat reports the LOCAL table size");
         let got = rows_of(exec_w("SELECT id, x FROM mirror.items ORDER BY id"));
         assert_eq!(
             got.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
@@ -2371,11 +2377,13 @@ pub(crate) mod tests {
         );
         assert_eq!(got[0][1], Value::String("A2".into()), "the UPDATE must propagate");
 
-        // Cycle 3: nothing changed — the staleness guard applies zero rows.
+        // Cycle 3: nothing changed — the write_seq hint skips the table
+        // without moving a byte (the near-live steady state).
         let s3 = crate::witness_pull::run_cycle(&witness, &wcfg).unwrap();
-        let (_name, pulled, applied) = &s3.tables[0];
-        assert!(*pulled >= 3, "tombstone + rows still page over");
-        assert_eq!(*applied, 0, "unchanged rows must be skipped, not re-applied");
+        let (_name, pulled, applied, rows_now) = &s3.tables[0];
+        assert_eq!(*pulled, 0, "unchanged table skipped entirely");
+        assert_eq!(*applied, 0);
+        assert_eq!(*rows_now, 3, "skipped table still reports its size");
     }
 
     fn cluster_ctx() -> Shared {

@@ -57,6 +57,27 @@ pub enum Request {
         after: Option<Vec<u8>>,
         limit: u32,
     },
+    /// The table's mutation counter on THIS member (`Engine::write_seq`,
+    /// process-lifetime monotonic). A witness compares it across pull
+    /// cycles as a change hint: unchanged seq (same member) → the table
+    /// can be skipped without moving a byte of row data. Per-member and
+    /// reset on restart — comparable only against the same member; a
+    /// failover or restart just makes one cycle treat the table as
+    /// changed.
+    TableSeq { table: String },
+    /// Delta page for a witness's incremental pull: walk up to `limit`
+    /// value-free stamps after `after` and return the rows whose HLC
+    /// physical time is `>= since_physical` — values fetched per matching
+    /// key, tombstones included (a delete's stamp is its tombstone).
+    /// Answered with [`Response::DeltaPage`]; its cursor resumes the
+    /// STAMPS walk (not the matched rows), so sparse deltas page in
+    /// bounded work per call.
+    ScanSincePage {
+        table: String,
+        since_physical: u64,
+        after: Option<Vec<u8>>,
+        limit: u32,
+    },
     /// Append time-series samples to the peer's local store (TS replication).
     /// Rows are `(sorted labels, ts ms, value)`; replays are harmless (an
     /// already-present timestamp is rejected per sample, not per batch).
@@ -296,6 +317,14 @@ pub enum Response {
         keys: Vec<Vec<u8>>,
     },
     /// Reply to [`Request::RepairDigest`]: the 4096 bucket accumulators.
+    TableSeq { write_seq: u64 },
+    /// See [`Request::ScanSincePage`]: `cursor` resumes the stamps walk,
+    /// `done` marks the final page.
+    DeltaPage {
+        rows: Vec<WireRow>,
+        cursor: Option<Vec<u8>>,
+        done: bool,
+    },
     Digest {
         buckets: Vec<u64>,
     },
@@ -412,6 +441,8 @@ const REQ_ENTRYRANGE: u8 = 32;
 const REQ_GIDXREADY: u8 = 33;
 const REQ_KEYSPRESENT: u8 = 34;
 const REQ_GIDXPRODUCED: u8 = 35;
+const REQ_TABLESEQ: u8 = 36;
+const REQ_SCANSINCE: u8 = 37;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
@@ -431,6 +462,8 @@ const RES_SORTEDROWS: u8 = 14;
 const RES_EXPLAIN: u8 = 15;
 const RES_HOSTSTATS: u8 = 16;
 const RES_DIGEST: u8 = 17;
+const RES_TABLESEQ: u8 = 18;
+const RES_DELTAPAGE: u8 = 19;
 
 impl Request {
     pub fn encode(&self) -> Vec<u8> {
@@ -473,6 +506,22 @@ impl Request {
             Request::ScanPage { table, after, limit } => {
                 o.push(REQ_SCANPAGE);
                 put_str(o, table);
+                put_opt_bytes(o, after.as_deref());
+                o.extend_from_slice(&limit.to_le_bytes());
+            }
+            Request::TableSeq { table } => {
+                o.push(REQ_TABLESEQ);
+                put_str(o, table);
+            }
+            Request::ScanSincePage {
+                table,
+                since_physical,
+                after,
+                limit,
+            } => {
+                o.push(REQ_SCANSINCE);
+                put_str(o, table);
+                o.extend_from_slice(&since_physical.to_le_bytes());
                 put_opt_bytes(o, after.as_deref());
                 o.extend_from_slice(&limit.to_le_bytes());
             }
@@ -724,6 +773,13 @@ impl Request {
                 after: c.opt_bytes()?,
                 limit: c.u32()?,
             },
+            REQ_TABLESEQ => Request::TableSeq { table: c.string()? },
+            REQ_SCANSINCE => Request::ScanSincePage {
+                table: c.string()?,
+                since_physical: c.u64()?,
+                after: c.opt_bytes()?,
+                limit: c.u32()?,
+            },
             REQ_TSAPPEND => {
                 let table = c.string()?;
                 let n = c.u32()? as usize;
@@ -971,6 +1027,16 @@ impl Response {
                     o.extend_from_slice(&b.to_le_bytes());
                 }
             }
+            Response::TableSeq { write_seq } => {
+                o.push(RES_TABLESEQ);
+                o.extend_from_slice(&write_seq.to_le_bytes());
+            }
+            Response::DeltaPage { rows, cursor, done } => {
+                o.push(RES_DELTAPAGE);
+                put_rows(o, rows);
+                put_opt_bytes(o, cursor.as_deref());
+                o.push(u8::from(*done));
+            }
             Response::VectorHits { hits } => {
                 o.push(RES_VHITS);
                 o.extend_from_slice(&(hits.len() as u32).to_le_bytes());
@@ -1126,6 +1192,12 @@ impl Response {
                 }
                 Response::Digest { buckets }
             }
+            RES_TABLESEQ => Response::TableSeq { write_seq: c.u64()? },
+            RES_DELTAPAGE => Response::DeltaPage {
+                rows: c.rows()?,
+                cursor: c.opt_bytes()?,
+                done: c.u8()? != 0,
+            },
             RES_VHITS => {
                 let n = c.u32()? as usize;
                 let mut hits = Vec::with_capacity(n);

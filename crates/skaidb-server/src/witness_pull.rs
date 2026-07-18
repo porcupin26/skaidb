@@ -44,12 +44,26 @@ const PULL_PAGE_ROWS: u32 = 2_000;
 /// floor keeps even sub-millisecond pages from spinning.
 const PULL_PAGE_PAUSE_FLOOR: std::time::Duration = std::time::Duration::from_millis(25);
 
+/// Safety margin subtracted from a table's watermark on a delta pull:
+/// re-observing the last minute costs a few idempotently-skipped rows and
+/// absorbs modest HLC skew between primary members.
+const DELTA_MARGIN_MS: u64 = 60_000;
+
+/// Local (witness-side) persistent per-table sync state: which primary
+/// member's `write_seq` we last saw (comparable only against that member),
+/// the HLC-physical watermark deltas resume from, and the last FULL sweep
+/// time (the anti-entropy backstop clock).
+const SYNC_STATE_TABLE: &str = "witness_sync_state";
+
 /// What one cycle did, for the log line and the heartbeat watermarks.
 #[derive(Debug, Default)]
 pub struct CycleSummary {
-    /// `(db.table, rows_pulled, rows_applied)` — applied < pulled means the
-    /// staleness guard skipped rows the witness already held.
-    pub tables: Vec<(String, usize, usize)>,
+    /// `(db.table, rows_pulled, rows_applied, rows_now)` — applied < pulled
+    /// means the staleness guard skipped rows already held; `rows_now` is
+    /// the LOCAL live-row count (key stats, no scan) so the heartbeat
+    /// reports table sizes, not per-cycle traffic (a skipped table pulls 0
+    /// but still holds everything).
+    pub tables: Vec<(String, usize, usize, i64)>,
 }
 
 /// Start the pull loop when witness mode is enabled. Called once at serve().
@@ -87,7 +101,7 @@ pub fn spawn_if_enabled(ctx: Shared) {
                 let (pulled, applied): (usize, usize) = summary
                     .tables
                     .iter()
-                    .fold((0, 0), |(p, a), (_, tp, ta)| (p + tp, a + ta));
+                    .fold((0, 0), |(p, a), (_, tp, ta, _)| (p + tp, a + ta));
                 skaidb_types::slog!(
                     "witness: cycle ok — {} tables, {pulled} rows pulled, {applied} applied \
                      ({} skipped as already-current) in {:.1}s",
@@ -110,21 +124,77 @@ pub(crate) fn run_cycle(ctx: &Shared, cfg: &WitnessConfig) -> Result<CycleSummar
 
     register(&mut sql, cfg)?;
 
+    ensure_sync_state_table(ctx)?;
+    let now = now_ms() as u64;
     let mut summary = CycleSummary::default();
     for db in &cfg.databases {
         let tables = list_tables(&mut sql, db)?;
         for (table, pk_cols) in &tables {
             ensure_local_table(ctx, db, table, pk_cols)?;
-            let (pulled, applied) = pull_table(ctx, cfg, db, table)?;
-            summary.tables.push((format!("{db}.{table}"), pulled, applied));
+            let qualified = skaidb_engine::namespace::qualify(db, table);
+            let state = load_sync_state(ctx, &qualified);
+            // Cheap change hint: the serving member's per-table write_seq.
+            // Unknown verb (old primary) → None → full-sweep behavior.
+            let seq = table_seq_with_failover(cfg, &qualified);
+            let backstop_due = now.saturating_sub(state.last_full_ms)
+                >= cfg.full_sweep_interval_secs.saturating_mul(1000);
+            let (pulled, applied) = match &seq {
+                // Same member, same seq, a watermark exists, backstop not
+                // due: nothing changed — skip without moving a byte.
+                Some((addr, seq_v))
+                    if *addr == state.member
+                        && *seq_v == state.seq
+                        && state.watermark_ms > 0
+                        && !backstop_due =>
+                {
+                    (0, 0)
+                }
+                // Changed (or first contact with this member) with a
+                // watermark: pull only the delta since it.
+                Some((addr, seq_v)) if state.watermark_ms > 0 && !backstop_due => {
+                    let since = state.watermark_ms.saturating_sub(DELTA_MARGIN_MS);
+                    let (pulled, applied, max_hlc) =
+                        pull_table_delta(ctx, cfg, addr, &qualified, since)?;
+                    save_sync_state(
+                        ctx,
+                        &qualified,
+                        addr,
+                        *seq_v,
+                        state.watermark_ms.max(max_hlc),
+                        state.last_full_ms,
+                    )?;
+                    (pulled, applied)
+                }
+                // First sync, an old primary without the verbs, or the
+                // backstop is due: full sweep.
+                _ => {
+                    let (pulled, applied, max_hlc) = pull_table(ctx, cfg, db, table)?;
+                    let (member, seq_v) = seq.unwrap_or_default();
+                    save_sync_state(
+                        ctx,
+                        &qualified,
+                        &member,
+                        seq_v,
+                        state.watermark_ms.max(max_hlc),
+                        now,
+                    )?;
+                    (pulled, applied)
+                }
+            };
+            let rows_now = rows_now(ctx, &qualified);
+            summary
+                .tables
+                .push((format!("{db}.{table}"), pulled, applied, rows_now));
             // A finished table's memtable would otherwise sit resident
             // until organic pressure — across a 30-table sync those piles
             // are exactly what OOM'd the first deployment. Flush eagerly:
             // the witness is idle-by-design between cycles, so trading a
             // few small SSTables for a flat memory profile is free.
-            if let Backend::Local(local) = &ctx.backend {
-                if let Ok(mut db) = local.write() {
-                    db.flush_memtables_under_pressure();
+            if pulled > 0 {
+                if let Backend::Local(local) = &ctx.backend {
+                    if let Ok(mut db) = local.write() {
+                        db.flush_memtables_under_pressure();
+                    }
                 }
             }
         }
@@ -132,6 +202,172 @@ pub(crate) fn run_cycle(ctx: &Shared, cfg: &WitnessConfig) -> Result<CycleSummar
 
     heartbeat(&mut sql, cfg, &summary)?;
     Ok(summary)
+}
+
+/// The witness's own persistent per-table sync bookkeeping (local only,
+/// written as the superuser beneath the read-only gate).
+fn ensure_sync_state_table(ctx: &Shared) -> Result<(), String> {
+    let role = ctx.superuser_role.clone();
+    let mut current_db = skaidb_engine::DEFAULT_DATABASE.to_string();
+    match crate::shared::execute_session_as(
+        ctx,
+        &role,
+        &mut current_db,
+        &format!("CREATE TABLE IF NOT EXISTS {SYNC_STATE_TABLE} (PRIMARY KEY (tbl))"),
+        None,
+    ) {
+        skaidb_proto::Response::Error(e) => Err(format!("sync state ddl: {e}")),
+        _ => Ok(()),
+    }
+}
+
+#[derive(Debug, Default)]
+struct SyncState {
+    member: String,
+    seq: u64,
+    watermark_ms: u64,
+    last_full_ms: u64,
+}
+
+fn load_sync_state(ctx: &Shared, qualified: &str) -> SyncState {
+    let role = ctx.superuser_role.clone();
+    let mut current_db = skaidb_engine::DEFAULT_DATABASE.to_string();
+    let resp = crate::shared::execute_session_as(
+        ctx,
+        &role,
+        &mut current_db,
+        &format!(
+            "SELECT member, seq, watermark, last_full FROM {SYNC_STATE_TABLE} \
+             WHERE tbl = '{}'",
+            quote(qualified)
+        ),
+        None,
+    );
+    let skaidb_proto::Response::Rows { rows, .. } = resp else {
+        return SyncState::default();
+    };
+    let Some(row) = rows.first() else {
+        return SyncState::default();
+    };
+    let as_u = |v: Option<&Value>| match v {
+        Some(Value::Int(n)) => *n as u64,
+        _ => 0,
+    };
+    SyncState {
+        member: match row.first() {
+            Some(Value::String(s)) => s.clone(),
+            _ => String::new(),
+        },
+        seq: as_u(row.get(1)),
+        watermark_ms: as_u(row.get(2)),
+        last_full_ms: as_u(row.get(3)),
+    }
+}
+
+fn save_sync_state(
+    ctx: &Shared,
+    qualified: &str,
+    member: &str,
+    seq: u64,
+    watermark_ms: u64,
+    last_full_ms: u64,
+) -> Result<(), String> {
+    let role = ctx.superuser_role.clone();
+    let mut current_db = skaidb_engine::DEFAULT_DATABASE.to_string();
+    match crate::shared::execute_session_as(
+        ctx,
+        &role,
+        &mut current_db,
+        &format!(
+            "INSERT INTO {SYNC_STATE_TABLE} (tbl, member, seq, watermark, last_full) \
+             VALUES ('{}', '{}', {seq}, {watermark_ms}, {last_full_ms})",
+            quote(qualified),
+            quote(member),
+        ),
+        None,
+    ) {
+        skaidb_proto::Response::Error(e) => Err(format!("sync state save: {e}")),
+        _ => Ok(()),
+    }
+}
+
+/// Local live-row count from key stats (no scan) for the heartbeat.
+fn rows_now(ctx: &Shared, qualified: &str) -> i64 {
+    let Backend::Local(local) = &ctx.backend else { return 0 };
+    local
+        .read()
+        .ok()
+        .and_then(|db| db.local_count_rows(qualified).ok().flatten())
+        .map(|n| n as i64)
+        .unwrap_or(0)
+}
+
+/// The serving member's per-table write_seq: `(addr, seq)` from the first
+/// primary that answers; `None` if none do or the verb is unknown (old
+/// primary mid-rolling-upgrade) — callers then take the full-sweep path.
+fn table_seq_with_failover(cfg: &WitnessConfig, qualified: &str) -> Option<(String, u64)> {
+    for addr in &cfg.primary_internode_addrs {
+        match internode::call(
+            addr,
+            &Request::TableSeq {
+                table: qualified.to_string(),
+            },
+        ) {
+            Ok(Response::TableSeq { write_seq }) => return Some((addr.clone(), write_seq)),
+            _ => continue,
+        }
+    }
+    None
+}
+
+/// Incremental pull: page the primary's stamps-walked delta since
+/// `since_physical` and apply through the same guarded path the full sweep
+/// uses. Pinned to ONE member (`addr`) — a mid-delta failover would mix
+/// incomparable write_seq spaces; on error the cycle fails and the next
+/// one retries. Returns `(pulled, applied, max_hlc_physical_seen)`.
+fn pull_table_delta(
+    ctx: &Shared,
+    cfg: &WitnessConfig,
+    addr: &str,
+    qualified: &str,
+    since_physical: u64,
+) -> Result<(usize, usize, u64), String> {
+    let Backend::Local(local) = &ctx.backend else {
+        return Err("witness pull requires a standalone backend".into());
+    };
+    let (mut pulled, mut applied, mut max_hlc) = (0usize, 0usize, 0u64);
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let page_started = std::time::Instant::now();
+        let (rows, cursor, done) = match internode::call(
+            addr,
+            &Request::ScanSincePage {
+                table: qualified.to_string(),
+                since_physical,
+                after: after.clone(),
+                limit: PULL_PAGE_ROWS,
+            },
+        ) {
+            Ok(Response::DeltaPage { rows, cursor, done }) => (rows, cursor, done),
+            Ok(Response::Err(e)) => return Err(format!("delta {qualified} @{addr}: {e}")),
+            Ok(other) => return Err(format!("delta {qualified} @{addr}: unexpected {other:?}")),
+            Err(e) => return Err(format!("delta {qualified} @{addr}: {e}")),
+        };
+        after = cursor;
+        pulled += rows.len();
+        for (_, _, hlc, _) in &rows {
+            max_hlc = max_hlc.max(hlc.physical);
+        }
+        if !rows.is_empty() {
+            applied += apply_rows_guarded(local, qualified, rows)?;
+        }
+        if done {
+            return Ok((pulled, applied, max_hlc));
+        }
+        let pct = f64::from(cfg.duty_pct.clamp(1, 90));
+        let rest = page_started.elapsed().mul_f64((100.0 - pct) / pct);
+        std::thread::sleep(rest.max(PULL_PAGE_PAUSE_FLOOR));
+    }
 }
 
 /// Ensure the witness's registration row exists on the primary. An
@@ -225,19 +461,19 @@ fn ensure_local_table(
     Ok(())
 }
 
-/// Pull one table's pages from the primary and apply them locally.
-/// Returns `(rows_pulled, rows_applied)`.
+/// Full-sweep pull of one table. Returns
+/// `(rows_pulled, rows_applied, max_hlc_physical_seen)`.
 fn pull_table(
     ctx: &Shared,
     cfg: &WitnessConfig,
     db: &str,
     table: &str,
-) -> Result<(usize, usize), String> {
+) -> Result<(usize, usize, u64), String> {
     let qualified = skaidb_engine::namespace::qualify(db, table);
     let Backend::Local(local) = &ctx.backend else {
         return Err("witness pull requires a standalone backend".into());
     };
-    let (mut pulled, mut applied) = (0usize, 0usize);
+    let (mut pulled, mut applied, mut max_hlc) = (0usize, 0usize, 0u64);
     let mut after: Option<Vec<u8>> = None;
     let mut pages_since_flush = 0usize;
     loop {
@@ -246,71 +482,11 @@ fn pull_table(
         let done = page.len() < PULL_PAGE_ROWS as usize;
         after = page.last().map(|(k, ..)| k.clone());
         pulled += page.len();
+        for (_, _, hlc, _) in &page {
+            max_hlc = max_hlc.max(hlc.physical);
+        }
         if !page.is_empty() {
-            // Staleness guard + apply, one write-lock acquisition per page
-            // (2000 rows — same tenure the replica appliers accept).
-            //
-            // The guard compares against the VALUE-FREE stamps range, not
-            // per-row point reads: `local_get_versioned` pulls each full
-            // row through the read cache, and an entry-capped cache fed
-            // 2000 multi-KB rows per page ramped RSS to the cgroup
-            // ceiling on large-row tables (the fifth and final OOM shape
-            // of the first deployment — flat 114 MB all sweep, then the
-            // vectors table killed the box). One sorted stamps walk over
-            // the page's own key span reads zero values, pollutes
-            // nothing, and is ~2000× fewer storage reads per page.
-            let mut dbw = local.write().map_err(|_| "local lock poisoned".to_string())?;
-            let span_first = page.first().map(|(k, ..)| k.clone()).unwrap_or_default();
-            let span_last = page.last().map(|(k, ..)| k.clone()).unwrap_or_default();
-            let mut local_stamps: std::collections::HashMap<Vec<u8>, skaidb_engine::Hlc> =
-                std::collections::HashMap::new();
-            // Start strictly BEFORE the span's first key so it is included
-            // (`after` is exclusive); an empty `after` covers it.
-            let mut cursor: Option<Vec<u8>> = span_first
-                .len()
-                .checked_sub(1)
-                .map(|n| span_first[..n].to_vec());
-            'stamps: loop {
-                let stamps = dbw
-                    .local_scan_stamps_page(&qualified, cursor.as_deref(), 4096)
-                    .map_err(|e| format!("stamps {qualified}: {e}"))?;
-                let done = stamps.len() < 4096;
-                cursor = stamps.last().map(|(k, ..)| k.clone());
-                for (key, hlc, _is_put) in stamps {
-                    if key > span_last {
-                        break 'stamps;
-                    }
-                    if key >= span_first {
-                        local_stamps.insert(key, hlc);
-                    }
-                }
-                if done {
-                    break;
-                }
-            }
-            let fresh: Vec<_> = page
-                .into_iter()
-                .filter(|(key, _, hlc, _)| match local_stamps.get(key) {
-                    Some(cur) => cur < hlc,
-                    None => true,
-                })
-                .collect();
-            applied += fresh.len();
-            if !fresh.is_empty() {
-                // Sync the page's WAL commits like the replica applier does
-                // (one fsync per page): dropping the handles unsynced lets
-                // buffered WAL data accumulate in memory for the whole
-                // table — a 1.9 GB table's pull OOM-killed the witness
-                // three times before this landed. Durability per page is
-                // the bonus; bounded memory is the point.
-                if let Some((commit, sync)) = dbw
-                    .apply_batch_buffered(&qualified, &fresh)
-                    .map_err(|e| format!("apply {qualified}: {e}"))?
-                {
-                    sync.sync_through(commit)
-                        .map_err(|e| format!("wal sync {qualified}: {e}"))?;
-                }
-            }
+            applied += apply_rows_guarded(local, &qualified, page)?;
         }
         // Mid-table flush every ~64k rows: a standalone witness has none
         // of the Node-level memory-pressure machinery replicas rely on
@@ -326,7 +502,7 @@ fn pull_table(
             }
         }
         if done {
-            return Ok((pulled, applied));
+            return Ok((pulled, applied, max_hlc));
         }
         // Bounded duty on the primary (`witness.duty_pct`, default 50,
         // live via SET CONFIG): rest `work × (100 − pct) / pct`.
@@ -334,6 +510,71 @@ fn pull_table(
         let rest = page_started.elapsed().mul_f64((100.0 - pct) / pct);
         std::thread::sleep(rest.max(PULL_PAGE_PAUSE_FLOOR));
     }
+}
+
+/// Apply one page of pulled rows under the staleness guard, then sync
+/// the page's WAL commits. Shared by the full sweep and the delta pull.
+///
+/// The guard compares against the VALUE-FREE stamps range, not per-row
+/// point reads: `local_get_versioned` pulls each full row through the
+/// entry-capped read cache, and 2000 multi-KB rows per page ramped RSS to
+/// the cgroup ceiling on large-row tables (the fifth OOM shape of the
+/// first deployment). One sorted stamps walk over the page's own key span
+/// reads zero values and is ~2000× fewer storage reads. The WAL sync
+/// mirrors the replica applier — dropping the handles unsynced accumulated
+/// buffered WAL data across a whole 1.9 GB table (the third OOM shape).
+fn apply_rows_guarded(
+    local: &std::sync::RwLock<skaidb_engine::Database>,
+    qualified: &str,
+    page: Vec<PulledRow>,
+) -> Result<usize, String> {
+    let mut dbw = local.write().map_err(|_| "local lock poisoned".to_string())?;
+    let span_first = page.first().map(|(k, ..)| k.clone()).unwrap_or_default();
+    let span_last = page.last().map(|(k, ..)| k.clone()).unwrap_or_default();
+    let mut local_stamps: std::collections::HashMap<Vec<u8>, skaidb_engine::Hlc> =
+        std::collections::HashMap::new();
+    // Start strictly BEFORE the span's first key so it is included
+    // (`after` is exclusive); an empty `after` covers it.
+    let mut cursor: Option<Vec<u8>> = span_first
+        .len()
+        .checked_sub(1)
+        .map(|n| span_first[..n].to_vec());
+    'stamps: loop {
+        let stamps = dbw
+            .local_scan_stamps_page(qualified, cursor.as_deref(), 4096)
+            .map_err(|e| format!("stamps {qualified}: {e}"))?;
+        let done = stamps.len() < 4096;
+        cursor = stamps.last().map(|(k, ..)| k.clone());
+        for (key, hlc, _is_put) in stamps {
+            if key > span_last {
+                break 'stamps;
+            }
+            if key >= span_first {
+                local_stamps.insert(key, hlc);
+            }
+        }
+        if done {
+            break;
+        }
+    }
+    let fresh: Vec<_> = page
+        .into_iter()
+        .filter(|(key, _, hlc, _)| match local_stamps.get(key) {
+            Some(cur) => cur < hlc,
+            None => true,
+        })
+        .collect();
+    let applied = fresh.len();
+    if !fresh.is_empty() {
+        if let Some((commit, sync)) = dbw
+            .apply_batch_buffered(qualified, &fresh)
+            .map_err(|e| format!("apply {qualified}: {e}"))?
+        {
+            sync.sync_through(commit)
+                .map_err(|e| format!("wal sync {qualified}: {e}"))?;
+        }
+    }
+    Ok(applied)
 }
 
 /// One `ScanPage` against the first reachable primary internode endpoint.
@@ -374,8 +615,8 @@ fn heartbeat(sql: &mut Client, cfg: &WitnessConfig, summary: &CycleSummary) -> R
     let watermarks: Vec<String> = summary
         .tables
         .iter()
-        .map(|(name, pulled, _)| {
-            format!("'{}': {{rows: {pulled}, synced_at: {now_ms}}}", quote(name))
+        .map(|(name, _pulled, _applied, rows_now)| {
+            format!("'{}': {{rows: {rows_now}, synced_at: {now_ms}}}", quote(name))
         })
         .collect();
     sql.execute(&format!(

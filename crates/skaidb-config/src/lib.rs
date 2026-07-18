@@ -119,9 +119,17 @@ pub struct WitnessConfig {
     /// Databases to mirror. Empty = witness mode refuses to start (an
     /// explicit list is the operator stating what the backup covers).
     pub databases: Vec<String>,
-    /// Seconds between pull cycles. A witness does not need to keep up —
-    /// default one hour.
+    /// Seconds between pull cycles — default 60 (near-live): a cycle is
+    /// cheap at steady state, since unchanged tables are skipped by the
+    /// per-table `write_seq` hint and changed tables pull only their
+    /// stamps-walked delta.
     pub interval_secs: u64,
+    /// Seconds between FULL sweeps per table (default 24h) — the
+    /// anti-entropy backstop for the one delta blind spot: a delayed
+    /// hint-replay can land an old-stamped row on the primary after the
+    /// witness's watermark already passed that timestamp, and only a full
+    /// sweep re-observes it.
+    pub full_sweep_interval_secs: u64,
     /// Ceiling, in percent (1–90), on how much of the serving primary's
     /// capacity the pull may take (same rest rule as
     /// `cluster.bootstrap_duty_pct`). **Live-mutable**:
@@ -141,7 +149,8 @@ impl Default for WitnessConfig {
             user: String::new(),
             password: String::new(),
             databases: Vec::new(),
-            interval_secs: 3600,
+            interval_secs: 60,
+            full_sweep_interval_secs: 86_400,
             duty_pct: 50,
             witness_id: "witness".to_string(),
             region: String::new(),

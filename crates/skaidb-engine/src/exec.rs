@@ -6098,6 +6098,56 @@ impl Database {
     /// `(key, hlc, is_put)` stamps in key order. Anti-entropy digests hash
     /// exactly these three fields, and the storage layer serves them from the
     /// stamps sidecar — a whole-table digest pass never decompresses values.
+    /// The table's storage mutation counter (`Engine::write_seq`):
+    /// process-lifetime monotonic, bumped on every applied mutation. A
+    /// witness uses it as a cheap per-cycle change hint.
+    pub fn table_write_seq(&self, table: &str) -> Result<u64> {
+        let engine = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+        Ok(engine.write_seq())
+    }
+
+    /// One bounded DELTA page for a witness's incremental pull: walk up to
+    /// `stamp_limit` value-free stamps with key strictly greater than
+    /// `after`, and return the rows whose HLC physical time is
+    /// `>= since_physical` — values point-read per matching key (a put
+    /// whose value vanished mid-walk is skipped; the next cycle converges
+    /// it), tombstones included with empty values. Returns
+    /// `(rows, cursor, done)`: the cursor resumes the STAMPS walk, so a
+    /// sparse delta costs bounded work per call regardless of match count.
+    pub fn local_scan_since_page(
+        &self,
+        table: &str,
+        since_physical: u64,
+        after: Option<&[u8]>,
+        stamp_limit: usize,
+    ) -> Result<(Vec<VersionedTombstoneRow>, Option<Vec<u8>>, bool)> {
+        let engine = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+        let stamps = engine.scan_stamps_page(after, stamp_limit)?;
+        let done = stamps.len() < stamp_limit;
+        let cursor = stamps.last().map(|(k, ..)| k.clone());
+        let mut rows = Vec::new();
+        for (key, hlc, is_put) in stamps {
+            if hlc.physical < since_physical {
+                continue;
+            }
+            if is_put {
+                // A vanished value (rewritten mid-walk) converges next cycle.
+                if let Some(value) = engine.get(&key)? {
+                    rows.push((key, value, hlc, true));
+                }
+            } else {
+                rows.push((key, Vec::new(), hlc, false));
+            }
+        }
+        Ok((rows, cursor, done))
+    }
+
     pub fn local_scan_stamps_page(
         &self,
         table: &str,
