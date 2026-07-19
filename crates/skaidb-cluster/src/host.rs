@@ -96,6 +96,10 @@ pub struct HostStats {
     /// largest peer's, captured at resync start). 1.0 when not resyncing.
     #[serde(default)]
     pub resync_progress: f64,
+    /// Host(s) this node is backfilling FROM during a resync, comma-joined
+    /// (empty when not resyncing) — the "resync from …" display.
+    #[serde(default)]
+    pub resync_source: String,
     /// Set by a coordinator when this snapshot was served from cache because
     /// the node missed a probe: seconds since it last answered. 0 = fresh.
     #[serde(default)]

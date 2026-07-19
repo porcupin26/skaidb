@@ -964,8 +964,9 @@ function renderHosts(hosts, status) {
     if (n.resyncing) {
       const b = document.createElement("span");
       b.className = "badge-resync";
-      b.textContent =
-        n.resync_progress != null ? `resync ${Math.round(n.resync_progress * 100)}%` : "resync";
+      const pct = n.resync_progress != null ? ` ${Math.round(n.resync_progress * 100)}%` : "";
+      const from = n.resync_source ? ` ← ${n.resync_source}` : "";
+      b.textContent = `resync${pct}${from}`;
       idCell.append(" ", b);
     }
     tr.append(

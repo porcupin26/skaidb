@@ -889,6 +889,7 @@ fn status_json(ctx: &Shared) -> Json {
                 // until `resync_progress` reaches 1.0 (filesize-based).
                 "resyncing": c.resyncing,
                 "resync_progress": c.resync_progress,
+                "resync_source": c.resync_source,
             })
         }
         None => json!({ "clustered": false, "client_tls": client_tls_mode(ctx), "at_rest": at_rest_mode(ctx), "ready": ctx.backend.is_ready() }),

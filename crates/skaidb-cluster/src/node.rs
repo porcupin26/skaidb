@@ -194,6 +194,9 @@ pub struct Node {
     /// Denominator for filesize-based resync progress: the largest peer's data
     /// footprint (bytes), captured when the resync began. 0 = unknown.
     resync_target_bytes: AtomicU64,
+    /// Host(s) this node is backfilling FROM during a resync — the complete
+    /// peers it reconciles against — for the UI/status "resync from …" display.
+    resync_sources: Mutex<Vec<String>>,
     /// Completed anti-entropy passes since boot (monotonic). Placement-
     /// transition drivers gate finalize on every member advancing this
     /// by 2 past a baseline — see `drive_placement_transitions`.
@@ -347,6 +350,8 @@ pub struct ClusterStats {
     pub resyncing: bool,
     /// Resync completion in `0.0..=1.0` (filesize-based). 1.0 when not resyncing.
     pub resync_progress: f64,
+    /// Host(s) this node is backfilling FROM during a resync (empty otherwise).
+    pub resync_source: String,
 }
 
 /// A buffered write awaiting handoff to a recovered replica:
@@ -761,6 +766,7 @@ impl Node {
             repairing: AtomicBool::new(false),
             resyncing: AtomicBool::new(false),
             resync_target_bytes: AtomicU64::new(0),
+            resync_sources: Mutex::new(Vec::new()),
             repair_passes: AtomicU64::new(0),
             placement_drive_at: Mutex::new(Instant::now()),
             placement_baselines: Mutex::new(std::collections::HashMap::new()),
@@ -1384,6 +1390,7 @@ impl Node {
             memory_limit_bytes: self.mem.snapshot().1,
             resyncing: self.resyncing.load(Ordering::Relaxed),
             resync_progress: self.resync_progress(),
+            resync_source: self.resync_source(),
         }
     }
 
@@ -1416,6 +1423,7 @@ impl Node {
         self_stats.data_dir_bytes = self.local_data_bytes();
         self_stats.resyncing = self.resyncing.load(Ordering::Relaxed);
         self_stats.resync_progress = self.resync_progress();
+        self_stats.resync_source = self.resync_source();
         let mut out = vec![(self.id.0.clone(), Some(self_stats))];
         let peers: Vec<(NodeId, String)> = self
             .members_snapshot()
@@ -1492,6 +1500,18 @@ impl Node {
     /// Whether this node is backfilling from empty after a (re)join.
     pub fn is_resyncing(&self) -> bool {
         self.resyncing.load(Ordering::Relaxed)
+    }
+
+    /// The host(s) this node is backfilling FROM during a resync, comma-joined
+    /// (empty when not resyncing). For the UI/status "resync from …" display.
+    pub fn resync_source(&self) -> String {
+        if !self.resyncing.load(Ordering::Relaxed) {
+            return String::new();
+        }
+        self.resync_sources
+            .lock()
+            .map(|s| s.join(", "))
+            .unwrap_or_default()
     }
 
     /// Resync completion in `0.0..=1.0`, filesize-based (local data bytes over
@@ -4865,24 +4885,33 @@ impl Node {
             }
             // Not yet flagged and catch-up not done: detect a from-empty start —
             // our data is tiny AND a peer holds far more (a fresh all-empty
-            // cluster is never flagged). Cheap `DataBytes` probe (no df).
+            // cluster is never flagged). Cheap `DataBytes` probe (no df). Record
+            // which complete peers we'll backfill FROM for the "resync from …"
+            // display.
             let local = self.local_data_bytes();
             if local < RESYNC_EMPTY_BYTES {
-                let target = self
-                    .peer_addrs()
-                    .iter()
-                    .filter_map(|a| match self.pool.call(a, &Request::DataBytes) {
-                        Ok(Response::DataBytes { bytes }) => Some(bytes),
-                        _ => None,
-                    })
-                    .max()
-                    .unwrap_or(0);
+                let mut target = 0u64;
+                let mut sources = Vec::new();
+                for (id, addr) in self.peer_addrs_with_ids() {
+                    if let Ok(Response::DataBytes { bytes }) =
+                        self.pool.call(&addr, &Request::DataBytes)
+                    {
+                        target = target.max(bytes);
+                        if bytes >= RESYNC_EMPTY_BYTES {
+                            let host = id.0.rsplit_once(':').map(|(h, _)| h).unwrap_or(&id.0);
+                            sources.push(host.to_string());
+                        }
+                    }
+                }
                 if target >= RESYNC_EMPTY_BYTES && local.saturating_mul(4) < target {
+                    sources.sort();
                     self.resync_target_bytes.store(target, Ordering::Relaxed);
+                    *self.resync_sources.lock().expect("resync sources") = sources.clone();
                     self.resyncing.store(true, Ordering::Relaxed);
                     skaidb_types::slog!(
-                        "skaidb: resync detected — backfilling from empty (target ~{} MB); \
+                        "skaidb: resync detected — backfilling from {} (target ~{} MB); \
                          not serving scans locally until caught up",
+                        sources.join(", "),
                         target / (1024 * 1024)
                     );
                 }
@@ -4933,6 +4962,7 @@ impl Node {
                 stats.data_dir_bytes = self.local_data_bytes();
                 stats.resyncing = self.resyncing.load(Ordering::Relaxed);
                 stats.resync_progress = self.resync_progress();
+                stats.resync_source = self.resync_source();
                 match serde_json::to_string(&stats) {
                     Ok(json) => Response::HostStats { json },
                     Err(e) => Response::Err(format!("encode host stats: {e}")),
