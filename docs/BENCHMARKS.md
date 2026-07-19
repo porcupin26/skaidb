@@ -258,6 +258,56 @@ The original round's 3-node cluster leg (ingest + scatter latency +
 kill/rejoin) was not re-verified — re-run before citing cluster-scale FTS
 claims.
 
+## Encryption overhead A/B (2026-07-18)
+
+Cost of the confidentiality features (internode mTLS, client TLS, at-rest
+AES-256-GCM) vs plaintext, on the bench fleet (three 1-vCPU/512 MB LXCs on
+p225, client colocated on node 1, `abench` load generator — 4 threads, 8 s
+runs, prepared statements). Same-day A/B, ≥2 runs each. Run-to-run spread on
+this fleet is ±10–15%, so treat single-digit deltas as indicative, not exact.
+
+**Full stack — plaintext vs (mTLS + client_tls=required + at_rest), in-memory
+workload** (64 MB memtable → data stayed resident; measures wire TLS + WAL
+sealing, NOT SSTable at-rest):
+
+| Workload (4 threads) | Plaintext | Fully encrypted | Overhead |
+|---|---|---|---|
+| write | ~1,427 ops/s | ~1,358 ops/s | ~5% |
+| read  | ~14,500 ops/s (±15% noise) | ~13,360 ops/s | within noise (≤~8%) |
+| mixed | ~2,615 ops/s | ~2,554 ops/s | ~2–3% |
+
+Writes take the clearest hit: a QUORUM write does TLS round-trips to two
+replicas; the WAL AES is a tiny fraction (writes are fsync-bound).
+
+**Cold-SSTable point reads — at-rest isolated** (standalone node, no TLS;
+incompressible ~200-byte payloads → 26 MB of on-disk SSTables, larger than the
+block cache, so reads miss and decrypt):
+
+| | ops/s |
+|---|---|
+| at_rest off | ~13,450 (13518, 13390) |
+| at_rest on  | ~12,490 (12463, 12514) |
+| **overhead** | **~7%** |
+
+Tight/consistent — the per-block AES-GCM decrypt on a cache miss. **Hot reads
+(block-cache hit) showed ~0%** (16998 vs 16947 when a compressible table fit
+in cache): the block cache stores decrypted blocks, so only genuinely cold
+reads pay.
+
+**Repair — at-rest isolated** (converged 2-node pair, `REPAIR CLUSTER` timed,
+17 MB): plaintext = 2 stamps sidecars, encrypted = **0** (encrypted tables
+write no sidecar). Steady-state repair time **~2,567 ms both** — no measurable
+difference at this scale. Repair is dominated by fixed per-(table,peer)
+round-trips + QoS pacing, which mask the stamps-walk-vs-full-block-decode
+difference on 17 MB. **The sidecar-loss regression is expected to appear at
+production data volumes (GB tables) but was NOT reproducible on the 1-vCPU
+bench** — re-measure at scale before relying on encrypted-repair cost.
+
+**Not measured**: REST client-TLS handshake-per-request cost (REST is
+`Connection: close`; matters only for high-QPS REST — the binary driver
+amortizes it); SSTable compaction sealing cost; sustained-bulk at-rest memory
+flatness. Harness: `crates/skaidb-driver/examples/abench.rs`.
+
 ## Reproducing
 
 All load generators are in-tree. Client binaries/scripts get staged into
