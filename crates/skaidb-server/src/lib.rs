@@ -99,7 +99,7 @@ fn build_backend(db: Database, config: &Config) -> Result<Backend, Box<dyn std::
 /// Build the internode authenticator from `[auth]` config. Fails closed: a mode
 /// that's selected but missing its secret/cert material is an error, not a
 /// silent fallback to no auth.
-fn build_internode_auth(config: &Config) -> Result<Arc<Authenticator>, Box<dyn std::error::Error>> {
+pub(crate) fn build_internode_auth(config: &Config) -> Result<Arc<Authenticator>, Box<dyn std::error::Error>> {
     let a = &config.auth;
     match a.internode_auth {
         InternodeAuth::None => Ok(Arc::new(Authenticator::None)),
@@ -2093,6 +2093,14 @@ pub(crate) mod tests {
         assert!(err.contains("standalone"), "{err}");
     }
 
+    /// A plaintext internode pool for witness-pull tests (primaries run
+    /// `Authenticator::None`).
+    fn witness_test_pool() -> skaidb_cluster::internode::Pool {
+        skaidb_cluster::internode::Pool::new(std::sync::Arc::new(
+            skaidb_cluster::Authenticator::None,
+        ))
+    }
+
     fn rbac_test_ctx() -> Shared {
         Arc::new(Context {
             backend: Backend::Local(Box::new(RwLock::new(Database::open(temp_dir()).unwrap()))),
@@ -2695,7 +2703,7 @@ pub(crate) mod tests {
             witness_id: "w-scatter".into(),
             region: "unit".into(),
         };
-        let s1 = crate::witness_pull::run_cycle(&witness, &wcfg).unwrap();
+        let s1 = crate::witness_pull::run_cycle(&witness, &wcfg, &witness_test_pool()).unwrap();
         let rows_of = |t: &str| {
             s1.tables
                 .iter()
@@ -2707,7 +2715,7 @@ pub(crate) mod tests {
         assert_eq!(rows_of("mirror.pinned"), 10, "pinned pulled from its pin");
 
         // Idempotency across sources: a second cycle applies nothing.
-        let s2 = crate::witness_pull::run_cycle(&witness, &wcfg).unwrap();
+        let s2 = crate::witness_pull::run_cycle(&witness, &wcfg, &witness_test_pool()).unwrap();
         let applied: usize = s2.tables.iter().map(|&(_, _, a, _)| a).sum();
         assert_eq!(applied, 0, "second cycle applies nothing: {:?}", s2.tables);
     }
@@ -2785,7 +2793,7 @@ pub(crate) mod tests {
         };
 
         // Cycle 1: full copy arrives, registration lands on the primary.
-        let s1 = crate::witness_pull::run_cycle(&witness, &wcfg).unwrap();
+        let s1 = crate::witness_pull::run_cycle(&witness, &wcfg, &witness_test_pool()).unwrap();
         assert_eq!(s1.tables, vec![("mirror.items".to_string(), 3, 3, 3)]);
         let exec_w = |sql: &str| match crate::shared::execute_as(&witness, "superuser", sql) {
             Response::Error(e) => panic!("witness {sql}: {e}"),
@@ -2828,7 +2836,7 @@ pub(crate) mod tests {
         exec_p("UPDATE mirror.items SET x = 'A2' WHERE id = 1");
         exec_p("DELETE FROM mirror.items WHERE id = 2");
         exec_p("INSERT INTO mirror.items (id, x) VALUES (4, 'd')");
-        let s2 = crate::witness_pull::run_cycle(&witness, &wcfg).unwrap();
+        let s2 = crate::witness_pull::run_cycle(&witness, &wcfg, &witness_test_pool()).unwrap();
         // Incremental: only the 3-row delta crosses the wire, not the table.
         let (_n, pulled2, applied2, rows_now2) = &s2.tables[0];
         assert!(*pulled2 <= 4, "delta pull, not a sweep: pulled {pulled2}");
@@ -2846,7 +2854,7 @@ pub(crate) mod tests {
         // mirror, and flipping it back on picks it up next cycle.
         exec_p("CREATE TABLE mirror.private (PRIMARY KEY (id)) WITH (witness = false)");
         exec_p("INSERT INTO mirror.private (id) VALUES (1)");
-        let s2b = crate::witness_pull::run_cycle(&witness, &wcfg).unwrap();
+        let s2b = crate::witness_pull::run_cycle(&witness, &wcfg, &witness_test_pool()).unwrap();
         assert!(
             !s2b.tables.iter().any(|(n, ..)| n == "mirror.private"),
             "excluded table must not appear in the cycle: {:?}",
@@ -2857,7 +2865,7 @@ pub(crate) mod tests {
             other => panic!("excluded table must not exist on the witness: {other:?}"),
         }
         exec_p("ALTER TABLE mirror.private SET (witness = true)");
-        let s2c = crate::witness_pull::run_cycle(&witness, &wcfg).unwrap();
+        let s2c = crate::witness_pull::run_cycle(&witness, &wcfg, &witness_test_pool()).unwrap();
         assert!(
             s2c.tables.iter().any(|(n, _, _, rows)| n == "mirror.private" && *rows == 1),
             "re-included table mirrors on the next cycle: {:?}",
@@ -2876,11 +2884,126 @@ pub(crate) mod tests {
 
         // Cycle 3: nothing changed — the write_seq hint skips the table
         // without moving a byte (the near-live steady state).
-        let s3 = crate::witness_pull::run_cycle(&witness, &wcfg).unwrap();
+        let s3 = crate::witness_pull::run_cycle(&witness, &wcfg, &witness_test_pool()).unwrap();
         let (_name, pulled, applied, rows_now) = &s3.tables[0];
         assert_eq!(*pulled, 0, "unchanged table skipped entirely");
         assert_eq!(*applied, 0);
         assert_eq!(*rows_now, 3, "skipped table still reports its size");
+    }
+
+    /// The witness pulls over mutual TLS from a `cert`-mode primary: its pool
+    /// presents a CA-signed client cert and the primary accepts it. A witness
+    /// whose pool uses a FOREIGN CA is rejected (mirrors nothing) — proving the
+    /// pull is genuinely authenticated, not silently plaintext.
+    #[test]
+    fn witness_pull_authenticates_over_mtls() {
+        use skaidb_cluster::internode::Pool;
+        use skaidb_cluster::Authenticator;
+
+        // Mint a CA + a leaf (SAN `skaidb`) into `dir`; returns cert/key/ca paths.
+        fn mint(dir: &std::path::Path, tag: &str) -> (String, String, String) {
+            use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+            let mut ca_p = CertificateParams::new(Vec::new()).unwrap();
+            ca_p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            let ca_key = KeyPair::generate().unwrap();
+            let ca = ca_p.self_signed(&ca_key).unwrap();
+            let leaf_p = CertificateParams::new(vec!["skaidb".to_string()]).unwrap();
+            let leaf_key = KeyPair::generate().unwrap();
+            let leaf = leaf_p.signed_by(&leaf_key, &ca, &ca_key).unwrap();
+            let (c, k, a) = (
+                dir.join(format!("{tag}.crt")),
+                dir.join(format!("{tag}.key")),
+                dir.join(format!("{tag}-ca.crt")),
+            );
+            std::fs::write(&c, leaf.pem()).unwrap();
+            std::fs::write(&k, leaf_key.serialize_pem()).unwrap();
+            std::fs::write(&a, ca.pem()).unwrap();
+            (
+                c.to_str().unwrap().into(),
+                k.to_str().unwrap().into(),
+                a.to_str().unwrap().into(),
+            )
+        }
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let (crt, key, ca) = mint(&dir, "node");
+        let cert_auth = || Arc::new(Authenticator::cert(&crt, &key, &ca).unwrap());
+
+        // Primary: cert-mode internode listener.
+        let internode_addr = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let a = l.local_addr().unwrap().to_string();
+            drop(l);
+            a
+        };
+        let cfg = NodeConfig {
+            id: NodeId::new(&internode_addr),
+            internode_addr: internode_addr.clone(),
+            members: vec![(NodeId::new(&internode_addr), internode_addr.clone())],
+            replication_factor: 1,
+            vnodes_per_node: 64,
+            read_consistency: ClusterConsistency::Quorum,
+            write_consistency: ClusterConsistency::Quorum,
+            auth: cert_auth(),
+            auto_join: false,
+            anti_entropy_interval_secs: 0,
+        };
+        let node = Node::new(Database::open(temp_dir()).unwrap(), cfg);
+        node.serve_internode().unwrap();
+        let primary: Shared = Arc::new(Context {
+            backend: Backend::Cluster(node),
+            metrics: Metrics::new(),
+            audit: RwLock::new(quiet_audit()),
+            authn: AuthState::disabled(),
+            superuser_role: "superuser".into(),
+            admin_lock: Mutex::new(()),
+            start: Instant::now(),
+            slow_log: crate::slowlog::SlowLog::new(),
+            config: RwLock::new(Config::default()),
+            config_path: None,
+            drivers_table_ensured: std::sync::atomic::AtomicBool::new(false),
+        });
+        let (sql_addr, _h) = binary::spawn("127.0.0.1:0", primary.clone()).unwrap();
+        crate::witnesses::ensure_tables(&primary).unwrap();
+        let exec_p = |sql: &str| match crate::shared::execute_as(&primary, "superuser", sql) {
+            Response::Error(e) => panic!("primary {sql}: {e}"),
+            other => other,
+        };
+        exec_p("CREATE DATABASE mirror");
+        exec_p("CREATE TABLE mirror.items (PRIMARY KEY (id))");
+        exec_p("INSERT INTO mirror.items (id, x) VALUES (1, 'a'), (2, 'b')");
+
+        let witness = temp_ctx();
+        let wcfg = skaidb_config::WitnessConfig {
+            enabled: true,
+            primary_sql_addrs: vec![sql_addr.to_string()],
+            primary_internode_addrs: vec![internode_addr.clone()],
+            user: "anonymous".into(),
+            password: String::new(),
+            databases: vec!["mirror".into()],
+            interval_secs: 3600,
+            full_sweep_interval_secs: 86_400,
+            duty_pct: 90,
+            witness_id: "w-mtls".into(),
+            region: "unit".into(),
+        };
+
+        // A cert pool from the SAME CA pulls successfully over mTLS.
+        let good_pool = Pool::new(cert_auth());
+        let s = crate::witness_pull::run_cycle(&witness, &wcfg, &good_pool).unwrap();
+        let rows: i64 = s.tables.iter().map(|&(_, _, _, n)| n).sum();
+        assert_eq!(rows, 2, "cert-mode witness mirrors over mTLS: {:?}", s.tables);
+
+        // A pool with a DIFFERENT CA is rejected → pulls nothing (a fresh
+        // witness so we don't see the already-mirrored rows).
+        let evil_dir = temp_dir();
+        std::fs::create_dir_all(&evil_dir).unwrap();
+        let (ec, ek, eca) = mint(&evil_dir, "rogue");
+        let evil_pool = Pool::new(Arc::new(Authenticator::cert(&ec, &ek, &eca).unwrap()));
+        let witness2 = temp_ctx();
+        let r = crate::witness_pull::run_cycle(&witness2, &wcfg, &evil_pool);
+        let mirrored = r.map(|s| s.tables.iter().map(|&(_, _, a, _)| a).sum::<usize>()).unwrap_or(0);
+        assert_eq!(mirrored, 0, "foreign-CA witness must mirror nothing");
     }
 
     fn cluster_ctx() -> Shared {

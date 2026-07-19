@@ -26,7 +26,7 @@
 //! layer, so `server.read_only` (which a witness should run with) never
 //! blocks the pull while still rejecting every client mutation.
 
-use skaidb_cluster::internode::{self, Request, Response};
+use skaidb_cluster::internode::{Pool, Request, Response};
 use skaidb_config::WitnessConfig;
 use skaidb_driver::Client;
 use skaidb_types::Value;
@@ -95,10 +95,23 @@ pub fn spawn_if_enabled(ctx: Shared) {
              local writes; set server.read_only = true (pull continues anyway)"
         );
     }
+    // The pull's internode connections go through the SAME authenticator the
+    // primary requires (none / token / cert), built from this witness's
+    // `[auth]` config — so a cert-mode primary accepts the witness's mTLS pull
+    // instead of dropping an unauthenticated plaintext connection. A bad/absent
+    // auth config fails loud here (the pull never starts) rather than silently
+    // going plaintext against a secured primary.
+    let pool = match crate::build_internode_auth(&ctx.config_snapshot()) {
+        Ok(auth) => Pool::new(auth),
+        Err(e) => {
+            skaidb_types::slog!("witness: internode auth config invalid: {e} — pull not started");
+            return;
+        }
+    };
     std::thread::spawn(move || loop {
         let cfg = ctx.config_snapshot().witness; // live re-read each cycle
         let started = std::time::Instant::now();
-        match run_cycle(&ctx, &cfg) {
+        match run_cycle(&ctx, &cfg, &pool) {
             Ok(summary) => {
                 let (pulled, applied): (usize, usize) = summary
                     .tables
@@ -119,7 +132,7 @@ pub fn spawn_if_enabled(ctx: Shared) {
 }
 
 /// One full pull cycle. Public-in-crate so tests drive it synchronously.
-pub(crate) fn run_cycle(ctx: &Shared, cfg: &WitnessConfig) -> Result<CycleSummary, String> {
+pub(crate) fn run_cycle(ctx: &Shared, cfg: &WitnessConfig, pool: &Pool) -> Result<CycleSummary, String> {
     // One SQL connection for the whole cycle (failover inside the driver).
     let mut sql = Client::connect_many(&cfg.primary_sql_addrs, &cfg.user, &cfg.password)
         .map_err(|e| format!("primary SQL connect: {e}"))?;
@@ -172,7 +185,7 @@ pub(crate) fn run_cycle(ctx: &Shared, cfg: &WitnessConfig) -> Result<CycleSummar
                 // down member degrades that member's shard until it
                 // returns instead of failing the whole cycle — but say so.
                 for addr in &sources {
-                    match sync_from_member(ctx, cfg, db, table, &qualified, addr, true, now) {
+                    match sync_from_member(ctx, cfg, pool, db, table, &qualified, addr, true, now) {
                         Ok((p, a)) => {
                             pulled += p;
                             applied += a;
@@ -188,7 +201,7 @@ pub(crate) fn run_cycle(ctx: &Shared, cfg: &WitnessConfig) -> Result<CycleSummar
                 let mut last_err = String::new();
                 let mut synced = false;
                 for addr in &sources {
-                    match sync_from_member(ctx, cfg, db, table, &qualified, addr, false, now) {
+                    match sync_from_member(ctx, cfg, pool, db, table, &qualified, addr, false, now) {
                         Ok((p, a)) => {
                             pulled = p;
                             applied = a;
@@ -235,6 +248,7 @@ pub(crate) fn run_cycle(ctx: &Shared, cfg: &WitnessConfig) -> Result<CycleSummar
 fn sync_from_member(
     ctx: &Shared,
     cfg: &WitnessConfig,
+    pool: &Pool,
     db: &str,
     table: &str,
     qualified: &str,
@@ -248,7 +262,7 @@ fn sync_from_member(
         qualified.to_string()
     };
     let state = load_sync_state(ctx, &state_key);
-    let seq = table_seq_at(addr, qualified);
+    let seq = table_seq_at(pool, addr, qualified);
     let backstop_due = now.saturating_sub(state.last_full_ms)
         >= cfg.full_sweep_interval_secs.saturating_mul(1000);
     match seq {
@@ -262,7 +276,7 @@ fn sync_from_member(
         }
         Some(seq_v) if state.watermark_ms > 0 && !backstop_due => {
             let since = state.watermark_ms.saturating_sub(DELTA_MARGIN_MS);
-            let (pulled, applied, max_hlc) = pull_table_delta(ctx, cfg, addr, qualified, since)?;
+            let (pulled, applied, max_hlc) = pull_table_delta(ctx, cfg, pool, addr, qualified, since)?;
             save_sync_state(
                 ctx,
                 &state_key,
@@ -274,7 +288,7 @@ fn sync_from_member(
             Ok((pulled, applied))
         }
         _ => {
-            let (pulled, applied, max_hlc) = pull_table(ctx, cfg, db, table, addr)?;
+            let (pulled, applied, max_hlc) = pull_table(ctx, cfg, pool, db, table, addr)?;
             save_sync_state(
                 ctx,
                 &state_key,
@@ -389,8 +403,8 @@ fn rows_now(ctx: &Shared, qualified: &str) -> i64 {
 /// One member's per-table write_seq; `None` when unreachable or the verb
 /// is unknown (old primary mid-rolling-upgrade) — callers then take the
 /// full-sweep path.
-fn table_seq_at(addr: &str, qualified: &str) -> Option<u64> {
-    match internode::call(
+fn table_seq_at(pool: &Pool, addr: &str, qualified: &str) -> Option<u64> {
+    match pool.call(
         addr,
         &Request::TableSeq {
             table: qualified.to_string(),
@@ -409,6 +423,7 @@ fn table_seq_at(addr: &str, qualified: &str) -> Option<u64> {
 fn pull_table_delta(
     ctx: &Shared,
     cfg: &WitnessConfig,
+    pool: &Pool,
     addr: &str,
     qualified: &str,
     since_physical: u64,
@@ -420,7 +435,7 @@ fn pull_table_delta(
     let mut after: Option<Vec<u8>> = None;
     loop {
         let page_started = std::time::Instant::now();
-        let (rows, cursor, done) = match internode::call(
+        let (rows, cursor, done) = match pool.call(
             addr,
             &Request::ScanSincePage {
                 table: qualified.to_string(),
@@ -637,6 +652,7 @@ fn ensure_local_table(
 fn pull_table(
     ctx: &Shared,
     cfg: &WitnessConfig,
+    pool: &Pool,
     db: &str,
     table: &str,
     addr: &str,
@@ -650,7 +666,7 @@ fn pull_table(
     let mut pages_since_flush = 0usize;
     loop {
         let page_started = std::time::Instant::now();
-        let page = scan_page_at(addr, &qualified, after.as_deref())?;
+        let page = scan_page_at(pool, addr, &qualified, after.as_deref())?;
         let done = page.len() < PULL_PAGE_ROWS as usize;
         after = page.last().map(|(k, ..)| k.clone());
         pulled += page.len();
@@ -752,8 +768,8 @@ fn apply_rows_guarded(
 /// One `ScanPage` against the first reachable primary internode endpoint.
 type PulledRow = (Vec<u8>, Vec<u8>, skaidb_engine::Hlc, bool);
 
-fn scan_page_at(addr: &str, qualified: &str, after: Option<&[u8]>) -> Result<Vec<PulledRow>, String> {
-    match internode::call(
+fn scan_page_at(pool: &Pool, addr: &str, qualified: &str, after: Option<&[u8]>) -> Result<Vec<PulledRow>, String> {
+    match pool.call(
         addr,
         &Request::ScanPage {
             table: qualified.to_string(),
