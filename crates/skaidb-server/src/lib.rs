@@ -2702,6 +2702,7 @@ pub(crate) mod tests {
             duty_pct: 90,
             witness_id: "w-scatter".into(),
             region: "unit".into(),
+            ..Default::default()
         };
         let s1 = crate::witness_pull::run_cycle(&witness, &wcfg, &witness_test_pool()).unwrap();
         let rows_of = |t: &str| {
@@ -2790,6 +2791,7 @@ pub(crate) mod tests {
             duty_pct: 90, // tests want speed, not politeness
             witness_id: "w-test".into(),
             region: "unit".into(),
+            ..Default::default()
         };
 
         // Cycle 1: full copy arrives, registration lands on the primary.
@@ -2986,6 +2988,7 @@ pub(crate) mod tests {
             duty_pct: 90,
             witness_id: "w-mtls".into(),
             region: "unit".into(),
+            ..Default::default()
         };
 
         // A cert pool from the SAME CA pulls successfully over mTLS.

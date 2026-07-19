@@ -36,6 +36,22 @@ use crate::shared::{Backend, Shared};
 /// Rows per pulled page — matches the primary's own gather/repair paging.
 const PULL_PAGE_ROWS: u32 = 2_000;
 
+/// Flush the ingesting table's memtable once this many applied bytes have
+/// accumulated since the last flush. This is the drain cadence for the
+/// from-empty bulk pull, and it MUST be measured in bytes, not pages: the
+/// standalone witness has NO background flusher (the `take_flush_job` pump
+/// lives only in the cluster `Node` thread), so the hot write path's
+/// freeze-at-`flush_threshold_bytes` (512 MB on the default auto budget)
+/// would stack up to 4 frozen + 1 active memtable ≈ 2.5 GB on a from-empty
+/// sweep of a large table — the SIXTH OOM shape. A page-COUNT cadence is
+/// byte-blind: 32 pages of 2 KB rows is 128 MB but 32 pages of multi-KB
+/// email bodies is ~2 GB, which is exactly what freezes and stacks. Flushing
+/// by bytes keeps the active memtable an order of magnitude below the freeze
+/// threshold, so it never freezes and RSS stays flat regardless of row size
+/// or how many tables a cycle touches. 64 MB trades a handful of small
+/// SSTables (compaction merges them) for a bounded, predictable footprint.
+const WITNESS_FLUSH_BYTES: usize = 64 * 1024 * 1024;
+
 /// Minimum pause between pulled pages. The REAL pacing rule is adaptive —
 /// sleep at least as long as the previous page took to fetch and apply —
 /// which caps the pull at ≤ 50% of the serving primary's capacity (and of
@@ -134,8 +150,33 @@ pub fn spawn_if_enabled(ctx: Shared) {
 /// One full pull cycle. Public-in-crate so tests drive it synchronously.
 pub(crate) fn run_cycle(ctx: &Shared, cfg: &WitnessConfig, pool: &Pool) -> Result<CycleSummary, String> {
     // One SQL connection for the whole cycle (failover inside the driver).
-    let mut sql = Client::connect_many(&cfg.primary_sql_addrs, &cfg.user, &cfg.password)
-        .map_err(|e| format!("primary SQL connect: {e}"))?;
+    // The SQL control-plane path is a plain client connection, so it must
+    // present client TLS when the primary requires it (`client_tls =
+    // "required"`) — otherwise the primary resets it and the whole cycle
+    // fails before any data moves. The bulk pull rides the [auth]-secured
+    // internode port and is unaffected. CA falls back to the internode CA:
+    // one cluster CA usually secures both ports.
+    let sql_tls = if cfg.primary_tls {
+        let ca = if cfg.primary_tls_ca.is_empty() {
+            ctx.config_snapshot().auth.internode_tls_ca.clone()
+        } else {
+            cfg.primary_tls_ca.clone()
+        };
+        let verify = if ca.is_empty() {
+            skaidb_driver::TlsVerify::Insecure
+        } else {
+            skaidb_driver::TlsVerify::CaFile(ca)
+        };
+        Some(
+            skaidb_driver::TlsConfig::new(verify, &cfg.primary_tls_server_name)
+                .map_err(|e| format!("witness SQL TLS config: {e}"))?,
+        )
+    } else {
+        None
+    };
+    let mut sql =
+        Client::connect_many_tls(&cfg.primary_sql_addrs, &cfg.user, &cfg.password, sql_tls)
+            .map_err(|e| format!("primary SQL connect: {e}"))?;
 
     register(&mut sql, cfg)?;
     mirror_names(ctx, &mut sql, cfg);
@@ -433,6 +474,7 @@ fn pull_table_delta(
     };
     let (mut pulled, mut applied, mut max_hlc) = (0usize, 0usize, 0u64);
     let mut after: Option<Vec<u8>> = None;
+    let mut bytes_since_flush = 0usize;
     loop {
         let page_started = std::time::Instant::now();
         let (rows, cursor, done) = match pool.call(
@@ -451,13 +493,30 @@ fn pull_table_delta(
         };
         after = cursor;
         pulled += rows.len();
-        for (_, _, hlc, _) in &rows {
+        let mut page_bytes = 0usize;
+        for (k, v, hlc, _) in &rows {
             max_hlc = max_hlc.max(hlc.physical);
+            page_bytes += k.len() + v.len();
         }
         if !rows.is_empty() {
             applied += apply_rows_guarded(local, qualified, rows)?;
         }
+        // Same byte-paced drain as the full sweep: a large catch-up delta
+        // (witness offline for a while) is a bulk load too, and without this
+        // it would freeze-stack exactly like the from-empty sweep.
+        bytes_since_flush += page_bytes;
+        if bytes_since_flush >= WITNESS_FLUSH_BYTES {
+            bytes_since_flush = 0;
+            if let Ok(mut dbw) = local.write() {
+                dbw.flush_memtables_under_pressure();
+            }
+        }
         if done {
+            if bytes_since_flush > 0 {
+                if let Ok(mut dbw) = local.write() {
+                    dbw.flush_memtables_under_pressure();
+                }
+            }
             return Ok((pulled, applied, max_hlc));
         }
         let pct = f64::from(cfg.duty_pct.clamp(1, 90));
@@ -663,33 +722,45 @@ fn pull_table(
     };
     let (mut pulled, mut applied, mut max_hlc) = (0usize, 0usize, 0u64);
     let mut after: Option<Vec<u8>> = None;
-    let mut pages_since_flush = 0usize;
+    let mut bytes_since_flush = 0usize;
     loop {
         let page_started = std::time::Instant::now();
         let page = scan_page_at(pool, addr, &qualified, after.as_deref())?;
         let done = page.len() < PULL_PAGE_ROWS as usize;
         after = page.last().map(|(k, ..)| k.clone());
         pulled += page.len();
-        for (_, _, hlc, _) in &page {
+        // Sum applied bytes as we go: this, not a page count, drives the
+        // flush cadence, because the memtable's growth is bytes, not rows
+        // (see `WITNESS_FLUSH_BYTES`). Key + value only — the Hlc/tombstone
+        // flag are fixed-size and negligible.
+        let mut page_bytes = 0usize;
+        for (k, v, hlc, _) in &page {
             max_hlc = max_hlc.max(hlc.physical);
+            page_bytes += k.len() + v.len();
         }
         if !page.is_empty() {
             applied += apply_rows_guarded(local, &qualified, page)?;
         }
-        // Mid-table flush every ~64k rows: a standalone witness has none
-        // of the Node-level memory-pressure machinery replicas rely on
-        // (the shedding/release tier), and per-TABLE flushing leaves a
-        // 1.9 GB table's whole ingest accumulating between flushes — the
-        // fourth OOM's shape after WAL sync bounded the third's. A flush
-        // every 32 pages is deterministic and cheap at this cadence.
-        pages_since_flush += 1;
-        if pages_since_flush >= 32 {
-            pages_since_flush = 0;
+        // Byte-paced flush: keep the active memtable well below the hot
+        // path's freeze threshold so it never freezes on the witness (which
+        // has no background flusher to drain a frozen pile). See
+        // `WITNESS_FLUSH_BYTES` for the OOM this bounds.
+        bytes_since_flush += page_bytes;
+        if bytes_since_flush >= WITNESS_FLUSH_BYTES {
+            bytes_since_flush = 0;
             if let Ok(mut dbw) = local.write() {
                 dbw.flush_memtables_under_pressure();
             }
         }
         if done {
+            // Drain this table's tail before moving on, so a finished table
+            // leaves nothing resident for the next table's ingest to stack
+            // on top of.
+            if bytes_since_flush > 0 {
+                if let Ok(mut dbw) = local.write() {
+                    dbw.flush_memtables_under_pressure();
+                }
+            }
             return Ok((pulled, applied, max_hlc));
         }
         // Bounded duty on the primary (`witness.duty_pct`, default 50,

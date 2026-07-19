@@ -155,6 +155,21 @@ pub struct WitnessConfig {
     /// Identity registered in the primary's `witnesses` table.
     pub witness_id: String,
     pub region: String,
+    /// Wrap the SQL control-plane connection (`primary_sql_addrs`: schema
+    /// listing, registration, heartbeat) in client TLS. REQUIRED when the
+    /// primary runs `encryption.client_tls = "required"` — that path is a
+    /// plain client connection and a required-TLS primary resets it
+    /// otherwise. The bulk DATA pull over the internode port is already
+    /// secured by `[auth]`, independent of this. Off by default.
+    pub primary_tls: bool,
+    /// CA file that verifies the primary's SQL cert. Empty falls back to the
+    /// internode CA (`[auth].internode_tls_ca`) — one cluster CA usually
+    /// secures both ports. If both are empty, TLS proceeds without
+    /// verification (dev only).
+    pub primary_tls_ca: String,
+    /// SNI / cert-verification name for the SQL connection — the SAN on the
+    /// primary's cert (`skaidb` for certs from `skaidbsh certs gen`).
+    pub primary_tls_server_name: String,
 }
 
 impl Default for WitnessConfig {
@@ -171,6 +186,9 @@ impl Default for WitnessConfig {
             duty_pct: 50,
             witness_id: "witness".to_string(),
             region: String::new(),
+            primary_tls: false,
+            primary_tls_ca: String::new(),
+            primary_tls_server_name: "skaidb".to_string(),
         }
     }
 }

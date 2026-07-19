@@ -496,7 +496,11 @@ WHERE ts >= now() - 6h GROUP BY t;
   `witnesses` table (PK=witness_id: region, registered_at, last_seen_at,
   watermarks) go over SQL with witness-scoped credentials on the primary
   (`CREATE ROLE witness_role; GRANT INSERT, UPDATE ON witnesses TO
-  witness_role`). Pair with `server.read_only = true`: drivers can read
+  witness_role`). If the primary runs `encryption.client_tls = "required"`,
+  set `witness.primary_tls = true` so this SQL control-plane connection
+  presents client TLS (CA defaults to `[auth].internode_tls_ca`, SNI to
+  `skaidb`) — the bulk data pull already rides the `[auth]`-secured
+  internode port. Pair with `server.read_only = true`: drivers can read
   the copy, nothing can diverge it (the pull applies beneath the session
   layer, so read-only never blocks it). Cycles are NEAR-LIVE cheap
   (default `interval_secs` 60): unchanged tables are skipped via a
@@ -508,6 +512,13 @@ WHERE ts >= now() - 6h GROUP BY t;
   24h) backstops the one delta blind spot (a delayed hint-replay
   landing an old-stamped row behind the watermark); primaries without
   the delta verbs (rolling upgrade) degrade gracefully to full sweeps.
+  The pull is MEMORY-BOUNDED regardless of dataset size: it pages at a
+  fixed row count, applies under a value-free staleness guard (no full
+  rows through the read cache), and byte-paces its memtable flushes — so
+  even a from-empty full resync of a multi-GB table (no incremental delta
+  to lean on) holds a flat, bounded footprint instead of stacking frozen
+  memtables. A standalone witness has no background flusher, so the pull
+  drains its own memtables by bytes applied, not page count.
   The single-row
   `witness_gc_config` table holds `grace_period_secs` (default 7 days) —
   cluster-consistent because it is a table row, settable with a plain
