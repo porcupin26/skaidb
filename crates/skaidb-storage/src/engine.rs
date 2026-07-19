@@ -985,7 +985,7 @@ impl Engine {
         // per-entry key/value clone, which used to double the memtable's
         // footprint for the duration of the build.
         let entries = job.mem.iter_latest_lazy().map(Ok);
-        SsTable::write_stream(&job.path, entries, job.mem.version_count(), job.codec)
+        SsTable::write_stream(&job.path, entries, job.mem.version_count(), job.codec, None)
     }
 
     /// Install a built flush: L0 gains the table, the manifest persists
@@ -1085,7 +1085,7 @@ impl Engine {
         let inputs: Vec<SsTable> = job
             .inputs
             .iter()
-            .map(SsTable::open)
+            .map(|p| SsTable::open(p, None))
             .collect::<Result<_>>()?;
         let refs: Vec<&SsTable> = inputs.iter().collect();
         merge_write(
@@ -1254,6 +1254,7 @@ impl Engine {
                 entries.into_iter().map(Ok),
                 count,
                 self.opts.bottom_compression,
+                None,
             )?)
         };
 
@@ -1599,7 +1600,7 @@ fn merge_write(
         Ok((key, hlc, value)) => Some(Ok(SstEntry { key, hlc, value })),
         Err(e) => Some(Err(e)),
     });
-    SsTable::write_stream(path, entries, approx as usize, codec)
+    SsTable::write_stream(path, entries, approx as usize, codec, None)
 }
 
 /// Wall-clock milliseconds since the Unix epoch (TTL comparisons).
@@ -1668,7 +1669,7 @@ fn load_manifest(dir: &Path) -> Result<(Vec<SsTable>, Vec<SsTable>, u64)> {
         {
             max_seq = max_seq.max(seq + 1);
         }
-        let sst = SsTable::open(&path).map_err(|e| {
+        let sst = SsTable::open(&path, None).map_err(|e| {
             skaidb_types::slog!(
                 "skaidb: manifest {} references {} which failed to open: {e}",
                 manifest.display(),

@@ -32,11 +32,20 @@ use crate::posfile::read_exact_at;
 
 use crate::bloom::Bloom;
 use crate::compress::{compress, decompress, Codec};
+use crate::crypto::{Dek, Kek};
 use crate::error::{Result, StorageError};
 use crate::hlc::Hlc;
 use crate::memtable::VersionValue;
 
 const MAGIC: u64 = 0x736b_6169_6462_5354; // "skaidbST"
+/// Magic for an ENCRYPTED SSTable — a distinct trailing value so an encrypted
+/// file is told apart from a plaintext one (old files read unchanged).
+const MAGIC_ENC: u64 = 0x736b_6169_6462_45ed; // "skaidbE." (byte-distinct)
+/// Encrypted footer length: `index_off | bloom_off | entry_count | codec |
+/// dek_off | MAGIC_ENC` (6 × u64).
+const ENC_FOOTER_LEN: u64 = 48;
+/// Wrapped-DEK region length in an encrypted file (nonce + key + tag).
+const WRAPPED_DEK_LEN: u64 = 12 + 32 + 16;
 const STAMPS_MAGIC: u64 = 0x736b_6169_6462_5350; // "skaidbSP"
 const FOOTER_LEN: u64 = 40;
 const OP_PUT: u8 = 0;
@@ -114,6 +123,8 @@ pub struct SsTable {
     file: File,
     path: PathBuf,
     codec: Codec,
+    /// Per-file data key when this table is encrypted (`None` = plaintext).
+    dek: Option<Dek>,
     blocks: Vec<BlockMeta>,
     bloom: Bloom,
     entry_count: u64,
@@ -265,7 +276,7 @@ impl BlockCache {
 impl SsTable {
     /// Write `entries` (sorted by key, unique) to a new SSTable using `codec`.
     pub fn write(path: impl AsRef<Path>, entries: &[SstEntry], codec: Codec) -> Result<SsTable> {
-        SsTable::write_stream(path, entries.iter().map(Ok), entries.len(), codec)
+        SsTable::write_stream(path, entries.iter().map(Ok), entries.len(), codec, None)
     }
 
     /// Write a stream of entries (sorted by key, unique) to a new SSTable,
@@ -277,9 +288,21 @@ impl SsTable {
         entries: impl Iterator<Item = Result<E>>,
         expected_entries: usize,
         codec: Codec,
+        enc: Option<&Kek>,
     ) -> Result<SsTable> {
         use std::io::BufWriter;
         let path = path.as_ref().to_path_buf();
+        // Encrypting: mint a fresh per-file DEK; its KEK-wrapped bytes go in
+        // the footer region. Each region is sealed by its byte offset (unique
+        // within this immutable file's single DEK).
+        let (dek, wrapped_dek) = match enc {
+            Some(kek) => {
+                let (d, w) = kek.wrap_new_dek()?;
+                (Some(d), Some(w))
+            }
+            None => (None, None),
+        };
+        let dek_ref = dek.as_ref();
         let mut writer = BufWriter::new(File::create(&path)?);
         let mut blocks: Vec<BlockMeta> = Vec::new();
         let mut bloom = Bloom::with_capacity(expected_entries, BLOOM_FP_RATE);
@@ -288,9 +311,15 @@ impl SsTable {
         let mut delete_count: u64 = 0;
 
         // Best-effort stamps sidecar, streamed in lockstep with the data
-        // blocks (see the module docs). Any sidecar I/O error just drops it —
-        // the data file alone is always sufficient.
-        let mut stamps_writer = File::create(stamps_path(&path)).map(BufWriter::new).ok();
+        // blocks (see the module docs). Skipped for encrypted tables — its
+        // blocks would need sealing too; encrypted tables fall back to
+        // decoding data blocks for stamp scans (correct, just no fast path).
+        let mut stamps_writer = if dek_ref.is_none() {
+            File::create(stamps_path(&path)).map(BufWriter::new).ok()
+        } else {
+            let _ = std::fs::remove_file(stamps_path(&path));
+            None
+        };
         let mut stamps_table: Vec<u8> = Vec::new();
 
         // Group entries into uncompressed blocks of ~BLOCK_TARGET bytes; seal,
@@ -306,14 +335,21 @@ impl SsTable {
                         stamps_table: &mut Vec<u8>|
          -> Result<BlockMeta> {
             let comp = compress(codec, buf);
-            writer.write_all(&comp)?;
+            // Encrypted: seal the COMPRESSED block, nonce = its file offset.
+            // `comp_len` stores the SEALED length so `read_block` reads the
+            // right span; `uncomp_len` stays the plaintext size for decompress.
+            let on_disk = match dek_ref {
+                Some(dek) => dek.seal(offset, &comp)?,
+                None => comp,
+            };
+            writer.write_all(&on_disk)?;
             let meta = BlockMeta {
                 first_key: first.take().unwrap(),
                 offset,
-                comp_len: comp.len() as u32,
+                comp_len: on_disk.len() as u32,
                 uncomp_len: buf.len() as u32,
             };
-            offset += comp.len() as u64;
+            offset += on_disk.len() as u64;
             buf.clear();
             if let Some(sw) = stamps_writer.as_mut() {
                 let scomp = compress(codec, stamp_buf);
@@ -361,30 +397,54 @@ impl SsTable {
             )?);
         }
 
-        // Index block.
+        // Index bytes (block index: first-keys + offsets + sizes).
         let index_off = offset;
-        let mut tail = Vec::new();
-        tail.extend_from_slice(&(blocks.len() as u64).to_le_bytes());
+        let mut index_bytes = Vec::new();
+        index_bytes.extend_from_slice(&(blocks.len() as u64).to_le_bytes());
         for b in &blocks {
-            tail.extend_from_slice(&(b.first_key.len() as u32).to_le_bytes());
-            tail.extend_from_slice(&b.first_key);
-            tail.extend_from_slice(&b.offset.to_le_bytes());
-            tail.extend_from_slice(&b.comp_len.to_le_bytes());
-            tail.extend_from_slice(&b.uncomp_len.to_le_bytes());
+            index_bytes.extend_from_slice(&(b.first_key.len() as u32).to_le_bytes());
+            index_bytes.extend_from_slice(&b.first_key);
+            index_bytes.extend_from_slice(&b.offset.to_le_bytes());
+            index_bytes.extend_from_slice(&b.comp_len.to_le_bytes());
+            index_bytes.extend_from_slice(&b.uncomp_len.to_le_bytes());
         }
+        let bloom_bytes = bloom.encode();
 
-        // Bloom block.
-        let bloom_off = index_off + tail.len() as u64;
-        tail.extend_from_slice(&bloom.encode());
-
-        // Footer.
-        tail.extend_from_slice(&index_off.to_le_bytes());
-        tail.extend_from_slice(&bloom_off.to_le_bytes());
-        tail.extend_from_slice(&entry_count.to_le_bytes());
-        tail.extend_from_slice(&(codec.to_u8() as u64).to_le_bytes());
-        tail.extend_from_slice(&MAGIC.to_le_bytes());
-        writer.write_all(&tail)?;
-        let disk_len = offset + tail.len() as u64;
+        let disk_len = if let Some(dek) = dek_ref {
+            // Encrypted layout:
+            //   [sealed blocks][sealed index][sealed bloom][wrapped_dek][footer]
+            // The index (first-keys) and bloom (hashed keys) are sensitive, so
+            // both are sealed; only the footer (offsets/codec/magic) is clear.
+            let sealed_index = dek.seal(index_off, &index_bytes)?;
+            writer.write_all(&sealed_index)?;
+            let bloom_off = index_off + sealed_index.len() as u64;
+            let sealed_bloom = dek.seal(bloom_off, &bloom_bytes)?;
+            writer.write_all(&sealed_bloom)?;
+            let dek_off = bloom_off + sealed_bloom.len() as u64;
+            let wrapped = wrapped_dek.as_ref().expect("wrapped dek when encrypting");
+            writer.write_all(wrapped)?;
+            let mut footer = Vec::with_capacity(ENC_FOOTER_LEN as usize);
+            footer.extend_from_slice(&index_off.to_le_bytes());
+            footer.extend_from_slice(&bloom_off.to_le_bytes());
+            footer.extend_from_slice(&entry_count.to_le_bytes());
+            footer.extend_from_slice(&(codec.to_u8() as u64).to_le_bytes());
+            footer.extend_from_slice(&dek_off.to_le_bytes());
+            footer.extend_from_slice(&MAGIC_ENC.to_le_bytes());
+            writer.write_all(&footer)?;
+            dek_off + wrapped.len() as u64 + ENC_FOOTER_LEN
+        } else {
+            // Plaintext layout (unchanged): [blocks][index][bloom][footer(40)].
+            let bloom_off = index_off + index_bytes.len() as u64;
+            let mut tail = index_bytes;
+            tail.extend_from_slice(&bloom_bytes);
+            tail.extend_from_slice(&index_off.to_le_bytes());
+            tail.extend_from_slice(&bloom_off.to_le_bytes());
+            tail.extend_from_slice(&entry_count.to_le_bytes());
+            tail.extend_from_slice(&(codec.to_u8() as u64).to_le_bytes());
+            tail.extend_from_slice(&MAGIC.to_le_bytes());
+            writer.write_all(&tail)?;
+            offset + tail.len() as u64
+        };
 
         let file = writer
             .into_inner()
@@ -427,6 +487,7 @@ impl SsTable {
             file,
             path,
             codec,
+            dek,
             blocks,
             bloom,
             entry_count,
@@ -438,7 +499,7 @@ impl SsTable {
     }
 
     /// Open an existing SSTable, loading its block index and Bloom filter.
-    pub fn open(path: impl AsRef<Path>) -> Result<SsTable> {
+    pub fn open(path: impl AsRef<Path>, kek: Option<&Kek>) -> Result<SsTable> {
         let path = path.as_ref().to_path_buf();
         let file = File::open(&path)?;
         let file_len = file.metadata()?.len();
@@ -446,35 +507,66 @@ impl SsTable {
             return Err(corrupt("file shorter than footer"));
         }
 
-        let mut footer = [0u8; FOOTER_LEN as usize];
-        read_exact_at(&file, &mut footer, file_len - FOOTER_LEN)?;
-        let index_off = u64::from_le_bytes(footer[0..8].try_into().unwrap());
-        let bloom_off = u64::from_le_bytes(footer[8..16].try_into().unwrap());
-        let entry_count = u64::from_le_bytes(footer[16..24].try_into().unwrap());
-        let codec = Codec::from_u8(footer[24]).ok_or_else(|| corrupt("unknown codec"))?;
-        let magic = u64::from_le_bytes(footer[32..40].try_into().unwrap());
-        if magic != MAGIC {
+        // Discriminate by the trailing magic (last 8 bytes): MAGIC_ENC =>
+        // encrypted (extended 48-byte footer + wrapped DEK); MAGIC => plaintext.
+        let mut tail_magic = [0u8; 8];
+        read_exact_at(&file, &mut tail_magic, file_len - 8)?;
+        let trailing = u64::from_le_bytes(tail_magic);
+
+        let (index_off, bloom_off, index_end, entry_count, codec, dek) = if trailing == MAGIC_ENC {
+            if file_len < ENC_FOOTER_LEN {
+                return Err(corrupt("file shorter than encrypted footer"));
+            }
+            let mut footer = [0u8; ENC_FOOTER_LEN as usize];
+            read_exact_at(&file, &mut footer, file_len - ENC_FOOTER_LEN)?;
+            let index_off = u64::from_le_bytes(footer[0..8].try_into().unwrap());
+            let bloom_off = u64::from_le_bytes(footer[8..16].try_into().unwrap());
+            let entry_count = u64::from_le_bytes(footer[16..24].try_into().unwrap());
+            let codec = Codec::from_u8(footer[24]).ok_or_else(|| corrupt("unknown codec"))?;
+            let dek_off = u64::from_le_bytes(footer[32..40].try_into().unwrap());
+            let kek = kek.ok_or_else(|| {
+                StorageError::Crypto("SSTable is encrypted but no keyfile is configured".into())
+            })?;
+            let mut wrapped = vec![0u8; WRAPPED_DEK_LEN as usize];
+            read_exact_at(&file, &mut wrapped, dek_off)?;
+            let dek = kek.unwrap_dek(&wrapped)?;
+            (index_off, bloom_off, dek_off, entry_count, codec, Some(dek))
+        } else if trailing == MAGIC {
+            let mut footer = [0u8; FOOTER_LEN as usize];
+            read_exact_at(&file, &mut footer, file_len - FOOTER_LEN)?;
+            let index_off = u64::from_le_bytes(footer[0..8].try_into().unwrap());
+            let bloom_off = u64::from_le_bytes(footer[8..16].try_into().unwrap());
+            let entry_count = u64::from_le_bytes(footer[16..24].try_into().unwrap());
+            let codec = Codec::from_u8(footer[24]).ok_or_else(|| corrupt("unknown codec"))?;
+            (index_off, bloom_off, file_len - FOOTER_LEN, entry_count, codec, None)
+        } else {
             return Err(corrupt("bad magic"));
-        }
-        if index_off > bloom_off || bloom_off > file_len - FOOTER_LEN {
+        };
+        if index_off > bloom_off || bloom_off > index_end {
             return Err(corrupt("inconsistent footer offsets"));
         }
 
-        let index_len = (bloom_off - index_off) as usize;
-        let mut index_buf = vec![0u8; index_len];
+        // Index region [index_off, bloom_off); bloom region [bloom_off,
+        // index_end). Both are sealed when encrypted — open before parsing.
+        let mut index_buf = vec![0u8; (bloom_off - index_off) as usize];
         read_exact_at(&file, &mut index_buf, index_off)?;
-        let blocks = parse_block_index(&index_buf)?;
-
-        let bloom_len = (file_len - FOOTER_LEN - bloom_off) as usize;
-        let mut bloom_buf = vec![0u8; bloom_len];
+        let mut bloom_buf = vec![0u8; (index_end - bloom_off) as usize];
         read_exact_at(&file, &mut bloom_buf, bloom_off)?;
+        if let Some(dek) = &dek {
+            index_buf = dek.open(index_off, &index_buf)?;
+            bloom_buf = dek.open(bloom_off, &bloom_buf)?;
+        }
+        let blocks = parse_block_index(&index_buf)?;
         let bloom = Bloom::decode(&bloom_buf).ok_or_else(|| corrupt("bad bloom block"))?;
 
+        // Encrypted tables carry no stamps sidecar (see write_stream); load
+        // returns None and stamp scans fall back to decoding data blocks.
         let stamps = load_stamps(&path, &blocks);
         Ok(SsTable {
             file,
             path,
             codec,
+            dek,
             blocks,
             bloom,
             entry_count,
@@ -627,8 +719,13 @@ impl SsTable {
 
     /// Read and decompress one block from disk.
     fn read_block(&self, meta: &BlockMeta) -> Result<Vec<u8>> {
-        let mut comp = vec![0u8; meta.comp_len as usize];
-        read_exact_at(&self.file, &mut comp, meta.offset)?;
+        let mut on_disk = vec![0u8; meta.comp_len as usize];
+        read_exact_at(&self.file, &mut on_disk, meta.offset)?;
+        // Encrypted: open the block (nonce = its offset) before decompressing.
+        let comp = match &self.dek {
+            Some(dek) => dek.open(meta.offset, &on_disk)?,
+            None => on_disk,
+        };
         decompress(self.codec, &comp, meta.uncomp_len as usize)
     }
 
@@ -1007,6 +1104,79 @@ mod tests {
         }
     }
 
+    // --- at-rest encryption ---
+
+    fn test_kek() -> Kek {
+        Kek::from_bytes(&[9u8; 32]).unwrap()
+    }
+
+    /// Encrypted SSTable: multi-block round trip through the block-read path,
+    /// on-disk bytes are ciphertext (keys/values absent), reopen recovers all.
+    #[test]
+    fn encrypted_sstable_round_trip_and_ciphertext() {
+        for codec in [Codec::None, Codec::Lz4, Codec::Brotli] {
+            let path = tmp();
+            let kek = test_kek();
+            // Enough distinct entries to span several blocks.
+            let entries: Vec<SstEntry> = (0..500)
+                .map(|i| put(&format!("topsecretkey{i:04}"), i as u64 + 1, &format!("topsecretval{i:04}")))
+                .collect();
+            let expected = entries.len();
+            let sst = SsTable::write_stream(&path, entries.iter().map(Ok), expected, codec, Some(&kek)).unwrap();
+            // Point read through the (decrypting) block path.
+            assert_eq!(
+                sst.get(b"topsecretkey0042").unwrap(),
+                Some((Hlc::new(43, 0), VersionValue::Put(b"topsecretval0042".to_vec())))
+            );
+            // No stamps sidecar for encrypted tables.
+            assert!(!stamps_path(&path).exists(), "encrypted tables write no sidecar");
+            // On-disk: keys/values are not in the clear; trailing magic is ENC.
+            let raw = std::fs::read(&path).unwrap();
+            let hay = String::from_utf8_lossy(&raw);
+            assert!(!hay.contains("topsecretkey0042"), "key must not be on disk in the clear ({codec:?})");
+            assert!(!hay.contains("topsecretval0042"), "value must not be on disk in the clear");
+            let trailing = u64::from_le_bytes(raw[raw.len()-8..].try_into().unwrap());
+            assert_eq!(trailing, MAGIC_ENC);
+            // Reopen with the key: full scan recovers every entry.
+            let re = SsTable::open(&path, Some(&kek)).unwrap();
+            let all = re.entries().unwrap();
+            assert_eq!(all.len(), 500);
+            assert_eq!(re.get(b"topsecretkey0499").unwrap(),
+                Some((Hlc::new(500, 0), VersionValue::Put(b"topsecretval0499".to_vec()))));
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// Wrong KEK / no KEK cannot open an encrypted SSTable.
+    #[test]
+    fn encrypted_sstable_wrong_key_refused() {
+        let path = tmp();
+        let entries = [put("a", 1, "1"), put("b", 2, "2")];
+        SsTable::write_stream(&path, entries.iter().map(Ok), 2, Codec::Lz4, Some(&test_kek())).unwrap();
+        assert!(SsTable::open(&path, None).is_err(), "encrypted file needs a key");
+        let wrong = Kek::from_bytes(&[1u8; 32]).unwrap();
+        assert!(SsTable::open(&path, Some(&wrong)).is_err(), "wrong KEK must fail");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Tampering a sealed data block fails the AEAD tag on read.
+    #[test]
+    fn encrypted_sstable_tamper_detected() {
+        let path = tmp();
+        let kek = test_kek();
+        let entries: Vec<SstEntry> = (0..200).map(|i| put(&format!("k{i:03}"), i as u64+1, "v")).collect();
+        SsTable::write_stream(&path, entries.iter().map(Ok), 200, Codec::None, Some(&kek)).unwrap();
+        // Flip a byte in the first data block (offset 0).
+        let mut raw = std::fs::read(&path).unwrap();
+        raw[10] ^= 0x80;
+        std::fs::write(&path, &raw).unwrap();
+        let re = SsTable::open(&path, Some(&kek)).unwrap(); // footer/index still ok
+        // Reading the tampered block fails.
+        let scan: Result<Vec<_>> = re.entries();
+        assert!(scan.is_err(), "tampered data block must fail the tag");
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn write_get_roundtrip() {
         for codec in [Codec::None, Codec::Lz4, Codec::Brotli] {
@@ -1054,7 +1224,7 @@ mod tests {
             put("gamma", 2, "y"),
         ];
         SsTable::write(&path, &entries, Codec::Brotli).unwrap();
-        let sst = SsTable::open(&path).unwrap();
+        let sst = SsTable::open(&path, None).unwrap();
         assert_eq!(sst.len(), 3);
         assert_eq!(sst.codec, Codec::Brotli);
         assert_eq!(
@@ -1103,7 +1273,7 @@ mod tests {
             // Old-file fallback: delete the sidecar, reopen — identical scan
             // straight off the data blocks.
             std::fs::remove_file(stamps_path(&path)).unwrap();
-            let sst = SsTable::open(&path).unwrap();
+            let sst = SsTable::open(&path, None).unwrap();
             assert!(sst.stamps.is_none());
             let via_fallback: Vec<SstStamp> = sst
                 .stamps_iter_from(None)
@@ -1128,7 +1298,7 @@ mod tests {
         let f = std::fs::OpenOptions::new().write(true).open(&sp).unwrap();
         f.set_len(len / 2).unwrap();
         drop(f);
-        let sst = SsTable::open(&path).unwrap();
+        let sst = SsTable::open(&path, None).unwrap();
         assert!(sst.stamps.is_none(), "torn sidecar rejected");
         let stamps: Vec<SstStamp> = sst
             .stamps_iter_from(None)
@@ -1147,7 +1317,7 @@ mod tests {
         let len = bytes.len();
         bytes[len - 1] ^= 0xFF;
         std::fs::write(&path, &bytes).unwrap();
-        assert!(SsTable::open(&path).is_err());
+        assert!(SsTable::open(&path, None).is_err());
         let _ = std::fs::remove_file(&path);
     }
 }
