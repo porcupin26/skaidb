@@ -1480,14 +1480,13 @@ impl Node {
         self.local_read_bounded().map(|db| db.stats(per_table))
     }
 
-    /// This node's on-disk data footprint (SSTables + WAL); 0 under lock
-    /// contention. The filesize measure behind resync detection and progress.
-    /// WAL is included so progress reflects data that's been pulled but not yet
-    /// flushed to SSTables (else progress sits near 0 through the first flushes).
+    /// This node's SETTLED on-disk data footprint (SSTable bytes); 0 under lock
+    /// contention. Used for resync DETECTION and as the peer target: it stays
+    /// ~0 on a freshly-wiped node until its first flush, so the "started empty"
+    /// check has a wide, reliable window (WAL, which fills fast during backfill,
+    /// would blur that). Progress uses SSTables + WAL — see `resync_progress`.
     pub fn local_data_bytes(&self) -> u64 {
-        self.db_stats(false)
-            .map(|s| s.disk_bytes + s.wal_bytes)
-            .unwrap_or(0)
+        self.db_stats(false).map(|s| s.disk_bytes).unwrap_or(0)
     }
 
     /// Whether this node is backfilling from empty after a (re)join.
@@ -1515,7 +1514,13 @@ impl Node {
         if target == 0 {
             return 0.0;
         }
-        (self.local_data_bytes() as f64 / target as f64).clamp(0.0, 1.0)
+        // Numerator includes WAL so progress reflects data pulled but not yet
+        // flushed (the target is a settled peer's SSTables — WAL-light).
+        let local = self
+            .db_stats(false)
+            .map(|s| s.disk_bytes + s.wal_bytes)
+            .unwrap_or(0);
+        (local as f64 / target as f64).clamp(0.0, 1.0)
     }
 
     /// Client endpoints (`host:quic_port`) of members currently known to be
