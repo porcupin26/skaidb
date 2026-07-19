@@ -304,7 +304,7 @@ impl Engine {
             // whole segment will ever hold.
             let chunk =
                 (opts.flush_threshold_bytes as u64).min(crate::wal::WAL_PREALLOC_CHUNK_BYTES);
-            Wal::open(dir.join("wal.log"), chunk)?
+            Wal::open(dir.join("wal.log"), chunk, None, false)?
         };
         let mut mem = Memtable::new();
         let mut max_hlc = Hlc::MIN;
