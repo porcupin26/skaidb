@@ -1,10 +1,11 @@
-//! SCRAM-SHA-256 authentication handshake messages (SPEC §8.1).
+//! Client authentication handshake messages.
 //!
-//! The exchange is always four frames, even when the server has auth disabled
-//! (it then accepts any proof), so both peers run one uniform code path:
+//! `AuthStart` names a **mechanism**. The default, `SCRAM_SHA_256`, is a fixed
+//! four-frame exchange run even when the server has auth disabled (it then
+//! accepts any proof), so both peers run one uniform code path:
 //!
 //! ```text
-//! client → AuthStart    { username, client_nonce }
+//! client → AuthStart    { username, client_nonce, mechanism: SCRAM_SHA_256 }
 //! server → AuthChallenge{ salt, iterations, server_nonce }
 //! client → AuthFinish   { client_proof }
 //! server → AuthOutcome  Ok{ server_signature } | Denied{ reason }
@@ -12,6 +13,17 @@
 //!
 //! The `AuthMessage` that the proof is computed over is built identically on
 //! both sides by [`auth_message`].
+//!
+//! `GSSAPI` (Kerberos) is an N-round context negotiation instead: after
+//! `AuthStart` the peers shuttle [`AuthToken`] frames in both directions until
+//! the GSS context reports complete, then the server sends `AuthOutcome`.
+//!
+//! **Wire compatibility:** the mechanism is a single trailing byte on
+//! `AuthStart`. A client that predates it simply omits the byte and
+//! [`AuthStart::decode`] defaults to `SCRAM_SHA_256`; a server that predates it
+//! ignores the extra trailing byte (the reader never inspects past the last
+//! field it needs). So old/new clients and servers interoperate on SCRAM in
+//! every combination.
 
 use crate::message::ProtoError;
 
@@ -19,12 +31,50 @@ const T_START: u8 = 10;
 const T_CHALLENGE: u8 = 11;
 const T_FINISH: u8 = 12;
 const T_OUTCOME: u8 = 13;
+const T_TOKEN: u8 = 14;
 
-/// First client message: who is connecting and a fresh client nonce.
+/// Client authentication mechanism, negotiated by [`AuthStart`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuthMechanism {
+    /// SCRAM-SHA-256 password proof — the default and the only mechanism a
+    /// pre-mechanism client requests (by omitting the selector entirely).
+    #[default]
+    ScramSha256,
+    /// Kerberos via SASL GSSAPI: a token-exchange context negotiation, no
+    /// password. The authenticated principal maps to an external user's role.
+    Gssapi,
+}
+
+impl AuthMechanism {
+    fn to_byte(self) -> u8 {
+        match self {
+            AuthMechanism::ScramSha256 => 0,
+            AuthMechanism::Gssapi => 1,
+        }
+    }
+    fn from_byte(b: u8) -> Result<Self, ProtoError> {
+        match b {
+            0 => Ok(AuthMechanism::ScramSha256),
+            1 => Ok(AuthMechanism::Gssapi),
+            _ => Err(ProtoError::Malformed("unknown auth mechanism")),
+        }
+    }
+}
+
+/// First client message: who is connecting, a fresh client nonce, and the
+/// mechanism the client wishes to authenticate with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthStart {
     pub username: String,
     pub client_nonce: String,
+    pub mechanism: AuthMechanism,
+}
+
+/// One leg of a multi-round token exchange (GSSAPI): an opaque security-context
+/// token, passed in either direction until the context is established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthToken {
+    pub token: Vec<u8>,
 }
 
 /// Server's challenge: the user's salt, iteration count, and a combined nonce.
@@ -65,13 +115,40 @@ impl AuthStart {
         let mut out = vec![T_START];
         put_str(&mut out, &self.username);
         put_str(&mut out, &self.client_nonce);
+        // Trailing mechanism selector. A pre-mechanism peer stops decoding
+        // after `client_nonce` and never sees this byte; a pre-mechanism
+        // server likewise ignores it — SCRAM stays wire-compatible.
+        out.push(self.mechanism.to_byte());
         out
     }
     pub fn decode(buf: &[u8]) -> Result<AuthStart, ProtoError> {
         let mut c = Reader::new(buf, T_START)?;
+        let username = c.string()?;
+        let client_nonce = c.string()?;
+        // Absent selector (older client) == SCRAM-SHA-256.
+        let mechanism = if c.remaining() > 0 {
+            AuthMechanism::from_byte(c.u8()?)?
+        } else {
+            AuthMechanism::default()
+        };
         Ok(AuthStart {
-            username: c.string()?,
-            client_nonce: c.string()?,
+            username,
+            client_nonce,
+            mechanism,
+        })
+    }
+}
+
+impl AuthToken {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![T_TOKEN];
+        put_bytes(&mut out, &self.token);
+        out
+    }
+    pub fn decode(buf: &[u8]) -> Result<AuthToken, ProtoError> {
+        let mut c = Reader::new(buf, T_TOKEN)?;
+        Ok(AuthToken {
+            token: c.bytes()?.to_vec(),
         })
     }
 }
@@ -169,6 +246,9 @@ impl<'a> Reader<'a> {
         }
         Ok(r)
     }
+    fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
+    }
     fn take(&mut self, n: usize) -> Result<&'a [u8], ProtoError> {
         let end = self
             .pos
@@ -202,11 +282,55 @@ mod tests {
 
     #[test]
     fn start_roundtrip() {
+        for mechanism in [AuthMechanism::ScramSha256, AuthMechanism::Gssapi] {
+            let m = AuthStart {
+                username: "ada".into(),
+                client_nonce: "abc123".into(),
+                mechanism,
+            };
+            assert_eq!(AuthStart::decode(&m.encode()).unwrap(), m);
+        }
+    }
+
+    /// A pre-mechanism client encodes `AuthStart` with no trailing selector
+    /// byte; a current server must decode that as SCRAM, not error. This is
+    /// the rolling-upgrade contract — old drivers keep authenticating.
+    #[test]
+    fn start_without_mechanism_byte_defaults_to_scram() {
+        // Hand-build the legacy wire form: tag + username + client_nonce only.
+        let mut legacy = vec![T_START];
+        put_str(&mut legacy, "ada");
+        put_str(&mut legacy, "abc123");
+        let decoded = AuthStart::decode(&legacy).unwrap();
+        assert_eq!(decoded.mechanism, AuthMechanism::ScramSha256);
+        assert_eq!(decoded.username, "ada");
+        assert_eq!(decoded.client_nonce, "abc123");
+    }
+
+    /// A pre-mechanism server ignores the trailing selector byte: decoding a
+    /// current SCRAM `AuthStart` with the legacy two-field reader still yields
+    /// the username and nonce (the extra byte is never inspected).
+    #[test]
+    fn trailing_mechanism_byte_is_ignored_by_legacy_reader() {
         let m = AuthStart {
             username: "ada".into(),
             client_nonce: "abc123".into(),
+            mechanism: AuthMechanism::ScramSha256,
         };
-        assert_eq!(AuthStart::decode(&m.encode()).unwrap(), m);
+        let wire = m.encode();
+        let mut c = Reader::new(&wire, T_START).unwrap();
+        assert_eq!(c.string().unwrap(), "ada");
+        assert_eq!(c.string().unwrap(), "abc123");
+    }
+
+    #[test]
+    fn token_roundtrip() {
+        let m = AuthToken {
+            token: vec![0xde, 0xad, 0xbe, 0xef],
+        };
+        assert_eq!(AuthToken::decode(&m.encode()).unwrap(), m);
+        // Wrong tag is rejected like every other frame.
+        assert!(AuthToken::decode(&m.encode()[1..]).is_err());
     }
 
     #[test]
@@ -250,6 +374,7 @@ mod tests {
         let bytes = AuthStart {
             username: "x".into(),
             client_nonce: "y".into(),
+            mechanism: AuthMechanism::ScramSha256,
         }
         .encode();
         assert!(AuthChallenge::decode(&bytes).is_err());

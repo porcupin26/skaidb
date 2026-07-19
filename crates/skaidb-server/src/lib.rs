@@ -1829,6 +1829,29 @@ pub(crate) mod tests {
         assert!(Client::connect(addr).is_err());
     }
 
+    /// A client that selects the GSSAPI mechanism on a server without it
+    /// enabled gets a definite `Denied` (naming GSSAPI), not a hang or a
+    /// mis-parsed SCRAM challenge. Crafted at the wire level since the driver
+    /// has no GSSAPI client path yet (phase 4).
+    #[test]
+    fn gssapi_mechanism_is_cleanly_denied_when_unsupported() {
+        use skaidb_proto::{read_frame, write_frame, AuthMechanism, AuthOutcome, AuthStart};
+        use std::net::TcpStream;
+
+        let (addr, _h) = binary::spawn("127.0.0.1:0", auth_ctx()).unwrap();
+        let mut conn = TcpStream::connect(addr).unwrap();
+        let start = AuthStart {
+            username: "ada".into(),
+            client_nonce: "c1".into(),
+            mechanism: AuthMechanism::Gssapi,
+        };
+        write_frame(&mut conn, &start.encode()).unwrap();
+        match AuthOutcome::decode(&read_frame(&mut conn).unwrap()).unwrap() {
+            AuthOutcome::Denied { reason } => assert!(reason.contains("GSSAPI"), "{reason}"),
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
     /// Client TLS on the binary port: a `required`-TLS server refuses a
     /// plaintext driver, accepts a CA-verifying TLS driver (SCRAM still
     /// enforced inside TLS), and rejects a wrong password over TLS.

@@ -6,8 +6,8 @@ use std::thread::{self, JoinHandle};
 
 use skaidb_proto::{
     auth_message, begin_frame, decode_client_request, finish_frame, read_frame, read_frame_into,
-    tag_response, write_frame, AuthChallenge, AuthFinish, AuthOutcome, AuthStart, ClientRequest,
-    Response, RowsChunkEncoder,
+    tag_response, write_frame, AuthChallenge, AuthFinish, AuthMechanism, AuthOutcome, AuthStart,
+    ClientRequest, Response, RowsChunkEncoder,
 };
 use skaidb_sql::ast::Statement;
 
@@ -331,10 +331,23 @@ fn prepare(prepared: &mut Vec<Option<PreparedStmt>>, sql: String) -> Response {
     }
 }
 
-/// Run the server side of the SCRAM handshake, returning the authorized role.
+/// Run the server side of the client handshake, returning the authorized role.
+/// Dispatches on the mechanism the client selected in `AuthStart` (SCRAM by
+/// default; GSSAPI when the client and server both support it).
 fn authenticate<C: io::Read + io::Write>(conn: &mut C, ctx: &Shared) -> Result<String, ()> {
     let start = AuthStart::decode(&read_frame(conn).map_err(|_| ())?).map_err(|_| ())?;
+    match start.mechanism {
+        AuthMechanism::ScramSha256 => authenticate_scram(conn, ctx, &start),
+        AuthMechanism::Gssapi => authenticate_gssapi(conn, ctx, &start),
+    }
+}
 
+/// SCRAM-SHA-256: the four-frame password proof (SPEC §8.1).
+fn authenticate_scram<C: io::Read + io::Write>(
+    conn: &mut C,
+    ctx: &Shared,
+    start: &AuthStart,
+) -> Result<String, ()> {
     let account = ctx.lookup_account(&start.username);
     let (salt, iterations) = ctx.authn.salt_for(account.as_ref());
     let server_nonce = ctx.authn.server_nonce(&start.client_nonce);
@@ -376,6 +389,23 @@ fn authenticate<C: io::Read + io::Write>(conn: &mut C, ctx: &Shared) -> Result<S
             Err(())
         }
     }
+}
+
+/// GSSAPI (Kerberos): an N-round `AuthToken` exchange driving the GSS accept
+/// loop, ending in `AuthOutcome`. The accept loop lands in phase 3 behind the
+/// `kerberos` cargo feature (glibc targets only); until then — and on any
+/// build without the feature — the mechanism is refused cleanly so a client
+/// that requests it gets a definite answer rather than a hang.
+fn authenticate_gssapi<C: io::Read + io::Write>(
+    conn: &mut C,
+    ctx: &Shared,
+    start: &AuthStart,
+) -> Result<String, ()> {
+    let reason = "GSSAPI authentication is not enabled on this server".to_string();
+    let _ = write_frame(conn, &AuthOutcome::Denied { reason }.encode());
+    ctx.metrics.incr_login_failure();
+    ctx.audit().log_login(&start.username, None, false);
+    Err(())
 }
 
 /// Intercept `SET CONSISTENCY { ONE | QUORUM | ALL }` — per-connection

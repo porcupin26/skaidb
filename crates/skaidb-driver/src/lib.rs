@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use skaidb_auth::scram;
 use skaidb_proto::{
     auth_message, decode_tagged_response, encode_tagged_request, read_frame, write_frame,
-    AuthChallenge, AuthFinish, AuthOutcome, AuthStart, ClientRequest, Consistency, ProtoError,
-    Request, Response,
+    AuthChallenge, AuthFinish, AuthMechanism, AuthOutcome, AuthStart, ClientRequest, Consistency,
+    ProtoError, Request, Response,
 };
 use skaidb_types::Value;
 
@@ -702,6 +702,8 @@ fn handshake<S: io::Read + io::Write>(
     let start = AuthStart {
         username: username.to_string(),
         client_nonce: client_nonce.clone(),
+        // This handshake helper speaks SCRAM; GSSAPI has its own client path.
+        mechanism: AuthMechanism::ScramSha256,
     };
     write_frame(stream, &start.encode())?;
 
