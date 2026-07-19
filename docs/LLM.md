@@ -277,6 +277,10 @@ BEGIN | COMMIT | ROLLBACK
 
 -- Users, roles, grants
 CREATE USER [IF NOT EXISTS] u PASSWORD 'pw'
+CREATE USER [IF NOT EXISTS] "user@REALM" GSSAPI   -- external Kerberos user,
+                                                  -- no local password; the KDC
+                                                  -- vouches, skaidb maps the
+                                                  -- principal to its own role
 ALTER USER u PASSWORD 'pw'
 DROP USER [IF EXISTS] u
 CREATE ROLE [IF NOT EXISTS] r  |  DROP ROLE [IF EXISTS] r
@@ -330,6 +334,10 @@ SET CONSISTENCY ONE | QUORUM | ALL
 **RBAC**: privileges are `SELECT INSERT UPDATE DELETE CREATE DROP GRANT
 MONITOR ADMIN`. `ADMIN ON *` = superuser; a database grant covers its
 tables; a user acts as its own-named role and inherits granted roles.
+A user created `… GSSAPI` is external (Kerberos): no local password, the KDC
+vouches for the principal and skaidb maps it to the same own-named role;
+external users can't authenticate by SCRAM and password users can't be
+reached through the external path.
 Table grants are matched by the table's **canonical `db.table` identity**,
 not the raw name: `GRANT ON t` in session db `d` means `d.t` (never a
 cross-database wildcard), and `GRANT ON d.t` authorizes the natural

@@ -303,6 +303,15 @@ impl Backend {
         }
     }
 
+    /// The role an externally-authenticated (GSSAPI) principal acts as, if the
+    /// catalog holds a matching external user.
+    pub fn external_user_role(&self, principal: &str) -> Option<String> {
+        match self {
+            Backend::Local(db) => db.read().ok()?.external_user_role(principal),
+            Backend::Cluster(node) => node.external_user_role(principal),
+        }
+    }
+
     /// Query time-series samples (the Prometheus HTTP API path): local
     /// store, or union-merged across the cluster.
     pub fn ts_query(
@@ -563,6 +572,15 @@ impl Context {
             credential,
             role: username.to_string(),
         })
+    }
+
+    /// Resolve an externally-authenticated (GSSAPI) principal to its acting
+    /// role — used by the GSSAPI accept path once the KDC has vouched for the
+    /// identity, in place of [`Self::lookup_account`] (there is no local
+    /// credential to verify). Exact-match mapping: the principal is the
+    /// username. Returns `None` if no such external user exists.
+    pub fn lookup_external_role(&self, principal: &str) -> Option<String> {
+        self.backend.external_user_role(principal)
     }
 }
 

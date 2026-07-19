@@ -240,11 +240,28 @@ pub struct RollupDef {
     pub bucket_ms: i64,
 }
 
-/// A user principal: its SCRAM verifier (encoded; never plaintext). A user
-/// acts as its own-named role.
+/// How a user proves its identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum UserAuthKind {
+    /// SCRAM-SHA-256: the [`UserDef::credential`] holds the encoded verifier.
+    #[default]
+    Scram,
+    /// External Kerberos/GSSAPI principal: no local secret; the KDC vouches
+    /// for the identity and skaidb only maps the principal to its role.
+    Gssapi,
+}
+
+/// A user principal. For SCRAM users, [`Self::credential`] is the encoded
+/// verifier (never plaintext); for external (GSSAPI) users it is empty and the
+/// KDC is the authority. A user acts as its own-named role either way.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UserDef {
     pub credential: String,
+    /// Authentication kind. `#[serde(default)]` so catalogs written before
+    /// external users existed deserialize as `Scram` (their credential is a
+    /// verifier), preserving on-disk and replicated compatibility.
+    #[serde(default)]
+    pub auth_kind: UserAuthKind,
 }
 
 /// A role's grants and inherited roles. `grants` pairs are

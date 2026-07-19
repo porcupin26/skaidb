@@ -204,6 +204,10 @@ pub struct CreateUser {
     pub password: Option<String>,
     /// Encoded verifier (internal replication/replay form).
     pub verifier: Option<String>,
+    /// External (passwordless) Kerberos/GSSAPI user: the name is the principal
+    /// and there is no local secret. Mutually exclusive with password/verifier
+    /// (the parser enforces exactly one form).
+    pub gssapi: bool,
 }
 
 impl Statement {

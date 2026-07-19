@@ -24,7 +24,7 @@ use skaidb_tsdb::{Tsdb, TsdbOptions};
 
 use skaidb_fts::{SearchIndex, SearchIndexConfig, SearchQuery, Watermark};
 
-use crate::catalog::{AuthRoleDef, Catalog, IndexDef, RollupDef, SchemaVersion, SearchIndexDef, TableDef, TsTableDef, UserDef, VectorIndexDef};
+use crate::catalog::{AuthRoleDef, Catalog, IndexDef, RollupDef, SchemaVersion, SearchIndexDef, TableDef, TsTableDef, UserAuthKind, UserDef, VectorIndexDef};
 use skaidb_auth::{privilege_from_name, Object as AuthObject, Privilege as AuthPrivilege, RoleStore, ScramCredential};
 use crate::error::{EngineError, Result};
 use crate::eval::{compare, eval, eval_predicate};
@@ -2515,11 +2515,12 @@ impl Database {
                 &cu.name,
                 cu.password.as_deref(),
                 cu.verifier.as_deref(),
+                cu.gssapi,
                 cu.if_not_exists,
                 false,
             ),
             Statement::AlterUser { name, password } => {
-                self.create_user(&name, Some(&password), None, false, true)
+                self.create_user(&name, Some(&password), None, false, false, true)
             }
             Statement::DropUser { name, if_exists } => self.drop_user(&name, if_exists),
             Statement::CreateRole {
@@ -3161,6 +3162,7 @@ impl Database {
         name: &str,
         password: Option<&str>,
         verifier: Option<&str>,
+        gssapi: bool,
         if_not_exists: bool,
         replace: bool,
     ) -> Result<QueryOutput> {
@@ -3179,35 +3181,46 @@ impl Database {
                 return Err(EngineError::Constraint(format!("user {name:?} already exists")));
             }
         }
-        let credential = match (password, verifier) {
-            (Some(pw), _) => {
-                // Deterministic per-user salt (matches the server's existing
-                // scheme; the salt travels inside the encoded verifier).
-                let salt = skaidb_auth::crypto::sha256(format!("skaidb-user:{name}").as_bytes())
-                    [..16]
-                    .to_vec();
-                ScramCredential::new(pw, &salt, skaidb_auth::DEFAULT_ITERATIONS).encode()
-            }
-            (None, Some(v)) => {
-                if ScramCredential::decode(v).is_none() {
-                    return Err(EngineError::Constraint("invalid VERIFIER encoding".into()));
+        // External (GSSAPI) users carry no local secret; everything else is a
+        // SCRAM credential derived from a password or replayed from a verifier.
+        let (credential, auth_kind) = if gssapi {
+            (String::new(), UserAuthKind::Gssapi)
+        } else {
+            let credential = match (password, verifier) {
+                (Some(pw), _) => {
+                    // Deterministic per-user salt (matches the server's existing
+                    // scheme; the salt travels inside the encoded verifier).
+                    let salt =
+                        skaidb_auth::crypto::sha256(format!("skaidb-user:{name}").as_bytes())[..16]
+                            .to_vec();
+                    ScramCredential::new(pw, &salt, skaidb_auth::DEFAULT_ITERATIONS).encode()
                 }
-                v.to_string()
-            }
-            (None, None) => {
-                return Err(EngineError::Constraint(
-                    "CREATE USER requires PASSWORD or VERIFIER".into(),
-                ))
-            }
+                (None, Some(v)) => {
+                    if ScramCredential::decode(v).is_none() {
+                        return Err(EngineError::Constraint("invalid VERIFIER encoding".into()));
+                    }
+                    v.to_string()
+                }
+                (None, None) => {
+                    return Err(EngineError::Constraint(
+                        "CREATE USER requires PASSWORD, VERIFIER, or GSSAPI".into(),
+                    ))
+                }
+            };
+            (credential, UserAuthKind::Scram)
         };
         let hlc = self.ddl_stamp();
         let key = format!("usr:{name}");
         if !self.schema_advances(&key, hlc) {
             return Ok(QueryOutput::Ddl);
         }
-        self.catalog
-            .users
-            .insert(name.to_string(), UserDef { credential });
+        self.catalog.users.insert(
+            name.to_string(),
+            UserDef {
+                credential,
+                auth_kind,
+            },
+        );
         // The user's personal role (idempotent; keeps existing grants).
         self.catalog.auth_roles.entry(name.to_string()).or_default();
         self.record_schema(key, hlc, false);
@@ -3381,9 +3394,24 @@ impl Database {
         self.role_store.has_privilege(role, privilege, object)
     }
 
-    /// The stored SCRAM credential for `name`, if the user exists.
+    /// The stored SCRAM credential for `name`, if the user exists and
+    /// authenticates by password. External (GSSAPI) users have no local
+    /// secret and return `None` here — they never take the SCRAM path.
     pub fn auth_user(&self, name: &str) -> Option<ScramCredential> {
-        ScramCredential::decode(&self.catalog.users.get(name)?.credential)
+        let user = self.catalog.users.get(name)?;
+        if user.auth_kind != UserAuthKind::Scram {
+            return None;
+        }
+        ScramCredential::decode(&user.credential)
+    }
+
+    /// The role an externally-authenticated (GSSAPI) principal acts as, if such
+    /// a user exists. A user acts as its own-named role, so this returns the
+    /// principal itself — but only when it was created `IDENTIFIED BY GSSAPI`,
+    /// so a password user can never be impersonated through the external path.
+    pub fn external_user_role(&self, principal: &str) -> Option<String> {
+        let user = self.catalog.users.get(principal)?;
+        (user.auth_kind == UserAuthKind::Gssapi).then(|| principal.to_string())
     }
 
     fn drop_table(&mut self, name: &str, if_exists: bool) -> Result<QueryOutput> {
@@ -5390,11 +5418,11 @@ impl Database {
             ));
         }
         for (name, def) in &self.catalog.users {
-            out.push((
-                DEFAULT_DATABASE.to_string(),
-                format!("CREATE USER {name} VERIFIER '{}'", def.credential),
-                ver(&format!("usr:{name}")),
-            ));
+            let ddl = match def.auth_kind {
+                UserAuthKind::Scram => format!("CREATE USER {name} VERIFIER '{}'", def.credential),
+                UserAuthKind::Gssapi => format!("CREATE USER {name} GSSAPI"),
+            };
+            out.push((DEFAULT_DATABASE.to_string(), ddl, ver(&format!("usr:{name}"))));
         }
         for (name, def) in &self.catalog.auth_roles {
             out.push((

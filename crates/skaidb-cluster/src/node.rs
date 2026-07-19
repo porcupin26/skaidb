@@ -2274,6 +2274,12 @@ impl Node {
         self.local.read().ok()?.auth_user(name)
     }
 
+    /// The role an externally-authenticated (GSSAPI) principal acts as (the
+    /// principal itself), if such a user exists in the replicated catalog.
+    pub fn external_user_role(&self, principal: &str) -> Option<String> {
+        self.local.read().ok()?.external_user_role(principal)
+    }
+
     /// Cluster-wide per-bucket partials at the configured read
     /// consistency — the PromQL `query_range` fast path (per-bucket
     /// partials ship instead of raw samples).

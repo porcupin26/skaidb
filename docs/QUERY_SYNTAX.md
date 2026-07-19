@@ -85,6 +85,11 @@ USE    [DATABASE] <name>
 
 -- Users, roles, grants (see Access control note)
 CREATE USER [IF NOT EXISTS] <name> PASSWORD '<password>'
+CREATE USER [IF NOT EXISTS] <name> GSSAPI      -- external Kerberos principal,
+                                               -- no local secret; <name> is the
+                                               -- principal, e.g. "user@REALM"
+                                               -- (double-quote it — it contains
+                                               -- '@' and '.')
 ALTER  USER <name> PASSWORD '<password>'
 DROP   USER [IF EXISTS] <name>
 CREATE ROLE [IF NOT EXISTS] <name>
@@ -351,7 +356,12 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   nonexistent index needs no privilege (`IF EXISTS` stays an idempotent
   no-op; index existence is already free via `SHOW INDEXES`). A **user** authenticates
   (SCRAM on the binary protocol, HTTP Basic on REST) and acts as its
-  own-named role; `GRANT ROLE r TO u` adds inherited roles. A grant
+  own-named role; `GRANT ROLE r TO u` adds inherited roles. A user created
+  `… GSSAPI` is **external**: it has no local password — a Kerberos KDC
+  vouches for the principal, and skaidb only maps the authenticated principal
+  to its own-named role (grants and role inheritance work identically). An
+  external user cannot authenticate by password/SCRAM, and a password user is
+  never reachable through the external path. A grant
   `ON DATABASE db` covers every table in that database (checked against the
   session's current database; shown by `SHOW GRANTS` as `db:<name>`).
   **A table grant is scoped to the table's canonical `<database>.<table>`

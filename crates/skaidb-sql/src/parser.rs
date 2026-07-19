@@ -775,19 +775,23 @@ impl Parser {
         } else if self.eat_keyword(Keyword::User) {
             let if_not_exists = self.parse_if_not_exists()?;
             let name = self.expect_ident()?;
-            let (mut password, mut verifier) = (None, None);
+            let (mut password, mut verifier, mut gssapi) = (None, None, false);
             if self.eat_keyword(Keyword::Password) {
                 password = Some(self.expect_string()?);
             } else if self.eat_keyword(Keyword::Verifier) {
                 verifier = Some(self.expect_string()?);
+            } else if self.eat_keyword(Keyword::Gssapi) {
+                // External Kerberos principal: no local secret follows.
+                gssapi = true;
             } else {
-                return Err(self.unexpected("PASSWORD or VERIFIER".into()));
+                return Err(self.unexpected("PASSWORD, VERIFIER, or GSSAPI".into()));
             }
             Ok(Statement::CreateUser(CreateUser {
                 name,
                 if_not_exists,
                 password,
                 verifier,
+                gssapi,
             }))
         } else if self.eat_keyword(Keyword::Role) {
             let if_not_exists = self.parse_if_not_exists()?;
@@ -2479,5 +2483,33 @@ mod tests {
         assert!(parse("SELECT *").is_err());
         assert!(parse("SELECT 1 WHERE x = 2").is_err());
         assert!(parse("SELECT 1 ORDER BY 1").is_err());
+    }
+
+    #[test]
+    fn parse_create_user_forms() {
+        // Password and verifier forms are unchanged.
+        match parse("CREATE USER ada PASSWORD 'pencil'").unwrap() {
+            Statement::CreateUser(u) => {
+                assert_eq!(u.password.as_deref(), Some("pencil"));
+                assert!(!u.gssapi);
+            }
+            other => panic!("{other:?}"),
+        }
+        // GSSAPI form: a double-quoted Kerberos principal, no secret.
+        match parse(r#"CREATE USER "alice@EXAMPLE.COM" GSSAPI"#).unwrap() {
+            Statement::CreateUser(u) => {
+                assert_eq!(u.name, "alice@EXAMPLE.COM");
+                assert!(u.gssapi);
+                assert!(u.password.is_none() && u.verifier.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+        // IF NOT EXISTS composes with GSSAPI.
+        match parse("CREATE USER IF NOT EXISTS svc GSSAPI").unwrap() {
+            Statement::CreateUser(u) => assert!(u.if_not_exists && u.gssapi),
+            other => panic!("{other:?}"),
+        }
+        // A bare CREATE USER with no auth form is still rejected.
+        assert!(parse("CREATE USER ghost").is_err());
     }
 }

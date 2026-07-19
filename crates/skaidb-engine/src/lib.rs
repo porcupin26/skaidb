@@ -1061,6 +1061,46 @@ mod tests {
         assert!(err.to_string().contains("does not exist"), "{err}");
     }
 
+    /// External (GSSAPI) users are passwordless: they resolve to their
+    /// own-named role for grants, carry no SCRAM credential, and persist their
+    /// external kind across a reopen.
+    #[test]
+    fn external_gssapi_users_resolve_to_a_role_without_a_credential() {
+        use skaidb_auth::{Object, Privilege};
+        let dir = tempdir();
+        {
+            let mut db = Database::open(&dir).unwrap();
+            db.execute(r#"CREATE USER "alice@EXAMPLE.COM" GSSAPI"#).unwrap();
+            db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+            // Grants target the principal's own-named role, exactly like a
+            // password user.
+            db.execute(r#"GRANT SELECT ON t TO "alice@EXAMPLE.COM""#).unwrap();
+            // The external principal maps to a role...
+            assert_eq!(
+                db.external_user_role("alice@EXAMPLE.COM").as_deref(),
+                Some("alice@EXAMPLE.COM")
+            );
+            // ...but has no SCRAM credential and cannot take the password path.
+            assert!(db.auth_user("alice@EXAMPLE.COM").is_none());
+            // A password user is never reachable via the external path.
+            db.execute("CREATE USER bob PASSWORD 'x'").unwrap();
+            assert!(db.external_user_role("bob").is_none());
+            assert!(db.auth_user("bob").is_some());
+        }
+        // Reopen: the external kind survived (still no credential, still a role).
+        let db = Database::open(&dir).unwrap();
+        assert_eq!(
+            db.external_user_role("alice@EXAMPLE.COM").as_deref(),
+            Some("alice@EXAMPLE.COM")
+        );
+        assert!(db.auth_user("alice@EXAMPLE.COM").is_none());
+        assert!(db.has_privilege(
+            "alice@EXAMPLE.COM",
+            Privilege::Select,
+            &Object::Table("t".into())
+        ));
+    }
+
     #[test]
     fn where_filtering_and_three_valued_logic() {
         let mut db = Database::open(tempdir()).unwrap();
