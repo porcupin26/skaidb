@@ -24,7 +24,7 @@ pub use exec::{
     gidx_table, global_entry_delta, index_entry_key,
     gidx_entry_key, gidx_entry_row_key, gidx_placement_prefix, gidx_probe_bounds, is_gidx_table,
 };
-pub use skaidb_storage::{Codec, EngineOptions, Hlc, DEFAULT_SEARCH_WRITER_HEAP};
+pub use skaidb_storage::{Codec, EngineOptions, Hlc, Kek, DEFAULT_SEARCH_WRITER_HEAP};
 pub use namespace::DEFAULT_DATABASE;
 pub use result::{QueryOutput, ResultSet, SessionEffect};
 

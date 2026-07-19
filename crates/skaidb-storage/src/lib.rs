@@ -23,6 +23,7 @@ mod error;
 
 pub use cache::CacheStats;
 pub use compress::Codec;
+pub use crypto::Kek;
 pub use engine::{CompactJob, Engine, EngineOptions, EngineStats, FlushJob, KeyStats, DEFAULT_FLUSH_THRESHOLD_BYTES, DEFAULT_SCAN_ROW_BUDGET, DEFAULT_SEARCH_WRITER_HEAP, DEFAULT_STATEMENT_TIMEOUT_SECS};
 pub use error::{Result, StorageError};
 pub use hlc::{Hlc, HlcClock};

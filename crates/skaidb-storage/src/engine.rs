@@ -22,6 +22,7 @@ use crate::hlc::{Hlc, HlcClock};
 use crate::memtable::{Memtable, VersionValue};
 use crate::sstable::{SsTable, SstEntry};
 use crate::wal::{Wal, WalCommit, WalOp, WalSync};
+use crate::crypto::Kek;
 
 /// One key's winning `(key, stamp, version)` as produced by the k-way merge.
 type MergeItem = (Vec<u8>, Hlc, VersionValue);
@@ -49,7 +50,7 @@ const DEFAULT_L0_COMPACTION_TRIGGER: usize = 4;
 const DEFAULT_LEVEL1_CAPACITY: u64 = 1024;
 
 /// Tuning knobs for the engine (mainly to make tests exercise flush/compaction).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct EngineOptions {
     pub flush_threshold_bytes: usize,
     pub l0_compaction_trigger: usize,
@@ -66,6 +67,12 @@ pub struct EngineOptions {
     /// to SSTables, empty on every open. For short-lived bounded data
     /// (stats, caches) where restart loss is fine — pair with a table TTL.
     pub ephemeral: bool,
+    /// At-rest encryption key (from a keyfile). `Some` = present, so encrypted
+    /// files can be opened; new files are encrypted only when `at_rest_enabled`.
+    pub kek: Option<Kek>,
+    /// Encrypt newly written WAL/SSTable files. Requires `kek`. Existing
+    /// plaintext files stay readable (mixed migration).
+    pub at_rest_enabled: bool,
     /// Per-statement scan budget: the maximum rows a single statement may
     /// examine (decode + filter) across all its gathers before it errors.
     /// Guards the node against filters that match (almost) nothing walking
@@ -125,6 +132,8 @@ impl Default for EngineOptions {
             bottom_compression: Codec::Lz4,
             read_cache_capacity: DEFAULT_READ_CACHE_CAPACITY,
             ephemeral: false,
+            kek: None,
+            at_rest_enabled: false,
             defer_search_startup: false,
             scan_row_budget: DEFAULT_SCAN_ROW_BUDGET,
             statement_timeout_secs: DEFAULT_STATEMENT_TIMEOUT_SECS,
@@ -157,6 +166,9 @@ pub struct FlushJob {
     pub codec: Codec,
     /// Which frozen entry this belongs to (its WAL segment number).
     pub wal_seq: u64,
+    /// At-rest key (for encrypting the output when `encrypt_new`).
+    pub kek: Option<Kek>,
+    pub encrypt_new: bool,
 }
 
 /// A background compaction work order: inputs are pinned by path and
@@ -177,6 +189,10 @@ pub struct CompactJob {
     /// tombstone purged before a witness pulls it resurrects the deleted
     /// row on the backup forever.
     pub tombstone_keep_after: u64,
+    /// At-rest key: opens (possibly encrypted) inputs, and encrypts the output
+    /// when `encrypt_new`.
+    pub kek: Option<Kek>,
+    pub encrypt_new: bool,
 }
 
 /// A single-node, single-keyspace LSM storage engine.
@@ -304,7 +320,7 @@ impl Engine {
             // whole segment will ever hold.
             let chunk =
                 (opts.flush_threshold_bytes as u64).min(crate::wal::WAL_PREALLOC_CHUNK_BYTES);
-            Wal::open(dir.join("wal.log"), chunk, None, false)?
+            Wal::open(dir.join("wal.log"), chunk, opts.kek.as_ref(), opts.at_rest_enabled)?
         };
         let mut mem = Memtable::new();
         let mut max_hlc = Hlc::MIN;
@@ -320,7 +336,7 @@ impl Engine {
         let (l0, levels, next_seq) = if opts.ephemeral {
             (Vec::new(), Vec::new(), 0)
         } else {
-            load_manifest(&dir)?
+            load_manifest(&dir, opts.kek.as_ref())?
         };
 
         let clock = HlcClock::new();
@@ -972,6 +988,8 @@ impl Engine {
         Some(FlushJob {
             mem: Arc::clone(&f.mem),
             path,
+            kek: self.opts.kek.clone(),
+            encrypt_new: self.opts.at_rest_enabled,
             codec: self.opts.compression,
             wal_seq: f.wal_seq,
         })
@@ -985,7 +1003,8 @@ impl Engine {
         // per-entry key/value clone, which used to double the memtable's
         // footprint for the duration of the build.
         let entries = job.mem.iter_latest_lazy().map(Ok);
-        SsTable::write_stream(&job.path, entries, job.mem.version_count(), job.codec, None)
+        let enc = if job.encrypt_new { job.kek.as_ref() } else { None };
+        SsTable::write_stream(&job.path, entries, job.mem.version_count(), job.codec, enc)
     }
 
     /// Install a built flush: L0 gains the table, the manifest persists
@@ -1044,6 +1063,8 @@ impl Engine {
                 codec: self.codec_for(deepest),
                 expire_before,
                 tombstone_keep_after,
+                kek: self.opts.kek.clone(),
+                encrypt_new: self.opts.at_rest_enabled,
             });
         }
         for level in 0..self.levels.len() {
@@ -1074,6 +1095,8 @@ impl Engine {
                 codec: self.codec_for(level + 1 == self.levels.len() - 1),
                 expire_before,
                 tombstone_keep_after,
+                kek: self.opts.kek.clone(),
+                encrypt_new: self.opts.at_rest_enabled,
             });
         }
         None
@@ -1085,10 +1108,12 @@ impl Engine {
         let inputs: Vec<SsTable> = job
             .inputs
             .iter()
-            .map(|p| SsTable::open(p, None))
+            .map(|p| SsTable::open(p, job.kek.as_ref()))
             .collect::<Result<_>>()?;
         let refs: Vec<&SsTable> = inputs.iter().collect();
+        let enc = if job.encrypt_new { job.kek.as_ref() } else { None };
         merge_write(
+            enc,
             &job.output,
             &refs,
             job.deepest,
@@ -1407,7 +1432,12 @@ impl Engine {
         let old_paths = collect_paths(&self.l0, self.levels.first());
         let expire_before = self.ttl_ms.map(|ttl| now_wall_ms().saturating_sub(ttl));
         let tombstone_keep_after = now_wall_ms().saturating_sub(self.tombstone_retention_ms);
-        let new_l1 = merge_write(&path, &sources, deepest, codec, expire_before, tombstone_keep_after)?;
+        let enc = if self.opts.at_rest_enabled {
+            self.opts.kek.as_ref()
+        } else {
+            None
+        };
+        let new_l1 = merge_write(enc, &path, &sources, deepest, codec, expire_before, tombstone_keep_after)?;
         self.compactions += 1;
         self.compaction_bytes += new_l1.disk_len();
         self.l0.clear();
@@ -1445,8 +1475,13 @@ impl Engine {
                 old_paths.push(self.levels[level + 1].path().to_path_buf());
             }
 
+            let enc = if self.opts.at_rest_enabled {
+                self.opts.kek.as_ref()
+            } else {
+                None
+            };
             let new_run =
-                merge_write(&path, &sources, deepest, codec, expire_before, tombstone_keep_after)?;
+                merge_write(enc, &path, &sources, deepest, codec, expire_before, tombstone_keep_after)?;
             self.compactions += 1;
             self.compaction_bytes += new_run.disk_len();
             if has_next {
@@ -1570,6 +1605,7 @@ impl Iterator for KWayMerge<'_> {
 /// `drop_tombstones` is set (merging into the deepest level), delete markers
 /// are discarded. Fully streaming: block-in, block-out.
 fn merge_write(
+    enc: Option<&Kek>,
     path: &Path,
     sources: &[&SsTable],
     drop_tombstones: bool,
@@ -1600,7 +1636,7 @@ fn merge_write(
         Ok((key, hlc, value)) => Some(Ok(SstEntry { key, hlc, value })),
         Err(e) => Some(Err(e)),
     });
-    SsTable::write_stream(path, entries, approx as usize, codec, None)
+    SsTable::write_stream(path, entries, approx as usize, codec, enc)
 }
 
 /// Wall-clock milliseconds since the Unix epoch (TTL comparisons).
@@ -1643,7 +1679,7 @@ fn remove_files(paths: &[PathBuf]) {
 /// Load the SSTable set described by the manifest. Returns (L0 newest-first,
 /// deeper levels, next sequence number).
 #[allow(clippy::type_complexity)]
-fn load_manifest(dir: &Path) -> Result<(Vec<SsTable>, Vec<SsTable>, u64)> {
+fn load_manifest(dir: &Path, kek: Option<&Kek>) -> Result<(Vec<SsTable>, Vec<SsTable>, u64)> {
     let manifest = dir.join("sst").join("MANIFEST");
     if !manifest.exists() {
         return Ok((Vec::new(), Vec::new(), 0));
@@ -1669,7 +1705,7 @@ fn load_manifest(dir: &Path) -> Result<(Vec<SsTable>, Vec<SsTable>, u64)> {
         {
             max_seq = max_seq.max(seq + 1);
         }
-        let sst = SsTable::open(&path, None).map_err(|e| {
+        let sst = SsTable::open(&path, kek).map_err(|e| {
             skaidb_types::slog!(
                 "skaidb: manifest {} references {} which failed to open: {e}",
                 manifest.display(),
@@ -1769,6 +1805,62 @@ mod tests {
             level1_capacity: 8,
             ..Default::default()
         }
+    }
+
+    /// End-to-end at-rest: an encrypted engine flushes + compacts encrypted
+    /// SSTables and an encrypted WAL, on-disk bytes are ciphertext, and a
+    /// reopen with the key recovers everything. Wrong/no key fails the reopen.
+    #[test]
+    fn at_rest_encrypts_wal_and_sstables_end_to_end() {
+        let dir = tempdir();
+        let kek = Kek::from_bytes(&[3u8; 32]).unwrap();
+        let enc_opts = || EngineOptions {
+            flush_threshold_bytes: 256,
+            l0_compaction_trigger: 3,
+            level1_capacity: 8,
+            kek: Some(kek.clone()),
+            at_rest_enabled: true,
+            ..Default::default()
+        };
+        {
+            let mut e = Engine::open_with_options(&dir, enc_opts()).unwrap();
+            for i in 0..300 {
+                e.put(format!("secretkey{i:04}").as_bytes(),
+                      format!("secretval{i:04}").into_bytes()).unwrap();
+            }
+            e.maybe_flush().unwrap();
+            e.maybe_compact().unwrap();
+            // Value still readable live.
+            assert_eq!(e.get(b"secretkey0100").unwrap(), Some(b"secretval0100".to_vec()));
+        }
+        // On disk: no plaintext key/value anywhere under the dir.
+        fn walk(d: &Path, needle: &str) -> bool {
+            for e in std::fs::read_dir(d).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    if walk(&p, needle) { return true; }
+                } else if String::from_utf8_lossy(&std::fs::read(&p).unwrap()).contains(needle) {
+                    return true;
+                }
+            }
+            false
+        }
+        assert!(!walk(&dir, "secretkey0100"), "key must not be on disk in the clear");
+        assert!(!walk(&dir, "secretval0100"), "value must not be on disk in the clear");
+        // Reopen WITH the key: data recovers.
+        {
+            let e = Engine::open_with_options(&dir, enc_opts()).unwrap();
+            assert_eq!(e.get(b"secretkey0299").unwrap(), Some(b"secretval0299".to_vec()));
+        }
+        // Reopen with the WRONG key, or none, fails (can't open the files).
+        let wrong = EngineOptions {
+            kek: Some(Kek::from_bytes(&[9u8; 32]).unwrap()),
+            at_rest_enabled: true,
+            ..enc_opts()
+        };
+        assert!(Engine::open_with_options(&dir, wrong).is_err(), "wrong KEK must fail");
+        let nokey = EngineOptions { kek: None, at_rest_enabled: false, ..enc_opts() };
+        assert!(Engine::open_with_options(&dir, nokey).is_err(), "encrypted store needs a key");
     }
 
     #[test]

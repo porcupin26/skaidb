@@ -40,6 +40,28 @@ use crate::shared::{Backend, Context, Shared};
 
 /// Build the execution backend: a cluster coordinator when seeds are
 /// configured, otherwise a standalone local engine.
+/// Load the at-rest KEK from config, or `None` when at-rest is off and no
+/// keyfile is set. Errors (loudly) on a requested-but-broken key so the server
+/// never comes up serving plaintext by accident.
+fn load_at_rest_kek(config: &Config) -> Result<Option<skaidb_engine::Kek>, Box<dyn std::error::Error>> {
+    use skaidb_config::KekSource;
+    let e = &config.encryption;
+    if !e.at_rest_enabled && e.at_rest_keyfile.is_empty() {
+        return Ok(None);
+    }
+    match e.at_rest_kek_source {
+        KekSource::Keyfile => {
+            if e.at_rest_keyfile.is_empty() {
+                return Err("at-rest encryption needs encryption.at_rest_keyfile".into());
+            }
+            Ok(Some(skaidb_engine::Kek::from_keyfile(&e.at_rest_keyfile)?))
+        }
+        KekSource::Kms => {
+            Err("encryption.at_rest_kek_source = kms is not yet implemented; use keyfile".into())
+        }
+    }
+}
+
 fn build_backend(db: Database, config: &Config) -> Result<Backend, Box<dyn std::error::Error>> {
     if config.cluster.seeds.is_empty() {
         return Ok(Backend::Local(Box::new(RwLock::new(db))));
@@ -163,6 +185,11 @@ pub fn run(
         Ok(None) => {}
         Err(e) => return Err(e.into()),
     }
+    // At-rest encryption key. Loaded whenever a keyfile is configured (so
+    // encrypted files can be OPENED even while at_rest_enabled is toggled);
+    // new files are encrypted only when at_rest_enabled. A configured-but-bad
+    // keyfile fails startup LOUD — never silently plaintext.
+    let kek = load_at_rest_kek(&config)?;
     let storage_opts = skaidb_engine::EngineOptions {
         flush_threshold_bytes,
         read_cache_capacity,
@@ -170,6 +197,8 @@ pub fn run(
         ts_head_max_bytes,
         scan_row_budget: config.storage.scan_row_budget as usize,
         statement_timeout_secs: config.storage.statement_timeout_secs,
+        kek,
+        at_rest_enabled: config.encryption.at_rest_enabled,
         // Server mode: a large FTS rebuild pages in the background instead
         // of blocking the listener for minutes at startup (#75).
         defer_search_startup: true,

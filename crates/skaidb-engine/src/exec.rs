@@ -415,7 +415,7 @@ impl Database {
 
         let mut tables = HashMap::new();
         for name in catalog.tables.keys() {
-            let mut table_opts = opts;
+            let mut table_opts = opts.clone();
             table_opts.ephemeral = catalog.tables[name].memory;
             let mut engine = StorageEngine::open_with_options(table_dir(&dir, name), table_opts)?;
             engine.set_ttl(catalog.tables[name].ttl_ms.map(|ms| ms as u64));
@@ -427,7 +427,7 @@ impl Database {
             if def.global {
                 continue; // entries live in the __gidx table opened above
             }
-            let engine = StorageEngine::open_with_options(index_dir(&dir, name), opts)?;
+            let engine = StorageEngine::open_with_options(index_dir(&dir, name), opts.clone())?;
             indexes.insert(name.clone(), engine);
         }
 
@@ -3010,7 +3010,7 @@ impl Database {
             }
             return Err(EngineError::TableExists(name.to_string()));
         }
-        let mut opts = self.storage_opts;
+        let mut opts = self.storage_opts.clone();
         opts.ephemeral = memory;
         let mut engine = StorageEngine::open_with_options(table_dir(&self.dir, name), opts)?;
         engine.set_ttl(ttl_ms.map(|ms| ms as u64));
@@ -3547,7 +3547,7 @@ impl Database {
             let gname = gidx_table(name);
             if !self.tables.contains_key(&gname) {
                 let engine =
-                    StorageEngine::open_with_options(table_dir(&self.dir, &gname), self.storage_opts)?;
+                    StorageEngine::open_with_options(table_dir(&self.dir, &gname), self.storage_opts.clone())?;
                 self.tables.insert(gname.clone(), engine);
             }
             self.catalog.tables.entry(gname).or_insert(TableDef {
@@ -3591,7 +3591,7 @@ impl Database {
         // meanwhile maintain the index normally (idempotent overlap with the
         // pages), and the planner refuses `building` indexes.
         let index_engine =
-            StorageEngine::open_with_options(index_dir(&self.dir, name), self.storage_opts)?;
+            StorageEngine::open_with_options(index_dir(&self.dir, name), self.storage_opts.clone())?;
         self.indexes.insert(name.to_string(), index_engine);
         self.catalog.indexes.insert(
             name.to_string(),
@@ -3913,7 +3913,7 @@ impl Database {
             std::fs::rename(&old_dir, &new_dir)?;
         }
         self.tables
-            .insert(new.to_string(), StorageEngine::open_with_options(new_dir, self.storage_opts)?);
+            .insert(new.to_string(), StorageEngine::open_with_options(new_dir, self.storage_opts.clone())?);
         // The reopened engine restarts write_seq at 0: purge both names' field
         // registry so a stale stamp can't validate against the fresh counter.
         {
@@ -4044,7 +4044,7 @@ impl Database {
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
         }
-        let engine = StorageEngine::open_with_options(dir, self.storage_opts)?;
+        let engine = StorageEngine::open_with_options(dir, self.storage_opts.clone())?;
         self.indexes.insert(name.to_string(), engine);
         if let Some(def) = self.catalog.indexes.get_mut(name) {
             def.building = true;
@@ -10022,7 +10022,7 @@ impl Database {
             )));
         }
         let dir = self.dir.clone();
-        let opts = self.storage_opts;
+        let opts = self.storage_opts.clone();
         // Move the live directory aside (transaction-ish: the backup copy
         // happens into the ORIGINAL path, so on any error the aside copy
         // still holds the previous state).
@@ -10047,7 +10047,7 @@ impl Database {
                 "restore from '{path}': {e} (previous data restored)"
             )));
         }
-        match Database::open_with_options(&dir, opts) {
+        match Database::open_with_options(&dir, opts.clone()) {
             Ok(fresh) => {
                 *self = fresh;
                 Ok(ResultSet {
