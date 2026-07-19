@@ -110,6 +110,22 @@ enum Cmd {
         #[command(subcommand)]
         op: CertsOp,
     },
+    /// Generate an at-rest encryption keyfile (offline; no server).
+    Keyfile {
+        #[command(subcommand)]
+        op: KeyfileOp,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum KeyfileOp {
+    /// Write a fresh random 32-byte KEK to `out` (0600). Back it up off-box:
+    /// losing it makes all encrypted data unrecoverable.
+    Gen {
+        /// Output path for the keyfile.
+        #[arg(long, default_value = "./skaidb-at-rest.key")]
+        out: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -173,6 +189,25 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("skaidbsh: certs gen: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        // Keyfile generation is fully offline — no server, no backend.
+        if let Cmd::Keyfile { op } = cmd {
+            let KeyfileOp::Gen { out } = op;
+            match generate_keyfile(out) {
+                Ok(()) => {
+                    println!("wrote a 32-byte at-rest keyfile to {out} (0600).");
+                    println!(
+                        "Back it up OFF-BOX now — losing it makes all encrypted data\n\
+                         unrecoverable. Configure: encryption.at_rest_enabled = true,\n\
+                         encryption.at_rest_keyfile = \"{out}\"."
+                    );
+                    return ExitCode::SUCCESS;
+                }
+                Err(e) => {
+                    eprintln!("skaidbsh: keyfile gen: {e}");
                     return ExitCode::FAILURE;
                 }
             }
@@ -668,6 +703,18 @@ enum Flow {
 }
 
 /// Run a one-shot admin subcommand over REST and exit accordingly.
+/// Write a fresh random 32-byte at-rest KEK to `path` with 0600 permissions.
+fn generate_keyfile(path: &str) -> Result<(), String> {
+    let kek = skaidb_engine::Kek::generate().map_err(|e| e.to_string())?;
+    std::fs::write(path, kek.as_bytes()).map_err(|e| format!("write {path}: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
 /// Whether any TLS flag is set (any of `--tls`, `--tls-ca`, `--tls-insecure`).
 fn tls_requested(cli: &Cli) -> bool {
     cli.tls || cli.tls_ca.is_some() || cli.tls_insecure
@@ -752,6 +799,8 @@ fn run_admin(cli: &Cli, cmd: &Cmd) -> ExitCode {
         Cmd::Export(_) => unreachable!("export is handled before run_admin"),
         // Certs is intercepted in main() (fully offline, no server).
         Cmd::Certs { .. } => unreachable!("certs is handled before run_admin"),
+        // Keyfile is intercepted in main() (fully offline, no server).
+        Cmd::Keyfile { .. } => unreachable!("keyfile is handled before run_admin"),
     };
 
     match result {

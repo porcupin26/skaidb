@@ -747,6 +747,15 @@ fn client_tls_mode(ctx: &Shared) -> &'static str {
     }
 }
 
+/// Whether at-rest encryption is on (`on`/`off`), from config, for `/status`.
+fn at_rest_mode(ctx: &Shared) -> &'static str {
+    if ctx.config_snapshot().encryption.at_rest_enabled {
+        "on"
+    } else {
+        "off"
+    }
+}
+
 fn status_json(ctx: &Shared) -> Json {
     match ctx.backend.cluster_stats() {
         Some(c) => {
@@ -813,10 +822,11 @@ fn status_json(ctx: &Shared) -> Json {
                 // visible. `at_rest` joins these when it lands.
                 "internode_auth": ctx.backend.internode_auth_mode().unwrap_or("none"),
                 "client_tls": client_tls_mode(ctx),
+                "at_rest": at_rest_mode(ctx),
                 "ready": ctx.backend.is_ready(),
             })
         }
-        None => json!({ "clustered": false, "client_tls": client_tls_mode(ctx), "ready": ctx.backend.is_ready() }),
+        None => json!({ "clustered": false, "client_tls": client_tls_mode(ctx), "at_rest": at_rest_mode(ctx), "ready": ctx.backend.is_ready() }),
     }
 }
 

@@ -484,8 +484,36 @@ skaidbsh -H node --tls --tls-insecure           # self-signed / dev (INSECURE)
 
 The driver takes `Client::connect_many_tls(endpoints, user, pw, Some(tls))`.
 
-> **Not yet shipped:** at-rest encryption (`encryption.at_rest_*` config
-> exists but is inert).
+### At-rest encryption
+
+Encrypt every table's and index's WAL and SSTables on disk with AES-256-GCM.
+The scheme is envelope: a **KEK** from a keyfile wraps a per-file **DEK** that
+seals the data, so key rotation is cheap and the KEK never touches data.
+
+```bash
+skaidbsh keyfile gen --out /etc/skaidb/at-rest.key   # 32 bytes, 0600
+```
+
+```toml
+[encryption]
+at_rest_enabled = true
+at_rest_kek_source = "keyfile"          # kms: not yet implemented
+at_rest_keyfile = "/etc/skaidb/at-rest.key"
+```
+
+- **New files encrypt; existing plaintext files stay readable** (mixed
+  migration). To fully encrypt an existing node, do a **rolling per-node
+  resync**: wipe the node's data dir and let it rebuild from peers onto the
+  encrypted engine — one node at a time, RF keeps the cluster serving (the
+  same shape as re-encrypting a MongoDB replica set).
+- A **missing or bad keyfile fails startup loud** — the node never comes up
+  silently unencrypted. `at_rest_enabled` is restart-scoped. The effective
+  state shows at `GET /status` as `at_rest`.
+- **Back up the keyfile off-box before enabling.** Losing it makes all
+  encrypted data unrecoverable — it is operator-critical.
+- The WAL and SSTables are ciphertext on disk; the stamps sidecar is omitted
+  for encrypted tables (stamp scans fall back to decoding data blocks —
+  correct, slightly slower for repair).
 
 ## Resilience
 
