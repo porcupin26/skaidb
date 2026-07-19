@@ -91,6 +91,28 @@ pub fn tick_bytes(bytes: usize) -> Result<(), EngineError> {
     Ok(())
 }
 
+/// Assert the statement's currently-RESIDENT materialization fits the byte
+/// budget. Unlike [`tick_bytes`] (monotonic — total bytes ever retained into a
+/// result), this is a high-water check against a size the caller tracks live
+/// as it grows AND shrinks: the coordinator's in-flight merge buffer, which
+/// holds un-finalized rows until every source's cursor passes them. When one
+/// source races ahead of a lagging peer, that buffer can swell to a whole
+/// shard before a single row finalizes (the gather OOM that killed 4 GB
+/// nodes even under `tick_bytes`, which only guards the finalized output).
+/// `0` budget disables the check.
+#[inline]
+pub fn check_resident(bytes: usize) -> Result<(), EngineError> {
+    let budget = BYTE_BUDGET.with(Cell::get);
+    if budget != 0 && bytes > budget {
+        return Err(EngineError::ResourceLimit(format!(
+            "scan gather buffer exceeded {budget} resident bytes (a source lagged, \
+             stalling row finalization): add a LIMIT, narrow the projection/filter, \
+             or raise storage.scan_byte_budget"
+        )));
+    }
+    Ok(())
+}
+
 /// Record `n` rows examined; errors once the statement exceeds its budget or
 /// deadline. The deadline is checked once per ~1024 rows — a syscall-free
 /// fast path for the common tick.

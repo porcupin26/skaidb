@@ -151,7 +151,11 @@ Key facts an agent must know:
   filter matching nothing under `ORDER BY .. LIMIT` walks the whole range. The
   row budget bounds work; the byte budget bounds MEMORY — a scan of many
   multi-KB rows can stay under 250k rows yet gather gigabytes on the
-  coordinator (the read path that OOM-killed 4 GB nodes). Streaming
+  coordinator (the read path that OOM-killed 4 GB nodes). The byte budget caps
+  BOTH the finalized result AND the coordinator's in-flight gather buffer: a
+  full-copy scan where one replica lags holds back finalization, so the buffer
+  of un-emitted rows would otherwise swell to a whole shard — that now errors
+  (`scan gather buffer exceeded N resident bytes`) instead of OOMing. Streaming
   `COUNT`/`DISTINCT` retain nothing and are never charged bytes; add a `LIMIT`,
   narrow the projection/filter, or raise `storage.scan_byte_budget` to lift it.
 - **Aggregates**: `COUNT(*)`, `COUNT(expr)`, `COUNT(DISTINCT expr)` (exact),

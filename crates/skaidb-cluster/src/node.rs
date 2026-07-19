@@ -7010,6 +7010,11 @@ impl Node {
         let mut peer_ok: Vec<bool> = vec![true; addrs.len()];
 
         let mut merged: BTreeMap<Vec<u8>, (Hlc, Option<Vec<u8>>)> = BTreeMap::new();
+        // Resident bytes held in `merged` (keys + values of un-finalized rows).
+        // Grows as pages merge, shrinks as rows finalize into `out`; bounded
+        // each round against the statement byte budget so a lagging source
+        // that stalls finalization can't swell the buffer to a whole shard.
+        let mut merged_bytes: usize = 0;
         let mut out: Vec<(Vec<u8>, Document)> = Vec::new();
         let mut max_hlc: Option<Hlc> = None;
         let filled = |out: &Vec<(Vec<u8>, Document)>| limit.is_some_and(|l| out.len() >= l);
@@ -7033,7 +7038,8 @@ impl Node {
                         (Some(wanted), Some(bytes)) => Some(prune_row_bytes(&bytes, wanted)?),
                         (_, v) => v,
                     };
-                    merge_row(&mut merged, key, value, hlc);
+                    merged_bytes =
+                        merged_bytes.saturating_add_signed(merge_row(&mut merged, key, value, hlc));
                 }
             }
             for (i, addr) in addrs.iter().enumerate() {
@@ -7055,7 +7061,8 @@ impl Node {
                                 }
                                 (_, v) => v,
                             };
-                            merge_row(&mut merged, key, value, hlc);
+                            merged_bytes = merged_bytes
+                                .saturating_add_signed(merge_row(&mut merged, key, value, hlc));
                         }
                     }
                     // Peer failed mid-scan: stop reading it and drop it from the
@@ -7066,6 +7073,11 @@ impl Node {
                     }
                 }
             }
+
+            // Bound the in-flight buffer before finalizing: a lagging source
+            // holds the seal back, so `merged` keeps every row the faster
+            // sources delivered past it. Error instead of OOMing the node.
+            skaidb_engine::scan_meter::check_resident(merged_bytes)?;
 
             // 2. Seal = the smallest latest-key among sources that still have
             //    more to deliver. Everything <= seal is final: each active
@@ -7095,6 +7107,8 @@ impl Node {
             };
             for k in finalized {
                 let (hlc, val) = merged.remove(&k).expect("finalised key present");
+                merged_bytes = merged_bytes
+                    .saturating_sub(k.len() + val.as_ref().map_or(0, Vec::len));
                 max_hlc = Some(max_hlc.map_or(hlc, |m| m.max(hlc)));
                 if keep.is_some_and(|set| !set.contains_key(&k)) {
                     continue; // not a candidate: merged for LWW, not returned
@@ -7598,20 +7612,35 @@ fn prune_row_bytes(bytes: &[u8], wanted: &HashSet<String>) -> EngineResult<Vec<u
     Ok(Value::encode_document(&doc))
 }
 
+/// Merge one versioned row into the gather buffer under last-writer-wins,
+/// returning the change in RESIDENT bytes (key + value) the buffer now holds —
+/// positive on a fresh key or a larger LWW replacement, negative when a
+/// replacement shrinks the value, zero when the incoming version loses. The
+/// caller sums these to bound the in-flight buffer (see
+/// `scan_meter::check_resident`).
 fn merge_row(
     merged: &mut BTreeMap<Vec<u8>, (Hlc, Option<Vec<u8>>)>,
     key: Vec<u8>,
     value: Option<Vec<u8>>,
     hlc: Hlc,
-) {
-    merged
-        .entry(key)
-        .and_modify(|cur| {
-            if hlc > cur.0 {
-                *cur = (hlc, value.clone());
+) -> isize {
+    let new_len = value.as_ref().map_or(0, Vec::len);
+    match merged.entry(key) {
+        std::collections::btree_map::Entry::Occupied(mut e) => {
+            if hlc > e.get().0 {
+                let old_len = e.get().1.as_ref().map_or(0, Vec::len);
+                *e.get_mut() = (hlc, value);
+                new_len as isize - old_len as isize
+            } else {
+                0
             }
-        })
-        .or_insert((hlc, value));
+        }
+        std::collections::btree_map::Entry::Vacant(e) => {
+            let delta = e.key().len() + new_len;
+            e.insert((hlc, value));
+            delta as isize
+        }
+    }
 }
 
 /// Map a local write result to an internode `Ack`/`Err` response.
@@ -11407,6 +11436,85 @@ mod tests {
         }
     }
 
+    /// A no-LIMIT full-table gather must be bounded by `scan_byte_budget`: it
+    /// errors cleanly once the accumulated result crosses the budget instead
+    /// of gathering the whole table into coordinator memory (the read path
+    /// that OOM-killed a 4 GB production node even after the row budget and
+    /// the finalized-output byte tick — the in-flight merge buffer was the
+    /// real OOM site). A `LIMIT` that fits under the budget still succeeds.
+    #[test]
+    fn full_gather_is_bounded_by_scan_byte_budget() {
+        use skaidb_types::Document;
+        let q = Consistency::Quorum;
+        let cfg2 = |id: &str, addr: &str, members: &[(NodeId, String)]| NodeConfig {
+            id: NodeId::new(id),
+            internode_addr: addr.to_string(),
+            members: members.to_vec(),
+            replication_factor: 2,
+            vnodes_per_node: 64,
+            read_consistency: q,
+            write_consistency: q,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
+            anti_entropy_interval_secs: 0,
+        };
+        let (a, b) = (free_addr(), free_addr());
+        let m = vec![member("a", &a), member("b", &b)];
+        // Coordinator `a` gets a small byte budget (64 KB) and no row budget,
+        // so the bound under test is purely the materialized-bytes guard, not
+        // the row count. The budget comfortably exceeds one gather page (so a
+        // pushed-down LIMIT succeeds) but is far below the full result. Note
+        // the local batch (32 rows) outruns the peer page (8 rows) under test,
+        // so `merged` grows like a lagging peer would in prod — this exercises
+        // the in-flight resident bound, not only the finalized-output tick.
+        let opts = skaidb_storage::EngineOptions {
+            scan_row_budget: 0,
+            scan_byte_budget: 64 * 1024,
+            ..Default::default()
+        };
+        let na = Node::new(
+            Database::open_with_options(temp_dir("bba"), opts).unwrap(),
+            cfg2("a", &a, &m),
+        );
+        let nb = Node::new(Database::open(temp_dir("bbb")).unwrap(), cfg2("b", &b, &m));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+
+        // 500 rows × ~256-byte payload ≈ 130 KB of result — well over 64 KB,
+        // while a single ~32-row page stays a few KB.
+        let pad = "x".repeat(256);
+        for id in 0..500i64 {
+            let mut doc = Document::new();
+            doc.insert("id", Value::Int(id));
+            doc.insert("pad", Value::String(pad.clone()));
+            let r = internode::call(
+                &a,
+                &Request::ApplyPut {
+                    table: "t".into(),
+                    key: Value::Array(vec![Value::Int(id)]).encode_key(),
+                    value: Value::Document(doc).encode(),
+                    hlc: Hlc::new(100 + id as u64, 0),
+                },
+            )
+            .unwrap();
+            assert!(matches!(r, Response::Ack));
+        }
+
+        // Unbounded gather: errors on the byte budget, does not OOM.
+        let err = na.execute("SELECT * FROM t").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("scan_byte_budget")
+                && (msg.contains("materialized") || msg.contains("gather buffer")),
+            "expected a byte-budget error, got: {msg}"
+        );
+        // A small LIMIT pushes down (only ~k rows gathered) and stays under
+        // budget.
+        let rs = rows(na.execute("SELECT id FROM t LIMIT 5").unwrap());
+        assert_eq!(rs.rows.len(), 5);
+    }
+
     #[test]
     fn limit_pushdown_scan_returns_merged_tombstone_skipping_prefix() {
         use skaidb_types::Document;
@@ -12697,5 +12805,59 @@ mod tests {
         // The two live replicas hold the data.
         let rs = rows(nb.execute("SELECT v FROM t WHERE id = 1").unwrap());
         assert_eq!(rs.rows, vec![vec![Value::String("x".into())]]);
+    }
+
+    /// `merge_row` reports the resident-byte delta the gather buffer uses to
+    /// bound itself: a fresh key adds key+value bytes, a newer (LWW-winning)
+    /// version adjusts by the value-size difference, and a losing version adds
+    /// nothing. Correct accounting here is what keeps `merged_bytes` tracking
+    /// the buffer's true size so `check_resident` fires before an OOM.
+    #[test]
+    fn merge_row_reports_resident_byte_delta() {
+        let mut m: BTreeMap<Vec<u8>, (Hlc, Option<Vec<u8>>)> = BTreeMap::new();
+        let mut bytes: usize = 0;
+
+        // Fresh key "k1" (2 bytes) + 4-byte value = +6.
+        bytes = bytes.saturating_add_signed(merge_row(
+            &mut m, b"k1".to_vec(), Some(b"aaaa".to_vec()), Hlc::new(10, 0),
+        ));
+        assert_eq!(bytes, 6);
+
+        // Older version loses: no change.
+        bytes = bytes.saturating_add_signed(merge_row(
+            &mut m, b"k1".to_vec(), Some(b"zzzzzzzz".to_vec()), Hlc::new(5, 0),
+        ));
+        assert_eq!(bytes, 6);
+
+        // Newer version replaces 4-byte value with 8-byte value: +4.
+        bytes = bytes.saturating_add_signed(merge_row(
+            &mut m, b"k1".to_vec(), Some(b"bbbbbbbb".to_vec()), Hlc::new(20, 0),
+        ));
+        assert_eq!(bytes, 10);
+
+        // Newer tombstone (None value) shrinks by the 8-byte value: -8.
+        bytes = bytes.saturating_add_signed(merge_row(
+            &mut m, b"k1".to_vec(), None, Hlc::new(30, 0),
+        ));
+        assert_eq!(bytes, 2); // just the key remains resident
+
+        // Removing the finalized entry returns the buffer to empty, matching
+        // the decrement the gather applies on finalize (key + value bytes).
+        let (_, val) = m.remove(b"k1".as_slice()).unwrap();
+        bytes = bytes.saturating_sub(b"k1".len() + val.as_ref().map_or(0, Vec::len));
+        assert_eq!(bytes, 0);
+    }
+
+    /// The resident check trips once a caller-tracked live size exceeds the
+    /// armed byte budget — the guard that turns an unbounded lagging-peer
+    /// gather into a clean error instead of an OOM.
+    #[test]
+    fn check_resident_trips_past_byte_budget() {
+        let _armed = skaidb_engine::scan_meter::arm(0, 1024, None).expect("armed");
+        assert!(skaidb_engine::scan_meter::check_resident(1024).is_ok()); // at budget
+        let err = skaidb_engine::scan_meter::check_resident(1025).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("gather buffer"), "{msg}");
+        assert!(msg.contains("scan_byte_budget"), "{msg}");
     }
 }
