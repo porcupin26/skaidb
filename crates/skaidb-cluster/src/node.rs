@@ -1480,10 +1480,14 @@ impl Node {
         self.local_read_bounded().map(|db| db.stats(per_table))
     }
 
-    /// This node's on-disk data footprint (SSTable bytes); 0 under lock
-    /// contention. The filesize measure behind resync progress.
+    /// This node's on-disk data footprint (SSTables + WAL); 0 under lock
+    /// contention. The filesize measure behind resync detection and progress.
+    /// WAL is included so progress reflects data that's been pulled but not yet
+    /// flushed to SSTables (else progress sits near 0 through the first flushes).
     pub fn local_data_bytes(&self) -> u64 {
-        self.db_stats(false).map(|s| s.disk_bytes).unwrap_or(0)
+        self.db_stats(false)
+            .map(|s| s.disk_bytes + s.wal_bytes)
+            .unwrap_or(0)
     }
 
     /// Whether this node is backfilling from empty after a (re)join.
@@ -4839,15 +4843,26 @@ impl Node {
                 self.resyncing.store(false, Ordering::Relaxed);
                 continue;
             }
-            // A completed repair pass means catch-up finished: never resyncing.
+            // The ONLY thing that clears the flag is a completed catch-up repair
+            // (`repair_passes > 0`). Filesize can't tell "caught up" from
+            // "compacted smaller", so a growing data dir must NOT clear it — a
+            // node that cleared at, say, its first 32 MB flush would resume
+            // serving incomplete scans ~10% into a multi-GB backfill.
             if self.repair_passes.load(Ordering::Relaxed) > 0 {
                 if self.resyncing.swap(false, Ordering::Relaxed) {
                     skaidb_types::slog!("skaidb: resync complete — serving normally");
                 }
                 continue;
             }
+            // Sticky: once flagged, stay flagged until the repair completes above.
+            if self.resyncing.load(Ordering::Relaxed) {
+                continue;
+            }
+            // Not yet flagged and catch-up not done: detect a from-empty start —
+            // our data is tiny AND a peer holds far more (a fresh all-empty
+            // cluster is never flagged). Cheap `DataBytes` probe (no df).
             let local = self.local_data_bytes();
-            let behind = if local < RESYNC_EMPTY_BYTES {
+            if local < RESYNC_EMPTY_BYTES {
                 let target = self
                     .peer_addrs()
                     .iter()
@@ -4859,21 +4874,13 @@ impl Node {
                     .unwrap_or(0);
                 if target >= RESYNC_EMPTY_BYTES && local.saturating_mul(4) < target {
                     self.resync_target_bytes.store(target, Ordering::Relaxed);
-                    true
-                } else {
-                    false
+                    self.resyncing.store(true, Ordering::Relaxed);
+                    skaidb_types::slog!(
+                        "skaidb: resync detected — backfilling from empty (target ~{} MB); \
+                         not serving scans locally until caught up",
+                        target / (1024 * 1024)
+                    );
                 }
-            } else {
-                false
-            };
-            if behind && !self.resyncing.swap(true, Ordering::Relaxed) {
-                skaidb_types::slog!(
-                    "skaidb: resync detected — backfilling from empty (target ~{} MB); \
-                     not serving scans locally until caught up",
-                    self.resync_target_bytes.load(Ordering::Relaxed) / (1024 * 1024)
-                );
-            } else if !behind {
-                self.resyncing.store(false, Ordering::Relaxed);
             }
         }
     }

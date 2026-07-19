@@ -958,8 +958,18 @@ function renderHosts(hosts, status) {
     if (age > 60) ageCell.className = "bad";
     else if (age > 10) ageCell.className = "warn";
     else ageCell.className = "muted";
+    // A node backfilling from empty (wipe+resync) — badge it with filesize-based
+    // progress; this reads fresh HostStats so it's reliable on the Hosts tab.
+    const idCell = cell(n.id);
+    if (n.resyncing) {
+      const b = document.createElement("span");
+      b.className = "badge-resync";
+      b.textContent =
+        n.resync_progress != null ? `resync ${Math.round(n.resync_progress * 100)}%` : "resync";
+      idCell.append(" ", b);
+    }
     tr.append(
-      cell(n.id),
+      idCell,
       cell(`${n.cpu_percent.toFixed(1)}% of ${n.cpus}`),
       cell(n.load1.toFixed(2)),
       cell(usedOfTotal(n.mem_used_bytes, n.mem_total_bytes)),
