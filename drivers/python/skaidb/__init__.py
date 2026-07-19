@@ -1,6 +1,6 @@
 """skaidb — Python driver (DB-API 2.0 / PEP 249).
 
-Pure standard library: ``socket``, ``hashlib``, ``hmac``. No third-party deps.
+Pure standard library: ``socket``, ``ssl``, ``hashlib``, ``hmac``. No third-party deps.
 
 Quick start::
 
@@ -27,6 +27,7 @@ import hashlib
 import hmac
 import random
 import socket
+import ssl
 import struct
 import threading
 import uuid
@@ -436,6 +437,8 @@ class Connection:
         connect_timeout,
         read_timeout,
         database=None,
+        tls_ctx=None,
+        tls_server_name="skaidb",
     ):
         self._consistency = Consistency.resolve(consistency)
         self._lock = threading.Lock()
@@ -453,6 +456,8 @@ class Connection:
         self._connect_timeout = connect_timeout
         self._read_timeout = read_timeout
         self._database = database
+        self._tls_ctx = tls_ctx
+        self._tls_server_name = tls_server_name
         self._sock = None
         self._file = None
         self._open()
@@ -468,6 +473,12 @@ class Connection:
                     (host, port), timeout=self._connect_timeout
                 )
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                # TLS wrap (SNI = the server cert's SAN, default 'skaidb') —
+                # the handshake runs here; SCRAM then rides inside TLS.
+                if self._tls_ctx is not None:
+                    sock = self._tls_ctx.wrap_socket(
+                        sock, server_hostname=self._tls_server_name
+                    )
                 sock.settimeout(self._read_timeout)
                 self._sock = sock
                 self._file = sock.makefile("rb")
@@ -900,6 +911,10 @@ def connect(
     seeds: Optional[Sequence[str]] = None,
     connect_timeout: Optional[float] = None,
     read_timeout: Optional[float] = None,
+    tls: bool = False,
+    tls_ca: Optional[str] = None,
+    tls_insecure: bool = False,
+    tls_server_name: str = "skaidb",
 ) -> Connection:
     """Open a connection to skaidb and run the SCRAM handshake.
 
@@ -914,7 +929,27 @@ def connect(
     endpoints = _resolve_endpoints(host, port, seeds)
     ct = connect_timeout if connect_timeout is not None else timeout
     rt = read_timeout if read_timeout is not None else timeout
-    return Connection(endpoints, user, password, consistency, ct, rt, database)
+    tls_ctx = _build_tls_context(tls, tls_ca, tls_insecure)
+    return Connection(
+        endpoints, user, password, consistency, ct, rt, database, tls_ctx, tls_server_name
+    )
+
+
+def _build_tls_context(tls: bool, tls_ca: "str | None", tls_insecure: bool):
+    """Build a client ``ssl.SSLContext`` for the binary protocol, or ``None``
+    for plaintext. TLS is enabled when ``tls`` is set or a CA / insecure flag
+    is given. ``tls_ca`` verifies the server cert against a specific CA (the
+    cluster ``ca.crt``); ``tls_insecure`` skips verification (self-signed/dev
+    only — INSECURE); otherwise the system trust store is used."""
+    if not (tls or tls_ca or tls_insecure):
+        return None
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    if tls_insecure:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    elif tls_ca:
+        ctx.load_verify_locations(tls_ca)
+    return ctx
 
 
 # ---- connection pool ------------------------------------------------------
