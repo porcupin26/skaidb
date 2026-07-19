@@ -322,6 +322,14 @@ pub struct StorageConfig {
     /// nothing under `ORDER BY .. LIMIT` otherwise walks whole tables per
     /// query. `0` disables.
     pub scan_row_budget: u64,
+    /// Per-statement byte budget: the maximum bytes one statement may
+    /// MATERIALIZE into a result set (retained rows, across every gather)
+    /// before it errors. `scan_row_budget` bounds rows *examined*; this bounds
+    /// *memory held* — a 250k-row scan of multi-KB rows stays under the row
+    /// budget yet materializes gigabytes on the coordinator (the read path
+    /// that OOM-killed 4 GB nodes). Streaming `COUNT`/`DISTINCT` retain nothing
+    /// and are never charged. `0` disables. Default 256 MB.
+    pub scan_byte_budget: u64,
     /// Wall-clock ceiling per statement in seconds; past it the statement
     /// errors at its next scan-meter check (kills queries whose client has
     /// long since disconnected). `0` disables.
@@ -592,6 +600,7 @@ impl Default for StorageConfig {
             memory_target: String::new(),
             memtable_size_mb: 256,
             scan_row_budget: 250_000,
+            scan_byte_budget: 256 * 1024 * 1024,
             statement_timeout_secs: 120,
             read_cache_entries: 16_384,
             compaction_strategy: "lazy_leveled".to_string(),

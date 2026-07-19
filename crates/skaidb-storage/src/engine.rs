@@ -79,6 +79,13 @@ pub struct EngineOptions {
     /// entire large tables per query — LIMIT bounds output, not scan work.
     /// `0` disables. Consumed by the engine layer via the scan meter.
     pub scan_row_budget: usize,
+    /// Per-statement byte budget: the maximum bytes a single statement may
+    /// MATERIALIZE into a result set (retained rows, across every gather)
+    /// before it errors. `scan_row_budget` bounds rows *examined*; this bounds
+    /// *memory held* — a scan under the row budget can still materialize
+    /// gigabytes of multi-KB rows on the coordinator. `0` disables. Consumed
+    /// by the engine layer via the scan meter.
+    pub scan_byte_budget: usize,
     /// Defer search-index catch-up/rebuild at open to a background worker
     /// (the server sets this; a full FTS rebuild blocked node startup for
     /// ~15 minutes on a large table). Single-node/Session keeps the inline
@@ -111,6 +118,11 @@ pub const DEFAULT_SEARCH_WRITER_HEAP: usize = 64 * 1024 * 1024;
 /// full sweep of the largest production table, small enough that a
 /// runaway filter cannot examine the table many times over per statement.
 pub const DEFAULT_SCAN_ROW_BUDGET: usize = 250_000;
+/// Default per-statement byte budget (bytes materialized into a result set).
+/// Bounds coordinator memory when a within-row-budget scan retains many
+/// multi-KB rows; 256 MB clears any legitimate paged result while capping the
+/// unbounded gather that OOM-killed 4 GB nodes.
+pub const DEFAULT_SCAN_BYTE_BUDGET: usize = 256 * 1024 * 1024;
 /// Default per-statement wall-clock ceiling (seconds).
 pub const DEFAULT_STATEMENT_TIMEOUT_SECS: u64 = 120;
 
@@ -136,6 +148,7 @@ impl Default for EngineOptions {
             at_rest_enabled: false,
             defer_search_startup: false,
             scan_row_budget: DEFAULT_SCAN_ROW_BUDGET,
+            scan_byte_budget: DEFAULT_SCAN_BYTE_BUDGET,
             statement_timeout_secs: DEFAULT_STATEMENT_TIMEOUT_SECS,
             search_writer_heap_bytes: DEFAULT_SEARCH_WRITER_HEAP,
             ts_head_max_bytes: 0,

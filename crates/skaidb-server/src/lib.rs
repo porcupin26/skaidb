@@ -196,6 +196,7 @@ pub fn run(
         search_writer_heap_bytes,
         ts_head_max_bytes,
         scan_row_budget: config.storage.scan_row_budget as usize,
+        scan_byte_budget: config.storage.scan_byte_budget as usize,
         statement_timeout_secs: config.storage.statement_timeout_secs,
         kek,
         at_rest_enabled: config.encryption.at_rest_enabled,

@@ -2545,12 +2545,12 @@ mod tests {
             .unwrap();
         }
         // Under budget: served.
-        let _armed = scan_meter::arm(1_000, None);
+        let _armed = scan_meter::arm(1_000, 0, None);
         let rs = rows(db.execute("SELECT * FROM m").unwrap());
         assert_eq!(rs.rows.len(), 300);
         drop(_armed);
         // Over budget: the clean metering error, not an unbounded gather.
-        let _armed = scan_meter::arm(100, None);
+        let _armed = scan_meter::arm(100, 0, None);
         let err = db.execute("SELECT * FROM m").unwrap_err();
         assert!(
             err.to_string().contains("scan budget"),
@@ -2558,7 +2558,7 @@ mod tests {
         );
         drop(_armed);
         // Aggregations take the partials path: unaffected by a small budget.
-        let _armed = scan_meter::arm(100, None);
+        let _armed = scan_meter::arm(100, 0, None);
         let rs = rows(
             db.execute("SELECT time_bucket(1h, ts) AS t, avg(value) FROM m GROUP BY t").unwrap(),
         );

@@ -5525,11 +5525,11 @@ impl Node {
             .read()
             .ok()
             .map(|db| db.scan_meter_opts())
-            .and_then(|(budget, secs)| {
+            .and_then(|(budget, byte_budget, secs)| {
                 let deadline = (secs != 0).then(|| {
                     std::time::Instant::now() + std::time::Duration::from_secs(secs)
                 });
-                skaidb_engine::scan_meter::arm(budget, deadline)
+                skaidb_engine::scan_meter::arm(budget, byte_budget, deadline)
             });
         let mut stmt = stmt;
         if matches!(
@@ -7119,6 +7119,12 @@ impl Node {
                         }
                         CollectSink::Rows(_) => {}
                     }
+                    // Charge the retained row's bytes against the statement's
+                    // materialization budget. `filled()` (LIMIT) caps *counted*
+                    // rows, but an unbounded gather (no/large LIMIT over
+                    // multi-KB rows) accumulates the whole result here — the
+                    // path that OOM-killed 4 GB coordinators.
+                    skaidb_engine::scan_meter::tick_bytes(bytes.len())?;
                     out.push((k, doc));
                     if filled(&out) {
                         break;

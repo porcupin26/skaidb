@@ -2320,11 +2320,13 @@ impl Database {
         inv
     }
 
-    /// The `(scan_row_budget, statement_timeout_secs)` pair for callers that
-    /// arm the scan meter outside this database (the cluster coordinator).
-    pub fn scan_meter_opts(&self) -> (usize, u64) {
+    /// The `(scan_row_budget, scan_byte_budget, statement_timeout_secs)` tuple
+    /// for callers that arm the scan meter outside this database (the cluster
+    /// coordinator, whose gather materializes the result set to bound).
+    pub fn scan_meter_opts(&self) -> (usize, usize, u64) {
         (
             self.storage_opts.scan_row_budget,
+            self.storage_opts.scan_byte_budget,
             self.storage_opts.statement_timeout_secs,
         )
     }
@@ -2336,7 +2338,11 @@ impl Database {
         let secs = self.storage_opts.statement_timeout_secs;
         let deadline = (secs != 0)
             .then(|| std::time::Instant::now() + std::time::Duration::from_secs(secs));
-        crate::scan_meter::arm(self.storage_opts.scan_row_budget, deadline)
+        crate::scan_meter::arm(
+            self.storage_opts.scan_row_budget,
+            self.storage_opts.scan_byte_budget,
+            deadline,
+        )
     }
 
     /// Execute an already-parsed read-only statement; see
@@ -4586,6 +4592,7 @@ impl Database {
                 // but residual predicates (other columns, NOT IN exclusions)
                 // can still drop a fetched row.
                 if matches_filter(filter, &doc)? {
+                    crate::scan_meter::tick_bytes(bytes.len())?;
                     rows.push((key, doc));
                 }
             }
@@ -4644,6 +4651,7 @@ impl Database {
                     crate::scan_meter::tick(1)?;
                     if let Ok(doc) = Self::decode_row(&bytes, project) {
                         if matches_filter(filter, &doc)? {
+                            crate::scan_meter::tick_bytes(bytes.len())?;
                             out.push((key, doc));
                             if order.is_none() && fetch_limit.is_some_and(|l| out.len() >= l)
                             {
@@ -4701,6 +4709,7 @@ impl Database {
                         crate::scan_meter::tick(1)?;
                         let doc = Self::decode_row(&bytes, project)?;
                         if matches_filter(filter, &doc)? {
+                            crate::scan_meter::tick_bytes(bytes.len())?;
                             out.push((key, doc));
                             if fetch_limit.is_some_and(|lim| out.len() >= lim) {
                                 break;
@@ -4752,6 +4761,7 @@ impl Database {
                         };
                         let doc = Self::decode_row(&bytes, project)?;
                         if matches_filter(filter, &doc)? {
+                            crate::scan_meter::tick_bytes(bytes.len())?;
                             out.push((key, doc));
                             if out.len() >= lim {
                                 break;
@@ -4828,6 +4838,7 @@ impl Database {
                 let (key, bytes) = item?;
                 let doc = Self::decode_row(&bytes, project)?;
                 if matches_filter(filter, &doc)? {
+                    crate::scan_meter::tick_bytes(bytes.len())?;
                     out.push((key, doc));
                     if order.is_none() && fetch_limit.is_some_and(|lim| out.len() >= lim) {
                         break;
@@ -4881,9 +4892,11 @@ impl Database {
                     if doc.get_path(col) != boundary.as_ref() {
                         break;
                     }
+                    crate::scan_meter::tick_bytes(bytes.len())?;
                     out.push((row_key, doc));
                     continue;
                 }
+                crate::scan_meter::tick_bytes(bytes.len())?;
                 out.push((row_key, doc));
                 // Stop early when the rows already arrive in `order`, or
                 // when the query never asked for one.

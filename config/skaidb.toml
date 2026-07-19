@@ -53,6 +53,12 @@ at_rest_keyfile = ""
 memtable_size_mb = 256
 # RAM read cache (entries) for point reads that miss the memtable; 0 disables.
 read_cache_entries = 16384
+# Per-statement scan limits (memory safety). scan_row_budget caps rows a
+# statement may examine; scan_byte_budget caps bytes it may materialize into a
+# result set (bounds coordinator memory — a scan under the row budget can still
+# gather GBs of multi-KB rows). 0 disables either. Defaults shown.
+# scan_row_budget = 250000
+# scan_byte_budget = 268435456  # 256 MB
 compaction_strategy = "lazy_leveled"
 use_io_uring = true
 

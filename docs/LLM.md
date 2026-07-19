@@ -144,10 +144,16 @@ Key facts an agent must know:
   pair with `ttl`. `SHOW STATUS` table counts are approximate version
   counts (exact after compaction).
 - **Scan budget**: one statement may examine at most `storage.scan_row_budget`
-  rows (default 250k; 0 disables) and run at most
-  `storage.statement_timeout_secs` (default 120s; 0 disables) — past either it
-  errors with `resource limit: ...`. `LIMIT` bounds output, not scan work: a
-  filter matching nothing under `ORDER BY .. LIMIT` walks the whole range.
+  rows (default 250k; 0 disables), materialize at most `storage.scan_byte_budget`
+  bytes into a result set (default 256 MB; 0 disables), and run at most
+  `storage.statement_timeout_secs` (default 120s; 0 disables) — past any of them
+  it errors with `resource limit: ...`. `LIMIT` bounds output, not scan work: a
+  filter matching nothing under `ORDER BY .. LIMIT` walks the whole range. The
+  row budget bounds work; the byte budget bounds MEMORY — a scan of many
+  multi-KB rows can stay under 250k rows yet gather gigabytes on the
+  coordinator (the read path that OOM-killed 4 GB nodes). Streaming
+  `COUNT`/`DISTINCT` retain nothing and are never charged bytes; add a `LIMIT`,
+  narrow the projection/filter, or raise `storage.scan_byte_budget` to lift it.
 - **Aggregates**: `COUNT(*)`, `COUNT(expr)`, `COUNT(DISTINCT expr)` (exact),
   filtered `COUNT(*)` is answered index-only when a secondary index fully
   covers a conjunctive equality/range filter (no row reads — safe on tables
@@ -662,7 +668,10 @@ only. `internode_tls_{cert,key,ca}` for cert mode; mint them with
 memory_target (`"auto"`, `"1GB"` — budgets memtable + read cache + FTS
 writer heaps + TS heads; set explicitly in containers), memtable_size_mb,
 read_cache_entries, scan_row_budget (rows one statement may examine,
-default 250000, 0 = off), statement_timeout_secs (default 120, 0 = off);
+default 250000, 0 = off), scan_byte_budget (bytes one statement may
+materialize into a result set — bounds coordinator memory, not rows;
+default 268435456 [256 MB], 0 = off), statement_timeout_secs (default 120,
+0 = off);
 `[encryption]` client_tls (`off`/`opportunistic`/`required` — client-facing
 TLS for the binary + REST ports; `opportunistic` serves TLS and plaintext on
 one port [ClientHello sniff], `required` refuses plaintext) with

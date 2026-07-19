@@ -744,6 +744,38 @@ mod tests {
         assert!(msg.contains("date"), "{msg}");
     }
 
+    /// The byte budget bounds MEMORY, not rows examined: a scan well under the
+    /// row budget can still materialize a multi-GB result of large rows (the
+    /// coordinator-gather shape that OOM-killed 4 GB nodes). A wide-open
+    /// `SELECT *` over big rows must error on the byte budget; a streaming
+    /// `COUNT(*)` over the same rows retains nothing and must succeed.
+    #[test]
+    fn byte_budget_bounds_materialized_result_not_examined_rows() {
+        let mut opts = skaidb_storage::EngineOptions {
+            scan_row_budget: 0,               // rows unbounded — isolate the byte path
+            scan_byte_budget: 256 * 1024,     // 256 KB
+            ..Default::default()
+        };
+        opts.statement_timeout_secs = 0;
+        let mut s = Session::open_with_options(tmp(), opts).unwrap();
+        s.execute("CREATE TABLE docs (PRIMARY KEY (id));").unwrap();
+        let big = "x".repeat(2048); // ~2 KB payload per row
+        for i in 0..1000 {
+            s.execute(&format!(
+                "INSERT INTO docs (id, body) VALUES ('k{i:05}', '{big}');"
+            ))
+            .unwrap();
+        }
+        // Materializing ~2 MB of rows blows the 256 KB byte budget.
+        let err = s.execute("SELECT * FROM docs;").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("bytes materialized"), "{msg}");
+        assert!(msg.contains("scan_byte_budget"), "{msg}");
+        // A streaming aggregate over the same rows retains nothing: no charge.
+        let ok = s.execute("SELECT COUNT(*) AS n FROM docs;");
+        assert!(ok.is_ok(), "COUNT should stream under the byte budget: {ok:?}");
+    }
+
     /// A filter matching nothing under ORDER BY .. LIMIT walks the whole
     /// index range; the scan budget must turn that into an error instead of
     /// unbounded work (the categorizer-poll shape that OOM-looped

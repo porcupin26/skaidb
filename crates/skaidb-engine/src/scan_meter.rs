@@ -24,6 +24,8 @@ thread_local! {
     static BUDGET: Cell<usize> = const { Cell::new(0) }; // 0 = unarmed
     static EXAMINED: Cell<usize> = const { Cell::new(0) };
     static DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+    static BYTE_BUDGET: Cell<usize> = const { Cell::new(0) }; // 0 = no byte budget
+    static MATERIALIZED: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Guard that disarms the meter when the statement finishes (any exit path).
@@ -35,24 +37,58 @@ impl Drop for Armed {
         BUDGET.with(|b| b.set(0));
         EXAMINED.with(|e| e.set(0));
         DEADLINE.with(|d| d.set(None));
+        BYTE_BUDGET.with(|b| b.set(0));
+        MATERIALIZED.with(|m| m.set(0));
     }
 }
 
 /// Arm the meter for the current thread's statement. `budget` rows examined
-/// (`0` = no row budget), optional wall-clock `deadline`. Nested arms keep
-/// the outermost meter: a statement's internal helpers must not reset the
-/// count mid-flight.
-pub fn arm(budget: usize, deadline: Option<Instant>) -> Option<Armed> {
-    if BUDGET.with(Cell::get) != 0 || DEADLINE.with(Cell::get).is_some() {
+/// (`0` = no row budget), `byte_budget` bytes MATERIALIZED into a result set
+/// (`0` = no byte budget — see [`tick_bytes`]), optional wall-clock `deadline`.
+/// Nested arms keep the outermost meter: a statement's internal helpers must
+/// not reset the count mid-flight.
+pub fn arm(budget: usize, byte_budget: usize, deadline: Option<Instant>) -> Option<Armed> {
+    if BUDGET.with(Cell::get) != 0
+        || BYTE_BUDGET.with(Cell::get) != 0
+        || DEADLINE.with(Cell::get).is_some()
+    {
         return None; // already armed by an outer scope
     }
-    if budget == 0 && deadline.is_none() {
+    if budget == 0 && byte_budget == 0 && deadline.is_none() {
         return None; // metering disabled
     }
     BUDGET.with(|b| b.set(budget));
     EXAMINED.with(|e| e.set(0));
     DEADLINE.with(|d| d.set(deadline));
+    BYTE_BUDGET.with(|b| b.set(byte_budget));
+    MATERIALIZED.with(|m| m.set(0));
     Some(Armed(()))
+}
+
+/// Record `bytes` RETAINED into the statement's result set; errors once the
+/// running total exceeds the byte budget. This bounds MEMORY (a 250k-row scan
+/// of multi-KB rows is within the row budget yet materializes GBs — the read
+/// path that OOM-killed production coordinators). Ticked at result-push sites,
+/// not the decode loop, so a streaming count/DISTINCT (which retains nothing)
+/// is never charged.
+#[inline]
+pub fn tick_bytes(bytes: usize) -> Result<(), EngineError> {
+    let budget = BYTE_BUDGET.with(Cell::get);
+    if budget == 0 {
+        return Ok(());
+    }
+    let total = MATERIALIZED.with(|m| {
+        let v = m.get().saturating_add(bytes);
+        m.set(v);
+        v
+    });
+    if total > budget {
+        return Err(EngineError::ResourceLimit(format!(
+            "scan result exceeded {budget} bytes materialized: add a LIMIT, narrow the \
+             projection/filter, or raise storage.scan_byte_budget"
+        )));
+    }
+    Ok(())
 }
 
 /// Record `n` rows examined; errors once the statement exceeds its budget or
