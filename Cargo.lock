@@ -1274,6 +1274,7 @@ version = "0.105.1"
 dependencies = [
  "brotli",
  "lz4_flex 0.11.6",
+ "ring",
  "skaidb-types",
  "thiserror",
 ]

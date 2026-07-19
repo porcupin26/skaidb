@@ -10,6 +10,12 @@ pub enum StorageError {
     /// torn or corrupted write. The offset is where the bad record began.
     #[error("WAL corruption at offset {offset}: {detail}")]
     Corruption { offset: u64, detail: &'static str },
+
+    /// At-rest encryption failure: a bad/missing key, an unloadable keyfile,
+    /// or an AEAD authentication failure (tampered or wrong-key data). Kept
+    /// distinct from `Corruption` so "wrong key" never looks like disk rot.
+    #[error("at-rest crypto: {0}")]
+    Crypto(String),
 }
 
 /// Convenience result alias for storage operations.

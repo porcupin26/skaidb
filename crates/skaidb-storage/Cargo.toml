@@ -14,3 +14,4 @@ skaidb-types.workspace = true
 thiserror.workspace = true
 lz4_flex.workspace = true
 brotli.workspace = true
+ring.workspace = true
