@@ -719,10 +719,10 @@ const CATCH_UP_DELAY: Duration = Duration::from_millis(120);
 /// Per-peer connect+round-trip budget for liveness probes in `/admin/status`.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 
-/// A node whose local data footprint is below this at (re)join is treated as a
-/// from-empty resync (a wipe): it stops serving scans locally until it catches
-/// up. A node that kept its SSTables restarts well above this, so a normal
-/// restart is never flagged.
+/// A peer must hold at least this much data to count as a resync source (and to
+/// arm resync detection). Below it there's no real data to gather, so a fresh
+/// all-empty cluster — where no node exceeds this — is never flagged. A node is
+/// then flagged as resyncing when it holds less than HALF such a peer.
 const RESYNC_EMPTY_BYTES: u64 = 32 * 1024 * 1024;
 
 /// How often the background resync watcher re-evaluates. Sleeps first, so the
@@ -4895,39 +4895,42 @@ impl Node {
             if self.resyncing.load(Ordering::Relaxed) {
                 continue;
             }
-            // Not yet flagged and catch-up not done: detect a from-empty start —
-            // our data is tiny AND a peer holds far more (a fresh all-empty
-            // cluster is never flagged). Cheap `DataBytes` probe (no df). Record
-            // which complete peers we'll backfill FROM for the "resync from …"
-            // display.
+            // Not yet flagged and catch-up not done: probe peers (cheap
+            // `DataBytes`, no df) and flag if a peer holds real data and we hold
+            // LESS THAN HALF of it. `< half` covers both a from-empty start AND
+            // a node that restarted PART-WAY through a backfill — e.g. after an
+            // OOM, whose on-disk data already exceeds the empty threshold but is
+            // still far behind. It does NOT flag a complete node: even a heavily
+            // compacted replica stays well above half a peer's footprint (and an
+            // uncompacted one can exceed it), and a fresh all-empty cluster has
+            // no peer above the threshold. Record which complete peers we'll
+            // backfill FROM for the "resync from …" display.
             let local = self.local_data_bytes();
-            if local < RESYNC_EMPTY_BYTES {
-                let mut target = 0u64;
-                let mut sources = Vec::new();
-                for (id, addr) in self.peer_addrs_with_ids() {
-                    if let Ok(Response::DataBytes { bytes }) =
-                        self.pool.call(&addr, &Request::DataBytes)
-                    {
-                        target = target.max(bytes);
-                        if bytes >= RESYNC_EMPTY_BYTES {
-                            let host = id.0.rsplit_once(':').map(|(h, _)| h).unwrap_or(&id.0);
-                            sources.push(host.to_string());
-                        }
+            let mut target = 0u64;
+            let mut sources = Vec::new();
+            for (id, addr) in self.peer_addrs_with_ids() {
+                if let Ok(Response::DataBytes { bytes }) =
+                    self.pool.call(&addr, &Request::DataBytes)
+                {
+                    target = target.max(bytes);
+                    if bytes >= RESYNC_EMPTY_BYTES {
+                        let host = id.0.rsplit_once(':').map(|(h, _)| h).unwrap_or(&id.0);
+                        sources.push(host.to_string());
                     }
                 }
-                if target >= RESYNC_EMPTY_BYTES && local.saturating_mul(4) < target {
-                    sources.sort();
-                    self.resync_target_bytes.store(target, Ordering::Relaxed);
-                    self.resync_last_local_bytes.store(0, Ordering::Relaxed);
-                    *self.resync_sources.lock().expect("resync sources") = sources.clone();
-                    self.resyncing.store(true, Ordering::Relaxed);
-                    skaidb_types::slog!(
-                        "skaidb: resync detected — backfilling from {} (target ~{} MB); \
-                         not serving scans locally until caught up",
-                        sources.join(", "),
-                        target / (1024 * 1024)
-                    );
-                }
+            }
+            if target >= RESYNC_EMPTY_BYTES && local.saturating_mul(2) < target {
+                sources.sort();
+                self.resync_target_bytes.store(target, Ordering::Relaxed);
+                self.resync_last_local_bytes.store(0, Ordering::Relaxed);
+                *self.resync_sources.lock().expect("resync sources") = sources.clone();
+                self.resyncing.store(true, Ordering::Relaxed);
+                skaidb_types::slog!(
+                    "skaidb: resync detected — backfilling from {} (target ~{} MB); \
+                     not serving scans locally until caught up",
+                    sources.join(", "),
+                    target / (1024 * 1024)
+                );
             }
         }
     }
