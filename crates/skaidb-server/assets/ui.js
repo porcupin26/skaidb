@@ -85,7 +85,7 @@ async function refreshStatus() {
     ["uptime", meta.uptime_seconds !== undefined ? fmtDuration(meta.uptime_seconds) : undefined],
   ]);
   if (status.clustered) {
-    kv("cluster-info", [
+    const clusterRows = [
       ["members", status.members],
       ["epoch", status.epoch],
       ["in ring", mark(status.self_in_ring)],
@@ -93,7 +93,14 @@ async function refreshStatus() {
       ["read / write consistency", `${status.read_consistency} / ${status.write_consistency}`],
       ["hints pending", status.hints_pending],
       ["resharding", mark(!status.resharding, status.resharding ? "active" : "idle")],
-    ]);
+    ];
+    // A node backfilling from empty (wipe+resync) holds incomplete data and
+    // is routed around by drivers until progress reaches 100%.
+    if (status.resyncing) {
+      const pct = Math.round((status.resync_progress || 0) * 100);
+      clusterRows.push(["resync", `active — ${pct}% (backfilling from empty)`]);
+    }
+    kv("cluster-info", clusterRows);
     renderMembers(status);
   } else {
     kv("cluster-info", [["mode", "single node"]]);
@@ -110,6 +117,9 @@ function renderMembers(status) {
   // server surfaces explicitly.
   const halfJoined = new Set(status.configured_not_in_ring || []);
   const unconfigured = new Set(status.ring_not_configured || []);
+  // Members backfilling from empty — flagged "resync" so an operator sees the
+  // node is holding incomplete data (drivers already route around it).
+  const resyncing = new Set(status.resyncing_endpoints || []);
   // Per-peer replication backlog/lag, keyed by host (peer ids and client
   // endpoints share a host but differ in port). One node per host here.
   const byHost = new Map();
@@ -118,6 +128,12 @@ function renderMembers(status) {
     const tr = document.createElement("tr");
     const idc = document.createElement("td");
     idc.textContent = endpoint;
+    if (resyncing.has(endpoint)) {
+      const b = document.createElement("span");
+      b.className = "badge-resync";
+      b.textContent = "resync";
+      idc.append(" ", b);
+    }
     const cc = document.createElement("td");
     cc.append(mark(!unconfigured.has(endpoint)));
     const rc = document.createElement("td");

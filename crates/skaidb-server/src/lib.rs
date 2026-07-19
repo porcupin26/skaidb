@@ -321,10 +321,31 @@ pub fn run(
     let rest_addr = format!("{}:{}", bind, config.server.rest_port);
 
     let (binary_local, binary_handle) = binary::spawn(&binary_addr, ctx.clone())?;
-    let (rest_local, _rest_handle) = rest::spawn(&rest_addr, ctx.clone())?;
+
+    // REST: with client TLS off, `rest_port` serves plaintext REST as before.
+    // With TLS on, HTTPS moves to `rest_tls_port` (7443) and `rest_port` (7080)
+    // becomes a plaintext HTTP→HTTPS redirect to it — so a stale `http://…:7080`
+    // URL bounces to TLS instead of getting reset under `required`.
+    let tls_on = config.encryption.client_tls != skaidb_config::ClientTlsMode::Off;
+    if tls_on {
+        let rest_tls_addr = format!("{}:{}", bind, config.server.rest_tls_port);
+        let (rest_tls_local, _h) = rest::spawn(&rest_tls_addr, ctx.clone(), rest::RestRole::Data)?;
+        let (rest_local, _rest_handle) = rest::spawn(
+            &rest_addr,
+            ctx.clone(),
+            rest::RestRole::RedirectToTls(config.server.rest_tls_port),
+        )?;
+        skaidb_types::slog!("skaidb REST endpoint listening on https://{rest_tls_local}/query");
+        skaidb_types::slog!(
+            "skaidb REST http://{rest_local} redirects to https://…:{}",
+            config.server.rest_tls_port
+        );
+    } else {
+        let (rest_local, _rest_handle) = rest::spawn(&rest_addr, ctx.clone(), rest::RestRole::Data)?;
+        skaidb_types::slog!("skaidb REST endpoint listening on http://{rest_local}/query");
+    }
 
     skaidb_types::slog!("skaidb binary endpoint listening on {binary_local}");
-    skaidb_types::slog!("skaidb REST endpoint listening on http://{rest_local}/query");
 
     // Background NRT refresher: search-index refresh checks otherwise run
     // only on the write path, so an idle table's last index writes would
@@ -522,7 +543,7 @@ pub fn run(
     let prom_port = config.observability.prometheus_port;
     if prom_port != 0 && prom_port != config.server.rest_port {
         let prom_addr = format!("{}:{}", bind, prom_port);
-        match rest::spawn(&prom_addr, ctx.clone()) {
+        match rest::spawn(&prom_addr, ctx.clone(), rest::RestRole::Data) {
             Ok((prom_local, _h)) => {
                 skaidb_types::slog!("skaidb metrics endpoint listening on http://{prom_local}/metrics")
             }
@@ -815,7 +836,7 @@ pub(crate) mod tests {
     #[test]
     fn rest_query_rows_stream_chunked() {
         let ctx = temp_ctx();
-        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx, rest::RestRole::Data).unwrap();
         let http = |body: &str| -> String {
             let mut stream = TcpStream::connect(addr).unwrap();
             let head = format!(
@@ -864,10 +885,33 @@ pub(crate) mod tests {
         assert!(resp.contains("does not exist"), "{resp}");
     }
 
+    /// The plaintext REST port, when configured as a redirect (TLS enabled),
+    /// answers any request with a 308 to the same host+path on the TLS port —
+    /// preserving method/body — so a stale `http://…:7080` URL reaches HTTPS.
+    #[test]
+    fn rest_redirect_to_tls_bounces_plaintext_to_https() {
+        let ctx = temp_ctx();
+        let (addr, _h) =
+            rest::spawn("127.0.0.1:0", ctx, rest::RestRole::RedirectToTls(7443)).unwrap();
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .write_all(
+                b"POST /query HTTP/1.1\r\nHost: db.example:7080\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 308"), "expected 308, got: {resp}");
+        assert!(
+            resp.contains("Location: https://db.example:7443/query"),
+            "expected https redirect to the TLS port + preserved path, got: {resp}"
+        );
+    }
+
     #[test]
     fn es_rest_subset_end_to_end() {
         let ctx = temp_ctx();
-        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx, rest::RestRole::Data).unwrap();
         let http = |method: &str, path: &str, body: &str| -> String {
             let mut stream = TcpStream::connect(addr).unwrap();
             let head = format!(
@@ -1067,7 +1111,7 @@ pub(crate) mod tests {
     #[test]
     fn web_ui_end_to_end() {
         let ctx = temp_ctx();
-        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx.clone()).unwrap();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx.clone(), rest::RestRole::Data).unwrap();
         let get = |path: &str| -> String {
             let mut stream = TcpStream::connect(addr).unwrap();
             stream
@@ -1129,7 +1173,7 @@ pub(crate) mod tests {
     #[test]
     fn ui_drivers_and_witnesses_over_rest() {
         let ctx = temp_ctx();
-        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx.clone()).unwrap();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx.clone(), rest::RestRole::Data).unwrap();
         let get = |path: &str| -> String {
             let mut stream = TcpStream::connect(addr).unwrap();
             stream
@@ -1238,7 +1282,7 @@ pub(crate) mod tests {
     #[test]
     fn ui_schema_filters_by_role() {
         let ctx = temp_ctx();
-        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx.clone()).unwrap();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx.clone(), rest::RestRole::Data).unwrap();
         let post = |sql: &str| {
             let mut stream = TcpStream::connect(addr).unwrap();
             let head = format!(
@@ -1289,7 +1333,7 @@ pub(crate) mod tests {
     #[test]
     fn sql_admin_statements() {
         let ctx = temp_ctx();
-        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx.clone()).unwrap();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx.clone(), rest::RestRole::Data).unwrap();
         let post = |sql: &str| -> String {
             let mut stream = TcpStream::connect(addr).unwrap();
             let head = format!(
@@ -1345,7 +1389,7 @@ pub(crate) mod tests {
     #[test]
     fn rest_query_db_parameter() {
         let ctx = temp_ctx();
-        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx, rest::RestRole::Data).unwrap();
         let post = |body: &str| -> String {
             let mut stream = TcpStream::connect(addr).unwrap();
             let head = format!(
@@ -1477,7 +1521,7 @@ pub(crate) mod tests {
     #[test]
     fn remote_write_end_to_end() {
         let ctx = temp_ctx();
-        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx, rest::RestRole::Data).unwrap();
         let body = crate::promwrite::tests::encode_write_request(&[
             (
                 &[("__name__", "http_requests_total"), ("job", "api")],
@@ -1516,7 +1560,7 @@ pub(crate) mod tests {
     #[test]
     fn promql_api_end_to_end() {
         let ctx = temp_ctx();
-        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx, rest::RestRole::Data).unwrap();
         // Ingest counters via remote_write: two jobs, 60s apart, +60/step.
         let body = crate::promwrite::tests::encode_write_request(&[
             (
@@ -1587,7 +1631,7 @@ pub(crate) mod tests {
     #[test]
     fn rest_endpoint_end_to_end() {
         let ctx = temp_ctx();
-        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx, rest::RestRole::Data).unwrap();
 
         // DDL + insert, then a query — each over its own connection.
         assert!(http_post(addr, "CREATE TABLE t (PRIMARY KEY (id))").contains("\"ok\":true"));
@@ -1606,7 +1650,7 @@ pub(crate) mod tests {
     #[test]
     fn rest_json_insert_end_to_end() {
         let ctx = temp_ctx();
-        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx, rest::RestRole::Data).unwrap();
 
         let post = |path: &str, body: &str| -> (u16, String) {
             let mut stream = TcpStream::connect(addr).unwrap();
@@ -1659,7 +1703,7 @@ pub(crate) mod tests {
     #[test]
     fn metrics_endpoint_reports_query_counts() {
         let ctx = temp_ctx();
-        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx, rest::RestRole::Data).unwrap();
         http_post(addr, "CREATE TABLE t (PRIMARY KEY (id))");
         http_post(addr, "INSERT INTO t (id) VALUES (1)");
         http_post(addr, "SELECT * FROM t");
@@ -1688,7 +1732,7 @@ pub(crate) mod tests {
     #[test]
     fn metrics_render_correct_types_and_histogram() {
         let ctx = temp_ctx();
-        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx, rest::RestRole::Data).unwrap();
         http_post(addr, "CREATE TABLE t (PRIMARY KEY (id))");
         http_post(addr, "INSERT INTO t (id) VALUES (1)");
         http_post(addr, "SELECT * FROM t");
@@ -1711,7 +1755,7 @@ pub(crate) mod tests {
     #[test]
     fn health_ready_and_status_endpoints() {
         let ctx = temp_ctx();
-        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx, rest::RestRole::Data).unwrap();
 
         assert_eq!(http_get_status(addr, "/health"), 200);
         assert_eq!(http_get_status(addr, "/ready"), 200);
@@ -1722,7 +1766,7 @@ pub(crate) mod tests {
     #[test]
     fn show_tables_over_rest() {
         let ctx = temp_ctx();
-        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx, rest::RestRole::Data).unwrap();
         http_post(addr, "CREATE TABLE alpha (PRIMARY KEY (id))");
         http_post(addr, "CREATE TABLE beta (PRIMARY KEY (id))");
         let body = http_post(addr, "SHOW TABLES");
@@ -2527,7 +2571,7 @@ pub(crate) mod tests {
 
     #[test]
     fn rest_basic_auth_enforced() {
-        let (addr, _h) = rest::spawn("127.0.0.1:0", auth_ctx()).unwrap();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", auth_ctx(), rest::RestRole::Data).unwrap();
 
         // Correct credentials (ada:pencil → base64) authenticate.
         let (status, _) = http_post_auth(
@@ -3072,7 +3116,7 @@ pub(crate) mod tests {
     #[test]
     fn admin_status_over_rest() {
         let ctx = cluster_ctx();
-        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx, rest::RestRole::Data).unwrap();
         let (status, body) = http_post_path(addr, "/admin/status", "");
         assert_eq!(status, 200);
         assert!(body.contains("\"clustered\":true"), "got: {body}");
@@ -3083,7 +3127,7 @@ pub(crate) mod tests {
     #[test]
     fn status_advertises_member_client_endpoints() {
         let ctx = cluster_ctx();
-        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx, rest::RestRole::Data).unwrap();
         // /status carries the members' client SQL endpoints (host:quic_port) so a
         // client that reached one seed can discover its peers for failover.
         let body = http_get(addr, "/status");
@@ -3094,7 +3138,7 @@ pub(crate) mod tests {
     #[test]
     fn admin_config_show_get_set_over_rest() {
         let ctx = temp_ctx();
-        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx).unwrap();
+        let (addr, _h) = rest::spawn("127.0.0.1:0", ctx, rest::RestRole::Data).unwrap();
 
         // Show: full config, with the (empty) superuser password present.
         let (status, body) = http_post_path(addr, "/admin/config", "");

@@ -669,7 +669,12 @@ one port [ClientHello sniff], `required` refuses plaintext) with
 tls_cert_file + tls_key_file. Effective mode shows at `/status` as
 `client_tls`. Clients pass `--tls --tls-ca <ca.crt>` (or `--tls-insecure` for
 self-signed; `--tls-server-name`, default `skaidb`) to `skaidbsh`; the driver
-takes `Client::connect_many_tls(...)`.
+takes `Client::connect_many_tls(...)`. **REST port when TLS is on:** with
+`client_tls != off`, HTTPS REST moves to `server.rest_tls_port` (default
+**7443**) and `rest_port` (7080) becomes a plaintext HTTP→HTTPS **308 redirect**
+to it — so point REST/UI/monitoring clients at `https://…:7443` (`skaidbsh`
+auto-targets 7443 when a `--tls*` flag is set). With `client_tls = off`, 7080
+serves plaintext REST as before and 7443 is not bound.
 `[encryption]` also does AT-REST: at_rest_enabled = true + at_rest_kek_source
 = keyfile + at_rest_keyfile = <path> encrypts every table/index WAL + SSTable
 with AES-256-GCM (envelope: a keyfile KEK wraps per-file DEKs). Generate a
@@ -678,6 +683,15 @@ off-box; losing it loses all encrypted data). New files encrypt; existing
 plaintext files stay readable (mixed migration — fully encrypt via a rolling
 per-node wipe+rejoin). A missing/bad keyfile fails startup loud. Restart-scoped.
 Shows at `/status` as `at_rest`. (kms KEK source not yet implemented.)
+**RESYNC state**: a node that (re)joins from a WIPED data dir (far less data
+than its peers) is flagged `resyncing` while it backfills. A resyncing node does
+NOT serve full-scan/aggregate/count results from its own (incomplete) copy — it
+gathers from complete peers — so clients get correct results at every
+consistency level even mid-backfill. `/status` exposes the node's own
+`resyncing`/`resync_progress` (filesize-based, 0..1) and a `resyncing_endpoints`
+list; `skaidbsh`/the driver drop those endpoints from the failover pool, and the
+UI shows the node as `resync`. The flag clears when the startup catch-up repair
+completes. This is what makes the at-rest wipe+rejoin safe against live reads.
 `[observability]` slow_query_ms, query_log_*,
 log_format/log_file, per_table_metrics, prometheus_port, self_scrape,
 self_scrape_interval_secs, node_stats, node_stats_interval_secs; `[ui]` enabled;

@@ -184,6 +184,16 @@ pub struct Node {
     /// loop or an admin REPAIR). Served to peers in HostStats so they defer
     /// their own pass — concurrent passes dent write quorum.
     repairing: AtomicBool,
+    /// True while this node is backfilling from an empty data directory after
+    /// a (re)join (a wipe+resync). It holds INCOMPLETE data, so `holds_full_table`
+    /// returns false — counts/scans/aggregates gather from complete peers instead
+    /// of serving this node's partial local copy — and the state is surfaced so
+    /// the UI shows "resync" and drivers route around it. Cleared once the
+    /// startup catch-up repair completes.
+    resyncing: AtomicBool,
+    /// Denominator for filesize-based resync progress: the largest peer's data
+    /// footprint (bytes), captured when the resync began. 0 = unknown.
+    resync_target_bytes: AtomicU64,
     /// Completed anti-entropy passes since boot (monotonic). Placement-
     /// transition drivers gate finalize on every member advancing this
     /// by 2 past a baseline — see `drive_placement_transitions`.
@@ -331,6 +341,12 @@ pub struct ClusterStats {
     pub shedding_writes: bool,
     pub memory_used_bytes: u64,
     pub memory_limit_bytes: u64,
+    /// Whether this node is backfilling from empty after a (re)join (a wipe+
+    /// resync): it holds incomplete data, does not serve local scans/counts,
+    /// and should be routed around until caught up.
+    pub resyncing: bool,
+    /// Resync completion in `0.0..=1.0` (filesize-based). 1.0 when not resyncing.
+    pub resync_progress: f64,
 }
 
 /// A buffered write awaiting handoff to a recovered replica:
@@ -693,6 +709,20 @@ const CATCH_UP_DELAY: Duration = Duration::from_millis(120);
 /// Per-peer connect+round-trip budget for liveness probes in `/admin/status`.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 
+/// A node whose local data footprint is below this at (re)join is treated as a
+/// from-empty resync (a wipe): it stops serving scans locally until it catches
+/// up. A node that kept its SSTables restarts well above this, so a normal
+/// restart is never flagged.
+const RESYNC_EMPTY_BYTES: u64 = 32 * 1024 * 1024;
+
+/// How often the background resync watcher re-evaluates. Sleeps first, so the
+/// fast unit tests (which finish well within the test interval) never trigger a
+/// probe and stay timing-stable.
+#[cfg(not(test))]
+const RESYNC_WATCH_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const RESYNC_WATCH_INTERVAL: Duration = Duration::from_secs(3600);
+
 impl Node {
     /// Create a node with the given local database and cluster config. If a
     /// persisted membership from a prior run exists (a node that joined/left
@@ -729,6 +759,8 @@ impl Node {
             maint_tx: Mutex::new(maint_tx),
             maint_pending: AtomicUsize::new(0),
             repairing: AtomicBool::new(false),
+            resyncing: AtomicBool::new(false),
+            resync_target_bytes: AtomicU64::new(0),
             repair_passes: AtomicU64::new(0),
             placement_drive_at: Mutex::new(Instant::now()),
             placement_baselines: Mutex::new(std::collections::HashMap::new()),
@@ -1350,6 +1382,8 @@ impl Node {
             shedding_writes: self.mem.shedding(),
             memory_used_bytes: self.mem.snapshot().0,
             memory_limit_bytes: self.mem.snapshot().1,
+            resyncing: self.resyncing.load(Ordering::Relaxed),
+            resync_progress: self.resync_progress(),
         }
     }
 
@@ -1377,7 +1411,12 @@ impl Node {
             .ok()
             .map(|db| db.dir().to_path_buf())
             .unwrap_or_default();
-        let mut out = vec![(self.id.0.clone(), Some(crate::host::sample(&dir)))];
+        let mut self_stats = crate::host::sample(&dir);
+        self_stats.repairing = self.repairing.load(Ordering::Relaxed);
+        self_stats.data_dir_bytes = self.local_data_bytes();
+        self_stats.resyncing = self.resyncing.load(Ordering::Relaxed);
+        self_stats.resync_progress = self.resync_progress();
+        let mut out = vec![(self.id.0.clone(), Some(self_stats))];
         let peers: Vec<(NodeId, String)> = self
             .members_snapshot()
             .into_iter()
@@ -1439,6 +1478,87 @@ impl Node {
     /// contention; callers already treat that as "stats unavailable".
     pub fn db_stats(&self, per_table: bool) -> Option<DbStats> {
         self.local_read_bounded().map(|db| db.stats(per_table))
+    }
+
+    /// This node's on-disk data footprint (SSTable bytes); 0 under lock
+    /// contention. The filesize measure behind resync progress.
+    pub fn local_data_bytes(&self) -> u64 {
+        self.db_stats(false).map(|s| s.disk_bytes).unwrap_or(0)
+    }
+
+    /// Whether this node is backfilling from empty after a (re)join.
+    pub fn is_resyncing(&self) -> bool {
+        self.resyncing.load(Ordering::Relaxed)
+    }
+
+    /// Resync completion in `0.0..=1.0`, filesize-based (local data bytes over
+    /// the target captured at resync start). 1.0 when not resyncing; 0.0 when
+    /// resyncing but the target is unknown.
+    pub fn resync_progress(&self) -> f64 {
+        if !self.resyncing.load(Ordering::Relaxed) {
+            return 1.0;
+        }
+        // Target = the largest peer's data footprint. Prefer a value captured at
+        // resync start; otherwise read the host-stats cache (no probe). 0 until
+        // a peer sample is seen — report 0.0 progress rather than divide by it.
+        let mut target = self.resync_target_bytes.load(Ordering::Relaxed);
+        if target == 0 {
+            target = self.cached_max_peer_data_bytes();
+            if target > 0 {
+                self.resync_target_bytes.store(target, Ordering::Relaxed);
+            }
+        }
+        if target == 0 {
+            return 0.0;
+        }
+        (self.local_data_bytes() as f64 / target as f64).clamp(0.0, 1.0)
+    }
+
+    /// Client endpoints (`host:quic_port`) of members currently known to be
+    /// resyncing — this node (if resyncing) plus any peer whose last cached
+    /// host-stats sample said so. Best-effort (depends on cache freshness); a
+    /// driver subtracts these from the full endpoint list so it never pins its
+    /// coordinator to a backfilling node. Correctness does NOT depend on this —
+    /// `holds_full_table` already makes a resyncing coordinator gather from
+    /// complete peers — this only saves the latency/load of routing there.
+    pub fn resyncing_client_endpoints(&self, quic_port: u16) -> Vec<String> {
+        let to_client = |id: &str| {
+            let host = id.rsplit_once(':').map(|(h, _)| h).unwrap_or(id);
+            format!("{host}:{quic_port}")
+        };
+        let mut out = Vec::new();
+        if self.resyncing.load(Ordering::Relaxed) {
+            out.push(to_client(&self.id.0));
+        }
+        if let Ok(cache) = self.host_cache.lock() {
+            for (id, (stats, _, _)) in cache.iter() {
+                if stats.resyncing {
+                    out.push(to_client(&id.0));
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The largest peer's on-disk data footprint (bytes) from the host-stats
+    /// cache — the denominator for resync progress. No probe (the cache is
+    /// refreshed by the periodic monitoring path); 0 if no peer sample is
+    /// cached yet.
+    fn cached_max_peer_data_bytes(&self) -> u64 {
+        self.host_cache
+            .lock()
+            .ok()
+            .map(|cache| {
+                cache
+                    .iter()
+                    .filter(|(id, _)| **id != self.id)
+                    .map(|(_, (stats, _, _))| stats.data_dir_bytes)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
     }
 
     /// The current membership as node ids (for diagnostics).
@@ -1710,6 +1830,14 @@ impl Node {
     /// local search). A pin holds the whole table by definition; a non-pin
     /// holds none of it.
     fn holds_full_table(&self, table: &str) -> bool {
+        // A node backfilling from empty holds INCOMPLETE data. Never treat it
+        // as a full holder — otherwise the local-serving fast paths (count(*),
+        // filtered count, DISTINCT, ordered reads, local search) answer from
+        // this node's partial copy at EVERY consistency level. Returning false
+        // routes those through the cluster gather, which merges complete peers.
+        if self.resyncing.load(Ordering::Relaxed) {
+            return false;
+        }
         let full = |p: &TablePlacement| match p {
             TablePlacement::Pinned(pins) => pins.contains(&self.id),
             TablePlacement::Rf(n) => *n >= self.member_count(),
@@ -4528,6 +4656,8 @@ impl Node {
         }
         let node = Arc::clone(self);
         thread::spawn(move || node.startup_catch_up());
+        let node = Arc::clone(self);
+        thread::spawn(move || node.resync_watch_loop());
         // Continuous anti-entropy: periodically reconcile so a missed broadcast
         // (e.g. a DDL that committed at quorum while this node was momentarily
         // behind) converges on its own, without an operator running repair.
@@ -4692,6 +4822,62 @@ impl Node {
         }
     }
 
+    /// Background resync watcher: separate from `startup_catch_up` so the join
+    /// path stays fast and side-effect-free (adding probes there perturbed
+    /// timing-sensitive tests). Periodically decides whether this node is a
+    /// from-empty resync — its data is tiny AND a peer holds far more (a fresh
+    /// cluster where every node starts empty is never flagged) AND no repair
+    /// pass has completed yet (`repair_passes == 0`, the lifecycle "caught up"
+    /// signal; filesize alone can't tell caught-up from compacted-smaller). The
+    /// peer probe is a cheap `DataBytes` (engine stats: no `df`, no per-table
+    /// scan). While flagged, `holds_full_table` returns false so scans gather
+    /// from complete peers and drivers route around this node.
+    fn resync_watch_loop(self: Arc<Self>) {
+        loop {
+            thread::sleep(RESYNC_WATCH_INTERVAL);
+            if self.member_count() <= 1 {
+                self.resyncing.store(false, Ordering::Relaxed);
+                continue;
+            }
+            // A completed repair pass means catch-up finished: never resyncing.
+            if self.repair_passes.load(Ordering::Relaxed) > 0 {
+                if self.resyncing.swap(false, Ordering::Relaxed) {
+                    skaidb_types::slog!("skaidb: resync complete — serving normally");
+                }
+                continue;
+            }
+            let local = self.local_data_bytes();
+            let behind = if local < RESYNC_EMPTY_BYTES {
+                let target = self
+                    .peer_addrs()
+                    .iter()
+                    .filter_map(|a| match self.pool.call(a, &Request::DataBytes) {
+                        Ok(Response::DataBytes { bytes }) => Some(bytes),
+                        _ => None,
+                    })
+                    .max()
+                    .unwrap_or(0);
+                if target >= RESYNC_EMPTY_BYTES && local.saturating_mul(4) < target {
+                    self.resync_target_bytes.store(target, Ordering::Relaxed);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if behind && !self.resyncing.swap(true, Ordering::Relaxed) {
+                skaidb_types::slog!(
+                    "skaidb: resync detected — backfilling from empty (target ~{} MB); \
+                     not serving scans locally until caught up",
+                    self.resync_target_bytes.load(Ordering::Relaxed) / (1024 * 1024)
+                );
+            } else if !behind {
+                self.resyncing.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+
     fn handle_internode(&self, stream: TcpStream) {
         // Authenticate the connection (token challenge / mTLS handshake / none)
         // before serving any RPC. A peer that can't satisfy the configured mode
@@ -4722,6 +4908,9 @@ impl Node {
     fn apply_local(&self, req: Request) -> Response {
         match req {
             Request::Ping => Response::Pong,
+            Request::DataBytes => Response::DataBytes {
+                bytes: self.local_data_bytes(),
+            },
             Request::HostStats => {
                 let dir = match self.local_read_bounded() {
                     Some(db) => db.dir().to_path_buf(),
@@ -4729,6 +4918,9 @@ impl Node {
                 };
                 let mut stats = crate::host::sample(&dir);
                 stats.repairing = self.repairing.load(Ordering::Relaxed);
+                stats.data_dir_bytes = self.local_data_bytes();
+                stats.resyncing = self.resyncing.load(Ordering::Relaxed);
+                stats.resync_progress = self.resync_progress();
                 match serde_json::to_string(&stats) {
                     Ok(json) => Response::HostStats { json },
                     Err(e) => Response::Err(format!("encode host stats: {e}")),

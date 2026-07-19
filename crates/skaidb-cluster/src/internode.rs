@@ -298,6 +298,10 @@ pub enum Request {
     /// Ask a peer for its host system statistics (CPU, memory, disk IO,
     /// disk space) for the UI's per-node view.
     HostStats,
+    /// Ask a peer for its on-disk data footprint (SSTable bytes) — a cheap probe
+    /// (engine stats, no `df`, no per-table scan) used at (re)join to decide
+    /// whether this node started far behind (a from-empty resync).
+    DataBytes,
 }
 
 /// A response from a peer member.
@@ -376,6 +380,8 @@ pub enum Response {
     /// serde_json-encoded [`crate::host::HostStats`] (self-describing, so
     /// fields can grow without a wire change).
     HostStats { json: String },
+    /// Reply to [`Request::DataBytes`]: the peer's on-disk data footprint (bytes).
+    DataBytes { bytes: u64 },
     /// Reply to [`Request::TsQuery`]: this node's matching series and samples.
     TsSeries {
         series: TsSeriesData,
@@ -453,6 +459,7 @@ const REQ_GIDXPRODUCED: u8 = 35;
 const REQ_TABLESEQ: u8 = 36;
 const REQ_SCANSINCE: u8 = 37;
 const REQ_REPAIRSEQ: u8 = 38;
+const REQ_DATABYTES: u8 = 39;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
@@ -474,6 +481,7 @@ const RES_HOSTSTATS: u8 = 16;
 const RES_DIGEST: u8 = 17;
 const RES_TABLESEQ: u8 = 18;
 const RES_DELTAPAGE: u8 = 19;
+const RES_DATABYTES: u8 = 21;
 const RES_REPAIRSEQ: u8 = 20;
 
 impl Request {
@@ -758,6 +766,7 @@ impl Request {
             }
             Request::NodeStatus => o.push(REQ_NODESTATUS),
             Request::HostStats => o.push(REQ_HOSTSTATS),
+            Request::DataBytes => o.push(REQ_DATABYTES),
         }
     }
 
@@ -994,6 +1003,7 @@ impl Request {
             },
             REQ_NODESTATUS => Request::NodeStatus,
             REQ_HOSTSTATS => Request::HostStats,
+            REQ_DATABYTES => Request::DataBytes,
             _ => return Err(WireError::Malformed("unknown request op")),
         })
     }
@@ -1117,6 +1127,10 @@ impl Response {
             Response::HostStats { json } => {
                 o.push(RES_HOSTSTATS);
                 put_str(o, json);
+            }
+            Response::DataBytes { bytes } => {
+                o.push(RES_DATABYTES);
+                o.extend_from_slice(&bytes.to_le_bytes());
             }
             Response::NodeStatus {
                 epoch,
@@ -1260,6 +1274,7 @@ impl Response {
             RES_ERR => Response::Err(c.string()?),
             RES_PONG => Response::Pong,
             RES_HOSTSTATS => Response::HostStats { json: c.string()? },
+            RES_DATABYTES => Response::DataBytes { bytes: c.u64()? },
             RES_NODESTATUS => {
                 let epoch = c.u64()?;
                 let n = c.u32()? as usize;

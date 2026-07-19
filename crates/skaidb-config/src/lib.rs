@@ -215,6 +215,11 @@ pub struct ServerConfig {
     pub bind_addr: String,
     pub quic_port: u16,
     pub rest_port: u16,
+    /// HTTPS REST port, used only when `encryption.client_tls` is on: the TLS
+    /// REST API is served here (default 7443) and `rest_port` (7080) becomes a
+    /// plaintext HTTP→HTTPS redirect to it. With `client_tls = off`, `rest_port`
+    /// serves plaintext REST as before and this port is not bound.
+    pub rest_tls_port: u16,
     pub node_role: NodeRole,
     pub data_dir: String,
     /// Reject every client-initiated mutation (INSERT/UPDATE/DELETE, DDL,
@@ -518,6 +523,7 @@ impl Default for ServerConfig {
             bind_addr: "127.0.0.1".to_string(),
             quic_port: 7000,
             rest_port: 7080,
+            rest_tls_port: 7443,
             node_role: NodeRole::Member,
             data_dir: "/var/lib/skaidb".to_string(),
             read_only: false,

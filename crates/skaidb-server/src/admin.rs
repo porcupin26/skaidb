@@ -214,6 +214,8 @@ pub fn handle(ctx: &Shared, role: &str, cmd: AdminCmd) -> (u16, Json) {
                     // What membership is configured (seeds) vs. what is live (ring).
                     "configured": stats.configured,
                     "self_in_ring": stats.self_in_ring,
+                    "resyncing": stats.resyncing,
+                    "resync_progress": stats.resync_progress,
                     "members": members,
                     "peers": peers_json,
                     "discrepancies": {

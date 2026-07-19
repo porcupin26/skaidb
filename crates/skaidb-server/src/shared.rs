@@ -389,6 +389,16 @@ impl Backend {
             }
         }
     }
+
+    /// Client endpoints of members currently known to be resyncing (a driver
+    /// subtracts these from `member_client_endpoints` to route around a
+    /// backfilling node). Empty for a standalone backend.
+    pub fn resyncing_client_endpoints(&self, quic_port: u16) -> Vec<String> {
+        match self {
+            Backend::Local(_) => Vec::new(),
+            Backend::Cluster(node) => node.resyncing_client_endpoints(quic_port),
+        }
+    }
 }
 
 /// State shared across connection-handling threads.

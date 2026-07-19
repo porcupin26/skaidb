@@ -399,7 +399,7 @@ impl Shell {
         };
         Ok(Shell {
             backend,
-            rest_port: cli.rest_port,
+            rest_port: effective_rest_port(cli),
             user: cli.user.clone(),
             password: cli.password.clone(),
             rest_tls: build_rest_tls(cli)?,
@@ -836,31 +836,54 @@ fn sql_endpoints(cli: &Cli) -> Vec<String> {
 }
 
 /// REST endpoints: the bare host of each entry with `--rest-port`.
+/// REST port to target. An explicit `--rest-port` wins; otherwise TLS moves the
+/// default to the HTTPS port (7443), since a TLS-enabled server serves HTTPS
+/// there and only redirects on 7080.
+fn effective_rest_port(cli: &Cli) -> u16 {
+    if cli.rest_port != 7080 {
+        cli.rest_port
+    } else if tls_requested(cli) {
+        7443
+    } else {
+        7080
+    }
+}
+
 fn rest_endpoints(cli: &Cli) -> Vec<String> {
+    let port = effective_rest_port(cli);
     cli.host
         .iter()
         .map(|h| {
             let host = h.split(':').next().unwrap_or(h);
-            format!("{host}:{}", cli.rest_port)
+            format!("{host}:{port}")
         })
         .collect()
 }
 
 /// Ask `/status` (unauthenticated) for the cluster members' client endpoints, so
-/// connecting to one seed yields the whole failover set. Best-effort: returns an
+/// connecting to one seed yields the whole failover set. Members currently
+/// resyncing (backfilling from empty) are excluded — a resyncing node holds
+/// incomplete data, so the driver routes around it. Best-effort: returns an
 /// empty list for a standalone node or any error.
 fn discover_peers(rest_endpoints: &[String], tls: Option<&http::TlsClient>) -> Vec<String> {
     let Ok((_, body)) = http::get(rest_endpoints, "/status", None, tls) else {
         return Vec::new();
     };
-    serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|v| {
-            v.get("endpoints")
-                .and_then(|e| e.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-        })
-        .unwrap_or_default()
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return Vec::new();
+    };
+    let str_array = |key: &str| -> Vec<String> {
+        v.get(key)
+            .and_then(|e| e.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default()
+    };
+    let resyncing: std::collections::HashSet<String> =
+        str_array("resyncing_endpoints").into_iter().collect();
+    str_array("endpoints")
+        .into_iter()
+        .filter(|ep| !resyncing.contains(ep))
+        .collect()
 }
 
 /// Build a `{"k":"v"}` JSON body.

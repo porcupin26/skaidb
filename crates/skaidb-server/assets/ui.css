@@ -23,6 +23,11 @@ header {
   font-size: 12px; color: var(--muted);
   border: 1px solid var(--line); border-radius: 10px; padding: 1px 8px;
 }
+.badge-resync {
+  font-size: 11px; color: var(--warn);
+  border: 1px solid var(--warn); border-radius: 10px; padding: 0 6px;
+  text-transform: uppercase; letter-spacing: 0.05em;
+}
 .spacer { flex: 1; }
 /* Fluid layout: use the whole window — wide result sets, the stats
    sparklines, and the per-node tables all benefit; no fixed column. */

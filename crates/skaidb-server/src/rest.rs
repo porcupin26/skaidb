@@ -30,17 +30,37 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 /// instead of ballooning the heap.
 const MAX_BODY_LEN: usize = skaidb_proto::MAX_FRAME_LEN as usize;
 
+/// What a REST listener does with a connection.
+#[derive(Clone, Copy, Debug)]
+pub enum RestRole {
+    /// Serve the REST API (plaintext and/or TLS per the acceptor).
+    Data,
+    /// Serve nothing but an HTTP→HTTPS redirect to `https://<host>:<port><path>`
+    /// (308). Used on the plaintext port when client TLS is enabled, so old
+    /// `http://…:7080` URLs bounce to the TLS port instead of failing.
+    RedirectToTls(u16),
+}
+
 /// Bind the REST endpoint and serve it on a background thread.
-pub fn spawn(addr: &str, ctx: Shared) -> io::Result<(std::net::SocketAddr, JoinHandle<()>)> {
+pub fn spawn(
+    addr: &str,
+    ctx: Shared,
+    role: RestRole,
+) -> io::Result<(std::net::SocketAddr, JoinHandle<()>)> {
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
     let acceptor = crate::tls::build(&ctx)?;
-    let handle = thread::spawn(move || serve(listener, ctx, acceptor));
+    let handle = thread::spawn(move || serve(listener, ctx, acceptor, role));
     Ok((local, handle))
 }
 
 /// Accept connections forever, handling each on its own thread.
-pub fn serve(listener: TcpListener, ctx: Shared, acceptor: Option<crate::tls::Acceptor>) {
+pub fn serve(
+    listener: TcpListener,
+    ctx: Shared,
+    acceptor: Option<crate::tls::Acceptor>,
+    role: RestRole,
+) {
     for stream in listener.incoming().flatten() {
         // Best-effort: a socket that rejects the option still gets served,
         // it just keeps the old unbounded behavior.
@@ -50,17 +70,46 @@ pub fn serve(listener: TcpListener, ctx: Shared, acceptor: Option<crate::tls::Ac
         let acceptor = acceptor.clone();
         thread::spawn(move || {
             ctx.metrics.connection_opened(Endpoint::Rest);
-            let _ = handle_connection(stream, ctx.clone(), acceptor.as_ref());
+            let _ = handle_connection(stream, ctx.clone(), acceptor.as_ref(), role);
             ctx.metrics.connection_closed(Endpoint::Rest);
         });
     }
+}
+
+/// Read one plaintext request and answer with a 308 to the TLS port. The
+/// redirect listener never touches the data plane — it exists so a client that
+/// hits the old plaintext REST port (7080) after TLS was turned on is bounced to
+/// `https://…:<tls_port>` rather than getting a connection reset.
+fn redirect_to_tls(tcp: TcpStream, tls_port: u16) -> io::Result<()> {
+    let mut stream = skaidb_net::Stream::Plain(tcp);
+    let req = match read_request(&mut stream) {
+        Ok(Some(req)) => req,
+        _ => return Ok(()),
+    };
+    // Reconstruct the target host from the Host header, dropping any :port.
+    // Without a Host header (rare on HTTP/1.1) we can't form an absolute URL —
+    // close rather than guess.
+    let Some(host) = req
+        .host
+        .as_deref()
+        .map(|h| h.rsplit_once(':').map(|(h, _)| h).unwrap_or(h))
+        .filter(|h| !h.is_empty())
+    else {
+        return Ok(());
+    };
+    let location = format!("https://{host}:{tls_port}{}", req.path);
+    write_redirect(&mut stream, &location)
 }
 
 fn handle_connection(
     tcp: TcpStream,
     ctx: Shared,
     acceptor: Option<&crate::tls::Acceptor>,
+    role: RestRole,
 ) -> io::Result<()> {
+    if let RestRole::RedirectToTls(port) = role {
+        return redirect_to_tls(tcp, port);
+    }
     // Wrap per the client-TLS policy (or drop a plaintext peer under
     // `required`). Probes (`/health` etc.) share this port, so under
     // `required` they must speak TLS too.
@@ -484,6 +533,8 @@ struct HttpRequest {
     method: String,
     path: String,
     authorization: Option<String>,
+    /// The `Host` header value (with any `:port`), for the HTTP→HTTPS redirect.
+    host: Option<String>,
     body: Vec<u8>,
 }
 
@@ -523,6 +574,7 @@ fn read_request<R: io::Read>(stream: &mut R) -> io::Result<Option<HttpRequest>> 
 
     let mut content_length = 0usize;
     let mut authorization = None;
+    let mut host = None;
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
@@ -538,6 +590,8 @@ fn read_request<R: io::Read>(stream: &mut R) -> io::Result<Option<HttpRequest>> 
                 content_length = value.parse().unwrap_or(0);
             } else if key.eq_ignore_ascii_case("authorization") {
                 authorization = Some(value.to_string());
+            } else if key.eq_ignore_ascii_case("host") {
+                host = Some(value.to_string());
             }
         }
     }
@@ -556,6 +610,7 @@ fn read_request<R: io::Read>(stream: &mut R) -> io::Result<Option<HttpRequest>> 
         method,
         path,
         authorization,
+        host,
         body,
     }))
 }
@@ -789,6 +844,11 @@ fn status_json(ctx: &Shared) -> Json {
                 "members": c.members,
                 // Client SQL endpoints (host:quic_port) of every member.
                 "endpoints": ctx.backend.member_client_endpoints(quic_port),
+                // Client endpoints of members currently resyncing — a driver
+                // removes these from `endpoints` so it never coordinates
+                // through a backfilling node (best-effort; correctness is
+                // guaranteed server-side regardless).
+                "resyncing_endpoints": ctx.backend.resyncing_client_endpoints(quic_port),
                 "replication_factor": c.replication_factor,
                 "resharding": c.resharding_active,
                 "hints_pending": c.hints_pending,
@@ -824,6 +884,11 @@ fn status_json(ctx: &Shared) -> Json {
                 "client_tls": client_tls_mode(ctx),
                 "at_rest": at_rest_mode(ctx),
                 "ready": ctx.backend.is_ready(),
+                // Resync (wipe+backfill) state of THIS node: a resyncing node
+                // holds incomplete data and should be routed around by drivers
+                // until `resync_progress` reaches 1.0 (filesize-based).
+                "resyncing": c.resyncing,
+                "resync_progress": c.resync_progress,
             })
         }
         None => json!({ "clustered": false, "client_tls": client_tls_mode(ctx), "at_rest": at_rest_mode(ctx), "ready": ctx.backend.is_ready() }),
@@ -910,6 +975,17 @@ fn write_json_body<W: io::Write>(stream: &mut W, status: u16, body: &str) -> io:
     stream.flush()
 }
 
+/// Write a 308 Permanent Redirect to `location` (the HTTP→HTTPS bounce). 308
+/// preserves the method and body, so a redirected POST /query still works.
+fn write_redirect<W: io::Write>(stream: &mut W, location: &str) -> io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 308 {}\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        http_reason(308)
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.flush()
+}
+
 /// Write a plain-text response (used by `/metrics`, `/health`, `/ready`).
 fn write_text<W: io::Write>(stream: &mut W, status: u16, body: &str) -> io::Result<()> {
     let reason = http_reason(status);
@@ -945,6 +1021,7 @@ fn write_asset<W: io::Write>(stream: &mut W, asset: &crate::ui::Asset) -> io::Re
 fn http_reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        308 => "Permanent Redirect",
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",

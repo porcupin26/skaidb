@@ -82,6 +82,20 @@ pub struct HostStats {
     /// concurrent passes (paced or not) were enough to dent write quorum.
     #[serde(default)]
     pub repairing: bool,
+    /// This node's on-disk data footprint (SSTable bytes) — the numerator of
+    /// filesize-based resync progress, and the denominator peers read to size
+    /// their own resync. 0 if unavailable (engine lock contended).
+    #[serde(default)]
+    pub data_dir_bytes: u64,
+    /// Whether this node is backfilling from an empty data directory after a
+    /// (re)join — it holds INCOMPLETE data, so it does not serve scans/counts
+    /// locally and the UI/drivers should route around it until it converges.
+    #[serde(default)]
+    pub resyncing: bool,
+    /// Resync completion in `0.0..=1.0` (this node's data bytes over the
+    /// largest peer's, captured at resync start). 1.0 when not resyncing.
+    #[serde(default)]
+    pub resync_progress: f64,
     /// Set by a coordinator when this snapshot was served from cache because
     /// the node missed a probe: seconds since it last answered. 0 = fresh.
     #[serde(default)]
