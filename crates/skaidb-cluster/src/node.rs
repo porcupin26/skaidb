@@ -197,6 +197,11 @@ pub struct Node {
     /// Host(s) this node is backfilling FROM during a resync — the complete
     /// peers it reconciles against — for the UI/status "resync from …" display.
     resync_sources: Mutex<Vec<String>>,
+    /// Last observed local data bytes during a resync, for a SMOOTH progress
+    /// readout: a momentarily lock-contended `db_stats` (which returns `None`)
+    /// must not drop progress to 0, and a WAL truncation on flush must not make
+    /// the bar go backwards. Reset to 0 when a new resync is detected.
+    resync_last_local_bytes: AtomicU64,
     /// Completed anti-entropy passes since boot (monotonic). Placement-
     /// transition drivers gate finalize on every member advancing this
     /// by 2 past a baseline — see `drive_placement_transitions`.
@@ -767,6 +772,7 @@ impl Node {
             resyncing: AtomicBool::new(false),
             resync_target_bytes: AtomicU64::new(0),
             resync_sources: Mutex::new(Vec::new()),
+            resync_last_local_bytes: AtomicU64::new(0),
             repair_passes: AtomicU64::new(0),
             placement_drive_at: Mutex::new(Instant::now()),
             placement_baselines: Mutex::new(std::collections::HashMap::new()),
@@ -1535,11 +1541,17 @@ impl Node {
             return 0.0;
         }
         // Numerator includes WAL so progress reflects data pulled but not yet
-        // flushed (the target is a settled peer's SSTables — WAL-light).
-        let local = self
-            .db_stats(false)
-            .map(|s| s.disk_bytes + s.wal_bytes)
-            .unwrap_or(0);
+        // flushed (the target is a settled peer's SSTables — WAL-light). Smooth
+        // it: a lock-contended `db_stats` (`None`) reuses the last value instead
+        // of dropping to 0, and progress never regresses within a resync (a WAL
+        // truncation on flush briefly shrinks disk+WAL). `.max(prev)` delivers
+        // both from a single cache.
+        let prev = self.resync_last_local_bytes.load(Ordering::Relaxed);
+        let local = match self.db_stats(false) {
+            Some(s) => (s.disk_bytes + s.wal_bytes).max(prev),
+            None => prev,
+        };
+        self.resync_last_local_bytes.store(local, Ordering::Relaxed);
         (local as f64 / target as f64).clamp(0.0, 1.0)
     }
 
@@ -4906,6 +4918,7 @@ impl Node {
                 if target >= RESYNC_EMPTY_BYTES && local.saturating_mul(4) < target {
                     sources.sort();
                     self.resync_target_bytes.store(target, Ordering::Relaxed);
+                    self.resync_last_local_bytes.store(0, Ordering::Relaxed);
                     *self.resync_sources.lock().expect("resync sources") = sources.clone();
                     self.resyncing.store(true, Ordering::Relaxed);
                     skaidb_types::slog!(
