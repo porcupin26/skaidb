@@ -206,6 +206,11 @@ pub struct Node {
     /// transition drivers gate finalize on every member advancing this
     /// by 2 past a baseline — see `drive_placement_transitions`.
     repair_passes: AtomicU64,
+    /// Whether the most recent repair pass reconciled every table it attempted
+    /// (no table abandoned mid-scan to a busy/unreachable peer). A resync clears
+    /// only after a COMPLETE pass — an incomplete pass (e.g. a peer write-locked
+    /// by compaction through all retries) must not be mistaken for convergence.
+    last_repair_complete: AtomicBool,
     /// Next time the maintenance loop may run the placement-transition
     /// driver (it probes every member; the loop ticks every ~200ms).
     placement_drive_at: Mutex<Instant>,
@@ -382,6 +387,14 @@ const REPAIR_PAGE_ROWS: usize = 2_000;
 const REPAIR_PAGE_PAUSE: Duration = Duration::from_millis(25);
 /// Pause between (table, peer) reconciliations in a pass.
 const REPAIR_PAIR_PAUSE: Duration = Duration::from_millis(250);
+/// How many times a repair page fill retries a peer that replies "busy" (its
+/// engine write-locked by a compaction) before giving up on the table. Each
+/// attempt already waits up to `SCAN_LOCK_WAIT` for the lock, so this rides out
+/// a long compaction (there's a free window between merges) instead of
+/// abandoning the table half-reconciled.
+const REPAIR_BUSY_RETRIES: usize = 30;
+/// Backoff between "busy" retries.
+const REPAIR_BUSY_BACKOFF: Duration = Duration::from_millis(500);
 #[cfg(test)]
 const REPAIR_PAGE_ROWS: usize = 8;
 
@@ -769,6 +782,7 @@ impl Node {
             maint_tx: Mutex::new(maint_tx),
             maint_pending: AtomicUsize::new(0),
             repairing: AtomicBool::new(false),
+            last_repair_complete: AtomicBool::new(true),
             resyncing: AtomicBool::new(false),
             resync_target_bytes: AtomicU64::new(0),
             resync_sources: Mutex::new(Vec::new()),
@@ -3479,6 +3493,10 @@ impl Node {
 
     fn repair_inner(&self) -> EngineResult<usize> {
         let mut repaired = 0usize;
+        // Cleared if any (table, peer) reconciliation is abandoned mid-scan
+        // (peer busy/unreachable), so a partial pass isn't mistaken for a
+        // converged one when deciding whether a resync is finished.
+        let mut complete = true;
         // Converge the catalog first (databases/tables/indexes), both directions,
         // so a node that missed a DDL broadcast learns it — and so the data pass
         // below sees any newly-created tables. Schema DDL is idempotent
@@ -3506,7 +3524,10 @@ impl Node {
                         // back to the old whole-table pull for it.
                         repaired += self.repair_table_unpaged(&table, &pid, &addr);
                     }
-                    Err(RepairPeerError::Unreachable) => continue,
+                    Err(RepairPeerError::Unreachable) => {
+                        complete = false;
+                        continue;
+                    }
                     Err(RepairPeerError::Engine(e)) => return Err(e),
                 }
                 // QoS: repair is a background op. Back-to-back (table, peer)
@@ -3520,6 +3541,7 @@ impl Node {
         }
         repaired += self.ts_repair()?;
         repaired += self.gidx_repair();
+        self.last_repair_complete.store(complete, Ordering::Relaxed);
         Ok(repaired)
     }
 
@@ -3946,20 +3968,41 @@ impl Node {
                 thread::sleep(REPAIR_PAGE_PAUSE);
             }
             if remote.needs_fill() {
-                let resp = self.pool.call(
-                    addr,
-                    &Request::ScanPage {
-                        table: table.to_string(),
-                        after: remote.after().map(<[u8]>::to_vec),
-                        limit: REPAIR_PAGE_ROWS as u32,
-                    },
-                );
-                match resp {
-                    Ok(Response::Scan { rows }) => remote.fill(rows),
-                    Ok(Response::Err(e)) if e.contains("unknown request op") => {
-                        return Err(RepairPeerError::Unpaged)
+                // A peer busy with a compaction holds the engine write lock in
+                // bursts and replies "busy: engine write-locked, retry" — a
+                // TRANSIENT condition. Retry with backoff (there's a free lock
+                // window between merges) instead of abandoning the table
+                // half-reconciled: that left a from-empty node with a partial
+                // table that STILL counted as a converged pass (2026-07-19).
+                let mut filled = false;
+                for _ in 0..REPAIR_BUSY_RETRIES {
+                    match self.pool.call(
+                        addr,
+                        &Request::ScanPage {
+                            table: table.to_string(),
+                            after: remote.after().map(<[u8]>::to_vec),
+                            limit: REPAIR_PAGE_ROWS as u32,
+                        },
+                    ) {
+                        Ok(Response::Scan { rows }) => {
+                            remote.fill(rows);
+                            filled = true;
+                            break;
+                        }
+                        Ok(Response::Err(e)) if e.contains("unknown request op") => {
+                            return Err(RepairPeerError::Unpaged)
+                        }
+                        Ok(Response::Err(e)) if e.contains("busy") => {
+                            thread::sleep(REPAIR_BUSY_BACKOFF);
+                        }
+                        _ => return Err(RepairPeerError::Unreachable),
                     }
-                    _ => return Err(RepairPeerError::Unreachable),
+                }
+                if !filled {
+                    // Busy through every retry — a very long lock hold. Surface
+                    // it as Unreachable so the pass is marked INCOMPLETE (the
+                    // node keeps resyncing and retries) rather than converged.
+                    return Err(RepairPeerError::Unreachable);
                 }
             }
 
@@ -4854,10 +4897,18 @@ impl Node {
                 continue; // no peer yet — keep waiting
             }
             match self.repair() {
-                Ok(n) => {
+                // Only a COMPLETE pass ends catch-up. An incomplete one (a peer
+                // was write-locked by compaction through all page retries) left
+                // a table partial — keep retrying so the node doesn't declare
+                // convergence with missing rows and wait an hour for the next
+                // anti-entropy pass to finish it.
+                Ok(n) if self.last_repair_complete.load(Ordering::Relaxed) => {
                     skaidb_types::slog!("skaidb: startup catch-up complete ({n} rows reconciled)");
                     return;
                 }
+                Ok(n) => skaidb_types::slog!(
+                    "skaidb: startup catch-up incomplete ({n} rows; a peer was busy) — retrying"
+                ),
                 Err(e) => skaidb_types::slog!("skaidb: startup catch-up attempt {attempt} failed: {e}"),
             }
         }
@@ -4885,7 +4936,9 @@ impl Node {
             // "compacted smaller", so a growing data dir must NOT clear it — a
             // node that cleared at, say, its first 32 MB flush would resume
             // serving incomplete scans ~10% into a multi-GB backfill.
-            if self.repair_passes.load(Ordering::Relaxed) > 0 {
+            if self.repair_passes.load(Ordering::Relaxed) > 0
+                && self.last_repair_complete.load(Ordering::Relaxed)
+            {
                 if self.resyncing.swap(false, Ordering::Relaxed) {
                     skaidb_types::slog!("skaidb: resync complete — serving normally");
                 }
