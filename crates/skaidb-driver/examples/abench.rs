@@ -115,7 +115,7 @@ fn main() {
                 let do_write = match mode.as_str() {
                     "write" => true,
                     "read" => false,
-                    _ => local % 2 == 0, // mixed
+                    _ => local.is_multiple_of(2), // mixed
                 };
                 let ok = if do_write {
                     wid += 1;
