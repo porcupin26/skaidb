@@ -18,7 +18,7 @@ use skaidb_sql::ast::{
 };
 use skaidb_types::Value;
 
-use crate::shared::{execute_session_statement_as, Shared};
+use crate::shared::{execute_session_statement_via, Shared};
 use skaidb_proto::Response;
 
 /// Auto-generated `_id` uniqueness within a process.
@@ -95,13 +95,14 @@ fn select_from(table: &str) -> Select {
 /// Run one statement through the session path (RBAC, cluster, metrics).
 fn run(ctx: &Shared, role: &str, stmt: Statement, audit: &str) -> Result<Response, String> {
     let mut current_db = skaidb_engine::DEFAULT_DATABASE.to_string();
-    Ok(execute_session_statement_as(
+    Ok(execute_session_statement_via(
         ctx,
         role,
         &mut current_db,
         audit,
         Ok(stmt),
         None,
+        "es",
     ))
 }
 

@@ -14,7 +14,7 @@ use serde_json::{json, Value as Json};
 use skaidb_proto::Response;
 
 use crate::metrics::{Endpoint, RestPath};
-use crate::shared::{collect_runtime_metrics, execute_as, Shared};
+use crate::shared::{collect_runtime_metrics, Shared};
 
 /// Socket timeouts for REST connections. A peer that stops reading (or a
 /// dead client behind a proxy) must not pin a handler thread — and its fully
@@ -373,6 +373,9 @@ fn handle_connection(
                 &format!("promql {} {expr}", prom_path.trim_start_matches("/api/v1/")),
                 started.elapsed().as_millis() as u64,
                 err.as_deref(),
+                &role,
+                &prom_scope.db,
+                "prom",
             );
         }
         return write_response(&mut stream, status, &payload);
@@ -500,9 +503,12 @@ fn handle_connection(
         // exactly like `USE <db>` would.
         Some(db) => {
             let mut current_db = db;
-            crate::shared::execute_session_as(&ctx, &role, &mut current_db, &sql, consistency)
+            crate::shared::execute_session_via(&ctx, &role, &mut current_db, &sql, consistency, "rest")
         }
-        None => execute_as(&ctx, &role, &sql),
+        None => {
+            let mut current_db = skaidb_engine::DEFAULT_DATABASE.to_string();
+            crate::shared::execute_session_via(&ctx, &role, &mut current_db, &sql, consistency, "rest")
+        }
     };
     // Row results stream as chunked JSON — one bounded buffer at a time, so
     // a big result never materializes a response-sized string (a multi-GB
@@ -936,13 +942,14 @@ fn handle_insert(ctx: &Shared, role: &str, body: &[u8]) -> (u16, Json) {
             rows: group_rows,
         });
         let mut current_db = db.clone();
-        let resp = crate::shared::execute_session_statement_as(
+        let resp = crate::shared::execute_session_statement_via(
             ctx,
             role,
             &mut current_db,
             "INSERT (JSON)",
             Ok(stmt),
             consistency,
+            "rest",
         );
         match resp {
             Response::Mutation { .. } | Response::Ddl => inserted += n,

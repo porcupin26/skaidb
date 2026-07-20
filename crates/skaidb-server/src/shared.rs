@@ -764,11 +764,26 @@ pub fn execute_session_as(
     sql: &str,
     consistency: Option<ProtoConsistency>,
 ) -> Response {
+    execute_session_via(ctx, role, current_db, sql, consistency, "internal")
+}
+
+/// [`execute_session_as`] with an explicit access-surface tag (`"driver"` —
+/// the binary protocol — `"rest"`, `"es"`, `"ui"`, `"prom"`); the tag lands
+/// in the audit query/slow/error logs beside the user and database. The
+/// no-tag wrapper stamps `"internal"` (background/system statements).
+pub fn execute_session_via(
+    ctx: &Shared,
+    role: &str,
+    current_db: &mut String,
+    sql: &str,
+    consistency: Option<ProtoConsistency>,
+    via: &str,
+) -> Response {
     // Parse once; the same result drives the privilege check, the lock-mode
     // choice, and (on the local backend) execution itself. SQL that fails to
     // parse skips the check — the backend then reports the parse error.
     let parsed = skaidb_sql::parse(sql);
-    execute_session_statement_as(ctx, role, current_db, sql, parsed, consistency)
+    execute_session_statement_via(ctx, role, current_db, sql, parsed, consistency, via)
 }
 
 /// [`execute_session_as`] for an already-parsed statement — the prepared
@@ -783,6 +798,20 @@ pub fn execute_session_statement_as(
     sql: &str,
     parsed: Result<Statement, ParseError>,
     consistency: Option<ProtoConsistency>,
+) -> Response {
+    execute_session_statement_via(ctx, role, current_db, sql, parsed, consistency, "internal")
+}
+
+/// [`execute_session_statement_as`] with the access-surface tag (see
+/// [`execute_session_via`]).
+pub fn execute_session_statement_via(
+    ctx: &Shared,
+    role: &str,
+    current_db: &mut String,
+    sql: &str,
+    parsed: Result<Statement, ParseError>,
+    consistency: Option<ProtoConsistency>,
+    via: &str,
 ) -> Response {
     // Authorization: check the role may perform the statement before
     // executing. `SHOW GRANTS FOR <own role>` is self-inspection and needs
@@ -897,7 +926,7 @@ pub fn execute_session_statement_as(
         Response::Error(m) => Some(m.as_str()),
         _ => None,
     };
-    ctx.audit().record(sql, elapsed_ms, err_msg);
+    ctx.audit().record(sql, elapsed_ms, err_msg, role, current_db, via);
     if let Some(summary) = auth_summary {
         ctx.audit().log_auth_ddl(role, &summary, err_msg.is_none());
     }

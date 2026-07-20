@@ -181,6 +181,12 @@ enum AggOp {
     Min,
     Max,
     Count,
+    /// Population standard deviation (Prometheus semantics). Grafana's
+    /// drilldown "Standard deviation" preview queries `stddev(m{…})`.
+    Stddev,
+    /// `quantile(φ, v)` — φ-quantile across the group, linear interpolation;
+    /// the drilldown's "Percentiles" preview (P50/P90/P99 …).
+    Quantile(f64),
 }
 
 // ---- parser ----
@@ -419,9 +425,12 @@ impl<'a> P<'a> {
             "min" => Some(AggOp::Min),
             "max" => Some(AggOp::Max),
             "count" => Some(AggOp::Count),
+            "stddev" => Some(AggOp::Stddev),
+            // φ parsed below, after the optional by/without modifier.
+            "quantile" => Some(AggOp::Quantile(f64::NAN)),
             _ => None,
         };
-        if let Some(op) = agg {
+        if let Some(mut op) = agg {
             let (mut by, mut without) = (None, None);
             self.ws();
             if self.peek() != Some(b'(') {
@@ -447,6 +456,17 @@ impl<'a> P<'a> {
                 }
             }
             self.expect(b'(')?;
+            // `quantile(φ, v)`: the scalar φ leads the argument list.
+            if matches!(op, AggOp::Quantile(_)) {
+                let PExpr::Number(phi) = self.factor()? else {
+                    return Err(
+                        "quantile needs a number as its first argument, e.g. quantile(0.95, m)"
+                            .into(),
+                    );
+                };
+                self.expect(b',')?;
+                op = AggOp::Quantile(phi);
+            }
             let arg = self.expr()?;
             self.expect(b')')?;
             return Ok(PExpr::Agg {
@@ -901,6 +921,27 @@ fn fold_agg(
                 AggOp::Min => values.iter().cloned().fold(f64::INFINITY, f64::min),
                 AggOp::Max => values.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
                 AggOp::Count => values.len() as f64,
+                AggOp::Stddev => {
+                    // Population stddev, Prometheus semantics.
+                    let mean = values.iter().sum::<f64>() / values.len() as f64;
+                    (values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>()
+                        / values.len() as f64)
+                        .sqrt()
+                }
+                AggOp::Quantile(phi) => {
+                    // φ outside [0, 1] → ±Inf, like Prometheus.
+                    if phi < 0.0 {
+                        f64::NEG_INFINITY
+                    } else if phi > 1.0 {
+                        f64::INFINITY
+                    } else {
+                        let mut sorted = values.clone();
+                        sorted.sort_by(|a, b| a.total_cmp(b));
+                        let rank = phi * (sorted.len() - 1) as f64;
+                        let (lo, hi) = (rank.floor() as usize, rank.ceil() as usize);
+                        sorted[lo] + (sorted[hi] - sorted[lo]) * (rank - lo as f64)
+                    }
+                }
             };
             (labels, value)
         })
@@ -1282,6 +1323,109 @@ mod tests {
         assert_eq!(run("avg_over_time(m[10s])", &one)[0].1, 7.0);
         // The drilldown's exact tile shape parses and evaluates.
         assert_eq!(run("avg(avg_over_time(m[10s]))", &one)[0].1, 7.0);
+    }
+
+    /// Grafana / Metrics Drilldown compatibility: the catalog of PromQL
+    /// shapes Grafana's stock dashboards and the drilldown app actually emit
+    /// (health check, tiles, function-picker previews, breakdowns, counter
+    /// and histogram panels), parsed and evaluated end-to-end against a
+    /// seeded series universe with matcher semantics applied — every shape
+    /// here has bitten in production at least once (the 2026-07-20 chain:
+    /// `1+1`, `*_over_time`, trailing commas, `stddev`/`quantile`).
+    #[test]
+    fn grafana_promql_compatibility() {
+        // The universe: a gauge with two label values, a counter, buckets.
+        let mk = |pairs: &[(&str, &str)], samples: &[(i64, f64)]| {
+            let mut labels: Labels =
+                pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            labels.sort();
+            let samples: Vec<Sample> =
+                samples.iter().map(|&(ts, value)| Sample { ts, value }).collect();
+            (labels, samples)
+        };
+        let universe: Vec<(Labels, Vec<Sample>)> = vec![
+            mk(&[("name", "aqi"), ("device_id", "a")], &[(1_000, 10.0), (5_000, 14.0), (9_000, 12.0)]),
+            mk(&[("name", "aqi"), ("device_id", "b")], &[(1_000, 20.0), (5_000, 24.0), (9_000, 22.0)]),
+            mk(&[("name", "reqs_total"), ("job", "api")], &[(1_000, 100.0), (5_000, 140.0), (9_000, 200.0)]),
+            mk(&[("name", "lat_bucket"), ("le", "50")], &[(1_000, 0.0), (9_000, 5.0)]),
+            mk(&[("name", "lat_bucket"), ("le", "100")], &[(1_000, 0.0), (9_000, 10.0)]),
+            mk(&[("name", "lat_bucket"), ("le", "+Inf")], &[(1_000, 0.0), (9_000, 10.0)]),
+        ];
+        // Apply matcher semantics like the store does (missing label = "").
+        let matches = |ms: &[Matcher], labels: &Labels| {
+            let get = |k: &str| {
+                labels.iter().find(|(lk, _)| lk == k).map_or("", |(_, v)| v.as_str())
+            };
+            ms.iter().all(|m| match m {
+                Matcher::Eq(k, v) => get(k) == v,
+                Matcher::Ne(k, v) => get(k) != v,
+                Matcher::Re(k, r) => r.is_match(get(k)),
+                Matcher::NotRe(k, r) => !r.is_match(get(k)),
+            })
+        };
+        // Parse, fetch (per spec, matcher-filtered), evaluate at t = 10s.
+        let eval = |q: &str| -> Result<Vec<(Labels, f64)>, String> {
+            let mut e = P::new(q).parse()?;
+            let mut specs = Vec::new();
+            assign_slots(&mut e, &mut specs);
+            let fetched: Vec<Fetched> = specs
+                .iter()
+                .map(|(ms, _, _)| Fetched {
+                    series: universe
+                        .iter()
+                        .filter(|(labels, _)| matches(ms, labels))
+                        .cloned()
+                        .collect(),
+                })
+                .collect();
+            match eval_steps(&e, &fetched, &[10_000])?.pop() {
+                Some(StepVal::Vector(v)) => Ok(v),
+                Some(StepVal::Scalar(v)) => Ok(vec![(Vec::new(), v)]),
+                None => Ok(Vec::new()),
+            }
+        };
+        let one = |q: &str| -> f64 {
+            let v = eval(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+            assert_eq!(v.len(), 1, "{q}: expected one series, got {v:?}");
+            v[0].1
+        };
+
+        // Datasource health check.
+        assert_eq!(one("1+1"), 2.0);
+        // Plain and filtered selectors, bare regex selectors.
+        assert_eq!(eval("aqi").unwrap().len(), 2);
+        assert_eq!(eval(r#"aqi{device_id="a"}"#).unwrap().len(), 1);
+        assert_eq!(eval(r#"{__name__=~"aqi|reqs.*"}"#).unwrap().len(), 3);
+        // Drilldown gauge tile (the verbatim production shape).
+        assert_eq!(one(r#"avg(avg_over_time(aqi{__ignore_usage__="", }[10s]))"#), 17.0);
+        // Function-picker previews: average / sum / min-max / stddev /
+        // percentiles.
+        assert_eq!(one(r#"avg(aqi{__ignore_usage__="", })"#), 17.0);
+        assert_eq!(one(r#"sum(aqi{__ignore_usage__="", })"#), 34.0);
+        assert_eq!(one(r#"min(aqi{__ignore_usage__="", })"#), 12.0);
+        assert_eq!(one(r#"max(aqi{__ignore_usage__="", })"#), 22.0);
+        assert_eq!(one(r#"stddev(aqi{__ignore_usage__="", })"#), 5.0);
+        assert_eq!(one(r#"quantile(0.5, aqi{__ignore_usage__="", })"#), 17.0);
+        assert_eq!(one(r#"quantile(0.99, aqi{__ignore_usage__="", })"#), 21.9);
+        assert_eq!(one(r#"quantile(1, aqi{})"#), 22.0);
+        // Breakdown tab: per-label grouping of the tile query.
+        let by = eval(r#"avg by (device_id) (avg_over_time(aqi{__ignore_usage__="", }[10s]))"#)
+            .unwrap();
+        assert_eq!(by.len(), 2, "{by:?}");
+        // Counter tile.
+        let rate = one(r#"sum(rate(reqs_total{__ignore_usage__="", }[10s]))"#);
+        assert!(rate > 0.0, "{rate}");
+        // Other *_over_time picker options.
+        assert_eq!(one(r#"max(max_over_time(aqi{}[10s]))"#), 24.0);
+        assert_eq!(one(r#"sum(count_over_time(aqi{}[10s]))"#), 6.0);
+        assert_eq!(eval(r#"last_over_time(aqi{}[10s])"#).unwrap().len(), 2);
+        // Histogram panels.
+        let hq = one(r#"histogram_quantile(0.9, sum by (le) (rate(lat_bucket{}[10s])))"#);
+        assert!(hq > 50.0 && hq <= 100.0, "{hq}");
+        // Classic dashboard staples (rate = increase / window: 100/10s → ×60).
+        assert_eq!(one(r#"sum by (job) (rate(reqs_total{job="api"}[10s])) * 60"#).round(), 600.0);
+        // quantile without a scalar first argument is a clear error.
+        assert!(eval("quantile(aqi)").is_err());
     }
 
     /// Grafana's Metrics Drilldown emits `{__ignore_usage__="", }` — a

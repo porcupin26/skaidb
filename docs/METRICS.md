@@ -254,6 +254,19 @@ ISO-8601 UTC instant (`2026-07-20T18:42:13.123Z …`); JSON-format lines
 (`observability.log_format = "json"`) carry it as a `ts` field instead, so
 each line stays independently parseable.
 
+**Query/slow-query/error lines carry the execution context**: the
+authenticated user, the session database, and the access surface —
+`via=driver` (binary-protocol/driver connections), `rest`, `es`, `ui`,
+`prom` (PromQL evaluations, which log like queries), or `internal`
+(background/system statements):
+
+```
+2026-07-20T18:42:13.123Z [query] 3ms user=agencik db=agencik via=driver SELECT … WHERE id = ?
+2026-07-20T18:42:14.001Z [query] 1ms user=pi_air_quality db=pi_air_quality via=prom promql query_range avg(pm25{}[?m])
+```
+
+JSON format carries the same as `user`/`db`/`via` fields.
+
 ## REST request activity
 
 - `skaidb_rest_requests_total{path="query"|"insert"|"es"|"prom"|"ui"|"ops"|"admin"|"other"}`

@@ -13,7 +13,7 @@ use skaidb_sql::ast::Statement;
 
 use crate::authn::AuthResult;
 use crate::metrics::Endpoint;
-use crate::shared::{execute_session_as, execute_session_statement_as, Shared};
+use crate::shared::{execute_session_statement_via, execute_session_via, Shared};
 
 /// Cap on statements prepared per connection, so a misbehaving client can't
 /// grow the per-connection cache without bound. `Close` frees slots.
@@ -130,13 +130,13 @@ fn handle_connection(stream: TcpStream, ctx: Shared, acceptor: Option<&crate::tl
                     resp
                 } else {
                     let c = session_consistency.unwrap_or(consistency);
-                    execute_session_as(&ctx, &role, &mut current_db, &sql, Some(c))
+                    execute_session_via(&ctx, &role, &mut current_db, &sql, Some(c), "driver")
                 }
             }
             Ok(ClientRequest::QueryStream { sql, consistency }) => {
                 let c = session_consistency.unwrap_or(consistency);
                 let response =
-                    execute_session_as(&ctx, &role, &mut current_db, &sql, Some(c));
+                    execute_session_via(&ctx, &role, &mut current_db, &sql, Some(c), "driver");
                 if write_streamed(&mut conn, &mut outbuf, response, &ctx, tag).is_err() {
                     return;
                 }
@@ -149,13 +149,14 @@ fn handle_connection(stream: TcpStream, ctx: Shared, acceptor: Option<&crate::tl
                 consistency,
             }) => match prepared.get(id as usize).and_then(Option::as_ref) {
                 Some(ps) => match skaidb_sql::bind(&ps.stmt, &params) {
-                    Ok(bound) => execute_session_statement_as(
+                    Ok(bound) => execute_session_statement_via(
                         &ctx,
                         &role,
                         &mut current_db,
                         &ps.sql,
                         Ok(bound),
                         Some(session_consistency.unwrap_or(consistency)),
+                        "driver",
                     ),
                     Err(e) => Response::Error(e.to_string()),
                 },
@@ -177,13 +178,14 @@ fn handle_connection(stream: TcpStream, ctx: Shared, acceptor: Option<&crate::tl
                     let mut failure = None;
                     for (i, params) in rows.iter().enumerate() {
                         let response = match skaidb_sql::bind(&ps.stmt, params) {
-                            Ok(bound) => execute_session_statement_as(
+                            Ok(bound) => execute_session_statement_via(
                                 &ctx,
                                 &role,
                                 &mut current_db,
                                 &ps.sql,
                                 Ok(bound),
                                 c,
+                                "driver",
                             ),
                             Err(e) => Response::Error(e.to_string()),
                         };

@@ -138,8 +138,18 @@ impl AuditSettings {
 
     /// Record one executed statement per the configured logs. Each category
     /// (query / slow-query / error) is formatted as text or JSON and written to
-    /// its own sink, so they can land in separate files.
-    pub fn record(&self, sql: &str, elapsed_ms: u64, error: Option<&str>) {
+    /// its own sink, so they can land in separate files. `user`/`db`/`via`
+    /// identify who ran it, in which database, over which access surface
+    /// (`driver`/`rest`/`es`/`ui`/`prom`/`internal`).
+    pub fn record(
+        &self,
+        sql: &str,
+        elapsed_ms: u64,
+        error: Option<&str>,
+        user: &str,
+        db: &str,
+        via: &str,
+    ) {
         let slow = self.slow_query_ms > 0 && elapsed_ms >= self.slow_query_ms;
         if self.query_log {
             let shown = if self.query_masked {
@@ -155,12 +165,17 @@ impl AuditSettings {
                         "elapsed_ms": elapsed_ms,
                         "slow": slow,
                         "error": error,
+                        "user": user,
+                        "db": db,
+                        "via": via,
                         "sql": shown,
                     })
                     .to_string(),
                 );
             } else {
-                self.query_sink.write_line(&format!("[query] {elapsed_ms}ms {shown}"));
+                self.query_sink.write_line(&format!(
+                    "[query] {elapsed_ms}ms user={user} db={db} via={via} {shown}"
+                ));
             }
         }
         if slow {
@@ -170,13 +185,18 @@ impl AuditSettings {
                         "ts": skaidb_types::log_timestamp(),
                         "event": "slow_query",
                         "elapsed_ms": elapsed_ms,
+                        "user": user,
+                        "db": db,
+                        "via": via,
                         "sql": mask_sql(sql),
                     })
                     .to_string(),
                 );
             } else {
-                self.slow_sink
-                    .write_line(&format!("[slow-query] {elapsed_ms}ms {}", mask_sql(sql)));
+                self.slow_sink.write_line(&format!(
+                    "[slow-query] {elapsed_ms}ms user={user} db={db} via={via} {}",
+                    mask_sql(sql)
+                ));
             }
         }
         if let Some(msg) = error {
@@ -186,12 +206,17 @@ impl AuditSettings {
                         &serde_json::json!({
                             "ts": skaidb_types::log_timestamp(),
                             "event": "error",
+                            "user": user,
+                            "db": db,
+                            "via": via,
                             "message": msg,
                         })
                         .to_string(),
                     );
                 } else {
-                    self.error_sink.write_line(&format!("[error] {msg}"));
+                    self.error_sink.write_line(&format!(
+                        "[error] user={user} db={db} via={via} {msg}"
+                    ));
                 }
             }
         }
@@ -328,15 +353,24 @@ mod tests {
             ..Default::default()
         };
         let audit = AuditSettings::from(&cfg);
-        audit.record("INSERT INTO t (id) VALUES (1)", 5, None);
-        audit.record("SELECT * FROM big", 250, Some("boom"));
+        audit.record("INSERT INTO t (id) VALUES (1)", 5, None, "ada", "shop", "driver");
+        audit.record("SELECT * FROM big", 250, Some("boom"), "ada", "shop", "rest");
         audit.log_login("ada", Some("admin"), true);
 
         let contents = std::fs::read_to_string(&path).unwrap();
         // Query, slow-query, error, and login lines all land in the one file.
-        assert!(contents.contains("[query] 5ms"), "got: {contents}");
-        assert!(contents.contains("[slow-query] 250ms"), "got: {contents}");
-        assert!(contents.contains("[error] boom"), "got: {contents}");
+        assert!(
+            contents.contains("[query] 5ms user=ada db=shop via=driver"),
+            "got: {contents}"
+        );
+        assert!(
+            contents.contains("[slow-query] 250ms user=ada db=shop via=rest"),
+            "got: {contents}"
+        );
+        assert!(
+            contents.contains("[error] user=ada db=shop via=rest boom"),
+            "got: {contents}"
+        );
         assert!(contents.contains("[login] user=ada"), "got: {contents}");
         let _ = std::fs::remove_file(&path);
     }
@@ -351,12 +385,12 @@ mod tests {
             ..Default::default()
         };
         let audit = AuditSettings::from(&cfg);
-        audit.record("SELECT 1", 1, Some("kaboom"));
+        audit.record("SELECT 1", 1, Some("kaboom"), "u", "d", "ui");
 
         // The error went to its own file; the query went to the shared file.
         let err_contents = std::fs::read_to_string(&errors).unwrap();
         let base_contents = std::fs::read_to_string(&base).unwrap();
-        assert!(err_contents.contains("[error] kaboom"), "got: {err_contents}");
+        assert!(err_contents.contains("via=ui kaboom"), "got: {err_contents}");
         assert!(!base_contents.contains("kaboom"), "got: {base_contents}");
         assert!(base_contents.contains("[query] 1ms"), "got: {base_contents}");
         let _ = std::fs::remove_file(&base);

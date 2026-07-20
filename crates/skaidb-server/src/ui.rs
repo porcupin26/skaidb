@@ -85,7 +85,7 @@ pub fn schema_json(ctx: &Shared, role: &str) -> (u16, String) {
 
     let run = |sql: &str, db: &str| -> Result<Vec<Vec<skaidb_types::Value>>, String> {
         let mut current_db = db.to_string();
-        match crate::shared::execute_session_as(ctx, role, &mut current_db, sql, None) {
+        match crate::shared::execute_session_via(ctx, role, &mut current_db, sql, None, "ui") {
             Response::Rows { rows, .. } => Ok(rows),
             Response::Error(e) => Err(e),
             other => Err(format!("unexpected response: {other:?}")),
