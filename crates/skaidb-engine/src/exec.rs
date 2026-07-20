@@ -2884,6 +2884,9 @@ impl Database {
         let _meter = self.arm_scan_meter();
         let mut stmt = stmt;
         skaidb_sql::resolve_now(&mut stmt, now_ms());
+        if let Statement::Select(sel) = &mut stmt {
+            skaidb_sql::resolve_select_aliases(sel);
+        }
         match stmt {
             // A search SELECT needs the `&mut` seam (its `search` receiver is
             // `&mut` for the write path's commit-if-dirty); `LocalRead` is a
@@ -8623,6 +8626,16 @@ pub fn statement_is_read_only(stmt: &Statement) -> bool {
 /// DDL is handled by each executor directly (locally, or broadcast in a
 /// cluster), so only the data-plane statements arrive here.
 pub fn run(stmt: Statement, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
+    // Output aliases referenced from ORDER BY/GROUP BY/HAVING resolve to
+    // their expressions BEFORE dispatch — unresolved they read NULL off the
+    // source docs and the query silently mis-orders or empties.
+    let stmt = match stmt {
+        Statement::Select(mut sel) => {
+            skaidb_sql::resolve_select_aliases(&mut sel);
+            Statement::Select(sel)
+        }
+        other => other,
+    };
     match stmt {
         Statement::Insert(ins) => run_insert(ins, cluster),
         // Hybrid (`RANK BY RRF`) runs both the search leg (needs the `&mut`

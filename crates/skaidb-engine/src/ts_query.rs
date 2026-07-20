@@ -131,8 +131,8 @@ pub(crate) fn run_ts_select(
 
     // `GROUP BY t` / `ORDER BY t` where `t` is an output alias
     // (`time_bucket(1m, ts) AS t`) is the canonical time-series shape;
-    // resolve such aliases to their expressions before executing.
-    let sel = &resolve_output_aliases(sel);
+    // aliases were already resolved by the dispatchers
+    // (`skaidb_sql::resolve_select_aliases`, shared with regular tables).
 
     // Pushdown: a time range and label matchers from AND-reachable
     // comparisons. Everything else stays in the residual filter, which is
@@ -226,40 +226,6 @@ pub(crate) fn run_ts_select(
     let mut hide = HashSet::new();
     hide.insert(SERIES_FIELD.to_string());
     project(sel, docs, &hide, true)
-}
-
-/// Replace top-level `Column(name)` references in GROUP BY / ORDER BY that
-/// name a select-item alias with that item's expression.
-fn resolve_output_aliases(sel: &Select) -> Select {
-    let aliases: Vec<(&String, &Expr)> = sel
-        .items
-        .iter()
-        .filter_map(|i| match i {
-            SelectItem::Expr {
-                expr,
-                alias: Some(a),
-            } => Some((a, expr)),
-            _ => None,
-        })
-        .collect();
-    if aliases.is_empty() {
-        return sel.clone();
-    }
-    let mut out = sel.clone();
-    let fix = |e: &mut Expr| {
-        if let Expr::Column(name) = e {
-            if let Some((_, target)) = aliases.iter().find(|(a, _)| *a == name) {
-                *e = (*target).clone();
-            }
-        }
-    };
-    for g in &mut out.group_by {
-        fix(g);
-    }
-    for o in &mut out.order_by {
-        fix(&mut o.expr);
-    }
-    out
 }
 
 /// Order-preserving series identity for grouping samples across field
@@ -1143,7 +1109,12 @@ mod tests {
 
     fn parsed(sql: &str) -> Select {
         match skaidb_sql::parse(sql).unwrap() {
-            skaidb_sql::ast::Statement::Select(sel) => resolve_output_aliases(&sel),
+            skaidb_sql::ast::Statement::Select(mut sel) => {
+                // The dispatchers resolve output aliases before execution;
+                // mirror that here so plans see resolved expressions.
+                skaidb_sql::resolve_select_aliases(&mut sel);
+                sel
+            }
             other => panic!("expected SELECT, got {other:?}"),
         }
     }

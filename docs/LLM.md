@@ -297,6 +297,10 @@ SELECT [DISTINCT] item [, ...] FROM t [[AS] a]
 --   MATCH + TOP k BY score() it is ES top_hits in SQL
   [{UNION | UNION ALL} SELECT ...]
   [ORDER BY expr [ASC|DESC] [, ...]] [LIMIT n] [OFFSET n]
+--   Output aliases resolve in ORDER BY/GROUP BY (bare names) and HAVING
+--   (anywhere in the predicate): count(*) AS c ... HAVING c > 1 ORDER BY c.
+--   Alias shadowing a source column: ORDER BY prefers the output column,
+--   GROUP BY/HAVING the source column.
   [AFTER (last_sort_value, last_pk_value)]
 --   AFTER: DEEP PAGINATION keyset cursor (ES search_after). Search queries
 --   only, ordered by score() DESC or one column + LIMIT; pk = implicit ASC
@@ -516,8 +520,7 @@ WHERE ts >= now() - 6h GROUP BY t;
   `timeseries.<t>.samples_rejected` in SHOW STATUS is the cumulative view.
 - `rate/increase/delta` are counter-reset-aware, computed per series then
   summed across the group (PromQL `sum(rate(...))` semantics); `first/last`
-  take the earliest/latest value. GROUP BY/ORDER BY may reference output
-  aliases (`GROUP BY t`).
+  take the earliest/latest value.
 - **Raw dumps are scan-metered** (v0.91): a raw `SELECT` (no aggregation)
   charges each gathered sample against the statement scan budget like any
   row gather — a huge unbounded range dump errors cleanly instead of

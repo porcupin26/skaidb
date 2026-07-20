@@ -333,6 +333,14 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   materializing rows — safe on tables of any size; an array-valued column
   dedupes whole arrays. **`HAVING`** filters groups after
   aggregation (it may reference aggregates and the `GROUP BY` columns).
+- **Output aliases resolve in `ORDER BY`, `GROUP BY`, and `HAVING`**
+  (`SELECT count(*) AS c … HAVING c > 1 ORDER BY c DESC`, `SELECT
+  time_bucket(1m, ts) AS t … GROUP BY t`). `ORDER BY`/`GROUP BY` resolve
+  bare names (`ORDER BY c`, not `ORDER BY c + 1`); `HAVING` resolves
+  references anywhere in its predicate. When an alias shadows a source
+  column of the same name (`SELECT price >= 10 AS price`), `ORDER BY`
+  prefers the output column while `GROUP BY`/`HAVING` keep the source
+  column — SQL's usual preference rules.
 - **`GROUP BY ... TOP <k> BY <expr> [ASC|DESC]`** — per-group top-k **rows**:
   instead of one aggregated row per group, each group contributes its `k`
   best rows ranked by the expression (`DESC` — best-first — is the
@@ -894,8 +902,9 @@ WHERE ts >= now() - 6h GROUP BY t;
   time-ordered samples, then **summed** across the series in the group —
   PromQL `sum(rate(...))` semantics. Group by label columns to keep series
   separate.
-- **`GROUP BY`/`ORDER BY` may reference output aliases** on time-series
-  tables (`GROUP BY t` with `time_bucket(1m, ts) AS t`).
+- **`GROUP BY`/`ORDER BY` may reference output aliases** (`GROUP BY t`
+  with `time_bucket(1m, ts) AS t`) — on every table kind; see the general
+  alias-resolution rules under SELECT.
 - **Rollups** (`CREATE ROLLUP r30m ON cpu BUCKET 30m RETENTION 90d`): a
   derived time-series table holding per-bucket partials of its source,
   maintained automatically when source windows flush. For each source field

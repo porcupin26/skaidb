@@ -10,6 +10,6 @@ mod parser;
 mod token;
 
 pub use ast::*;
-pub use bind::{bind, param_count, resolve_now, BindError};
+pub use bind::{bind, param_count, resolve_now, resolve_select_aliases, BindError};
 pub use parser::{parse, ParseError};
 pub use token::{tokenize, Keyword, LexError, Token};

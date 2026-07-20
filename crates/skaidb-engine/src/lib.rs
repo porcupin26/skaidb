@@ -75,6 +75,60 @@ mod tests {
         }
     }
 
+    /// Output aliases referenced from ORDER BY / HAVING / GROUP BY resolve
+    /// to their expressions on REGULAR tables (they always did on
+    /// time-series tables). Before the fix these evaluated to NULL against
+    /// the source docs and the query SUCCEEDED with wrongly-ordered or
+    /// empty results — the worst failure mode for a dashboard query.
+    #[test]
+    fn output_aliases_resolve_in_order_by_having_group_by() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        db.execute(
+            "INSERT INTO t (id, dept, price) VALUES \
+             (1, 'a', 10), (2, 'a', 20), (3, 'b', 5), (4, 'c', 40)",
+        )
+        .unwrap();
+
+        // ORDER BY an aliased expression (was: silently unordered).
+        let rs = rows(db.execute("SELECT id, price * 2 AS p FROM t ORDER BY p DESC").unwrap());
+        assert_eq!(
+            rs.rows.iter().map(|r| r[1].clone()).collect::<Vec<_>>(),
+            vec![Value::Int(80), Value::Int(40), Value::Int(20), Value::Int(10)]
+        );
+
+        // HAVING an aggregate alias (was: silently empty) + ORDER BY it.
+        let rs = rows(
+            db.execute(
+                "SELECT dept, count(*) AS c FROM t \
+                 GROUP BY dept HAVING c > 1 ORDER BY c DESC",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::String("a".into()), Value::Int(2)]]);
+
+        // GROUP BY a non-self-referential alias: prices 10/20/5/40 →
+        // expensive true/true/false/true → two groups.
+        let rs = rows(
+            db.execute(
+                "SELECT price >= 10 AS expensive, count(*) AS c \
+                 FROM t GROUP BY expensive ORDER BY c",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows.len(), 2, "{:?}", rs.rows);
+        assert_eq!(rs.rows[1][1], Value::Int(3));
+
+        // A SELF-referential alias (`price >= 10 AS price`) keeps the
+        // SOURCE column meaning in GROUP BY (SQL's input-column
+        // preference): four distinct prices, not two booleans.
+        let rs = rows(
+            db.execute("SELECT price >= 10 AS price, count(*) AS c FROM t GROUP BY price")
+                .unwrap(),
+        );
+        assert_eq!(rs.rows.len(), 4, "grouped by source price: {:?}", rs.rows);
+    }
+
     #[test]
     fn create_insert_select_roundtrip() {
         let mut db = Database::open(tempdir()).unwrap();

@@ -319,6 +319,116 @@ fn mutate_expr(e: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
     }
 }
 
+/// Resolve select-list output aliases referenced from ORDER BY, GROUP BY,
+/// and HAVING (`SELECT count(*) AS c ... HAVING c > 1 ORDER BY c`).
+/// Without this, an alias reference evaluates against source documents,
+/// reads NULL, and the query SUCCEEDS with wrongly-ordered or empty
+/// results — the silent-failure mode this rewrite exists to kill.
+///
+/// Semantics (Postgres-informed, adapted to schemaless tables where
+/// "does a source column with this name exist?" is undecidable):
+/// - ORDER BY / GROUP BY resolve bare top-level names only (`ORDER BY c`,
+///   not `ORDER BY c + 1`), matching how SQL treats output-column names.
+/// - GROUP BY and HAVING skip self-referential aliases
+///   (`upper(name) AS name` — the bare name keeps its source-column
+///   meaning, mirroring SQL's input-column preference there); ORDER BY
+///   prefers the output column, so it always resolves.
+/// - HAVING resolves references anywhere in the predicate tree
+///   (`HAVING c > 1` nests the reference), without re-entering
+///   replacements — alias cycles cannot loop.
+pub fn resolve_select_aliases(sel: &mut Select) {
+    let aliases: Vec<(String, Expr)> = sel
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            SelectItem::Expr {
+                expr,
+                alias: Some(a),
+            } => Some((a.clone(), expr.clone())),
+            _ => None,
+        })
+        .collect();
+    if aliases.is_empty() {
+        return;
+    }
+    let target = |name: &str, skip_self_ref: bool| -> Option<&Expr> {
+        let (_, t) = aliases.iter().find(|(a, _)| a == name)?;
+        (!(skip_self_ref && contains_column(t, name))).then_some(t)
+    };
+    for o in &mut sel.order_by {
+        if let Expr::Column(name) = &o.expr {
+            if let Some(t) = target(name, false) {
+                o.expr = t.clone();
+            }
+        }
+    }
+    for g in &mut sel.group_by {
+        if let Expr::Column(name) = &*g {
+            if let Some(t) = target(name, true) {
+                *g = t.clone();
+            }
+        }
+    }
+    if let Some(h) = &mut sel.having {
+        substitute_aliases(h, &|name| target(name, true).cloned());
+    }
+}
+
+/// Whether `e` references the column `name` anywhere.
+fn contains_column(e: &Expr, name: &str) -> bool {
+    let mut found = false;
+    mutate_expr(&mut e.clone(), &mut |x| {
+        if matches!(x, Expr::Column(c) if c == name) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Replace `Column` nodes for which `target` returns a replacement,
+/// recursing into ORIGINAL children only — replacements are final.
+fn substitute_aliases(e: &mut Expr, target: &impl Fn(&str) -> Option<Expr>) {
+    if let Expr::Column(name) = e {
+        if let Some(t) = target(name) {
+            *e = t;
+        }
+        return;
+    }
+    match e {
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => substitute_aliases(expr, target),
+        Expr::Binary { left, right, .. } => {
+            substitute_aliases(left, target);
+            substitute_aliases(right, target);
+        }
+        Expr::Aggregate { arg, .. } => {
+            if let AggArg::Expr(expr) = arg {
+                substitute_aliases(expr, target);
+            }
+        }
+        Expr::Func { args, .. } => {
+            for arg in args {
+                substitute_aliases(arg, target);
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            substitute_aliases(expr, target);
+            for item in list {
+                substitute_aliases(item, target);
+            }
+        }
+        Expr::Between { expr, lo, hi, .. } => {
+            substitute_aliases(expr, target);
+            substitute_aliases(lo, target);
+            substitute_aliases(hi, target);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            substitute_aliases(expr, target);
+            substitute_aliases(pattern, target);
+        }
+        Expr::Literal(_) | Expr::Column(_) | Expr::Parameter(_) => {}
+    }
+}
+
 /// Replace every `now()` call with the given timestamp literal, so one
 /// query-wide instant drives range predicates and bucketing (and pushdown
 /// sees plain literals). Called once per execution by the engine.
