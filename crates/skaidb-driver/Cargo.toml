@@ -9,6 +9,12 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# Kerberos (SASL GSSAPI) client auth. Pulls in skaidb-gssapi -> cross-krb5,
+# which links only on glibc/macOS/Windows — never the static-musl build.
+kerberos = ["dep:skaidb-gssapi", "skaidb-gssapi/kerberos"]
+
 [dependencies]
 skaidb-types.workspace = true
 skaidb-proto.workspace = true
@@ -16,3 +22,5 @@ skaidb-auth.workspace = true
 skaidb-net.workspace = true
 rustls.workspace = true
 thiserror.workspace = true
+# Optional: only compiled with the `kerberos` feature.
+skaidb-gssapi = { workspace = true, optional = true }

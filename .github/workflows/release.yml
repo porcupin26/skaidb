@@ -123,7 +123,7 @@ jobs:
             os: ubuntu-latest
             packaging: linux
             nfpm_arch: amd64
-            features: skaidb-server/kerberos
+            features: skaidb-server/kerberos skaidb-cli/kerberos
             # libkrb5-dev: krb5 headers/libs for cross-krb5 (libgssapi-sys).
             # clang + libclang-dev: libgssapi-sys runs bindgen at build time,
             # which needs libclang. macOS/Windows get theirs from Xcode/SSPI.

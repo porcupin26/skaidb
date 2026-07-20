@@ -1300,6 +1300,7 @@ version = "0.109.5"
 dependencies = [
  "rustls",
  "skaidb-auth",
+ "skaidb-gssapi",
  "skaidb-net",
  "skaidb-proto",
  "skaidb-types",

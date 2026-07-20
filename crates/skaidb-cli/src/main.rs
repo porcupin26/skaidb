@@ -50,6 +50,18 @@ struct Cli {
     #[arg(short = 'p', long, env = "SKAIDB_PASSWORD")]
     password: Option<String>,
 
+    /// Authentication mechanism: `scram` (password, default) or `gssapi`
+    /// (Kerberos — run `kinit` first; requires a `kerberos`-feature build and
+    /// `--gssapi-spn`). With `gssapi`, `--user` is the client principal and no
+    /// password is sent.
+    #[arg(long = "auth-mechanism", default_value = "scram", env = "SKAIDB_AUTH_MECHANISM")]
+    auth_mechanism: String,
+
+    /// Target service principal for `--auth-mechanism gssapi`, e.g.
+    /// `skaidb/host.example.com@REALM`.
+    #[arg(long = "gssapi-spn", env = "SKAIDB_GSSAPI_SPN")]
+    gssapi_spn: Option<String>,
+
     /// Default SQL consistency: one | quorum | all.
     #[arg(long, default_value = "quorum")]
     consistency: String,
@@ -372,8 +384,22 @@ impl Shell {
             let endpoints = sql_endpoints(cli);
             let user = cli.user.as_deref().unwrap_or("anonymous");
             let pass = cli.password.as_deref().unwrap_or("");
-            let mut client = Client::connect_many_tls(&endpoints, user, pass, build_tls(cli)?)
-                .map_err(|e| format!("could not connect: {e}"))?;
+            let mut client = match cli.auth_mechanism.to_ascii_lowercase().as_str() {
+                "gssapi" | "kerberos" => {
+                    let spn = cli.gssapi_spn.as_deref().ok_or_else(|| {
+                        "--auth-mechanism gssapi requires --gssapi-spn <service-principal> \
+                         (e.g. skaidb/host@REALM)"
+                            .to_string()
+                    })?;
+                    Client::connect_gssapi_tls(&endpoints, user, spn, build_tls(cli)?)
+                        .map_err(|e| format!("could not connect (GSSAPI): {e}"))?
+                }
+                "scram" | "password" => Client::connect_many_tls(&endpoints, user, pass, build_tls(cli)?)
+                    .map_err(|e| format!("could not connect: {e}"))?,
+                other => {
+                    return Err(format!("unknown --auth-mechanism {other:?} (use scram or gssapi)"))
+                }
+            };
             if let Some(c) = parse_consistency(&cli.consistency) {
                 client.set_consistency(c);
             }
@@ -1156,6 +1182,8 @@ mod tests {
             rest_port: 7080,
             user: None,
             password: None,
+            auth_mechanism: "scram".into(),
+            gssapi_spn: None,
             consistency: "quorum".into(),
             tls: false,
             tls_ca: None,

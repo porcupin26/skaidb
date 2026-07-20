@@ -58,6 +58,10 @@ pub struct Client {
     endpoints: Vec<String>,
     username: String,
     password: String,
+    /// When set, authenticate with Kerberos (GSSAPI) to this target service
+    /// principal instead of SCRAM; `password` is unused. Retained so failover
+    /// reconnects re-authenticate the same way.
+    gssapi_spn: Option<String>,
     /// The endpoint the live `stream` is connected to.
     connected: String,
     stream: skaidb_net::Stream,
@@ -154,19 +158,58 @@ impl Client {
         password: &str,
         tls: Option<TlsConfig>,
     ) -> Result<Client, DriverError> {
+        Client::connect_inner(endpoints, username, password, None, tls)
+    }
+
+    /// Connect authenticating with Kerberos (SASL GSSAPI) instead of a
+    /// password. `principal` is the client identity presented in the handshake
+    /// (the authenticated identity actually comes from the Kerberos ticket);
+    /// `target_spn` is the skaidb node's service principal, e.g.
+    /// `skaidb/host.example.com@REALM`. Uses the ambient ticket cache — run
+    /// `kinit` first. Requires a driver built with the `kerberos` feature.
+    /// `tls = None` is plaintext; `Some(cfg)` wraps every (re)connect in TLS
+    /// (recommended — GSSAPI provides authentication, TLS the confidentiality).
+    pub fn connect_gssapi_tls(
+        endpoints: &[String],
+        principal: &str,
+        target_spn: &str,
+        tls: Option<TlsConfig>,
+    ) -> Result<Client, DriverError> {
+        Client::connect_inner(endpoints, principal, "", Some(target_spn.to_string()), tls)
+    }
+
+    /// Plaintext [`Client::connect_gssapi_tls`].
+    pub fn connect_gssapi(
+        endpoints: &[String],
+        principal: &str,
+        target_spn: &str,
+    ) -> Result<Client, DriverError> {
+        Client::connect_gssapi_tls(endpoints, principal, target_spn, None)
+    }
+
+    /// Shared connect path: order endpoints by latency and dial each until one
+    /// authenticates, via SCRAM (`gssapi_spn = None`) or GSSAPI (`Some(spn)`).
+    fn connect_inner(
+        endpoints: &[String],
+        username: &str,
+        password: &str,
+        gssapi_spn: Option<String>,
+        tls: Option<TlsConfig>,
+    ) -> Result<Client, DriverError> {
         let ordered = order_by_latency(&dedup(endpoints));
         if ordered.is_empty() {
             return Err(DriverError::NoEndpoint("no endpoints given".into()));
         }
         let mut last = String::new();
         for ep in &ordered {
-            match dial(ep, username, password, tls.as_ref()) {
+            match dial(ep, username, password, gssapi_spn.as_deref(), tls.as_ref()) {
                 Ok(stream) => {
                     let connected = ep.clone();
                     return Ok(Client {
                         endpoints: ordered,
                         username: username.to_string(),
                         password: password.to_string(),
+                        gssapi_spn,
                         connected,
                         stream,
                         tls,
@@ -507,7 +550,13 @@ impl Client {
         ordered.sort_by_key(|e| *e == self.connected);
         let mut last = String::new();
         for ep in &ordered {
-            match dial(ep, &self.username, &self.password, self.tls.as_ref()) {
+            match dial(
+                ep,
+                &self.username,
+                &self.password,
+                self.gssapi_spn.as_deref(),
+                self.tls.as_ref(),
+            ) {
                 Ok(stream) => {
                     self.stream = stream;
                     self.connected = ep.clone();
@@ -592,11 +641,13 @@ impl Drop for RowStream<'_> {
     }
 }
 
-/// Open a TCP connection to `endpoint` and run the SCRAM handshake.
+/// Open a TCP connection to `endpoint` and run the client handshake — GSSAPI
+/// when `gssapi_spn` is set, otherwise SCRAM.
 fn dial(
     endpoint: &str,
     username: &str,
     password: &str,
+    gssapi_spn: Option<&str>,
     tls: Option<&TlsConfig>,
 ) -> Result<skaidb_net::Stream, DriverError> {
     let tcp = TcpStream::connect(endpoint)?;
@@ -605,8 +656,83 @@ fn dial(
         Some(t) => skaidb_net::connect_tls(tcp, t.cfg.clone(), &t.server_name)?,
         None => skaidb_net::Stream::Plain(tcp),
     };
-    handshake(&mut stream, username, password)?;
+    match gssapi_spn {
+        Some(spn) => handshake_gssapi(&mut stream, username, spn)?,
+        None => handshake(&mut stream, username, password)?,
+    }
     Ok(stream)
+}
+
+/// Client side of the GSSAPI handshake: announce the mechanism, send the first
+/// GSS token, then shuttle `AuthToken` frames until the server replies with an
+/// `AuthOutcome`. Uses the ambient ticket cache (run `kinit`). Built only with
+/// the `kerberos` feature.
+#[cfg(feature = "kerberos")]
+fn handshake_gssapi<S: io::Read + io::Write>(
+    stream: &mut S,
+    username: &str,
+    target_spn: &str,
+) -> Result<(), DriverError> {
+    use skaidb_gssapi::{ClientHandshake, ClientStep};
+    use skaidb_proto::AuthToken;
+
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+    let client_nonce = format!(
+        "c{}.{}",
+        std::process::id(),
+        NONCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let (client, token0) = ClientHandshake::new(target_spn, None)
+        .map_err(|e| DriverError::Auth(format!("gssapi init failed (did you kinit?): {e}")))?;
+    write_frame(
+        stream,
+        &AuthStart {
+            username: username.to_string(),
+            client_nonce,
+            mechanism: AuthMechanism::Gssapi,
+        }
+        .encode(),
+    )?;
+    write_frame(stream, &AuthToken { token: token0 }.encode())?;
+
+    let mut client = Some(client);
+    loop {
+        let frame = read_frame(stream)?;
+        if let Ok(tok) = AuthToken::decode(&frame) {
+            let c = client
+                .take()
+                .ok_or_else(|| DriverError::Auth("gssapi: unexpected server token".into()))?;
+            match c.step(&tok.token).map_err(|e| DriverError::Auth(e.to_string()))? {
+                ClientStep::Continue { next, token } => {
+                    client = Some(next);
+                    write_frame(stream, &AuthToken { token }.encode())?;
+                }
+                ClientStep::Done { token } => {
+                    if let Some(token) = token {
+                        write_frame(stream, &AuthToken { token }.encode())?;
+                    }
+                }
+            }
+        } else if let Ok(outcome) = AuthOutcome::decode(&frame) {
+            return match outcome {
+                AuthOutcome::Ok { .. } => Ok(()),
+                AuthOutcome::Denied { reason } => Err(DriverError::Auth(reason)),
+            };
+        } else {
+            return Err(DriverError::Auth("gssapi: unexpected handshake frame".into()));
+        }
+    }
+}
+
+#[cfg(not(feature = "kerberos"))]
+fn handshake_gssapi<S: io::Read + io::Write>(
+    _stream: &mut S,
+    _username: &str,
+    _target_spn: &str,
+) -> Result<(), DriverError> {
+    Err(DriverError::Auth(
+        "this driver was built without Kerberos (GSSAPI) support".into(),
+    ))
 }
 
 /// Remove duplicate endpoints while preserving the caller's order.

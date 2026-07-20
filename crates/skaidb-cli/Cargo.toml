@@ -13,6 +13,12 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+default = []
+# Kerberos (GSSAPI) client auth for `skaidbsh --auth-mechanism gssapi`.
+# Enables the driver's Kerberos support (-> cross-krb5, glibc/macOS/Windows).
+kerberos = ["skaidb-driver/kerberos"]
+
 [dependencies]
 skaidb-engine.workspace = true
 skaidb-types.workspace = true
