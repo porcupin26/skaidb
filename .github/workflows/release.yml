@@ -112,18 +112,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Kerberos (skaidb-server/kerberos -> cross-krb5) is enabled only
-          # where the C krb5 library links cleanly: x86_64 glibc (prod's .deb),
-          # macOS (GSS.framework), and Windows (SSPI). It is OFF for musl (the
-          # static binary must not link a C krb5) and for aarch64-linux (avoids
-          # cross-compiling libkrb5 for arm64). Entries with no `features` build
-          # without it.
+          # Kerberos (skaidb-server/kerberos -> cross-krb5) is enabled on
+          # x86_64 glibc only — prod's .deb target, the one validated end-to-end
+          # against a real KDC. It is OFF for musl (the static binary must not
+          # link a C krb5), aarch64-linux (avoids cross-compiling libkrb5), and
+          # for now macOS/Windows (added with the phase-4 client, once their
+          # GSS.framework/SSPI builds are tested). Entries with no `features`
+          # build without it.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             packaging: linux
             nfpm_arch: amd64
             features: skaidb-server/kerberos
-            apt: libkrb5-dev
+            # libkrb5-dev: krb5 headers/libs for cross-krb5 (libgssapi-sys).
+            # clang + libclang-dev: libgssapi-sys runs bindgen at build time,
+            # which needs libclang. macOS/Windows get theirs from Xcode/SSPI.
+            apt: libkrb5-dev clang libclang-dev
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             packaging: linux
@@ -137,15 +141,12 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-latest
             packaging: macos
-            features: skaidb-server/kerberos
           - target: aarch64-apple-darwin
             os: macos-latest
             packaging: macos
-            features: skaidb-server/kerberos
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             packaging: windows
-            features: skaidb-server/kerberos
     steps:
       - uses: actions/checkout@v6
         with:

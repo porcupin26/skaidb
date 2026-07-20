@@ -36,6 +36,20 @@ contents:
     dst: /etc/default/skaidb
     type: config|noreplace
 
+# The amd64 build links the krb5 GSSAPI library (the `kerberos` feature), so
+# the package must pull its runtime shared library. Declared for both arches
+# from the one shared config; the arm64 build doesn't link it, but the library
+# is a tiny, near-ubiquitous base dependency, so the over-declaration is
+# harmless. (musl ships as a static tarball, not via this config, and links no
+# C krb5 at all.)
+overrides:
+  deb:
+    depends:
+      - libgssapi-krb5-2
+  rpm:
+    depends:
+      - krb5-libs
+
 scripts:
   postinstall: ./packaging/postinstall.sh
   preremove: ./packaging/preremove.sh
