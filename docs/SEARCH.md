@@ -3,8 +3,7 @@
 Native full-text search over skaidb tables: BM25-ranked retrieval with
 `MATCH()` / `SEARCH()` SQL predicates, backed by an embedded
 [Tantivy](https://github.com/quickwit-oss/tantivy) index per search index.
-This documents the **shipped** state; pending work lives in
-[TODO.md](TODO.md), the SQL grammar in
+This documents the **shipped** state; the SQL grammar is in
 [QUERY_SYNTAX.md](QUERY_SYNTAX.md#full-text-search-match--search), and the
 phase history in git.
 
@@ -464,7 +463,7 @@ retriever or a `1/(1+distance)` similarity for a plain knn, and the
 - No `JOIN`, `UNION`, `DISTINCT` in the same query. A search predicate
   combines with `NEAREST` (vector) only through **hybrid `RANK BY RRF`** (see
   below), not as a boolean sibling.
-- Per-shard BM25 statistics (the standard distributed-index default); a
-  global-stats mode remains future work. Scoring targets result-set
+- Per-shard BM25 statistics (the standard distributed-index default); there
+  is no global-stats mode. Scoring targets result-set
   stability, not identical score floats — BM25 constants and
   length normalization differ subtly between engines.

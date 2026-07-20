@@ -497,7 +497,7 @@ skaidbsh keyfile gen --out /etc/skaidb/at-rest.key   # 32 bytes, 0600
 ```toml
 [encryption]
 at_rest_enabled = true
-at_rest_kek_source = "keyfile"          # kms: not yet implemented
+at_rest_kek_source = "keyfile"          # kms: not supported
 at_rest_keyfile = "/etc/skaidb/at-rest.key"
 ```
 

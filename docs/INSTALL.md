@@ -152,7 +152,7 @@ Get-FileHash .\skaidb-X.Y.Z-x86_64-pc-windows-msvc.zip -Algorithm SHA256
 Select-String skaidb-X.Y.Z-x86_64-pc-windows-msvc.zip .\SHA256SUMS
 ```
 
-A `... : OK` line (Linux/macOS) means the file is intact. (Releases are not yet
+A `... : OK` line (Linux/macOS) means the file is intact. (Releases are not
 GPG-signed; verify over HTTPS from the official repo.)
 
 ## Linux

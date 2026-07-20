@@ -491,7 +491,7 @@ WHERE ts >= now() - 6h GROUP BY t;
   datasource. PromQL subset: selectors with `= != =~ !~` (regex anchored),
   bare `{name=~"..."}` selectors, `offset`, `rate/increase/delta[5m]`,
   `sum/avg/min/max/count [by|without]`, vector arithmetic `+ - * /`,
-  `histogram_quantile`. Not yet: subqueries, `group_left/right`, `topk`.
+  `histogram_quantile`. Not supported: subqueries, `group_left/right`, `topk`.
 - **Self-scrape**: `config set observability.self_scrape true` (live) makes
   the node ingest its own `/metrics` every
   `observability.self_scrape_interval_secs` — self-dashboarding without an
@@ -744,7 +744,7 @@ keyfile with `skaidbsh keyfile gen --out <path>` (32 bytes, 0600 — BACK IT UP
 off-box; losing it loses all encrypted data). New files encrypt; existing
 plaintext files stay readable (mixed migration — fully encrypt via a rolling
 per-node wipe+rejoin). A missing/bad keyfile fails startup loud. Restart-scoped.
-Shows at `/status` as `at_rest`. (kms KEK source not yet implemented.)
+Shows at `/status` as `at_rest`. (kms KEK source not supported.)
 **RESYNC state**: a node that (re)joins from a WIPED data dir (far less data
 than its peers) is flagged `resyncing` while it backfills. A resyncing node does
 NOT serve full-scan/aggregate/count results from its own (incomplete) copy — it

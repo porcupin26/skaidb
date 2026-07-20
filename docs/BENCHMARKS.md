@@ -229,7 +229,7 @@ skaidb `SEARCH INDEX` vs Elasticsearch, single node each, both on
 dedicated **2 vCPU / 2 GB** LXCs, driven from a third VLAN-local client.
 **100,000-document synthetic corpus** (short prose, deterministic
 generation, `id`/`title`/`body`) — not the original 280,595-doc Simple
-English Wikipedia corpus (regenerating it is tracked in TODO.md). Both
+English Wikipedia corpus (regenerating it is a known follow-up). Both
 engines: `standard` analyzer, 1 s refresh, per-batch durability (skaidb:
 WAL fsync per statement; ES: translog fsync per bulk), 1 GB ES heap /
 matching skaidb memtable budget.
@@ -392,7 +392,7 @@ cargo run --release --example index_bench -p skaidb-engine
 
 *The durable audit record: what holds, root causes, measured dead ends,
 methodology. Result tables above get replaced on re-runs; this section
-only grows. Open `[perf]` work lives in [TODO.md](TODO.md).*
+only grows.*
 
 ### What already holds
 
@@ -487,9 +487,9 @@ produced six measured, code-verified findings:
   fleet (properly isolated A/B, first-run-after-restart outlier
   discarded). The quorum read path (`Node::point_get`) pipelines the
   peer confirmation concurrently with the local read — not sequential.
-  One flagged risk for future work: **read-repair is synchronous** — a
-  stale replica blocks the client response on its repair instead of
-  repairing in the background.
+  One flagged risk: **read-repair is synchronous** — a stale replica
+  blocks the client response on its repair instead of repairing in the
+  background.
 - **The published "16c coordinator bottleneck" was a harness artifact
   plus a real driver inefficiency** (both fixed, 2026-07-17). The
   original C1-C4 pass showed skaidb's 16-connection throughput stuck at

@@ -349,8 +349,8 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
 - **`BEGIN`/`COMMIT`/`ROLLBACK`** wrap several statements in a transaction with
   read-your-writes: buffered writes are invisible to other readers until
   `COMMIT`, and `ROLLBACK` discards them. **Embedded engine only** — in cluster
-  mode each statement autocommits and transaction control returns an error (a
-  distributed transaction coordinator is future work). DDL is not transactional.
+  mode each statement autocommits and transaction control returns an error
+  (there is no distributed transaction coordinator). DDL is not transactional.
 
 - **Access control.** `<privilege>` is one of `SELECT`, `INSERT`, `UPDATE`,
   `DELETE`, `CREATE`, `DROP`, `GRANT`, `MONITOR`, `ADMIN` (`ADMIN` on `*` =
@@ -752,8 +752,7 @@ WHERE (MATCH(body, 'rust') OR MATCH(title, 'rust'))
 
 `CREATE TIMESERIES TABLE` declares a table whose rows are **samples**, stored
 in the time-series engine (Gorilla-compressed chunks; feature status and
-internals in [TIMESERIES.md](TIMESERIES.md), pending work in
-[TODO.md](TODO.md)). Distributed: the DDL broadcasts, series place on the
+internals in [TIMESERIES.md](TIMESERIES.md)). Distributed: the DDL broadcasts, series place on the
 ring and replicate at the write consistency, and queries union-merge across
 members. Joins and
 decommissions migrate series like any other data.

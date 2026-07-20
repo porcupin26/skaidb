@@ -172,6 +172,6 @@ stateless REST path does not carry a multi-round negotiation.
 
 The GSS context requires mutual authentication and confidentiality, and runs
 inside client TLS. Channel binding (binding the GSS context to the outer TLS
-channel, `tls-server-end-point`) is a planned hardening — not yet implemented;
-until then, always run GSSAPI inside TLS, which already authenticates the
+channel, `tls-server-end-point`) is not implemented;
+always run GSSAPI inside TLS, which already authenticates the
 server and prevents token relay to a different endpoint.

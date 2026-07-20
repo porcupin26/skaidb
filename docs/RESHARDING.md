@@ -110,7 +110,7 @@ divergence:
   (tombstones included), so repair memory stays O(page) regardless of table
   size. This is the durable backstop that converges replicas even with no reads
   and even if hints were lost. It still *compares* every key; a Merkle tree
-  would let it skip identical key ranges entirely (future work).
+  would let it skip identical key ranges entirely.
 
 ## Reclaiming space after a move
 

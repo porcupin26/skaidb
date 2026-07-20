@@ -119,7 +119,7 @@ stored as its own compressed stream. Full grammar and semantics:
   numbers with less raw IO; the bucket straddling the head boundary stays
   on the source. Clustered deployments keep retention-only routing (a
   peer's head may lag; extending needs a min-over-replicas boundary
-  exchange, tracked in TODO.md).
+  exchange).
 - **Partial-aggregate pushdown** (v0.31.0): an aggregation whose `WHERE`
   is fully served by the pushdown (a `ts` range plus label `=`/`!=`),
   grouping by labels and/or one `time_bucket`, ships **per-series
@@ -133,7 +133,7 @@ stored as its own compressed stream. Full grammar and semantics:
   anything ineligible (residual predicates, `COUNT(*)`, computed aggregate
   arguments) transparently uses the raw union-merge path. The PromQL
   endpoint still gathers raw samples (its lookback windows aren't
-  bucket-aligned; see TODO).
+  bucket-aligned).
 - **Hinted handoff** (v0.30.0): a replica unreachable during an append
   gets its batch buffered on the coordinator (bounded per peer) and
   replayed via the gap-filling merge as soon as it's reachable — brief
@@ -160,18 +160,9 @@ stored as its own compressed stream. Full grammar and semantics:
 - Append-only semantics enforced: `UPDATE`/`DELETE`/transactions rejected
   with clear errors; reserved `__`-prefixed names blocked.
 
-## What's missing (and where it's planned)
+## Compatibility note
 
-All tracked, with more detail, in [`TODO.md`](TODO.md).
-
-| Gap | Notes | Planned |
-|---|---|---|
-| PromQL partial gather | `/api/v1/query_range` still ships raw samples; the SQL surface uses the v0.31.0 partial pushdown | open |
-| In-retention rollup serving, clustered | single-node ships; clustered needs a min-over-replicas head-boundary exchange | with sharded partials |
-| PromQL: regex matchers, offset, arithmetic, histogram_quantile | the shipped subset covers selectors, rate/increase/delta, and sum/avg/min/max/count by/without | phase 7 follow-up |
-| ~~Label postings index~~ | **shipped v0.92**: per-label-value postings in the head (maintained at series create/GC) and per block (built at open); Eq matchers select the smallest posting, regex matchers walk the label's value dictionary instead of the series population, and every candidate set is re-checked against the full matcher semantics (missing-label `=""` / empty-matching regexes keep the full walk) | done |
-| Regex label matchers | only `=` / `!=` push down | with postings |
-| TS gauges on `/metrics` | per-store stats are in `SHOW STATUS`; Prometheus-endpoint gauges pending | soon |
-| `memory_target` integration | head memory isn't yet part of the storage budget | soon |
-| Streamed TS results | raw dumps are scan-metered (v0.91) and both wire surfaces chunk-stream; true end-to-end streaming is an architecture item (see TODO) | later |
-| Exemplars / native histograms | schema headroom reserved in the chunk format | later |
+The shipped PromQL subset covers selectors, `rate`/`increase`/`delta`, and
+`sum`/`avg`/`min`/`max`/`count` `by`/`without`; label matchers push down `=`/`!=`
+(regex matchers re-check against the full population). Label-postings selection
+shipped in v0.92.
