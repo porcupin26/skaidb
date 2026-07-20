@@ -114,6 +114,12 @@ Key facts an agent must know:
   and `CAST(x AS INT|FLOAT|STRING|BOOL|TIMESTAMP)` (desugars to
   `to_int`/`to_float`/`to_string`/`to_bool`/`to_timestamp`, same
   NULL-on-unconvertible policy; timestamps stringify as ISO-8601).
+- **Geospatial**: `geo_distance(point, lat, lon)` → haversine metres;
+  `geo_bbox(point, min_lat, min_lon, max_lat, max_lon)` → bool (min_lon>max_lon
+  crosses the antimeridian). `point` is a `{lat,lon}` object or `[lat,lon]`
+  array; non-point/NULL → NULL. Use in `WHERE geo_distance(loc,..) <= <metres>`
+  and `ORDER BY geo_distance(loc,..) LIMIT k` (nearest-first). Evaluates over a
+  scan (no geo index yet — filter to scope large tables).
 - **`SELECT <expr>` without FROM**: constant projection, one row
   (`SELECT 1` = liveness probe; needs no privilege). `*` and other
   clauses still require a table; a FROM-less leg works inside UNION.

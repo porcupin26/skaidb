@@ -488,6 +488,18 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   execution errors. The full-text search functions `MATCH`, `MATCH_PHRASE`,
   `FUZZY`, `SEARCH`, and `score` parse the same way and are only valid in a
   search query (see *Full-text search* below).
+- **Geospatial:** `geo_distance(<point>, <lat>, <lon>)` returns the great-circle
+  (haversine) distance in **metres** from a point column to `(<lat>, <lon>)`;
+  `geo_bbox(<point>, <min_lat>, <min_lon>, <max_lat>, <max_lon>)` tests whether
+  a point lies inside a bounding box (`min_lon > max_lon` crosses the
+  antimeridian). A point is a `{lat, lon}` object (`lng` also accepted) or a
+  `[lat, lon]` array; a non-point / NULL value yields `NULL` (so it drops from a
+  filter) rather than erroring. Use them anywhere:
+  `WHERE geo_distance(loc, 40.71, -74.0) <= 5000`,
+  `ORDER BY geo_distance(loc, 40.71, -74.0) LIMIT 10` (nearest-first), or
+  `WHERE geo_bbox(loc, 40.4, -74.3, 40.9, -73.7)`. These evaluate over a scan
+  (bounded by the scan budget) — there is no geo index yet, so scope with a
+  `geo_bbox`/other filter on large tables.
 - **Bind parameters:** `?` marks a positional parameter in any expression
   position of a **prepared** `SELECT`/`INSERT`/`UPDATE`/`DELETE` (e.g.
   `INSERT INTO t (id, v) VALUES (?, ?)`), and additionally in `LIMIT ?` /

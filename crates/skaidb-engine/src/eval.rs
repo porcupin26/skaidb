@@ -226,6 +226,60 @@ fn eval_func(name: &str, args: &[Expr], row: &Document) -> Result<Value> {
                 EngineError::Type("rrf_score() is only valid in a RANK BY RRF query".into())
             })
         }
+        // `geo_distance(point, lat, lon)` — great-circle (haversine) distance in
+        // METERS from the row's `point` field to `(lat, lon)`. `point` is a
+        // `{lat, lon}` object or a `[lat, lon]` array; a non-point value (or a
+        // NULL/absent field or coordinate) yields NULL, never an error — one
+        // bad row in a schema-less column must not kill the query (the LIKE /
+        // to_* policy). Use in `WHERE geo_distance(loc, ..) <= <meters>` and in
+        // `ORDER BY geo_distance(loc, ..) LIMIT k` (nearest-first).
+        "geo_distance" => {
+            if args.len() != 3 {
+                return Err(EngineError::Type(
+                    "geo_distance(point, lat, lon) takes exactly three arguments".into(),
+                ));
+            }
+            let Some((plat, plon)) = read_point(&eval(&args[0], row)?) else {
+                return Ok(Value::Null);
+            };
+            match (
+                as_f64(&eval(&args[1], row)?),
+                as_f64(&eval(&args[2], row)?),
+            ) {
+                (Some(lat), Some(lon)) => Ok(Value::Float(haversine_m(plat, plon, lat, lon))),
+                _ => Ok(Value::Null),
+            }
+        }
+        // `geo_bbox(point, min_lat, min_lon, max_lat, max_lon)` — whether the
+        // row's `point` lies inside the bounding box. `min_lon > max_lon` is a
+        // box that crosses the antimeridian (±180°). Non-point/NULL → NULL.
+        "geo_bbox" => {
+            if args.len() != 5 {
+                return Err(EngineError::Type(
+                    "geo_bbox(point, min_lat, min_lon, max_lat, max_lon) takes exactly five \
+                     arguments"
+                        .into(),
+                ));
+            }
+            let Some((plat, plon)) = read_point(&eval(&args[0], row)?) else {
+                return Ok(Value::Null);
+            };
+            let mut b = [0.0f64; 4];
+            for (i, arg) in args[1..].iter().enumerate() {
+                match as_f64(&eval(arg, row)?) {
+                    Some(v) => b[i] = v,
+                    None => return Ok(Value::Null),
+                }
+            }
+            let [min_lat, min_lon, max_lat, max_lon] = b;
+            let lon_ok = if min_lon <= max_lon {
+                plon >= min_lon && plon <= max_lon
+            } else {
+                // Box crosses the antimeridian.
+                plon >= min_lon || plon <= max_lon
+            };
+            Ok(Value::Bool(plat >= min_lat && plat <= max_lat && lon_ok))
+        }
         // `HIGHLIGHT(col [, max_chars])` reads the snippet the search gather
         // injects for the column; outside a search query there is nothing to
         // read.
@@ -297,6 +351,41 @@ pub(crate) fn as_int_ms(v: &Value) -> Option<i64> {
         Value::Float(f) => Some(*f as i64),
         _ => None,
     }
+}
+
+/// A numeric value as `f64` (`Int`/`Float`/`Decimal`), else `None`.
+fn as_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(i) => Some(*i as f64),
+        Value::Float(f) => Some(*f),
+        Value::Decimal(d) => d.to_string().parse().ok(),
+        _ => None,
+    }
+}
+
+/// Read a geo point as `(lat, lon)` from a `{lat, lon}` object (`lng` also
+/// accepted) or a `[lat, lon]` array. `None` for any other shape.
+fn read_point(v: &Value) -> Option<(f64, f64)> {
+    match v {
+        Value::Document(d) => {
+            let lat = as_f64(d.get("lat")?)?;
+            let lon = as_f64(d.get("lon").or_else(|| d.get("lng"))?)?;
+            Some((lat, lon))
+        }
+        Value::Array(a) if a.len() == 2 => Some((as_f64(&a[0])?, as_f64(&a[1])?)),
+        _ => None,
+    }
+}
+
+/// Great-circle distance in metres between two `(lat, lon)` points (haversine,
+/// mean-Earth-radius sphere — the model Elasticsearch's `arc` distance uses).
+fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const EARTH_RADIUS_M: f64 = 6_371_000.0;
+    let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    let a = (dlat / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dlon / 2.0).sin().powi(2);
+    2.0 * EARTH_RADIUS_M * a.sqrt().atan2((1.0 - a).sqrt())
 }
 
 /// Evaluate `expr` as a `WHERE`/`HAVING` predicate (kept only when `True`).

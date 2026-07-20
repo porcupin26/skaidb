@@ -2300,6 +2300,62 @@ mod tests {
         assert_eq!(ids(rs)[0], 1);
     }
 
+    /// Geospatial scalar functions: `geo_distance` (haversine metres) filters
+    /// and sorts, `geo_bbox` tests a bounding box, and a non-point value yields
+    /// NULL (excluded) rather than an error.
+    #[test]
+    fn geo_distance_and_bbox_filter_and_sort() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE places (PRIMARY KEY (id))").unwrap();
+        // `[lat, lon]` points: (0,0), 1° east, 1° north; plus a non-point row.
+        db.execute(
+            "INSERT INTO places (id, loc) VALUES \
+             (1, [0.0, 0.0]), (2, [0.0, 1.0]), (3, [1.0, 0.0]), (4, 'not-a-point')",
+        )
+        .unwrap();
+
+        // Distance filter: only (0,0) is within 1 km of (0,0).
+        let rs = rows(
+            db.execute("SELECT id FROM places WHERE geo_distance(loc, 0.0, 0.0) <= 1000")
+                .unwrap(),
+        );
+        assert_eq!(sorted_ids(rs), vec![1]);
+
+        // Wider radius: the three points; id4 (non-point -> NULL distance) is out.
+        let rs = rows(
+            db.execute("SELECT id FROM places WHERE geo_distance(loc, 0.0, 0.0) <= 200000")
+                .unwrap(),
+        );
+        assert_eq!(sorted_ids(rs), vec![1, 2, 3]);
+
+        // Nearest-first sort (bounded top-k over the scalar expr).
+        let rs = rows(
+            db.execute(
+                "SELECT id FROM places WHERE geo_distance(loc, 0.0, 0.0) <= 200000 \
+                 ORDER BY geo_distance(loc, 0.0, 0.0) LIMIT 3",
+            )
+            .unwrap(),
+        );
+        assert_eq!(ids(rs)[0], 1);
+
+        // Distance value: 1° of longitude at the equator ≈ 111.3 km.
+        let rs = rows(
+            db.execute("SELECT geo_distance(loc, 0.0, 0.0) AS d FROM places WHERE id = 2")
+                .unwrap(),
+        );
+        match rs.rows[0][0] {
+            Value::Float(d) => assert!((d - 111_319.0).abs() < 500.0, "d = {d}"),
+            ref o => panic!("expected float distance, got {o:?}"),
+        }
+
+        // Bounding box: only (0,0) is inside [-0.5,0.5] × [-0.5,0.5].
+        let rs = rows(
+            db.execute("SELECT id FROM places WHERE geo_bbox(loc, -0.5, -0.5, 0.5, 0.5)")
+                .unwrap(),
+        );
+        assert_eq!(sorted_ids(rs), vec![1]);
+    }
+
     /// Failure injection: a torn search-index directory (truncated
     /// meta.json, a deleted segment file, or a wiped directory) must
     /// rebuild from the table on reopen — never error, never lose hits.
