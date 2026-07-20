@@ -134,6 +134,13 @@ enum PExpr {
     },
     /// `histogram_quantile(φ, expr)` over `_bucket` series with `le`.
     HistogramQuantile { phi: f64, arg: Box<PExpr> },
+    /// `timestamp(sel)` — each series' selected sample TIME (unix seconds)
+    /// as the value; `max(timestamp(m)) * 1000` is the "last reading"
+    /// dashboard pattern. The argument must be an instant selector.
+    Timestamp { arg: Box<PExpr> },
+    /// `time()` — the evaluation timestamp as a scalar (unix seconds);
+    /// `time() - max(timestamp(m))` is data staleness.
+    Time,
     /// A bare number.
     Number(f64),
 }
@@ -405,6 +412,22 @@ impl<'a> P<'a> {
         }
         let name = self.ident().ok_or("expected expression")?;
         // histogram_quantile(φ, expr).
+        if name == "timestamp" {
+            self.expect(b'(')?;
+            let arg = self.expr()?;
+            self.expect(b')')?;
+            if !matches!(arg, PExpr::Selector { range_ms: None, .. }) {
+                return Err(
+                    "timestamp() takes an instant selector, e.g. timestamp(m{})".into(),
+                );
+            }
+            return Ok(PExpr::Timestamp { arg: Box::new(arg) });
+        }
+        if name == "time" {
+            self.expect(b'(')?;
+            self.expect(b')')?;
+            return Ok(PExpr::Time);
+        }
         if name == "histogram_quantile" {
             self.expect(b'(')?;
             let PExpr::Number(phi) = self.factor()? else {
@@ -616,12 +639,13 @@ fn assign_slots(expr: &mut PExpr, specs: &mut Vec<(Vec<Matcher>, Option<i64>, i6
         }
         PExpr::RangeFn { arg, .. }
         | PExpr::Agg { arg, .. }
-        | PExpr::HistogramQuantile { arg, .. } => assign_slots(arg, specs),
+        | PExpr::HistogramQuantile { arg, .. }
+        | PExpr::Timestamp { arg } => assign_slots(arg, specs),
         PExpr::Binary { lhs, rhs, .. } => {
             assign_slots(lhs, specs);
             assign_slots(rhs, specs);
         }
-        PExpr::Number(_) => {}
+        PExpr::Time | PExpr::Number(_) => {}
     }
 }
 
@@ -631,9 +655,12 @@ fn selector_of(expr: &PExpr) -> Result<&Vec<Matcher>, String> {
         PExpr::Selector { matchers, .. } => Ok(matchers),
         PExpr::RangeFn { arg, .. }
         | PExpr::Agg { arg, .. }
-        | PExpr::HistogramQuantile { arg, .. } => selector_of(arg),
+        | PExpr::HistogramQuantile { arg, .. }
+        | PExpr::Timestamp { arg } => selector_of(arg),
         PExpr::Binary { lhs, .. } => selector_of(lhs),
-        PExpr::Number(_) => Err("number-only expressions are not supported".into()),
+        PExpr::Time | PExpr::Number(_) => {
+            Err("number-only expressions are not supported".into())
+        }
     }
 }
 
@@ -651,6 +678,35 @@ fn match_key(labels: &Labels) -> Labels {
 fn eval_steps(expr: &PExpr, fetched: &[Fetched], steps: &[i64]) -> Result<Vec<StepVal>, String> {
     match expr {
         PExpr::Number(n) => Ok(steps.iter().map(|_| StepVal::Scalar(*n)).collect()),
+        PExpr::Time => Ok(steps
+            .iter()
+            .map(|&t| StepVal::Scalar(t as f64 / 1000.0))
+            .collect()),
+        // Each series' selected sample TIME (unix seconds) as the value —
+        // instant-vector selection like a plain selector, but surfacing
+        // `s.ts` instead of `s.value`. Functions drop the metric name.
+        PExpr::Timestamp { arg } => {
+            let PExpr::Selector { slot, .. } = arg.as_ref() else {
+                unreachable!("parser enforces an instant selector");
+            };
+            let data = &fetched[*slot];
+            Ok(steps
+                .iter()
+                .map(|&t| {
+                    let mut v = Vec::new();
+                    for (labels, samples) in &data.series {
+                        let idx = samples.partition_point(|s| s.ts <= t);
+                        if idx > 0 {
+                            let s = &samples[idx - 1];
+                            if t - s.ts <= LOOKBACK_MS {
+                                v.push((clean_labels(labels, false), s.ts as f64 / 1000.0));
+                            }
+                        }
+                    }
+                    StepVal::Vector(v)
+                })
+                .collect())
+        }
         PExpr::Binary { op, lhs, rhs } => {
             let l = eval_steps(lhs, fetched, steps)?;
             let r = eval_steps(rhs, fetched, steps)?;
@@ -1424,7 +1480,15 @@ mod tests {
         assert!(hq > 50.0 && hq <= 100.0, "{hq}");
         // Classic dashboard staples (rate = increase / window: 100/10s → ×60).
         assert_eq!(one(r#"sum by (job) (rate(reqs_total{job="api"}[10s])) * 60"#).round(), 600.0);
-        // quantile without a scalar first argument is a clear error.
+        // "Last reading" stat panels: timestamp() surfaces the sample time
+        // (unix seconds; the dashboard multiplies by 1000 for a Time field),
+        // and time() - timestamp() is staleness.
+        assert_eq!(one(r#"max(timestamp(aqi{device_id=~"a"})) * 1000"#), 9_000.0);
+        assert_eq!(one("time()"), 10.0);
+        assert_eq!(one(r#"time() - max(timestamp(aqi{device_id="a"}))"#), 1.0);
+        // timestamp() over a computed vector is a clear error, not a wrong
+        // answer; quantile without a scalar first argument likewise.
+        assert!(eval("timestamp(avg(aqi))").is_err());
         assert!(eval("quantile(aqi)").is_err());
     }
 

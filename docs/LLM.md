@@ -533,6 +533,7 @@ WHERE ts >= now() - 6h GROUP BY t;
   bare `{name=~"..."}` selectors, `offset`, `rate/increase/delta[5m]`,
   `avg/min/max/sum/count/last_over_time[5m]` (Grafana drilldown tiles),
   `stddev` + `quantile(φ, v)` aggs, trailing commas in matcher blocks,
+  `timestamp(<selector>)` + `time()` (last-reading/staleness stats),
   number-only exprs (`1+1` health check),
   `sum/avg/min/max/count [by|without]`, vector arithmetic `+ - * /`,
   `histogram_quantile`. Not supported: subqueries, `group_left/right`, `topk`.

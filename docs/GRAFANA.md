@@ -79,7 +79,9 @@ the `*_over_time` family is what Grafana's Metrics Drilldown tiles use),
 `sum/avg/min/max/count/stddev [by|without (...)]` and `quantile(φ, v)`
 (the drilldown's "Standard deviation" / "Percentiles" previews), vector
 arithmetic (`+ - * /`, one-to-one matching), number-only expressions (the
-`1+1` datasource health check), and `histogram_quantile`. Trailing commas
+`1+1` datasource health check), `histogram_quantile`, and
+`timestamp(<selector>)` / `time()` (the "last reading" / staleness stat
+patterns: `max(timestamp(m)) * 1000`, `time() - max(timestamp(m))`). Trailing commas
 in matcher blocks are accepted, Prometheus-style. The drilldown's full
 query catalog is pinned by the `grafana_promql_compatibility` test. Typical dashboard panels —
 `sum by (job) (rate(http_requests_total[5m]))`,
