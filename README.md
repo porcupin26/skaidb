@@ -233,7 +233,9 @@ Implemented end-to-end and tested (430+ tests):
   changes serialized). See [docs/CLUSTERING.md](docs/CLUSTERING.md) /
   [docs/RESHARDING.md](docs/RESHARDING.md)
 - **auth**: SCRAM-SHA-256 handshake (mutual auth) on the binary endpoint and
-  HTTP Basic on REST, + per-statement **RBAC**
+  HTTP Basic on REST, + per-statement **RBAC**. Optional **Kerberos (GSSAPI)**
+  for passwordless external users and browser SSO — see
+  [docs/KERBEROS.md](docs/KERBEROS.md)
 - binary + REST endpoints, Prometheus metrics, masked audit logs
 - **benchmarked** against MongoDB 7/8, PostgreSQL, MariaDB — see
   [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
