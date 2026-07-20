@@ -16,7 +16,7 @@ mod session;
 mod ts_query;
 pub mod vector;
 
-pub use embed::{Embedder, HashEmbedder};
+pub use embed::{Embedder, HashEmbedder, OverlapReranker, Reranker};
 pub use error::EngineError;
 pub use exec::{
     filter_rows, filter_search_query, matches_filter, run, statement_is_read_only, Cluster,
@@ -2301,6 +2301,139 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(ids(rs)[0], 1);
+    }
+
+    /// `RERANK` re-scores the top BM25 candidates with the installed
+    /// [`crate::embed::Reranker`] and serves the page in the reranker's order,
+    /// with `score()` exposing the rerank score.
+    #[test]
+    fn rerank_reorders_search_hits() {
+        use std::sync::Arc;
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE docs (PRIMARY KEY (id))").unwrap();
+        // id2 spams the match term (top BM25); id1 matches the *rerank* query
+        // best; id3 matches both weakly.
+        db.execute(
+            "INSERT INTO docs (id, body) VALUES \
+             (1, 'fast rust database'), \
+             (2, 'database database database'), \
+             (3, 'a database of recipes')",
+        )
+        .unwrap();
+        db.execute("CREATE SEARCH INDEX docs_fts ON docs (body)").unwrap();
+
+        // Without a reranker installed, RERANK errors clearly.
+        let err = db
+            .execute("SELECT id FROM docs WHERE MATCH(body, 'database') RERANK LIMIT 2")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rerank provider"), "{err}");
+
+        db.set_reranker(Arc::new(crate::embed::OverlapReranker));
+        // BM25 alone puts the term-spamming id2 first…
+        let rs = rows(
+            db.execute(
+                "SELECT id FROM docs WHERE MATCH(body, 'database') \
+                 ORDER BY score() DESC LIMIT 3",
+            )
+            .unwrap(),
+        );
+        assert_eq!(ids(rs)[0], 2);
+        // …the cross-encoder pass reorders by the rerank query instead, and
+        // `score()` reads the rerank score (token overlap: id1 = 3/3).
+        let rs = rows(
+            db.execute(
+                "SELECT id, score() FROM docs WHERE MATCH(body, 'database') \
+                 RERANK QUERY 'fast rust database' TOP 10 LIMIT 2",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows.len(), 2);
+        assert_eq!(rs.rows[0][0], Value::Int(1));
+        assert_eq!(rs.rows[0][1], Value::Float(1.0));
+        // The derived query text (from MATCH) works too; `ON <col>` scopes the
+        // document text.
+        let rs = rows(
+            db.execute(
+                "SELECT id FROM docs WHERE MATCH(body, 'database') \
+                 RERANK ON body TOP 10 LIMIT 3",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows.len(), 3);
+
+        // Shape checks: ORDER BY and non-search selects are rejected.
+        let err = db
+            .execute(
+                "SELECT id FROM docs WHERE MATCH(body, 'database') RERANK \
+                 ORDER BY id LIMIT 2",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ORDER BY"), "{err}");
+        // (A bare ident right after the table is an alias, so the non-search
+        // case needs a WHERE for RERANK to parse as the clause.)
+        let err = db
+            .execute("SELECT id FROM docs WHERE id > 0 RERANK LIMIT 2")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("MATCH"), "{err}");
+    }
+
+    /// `RERANK` composes with hybrid retrieval: the fused top candidates are
+    /// re-scored, `rrf_score()` keeps the fusion score, and the final order is
+    /// the reranker's.
+    #[test]
+    fn rerank_on_hybrid_query() {
+        use std::sync::Arc;
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE docs (PRIMARY KEY (id))").unwrap();
+        db.execute(
+            "INSERT INTO docs (id, body, emb) VALUES \
+             (1, 'quick brown fox', [1.0, 0.0, 0.0]), \
+             (2, 'quick delivery service', [0.0, 1.0, 0.0]), \
+             (3, 'slow roasted meal', [0.9, 0.1, 0.0])",
+        )
+        .unwrap();
+        db.execute("CREATE SEARCH INDEX docs_fts ON docs (body)").unwrap();
+        db.execute("CREATE VECTOR INDEX docs_emb ON docs (emb) DIM 3 USING cosine")
+            .unwrap();
+        db.set_reranker(Arc::new(crate::embed::OverlapReranker));
+        // RRF alone ranks id1 first (hybrid test above); the rerank query
+        // promotes id3.
+        let rs = rows(
+            db.execute(
+                "SELECT id, score(), rrf_score() FROM docs \
+                 NEAREST (emb, [1.0, 0.0, 0.0], 3) \
+                 WHERE MATCH(body, 'quick') \
+                 RANK BY RRF RERANK QUERY 'slow roasted meal' TOP 10 LIMIT 3",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows[0][0], Value::Int(3));
+        assert_eq!(rs.rows[0][1], Value::Float(1.0));
+        assert!(matches!(rs.rows[0][2], Value::Float(f) if f > 0.0), "rrf_score kept");
+    }
+
+    /// OFFSET on a NEAREST select pages exactly once (the gather + `project`
+    /// used to BOTH apply it, skipping 2× the offset — found adding RERANK).
+    #[test]
+    fn nearest_offset_pages_once() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE docs (PRIMARY KEY (id))").unwrap();
+        db.execute(
+            "INSERT INTO docs (id, emb) VALUES \
+             (1, [1.0, 0.0, 0.0]), (2, [0.0, 1.0, 0.0]), (3, [0.9, 0.1, 0.0])",
+        )
+        .unwrap();
+        db.execute("CREATE VECTOR INDEX docs_emb ON docs (emb) DIM 3 USING cosine")
+            .unwrap();
+        // Nearest-first to [1,0,0]: id1, id3, id2 — page 2 of size 1 is id3.
+        let rs = rows(
+            db.execute("SELECT id FROM docs NEAREST (emb, [1.0, 0.0, 0.0], 3) LIMIT 1 OFFSET 1")
+                .unwrap(),
+        );
+        assert_eq!(ids(rs), vec![3]);
     }
 
     /// Geospatial scalar functions: `geo_distance` (haversine metres) filters

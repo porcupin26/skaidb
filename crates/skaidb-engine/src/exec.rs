@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use skaidb_sql::ast::{
     AggArg, AggFunc, AlterAction, AlterTable, BinaryOp, CreateSearchIndex, CreateTable, Delete,
-    Expr, Insert, JoinKind, OrderKey, Select, SelectItem, Statement, UnaryOp, Update,
+    Expr, Insert, JoinKind, OrderKey, Rerank, Select, SelectItem, Statement, UnaryOp, Update,
 };
 use skaidb_sql::parse;
 use std::sync::Arc;
@@ -237,6 +237,10 @@ pub struct Database {
     /// unless `[inference]` is configured. Invoked only off the hot path (the
     /// background embedding worker and query-time auto-embed).
     embedder: Option<Arc<dyn crate::embed::Embedder>>,
+    /// Cross-encoder rerank provider for the `RERANK` clause. `None` unless
+    /// `[inference] rerank_url` is configured. Invoked only by opt-in rerank
+    /// queries, coordinator-side, never on the write path.
+    reranker: Option<Arc<dyn crate::embed::Reranker>>,
 }
 
 /// A search index plus its NRT refresh state: writes apply immediately but
@@ -670,6 +674,7 @@ impl Database {
             field_registry: std::sync::Mutex::new(HashMap::new()),
             deferred_syncs: None,
             embedder: None,
+            reranker: None,
         };
         // Re-arm the storage truncation gates, then replay any deferred
         // maintenance the crash interrupted (WAL replay above re-populated
@@ -1324,6 +1329,33 @@ impl Database {
     /// The configured embedder, if any.
     pub fn embedder(&self) -> Option<Arc<dyn crate::embed::Embedder>> {
         self.embedder.clone()
+    }
+
+    /// Install the cross-encoder rerank provider for the `RERANK` clause. Set
+    /// at startup from `[inference] rerank_url`; `None` leaves `RERANK` as a
+    /// clear "no reranker configured" error.
+    pub fn set_reranker(&mut self, reranker: Arc<dyn crate::embed::Reranker>) {
+        self.reranker = Some(reranker);
+    }
+
+    /// Score `documents` against `query` with the configured reranker
+    /// (higher = more relevant, one score per document in order). Errors if no
+    /// reranker is installed or the endpoint misbehaves.
+    pub fn rerank(&self, model: &str, query: &str, documents: &[String]) -> Result<Vec<f32>> {
+        let reranker = self.reranker.as_ref().ok_or_else(|| {
+            EngineError::Unsupported(
+                "RERANK needs a rerank provider ([inference] rerank_url)".into(),
+            )
+        })?;
+        let scores = reranker.rerank(model, query, documents)?;
+        if scores.len() != documents.len() {
+            return Err(EngineError::Type(format!(
+                "reranker returned {} scores for {} documents",
+                scores.len(),
+                documents.len()
+            )));
+        }
+        Ok(scores)
     }
 
     fn vector_indexes_on(&self, table: &str) -> Vec<(String, String)> {
@@ -2036,10 +2068,11 @@ impl Database {
                             ),
                         }
                     } else {
-                        let score_topk = sel.limit.is_some()
-                            && sel.order_by.len() == 1
-                            && is_score_call(&sel.order_by[0].expr)
-                            && sel.order_by[0].descending;
+                        let score_topk = sel.rerank.is_some()
+                            || (sel.limit.is_some()
+                                && sel.order_by.len() == 1
+                                && is_score_call(&sel.order_by[0].expr)
+                                && sel.order_by[0].descending);
                         let col_topk = sel.limit.is_some()
                             && sel.order_by.len() == 1
                             && matches!(sel.order_by[0].expr, Expr::Column(_));
@@ -2048,7 +2081,11 @@ impl Database {
                                 "access",
                                 format!(
                                     "BM25 top-k pushdown via '{idx}' (k = {})",
-                                    sel.limit.unwrap_or(0)
+                                    sel.rerank
+                                        .as_ref()
+                                        .map(|r| r.top)
+                                        .or(sel.limit)
+                                        .unwrap_or(0)
                                 ),
                             );
                         } else if col_topk {
@@ -2149,6 +2186,20 @@ impl Database {
                             "ORDER BY + LIMIT uses top-k selection, not a full sort".into(),
                         );
                     }
+                }
+                if let Some(rr) = &sel.rerank {
+                    push(
+                        "rerank",
+                        format!(
+                            "top {} candidates re-scored coordinator-side by the \
+                             inference reranker{}",
+                            rr.top,
+                            rr.model
+                                .as_ref()
+                                .map(|m| format!(" (model '{m}')"))
+                                .unwrap_or_default()
+                        ),
+                    );
                 }
                 if let Some(t) = &sel.group_top {
                     push(
@@ -8249,6 +8300,15 @@ pub trait Cluster {
             "a string NEAREST query needs a managed EMBED index with [inference] configured".into(),
         ))
     }
+    /// Score `documents` against `query` with the deployment's rerank
+    /// provider (the `RERANK` clause) — higher = more relevant, one score per
+    /// document in order. Always answered by the coordinator's local engine
+    /// (the provider is installed on every node); no scatter.
+    fn rerank(&self, _model: &str, _query: &str, _documents: &[String]) -> Result<Vec<f32>> {
+        Err(EngineError::Unsupported(
+            "RERANK needs a rerank provider ([inference] rerank_url)".into(),
+        ))
+    }
     /// Full-text search over the search index covering `query`'s fields on
     /// `table`, as `(key, doc, score)`. `k = Some(n)` is the ranked path (the
     /// `n` best BM25 scores, best first); `k = None` returns every matching
@@ -8415,6 +8475,14 @@ pub fn run(stmt: Statement, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
         Statement::Select(sel) if select_uses_search(&sel) => {
             run_search_select(&sel, cluster).map(QueryOutput::Rows)
         }
+        // RERANK re-scores search hits: without a search predicate there is
+        // nothing to rerank (caught here so plain/NEAREST selects error
+        // clearly instead of silently ignoring the clause).
+        Statement::Select(sel) if sel.rerank.is_some() => Err(EngineError::Unsupported(
+            "RERANK requires a MATCH()/SEARCH() predicate in WHERE (optionally with \
+             NEAREST … RANK BY RRF)"
+                .into(),
+        )),
         // SELECT only reads: reborrow shared so the executor's read-only
         // requirements are checked by the compiler.
         Statement::Select(sel) => run_select(&sel, &*cluster).map(QueryOutput::Rows),
@@ -8711,7 +8779,7 @@ fn run_hybrid_select(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSe
     // Order by fused score desc; key asc as a deterministic tie-break.
     let mut ranked: Vec<(Vec<u8>, f32)> = fused.into_iter().collect();
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    let out_docs: Vec<Document> = ranked
+    let mut out_docs: Vec<Document> = ranked
         .into_iter()
         .map(|(key, s)| {
             let mut doc = docs.remove(&key).expect("doc present for fused key");
@@ -8719,9 +8787,13 @@ fn run_hybrid_select(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSe
             doc
         })
         .collect();
-    let mut rs = project(sel, out_docs, &HashSet::new(), true)?;
-    apply_offset_limit(&mut rs.rows, sel.offset, sel.limit);
-    Ok(rs)
+    // RERANK on a hybrid query re-scores the top `TOP` fused candidates;
+    // `rrf_score()` keeps the fusion score, `score()` reads the rerank score.
+    if let Some(rr) = &sel.rerank {
+        out_docs.truncate(rr.top as usize);
+        out_docs = apply_rerank(&*cluster, rr, &text_query, out_docs)?;
+    }
+    project(sel, out_docs, &HashSet::new(), true)
 }
 
 fn run_nearest_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> {
@@ -8759,9 +8831,9 @@ fn run_nearest_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> 
             doc
         })
         .collect();
-    let mut rs = project(sel, docs, &HashSet::new(), true)?;
-    apply_offset_limit(&mut rs.rows, sel.offset, sel.limit);
-    Ok(rs)
+    // `project` with `finalize` applies the OFFSET/LIMIT page (paging again
+    // here double-skipped the offset — found adding RERANK).
+    project(sel, docs, &HashSet::new(), true)
 }
 
 /// A geo predicate a geo index can serve — a `geo_distance(col, lat, lon) <= r`
@@ -8953,6 +9025,176 @@ fn collect_search_fields(query: &SearchQuery, out: &mut Vec<String>) {
             }
         }
     }
+}
+
+/// Candidate-window cap for `RERANK … TOP` — bounds both the coordinator
+/// gather and the size of the rerank HTTP request.
+const RERANK_MAX_TOP: u64 = 1000;
+/// Per-document text cap sent to the rerank endpoint (cross-encoders truncate
+/// around this length anyway; keeps the request body bounded).
+const RERANK_DOC_MAX_CHARS: usize = 4000;
+
+/// The positive query texts of a search predicate, for the reranker's query
+/// side. Negated (`NOT`) legs and term-level patterns (`wildcard`/`regexp`)
+/// carry no relevance text and are skipped.
+fn collect_search_texts(query: &SearchQuery, out: &mut Vec<String>) {
+    match query {
+        SearchQuery::Match { text, .. }
+        | SearchQuery::Phrase { text, .. }
+        | SearchQuery::Fuzzy { text, .. }
+        | SearchQuery::Prefix { text, .. }
+        | SearchQuery::MoreLikeThis { text, .. }
+        | SearchQuery::MultiMatch { text, .. } => {
+            if !out.contains(text) {
+                out.push(text.clone());
+            }
+        }
+        SearchQuery::QueryString(s) => {
+            if !out.contains(s) {
+                out.push(s.clone());
+            }
+        }
+        SearchQuery::Wildcard { .. } | SearchQuery::Regexp { .. } | SearchQuery::Not(_) => {}
+        SearchQuery::All(subs) | SearchQuery::Any(subs) => {
+            for sub in subs {
+                collect_search_texts(sub, out);
+            }
+        }
+        SearchQuery::Boosted { required, optional } => {
+            collect_search_texts(required, out);
+            for sub in optional {
+                collect_search_texts(sub, out);
+            }
+        }
+    }
+}
+
+/// The text sent to the reranker for one candidate row: the string values of
+/// `cols` (every string field of the doc when `cols` is empty — the
+/// field-less `SEARCH()` case), newline-joined, capped at
+/// [`RERANK_DOC_MAX_CHARS`]. Internal `_`-prefixed fields never contribute.
+fn rerank_doc_text(doc: &Document, cols: &[String]) -> String {
+    let mut text = String::new();
+    let mut push = |s: &str| {
+        if text.len() >= RERANK_DOC_MAX_CHARS || s.is_empty() {
+            return;
+        }
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(s);
+        if text.len() > RERANK_DOC_MAX_CHARS {
+            let mut cut = RERANK_DOC_MAX_CHARS;
+            while !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            text.truncate(cut);
+        }
+    };
+    if cols.is_empty() {
+        for (k, v) in &doc.0 {
+            if let (false, Value::String(s)) = (k.starts_with('_'), v) {
+                push(s);
+            }
+        }
+    } else {
+        for col in cols {
+            if let Some(Value::String(s)) = doc.get_path(col) {
+                push(s);
+            }
+        }
+    }
+    text
+}
+
+/// Apply the `RERANK` clause to an already-ranked candidate list: derive the
+/// query and per-document texts, score them with the deployment's reranker,
+/// and return the documents reordered best-first with the rerank score
+/// injected as `_score` (`score()` reads it). Ties keep the retrieval order.
+fn apply_rerank(
+    cluster: &dyn Cluster,
+    rerank: &Rerank,
+    search_query: &SearchQuery,
+    docs: Vec<Document>,
+) -> Result<Vec<Document>> {
+    if docs.is_empty() {
+        return Ok(docs);
+    }
+    let query_text = match &rerank.query {
+        Some(q) => q.clone(),
+        None => {
+            let mut texts = Vec::new();
+            collect_search_texts(search_query, &mut texts);
+            let t = texts.join(" ");
+            if t.trim().is_empty() {
+                return Err(EngineError::Type(
+                    "RERANK could not derive a query text from the search predicate; \
+                     add QUERY '<text>'"
+                        .into(),
+                ));
+            }
+            t
+        }
+    };
+    let cols: Vec<String> = match &rerank.column {
+        Some(c) => vec![c.clone()],
+        None => {
+            let mut fields = Vec::new();
+            collect_search_fields(search_query, &mut fields);
+            fields
+        }
+    };
+    let doc_texts: Vec<String> = docs
+        .iter()
+        .map(|d| {
+            let t = rerank_doc_text(d, &cols);
+            // Rerank endpoints reject empty documents; a blank stays scoreable.
+            if t.is_empty() {
+                " ".to_string()
+            } else {
+                t
+            }
+        })
+        .collect();
+    let scores = cluster.rerank(
+        rerank.model.as_deref().unwrap_or(""),
+        &query_text,
+        &doc_texts,
+    )?;
+    let mut order: Vec<usize> = (0..docs.len()).collect();
+    order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
+    let mut slots: Vec<Option<Document>> = docs.into_iter().map(Some).collect();
+    Ok(order
+        .into_iter()
+        .map(|i| {
+            let mut doc = slots[i].take().expect("each index taken once");
+            doc.insert("_score", Value::Float(f64::from(scores[i])));
+            doc
+        })
+        .collect())
+}
+
+/// Shared `RERANK` shape checks for the search and hybrid paths.
+fn check_rerank(sel: &Select) -> Result<()> {
+    let Some(rr) = &sel.rerank else {
+        return Ok(());
+    };
+    if is_grouped(sel) || sel.group_top.is_some() {
+        return Err(EngineError::Unsupported(
+            "RERANK cannot be combined with GROUP BY or aggregates".into(),
+        ));
+    }
+    if !sel.order_by.is_empty() {
+        return Err(EngineError::Unsupported(
+            "RERANK results are ordered by the reranker; ORDER BY is not supported".into(),
+        ));
+    }
+    if rr.top > RERANK_MAX_TOP {
+        return Err(EngineError::ResourceLimit(format!(
+            "RERANK TOP is capped at {RERANK_MAX_TOP} candidates"
+        )));
+    }
+    Ok(())
 }
 
 /// Whether the expression is built purely of search predicates composed
@@ -9287,6 +9529,17 @@ fn run_search_select(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSe
         1 => queries.pop().expect("len checked"),
         _ => SearchQuery::All(queries),
     };
+    // RERANK: fetch the top `TOP` candidates by BM25, re-score them with the
+    // external cross-encoder, and serve the page from the reranker's order
+    // (the rerank score lands in `_score`, so `score()` reads it).
+    if let Some(rr) = &sel.rerank {
+        check_rerank(sel)?;
+        let highlights = collect_highlights(sel)?;
+        let hits = cluster.search(&sel.from, &query, Some(rr.top as usize), &residual, &highlights)?;
+        let docs: Vec<Document> = hits.into_iter().map(|(_, doc, _)| doc).collect();
+        let docs = apply_rerank(&*cluster, rr, &query, docs)?;
+        return project(sel, docs, &HashSet::new(), true);
+    }
     // Aggregates / GROUP BY over a search (phase 6): push exact fast-field
     // facets into the index when the shape and deployment allow; otherwise
     // materialize the matching rows (deduped by key at the coordinator, so
@@ -10484,6 +10737,10 @@ impl Cluster for LocalCluster<'_> {
         self.db.embed_query(table, path, text)
     }
 
+    fn rerank(&self, model: &str, query: &str, documents: &[String]) -> Result<Vec<f32>> {
+        self.db.rerank(model, query, documents)
+    }
+
     fn search(
         &mut self,
         table: &str,
@@ -10665,6 +10922,10 @@ impl Cluster for LocalRead<'_> {
 
     fn embed_query(&self, table: &str, path: &str, text: &str) -> Result<Vec<f32>> {
         self.db.embed_query(table, path, text)
+    }
+
+    fn rerank(&self, model: &str, query: &str, documents: &[String]) -> Result<Vec<f32>> {
+        self.db.rerank(model, query, documents)
     }
 
     fn search(

@@ -48,6 +48,11 @@ SELECT id FROM places WHERE geo_bbox(loc, 40.4, -74.3, 40.9, -73.7);
 point-in-rectangle test. Full grammar in
 [`QUERY_SYNTAX.md`](QUERY_SYNTAX.md).
 
+ES clients get the same predicates through the `_search` DSL — `geo_distance`
+and `geo_bounding_box` queries map onto these functions (with ES unit
+suffixes like `"5km"` converted to metres, and object/GeoJSON-array/string/WKT
+point shapes accepted); see [SEARCH.md](SEARCH.md#es-compatible-rest-subset).
+
 ## Creating a geo index (SQL — works cluster-wide)
 
 ```sql
@@ -96,5 +101,6 @@ vector index.
 - A `geo_bbox` that crosses the antimeridian (`min_lon > max_lon`) or is
   degenerate falls back to a **scan** for that query (still correct, just not
   index-accelerated) — split it into two non-wrapping boxes to keep the index.
-- Metres only for `geo_distance`; there is no unit suffix syntax.
+- Metres only for `geo_distance` in SQL; there is no SQL unit suffix syntax
+  (the ES `_search` DSL accepts `"5km"`-style units and converts to metres).
 - No geo aggregations (geohash-grid / geo-bounds facets) yet.

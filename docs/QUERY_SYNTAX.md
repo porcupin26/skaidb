@@ -69,6 +69,8 @@ FROM <table> [[AS] <alias>]
 [NEAREST (<path>, <query-vector>, <k>)]
 [WHERE <expr>]
 [RANK BY RRF [(<constant>)]]            -- hybrid: fuse NEAREST + WHERE-search by RRF
+[RERANK [ON <col>] [WITH '<model>'] [QUERY '<text>'] [TOP <n>]]
+                                        -- second-stage cross-encoder reranking
 [GROUP BY <expr> [, <expr> ...] [TOP <k> BY <expr> [ASC|DESC]]]
 [HAVING <expr>]
 [ { UNION | UNION ALL } <select> ... ]
@@ -599,6 +601,42 @@ descending; `LIMIT` takes the final top-k.
   combine with `JOIN`, `UNION`, `DISTINCT`, `GROUP BY`, or `ORDER BY`
   (ordering is `rrf_score()` desc). Works cluster-wide (both legs
   scatter-gather; the coordinator fuses).
+
+## Reranking (`RERANK`)
+
+Second-stage relevance: retrieve the top candidates by BM25 (or hybrid RRF),
+send `(query, document)` pairs to an external **cross-encoder rerank
+endpoint** (`[inference] rerank_url` — see [VECTOR.md](VECTOR.md)), and
+return the page in the reranker's order:
+
+```sql
+SELECT id, title, score() FROM docs
+WHERE MATCH(body, 'how do I tune compaction')
+RERANK TOP 100                               -- rerank the top 100 BM25 hits
+LIMIT 10;
+```
+
+`RERANK [ON <col>] [WITH '<model>'] [QUERY '<text>'] [TOP <n>]` — every part
+is optional:
+
+- `ON <col>` — the column whose text is sent as each candidate's document.
+  Default: the columns the search predicate targets (all string fields for a
+  field-less `SEARCH('…')`). Document text is capped at 4000 chars.
+- `WITH '<model>'` — the model name sent to the endpoint. Default:
+  `inference.rerank_model`.
+- `QUERY '<text>'` — the query the reranker scores against. Default: the
+  search predicate's text (e.g. the `MATCH` string).
+- `TOP <n>` — the candidate window (default 100, capped at 1000). `LIMIT`/
+  `OFFSET` then page the reranked list.
+
+`score()` reads the rerank score. Composes with hybrid retrieval — `… RANK BY
+RRF RERANK TOP 50 LIMIT 10` reranks the fused top-50 (`rrf_score()` keeps the
+fusion score). Requires a search predicate in `WHERE`; cannot combine with
+`ORDER BY` (the reranker orders results), `GROUP BY`, or aggregates. Runs
+**coordinator-side** over the already-gathered candidates, cluster-wide; it
+is opt-in per query, so a down rerank endpoint fails only queries that ask
+for it. ES clients reach the same path via the `text_similarity_reranker`
+retriever ([SEARCH.md](SEARCH.md)).
 
 ## Full-text search (`MATCH` / `SEARCH`)
 

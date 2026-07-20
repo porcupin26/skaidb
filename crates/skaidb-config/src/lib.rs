@@ -134,6 +134,15 @@ pub struct InferenceConfig {
     pub tls_verify: String,
     /// CA certificate file (PEM) when `tls_verify = "ca"`.
     pub tls_ca: String,
+    /// Rerank endpoint for the `RERANK` query clause, Cohere/Jina/TEI-
+    /// compatible: `POST {rerank_url}` with `{"model", "query", "documents"}`
+    /// → `{"results": [{"index", "relevance_score"}]}` (a TEI-style top-level
+    /// `[{"index", "score"}]` array is accepted too). Empty = reranking off.
+    /// Shares `api_key`, `timeout_secs`, and the TLS settings above.
+    pub rerank_url: String,
+    /// Default rerank model sent in the request body; a query's
+    /// `RERANK WITH '<model>'` overrides it per statement.
+    pub rerank_model: String,
 }
 
 impl Default for InferenceConfig {
@@ -148,6 +157,8 @@ impl Default for InferenceConfig {
             timeout_secs: 30,
             tls_verify: "ca".to_string(),
             tls_ca: String::new(),
+            rerank_url: String::new(),
+            rerank_model: String::new(),
         }
     }
 }

@@ -8440,6 +8440,17 @@ impl Cluster for Coordinator {
             .embed_query(table, path, text)
     }
 
+    fn rerank(&self, model: &str, query: &str, documents: &[String]) -> EngineResult<Vec<f32>> {
+        // RERANK runs coordinator-side over the already-gathered candidates —
+        // a pure local call (the reranker is installed on every node's
+        // engine); no scatter needed.
+        self.node
+            .local
+            .read()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .rerank(model, query, documents)
+    }
+
     fn search(
         &mut self,
         table: &str,

@@ -23,6 +23,55 @@ pub trait Embedder: Send + Sync + Debug {
     fn dim(&self) -> usize;
 }
 
+/// Second-stage relevance scoring for `RERANK` (docs/SEARCH.md "Reranking").
+///
+/// A [`Reranker`] scores each candidate document's relevance to a query with a
+/// cross-encoder model. Like [`Embedder`], the engine holds one behind
+/// `Arc<dyn Reranker>` and the real HTTP client (a Cohere/Jina/TEI-style
+/// rerank endpoint) lives in the server. Only the opt-in `RERANK` query
+/// clause invokes it — never the write path, and never a query that didn't
+/// ask for it — so a rerank endpoint being down fails only rerank queries.
+pub trait Reranker: Send + Sync + Debug {
+    /// Score `documents` against `query`, one score per document in order
+    /// (higher = more relevant). `model` overrides the endpoint's configured
+    /// default when non-empty.
+    fn rerank(&self, model: &str, query: &str, documents: &[String]) -> Result<Vec<f32>>;
+}
+
+/// A deterministic, dependency-free reranker: each document scores the
+/// fraction of the query's distinct (lowercased, alphanumeric) tokens it
+/// contains. **Not semantic**, but deterministic and offline — the reranker
+/// for tests, demos, and air-gapped setups, like [`HashEmbedder`].
+#[derive(Debug, Clone, Default)]
+pub struct OverlapReranker;
+
+impl Reranker for OverlapReranker {
+    fn rerank(&self, _model: &str, query: &str, documents: &[String]) -> Result<Vec<f32>> {
+        let tokens = |text: &str| -> Vec<String> {
+            let mut v: Vec<String> = text
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|t| !t.is_empty())
+                .map(|t| t.to_ascii_lowercase())
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        let q = tokens(query);
+        Ok(documents
+            .iter()
+            .map(|d| {
+                if q.is_empty() {
+                    return 0.0;
+                }
+                let dt = tokens(d);
+                let hits = q.iter().filter(|t| dt.binary_search(t).is_ok()).count();
+                hits as f32 / q.len() as f32
+            })
+            .collect())
+    }
+}
+
 /// A deterministic, dependency-free embedder: a token-hashing bag-of-words
 /// projected onto `dim` axes and L2-normalized. **Not semantic** — texts that
 /// share words get similar vectors, texts that don't are near-orthogonal — but

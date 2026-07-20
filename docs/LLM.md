@@ -271,6 +271,16 @@ SELECT [DISTINCT] item [, ...] FROM t [[AS] a]
 --   rrf_score() = sum 1/(c+rank) over both legs (c default 60); residual WHERE
 --   filters both legs; ordered rrf_score() desc. Needs a NEAREST + a search
 --   predicate; cluster-wide.
+  [RERANK [ON col] [WITH 'model'] [QUERY 'text'] [TOP n]]
+--   RERANK: second-stage CROSS-ENCODER reranking (ES text_similarity_reranker).
+--   Top n candidates (default 100, cap 1000) of the search/hybrid retrieval
+--   are re-scored by the external [inference] rerank_url endpoint
+--   (Cohere/Jina/TEI wire) and served in the reranker's order; score() reads
+--   the rerank score (rrf_score() keeps the fusion score on hybrid). Defaults:
+--   ON = the searched columns, WITH = inference.rerank_model, QUERY = the
+--   search text. Needs a WHERE search predicate; no ORDER BY/GROUP BY.
+--   Coordinator-side, opt-in per query — endpoint down fails only RERANK
+--   queries. See docs/SEARCH.md, docs/VECTOR.md.
   [GROUP BY expr [, ...] [TOP k BY expr [ASC|DESC]]] [HAVING expr]
 --   GROUP BY ... TOP k BY e: per-group top-k ROWS (not aggregates); with
 --   MATCH + TOP k BY score() it is ES top_hits in SQL
@@ -810,7 +820,12 @@ POST /{index}/_search    query DSL: match, match_phrase, prefix, wildcard,
                          (must/filter/must_not/should — should beside
                          must boosts via BOOSTED; minimum_should_match 0|1),
                          multi_match (best_fields/most_fields/cross_fields),
-                         query_string, more_like_this; from/size, multi-key
+                         query_string, more_like_this,
+                         geo_distance / geo_bounding_box → SQL geo
+                         predicates (ES unit suffixes "5km"→metres;
+                         {lat,lon} | [lon,lat] | "lat,lon" | WKT POINT;
+                         corner pairs or flat edges; geo index prunes
+                         transparently); from/size, multi-key
                          sort, _source include/exclude (trailing-* globs),
                          highlight, "explain": true, exact totals;
                          aggs: terms, date_histogram + sum/avg/min/max/
@@ -819,9 +834,14 @@ POST /{index}/_search    query DSL: match, match_phrase, prefix, wildcard,
                          query_vector_builder(text→managed EMBED), k,
                          filter} → NEAREST; retriever {rrf {retrievers:
                          [standard, knn]}} → NEAREST + WHERE-search RANK
-                         BY RRF. num_candidates ignored (ef is on the
-                         index); _score = rrf_score() (hybrid) or
-                         1/(1+distance) (knn); total = #hits (≤ k)
+                         BY RRF; retriever {text_similarity_reranker
+                         {retriever: standard|knn|rrf, field→ON,
+                         inference_id→WITH, inference_text→QUERY,
+                         rank_window_size→TOP (default 10)}} → RERANK
+                         (_score = rerank score). num_candidates ignored
+                         (ef is on the index); _score = rrf_score()
+                         (hybrid) or 1/(1+distance) (knn); total =
+                         #hits (≤ k)
 POST /{index}/_count
 GET  /{index}/_doc/{id}
 GET  /{index}/_mapping

@@ -321,6 +321,34 @@ coordinator-merged ranked list, then the coordinator fuses. Requires both a
 `NEAREST` clause and a search predicate; no `JOIN`/`UNION`/`DISTINCT`/`GROUP
 BY`/`ORDER BY` (ordering is `rrf_score()` desc).
 
+## Reranking (`RERANK`)
+
+Second-stage relevance — the SQL analogue of Elasticsearch's
+`text_similarity_reranker` retriever. The top candidates of a search (or
+hybrid) retrieval are re-scored by an external **cross-encoder** model and the
+page is served in the reranker's order:
+
+```sql
+SELECT id, title, score() FROM docs
+WHERE MATCH(body, 'how do I tune compaction')
+RERANK TOP 100      -- send the top 100 BM25 hits to the rerank endpoint
+LIMIT 10;
+```
+
+Needs `[inference] rerank_url` (a Cohere/Jina/TEI-compatible endpoint — wire
+contract and config in [VECTOR.md](VECTOR.md)). Full clause syntax, defaults,
+and constraints: [QUERY_SYNTAX.md](QUERY_SYNTAX.md#reranking-rerank). Key
+properties:
+
+- **Opt-in per query** — a down rerank endpoint fails only `RERANK` queries,
+  never writes or ordinary searches.
+- **Coordinator-side, cluster-wide** — the reorder happens over the already
+  scatter-gathered candidate rows; one rerank HTTP call per query, bounded by
+  `TOP` (default 100, cap 1000) and 4000 chars per document.
+- `score()` reads the rerank score; on a hybrid query `rrf_score()` still
+  reads the fusion score.
+- Composes with `RANK BY RRF` (reranks the fused list) and `HIGHLIGHT`.
+
 ## ES-compatible REST subset
 
 The REST endpoint speaks enough Elasticsearch for existing ES client
@@ -342,7 +370,16 @@ POST /{index}/_search    query DSL: match, match_phrase, prefix, wildcard,
                          must/filter boosts scores via BOOSTED(), or is
                          required with minimum_should_match: 1),
                          query_string, more_like_this, multi_match
-                         (best_fields / most_fields / cross_fields);
+                         (best_fields / most_fields / cross_fields),
+                         geo_distance / geo_bounding_box → the SQL
+                         geo predicates (GEO.md; a geo index prunes
+                         transparently) — distances take ES unit
+                         suffixes ("5km", "1mi", …; bare number =
+                         metres), points are {lat, lon} objects,
+                         [lon, lat] GeoJSON arrays, "lat,lon" strings,
+                         or WKT POINT (geohashes unsupported), boxes
+                         take corner pairs or flat top/left/bottom/
+                         right edges;
                          "explain": true per-hit BM25 breakdowns; from/size,
                          multi-key sort (incl. _score), _source with
                          include/exclude lists (trailing-* globs),
@@ -357,7 +394,14 @@ POST /{index}/_search    query DSL: match, match_phrase, prefix, wildcard,
                          text searches a managed EMBED index, auto-
                          embedded); a retriever {rrf {retrievers:
                          [standard, knn]}} block → NEAREST + WHERE-search
-                         RANK BY RRF (rank_constant → the RRF constant)
+                         RANK BY RRF (rank_constant → the RRF constant);
+                         a retriever {text_similarity_reranker
+                         {retriever: standard | knn | rrf, field,
+                         inference_id, inference_text,
+                         rank_window_size}} block → RERANK (field → ON,
+                         inference_id → WITH, inference_text → QUERY,
+                         rank_window_size → TOP, default 10; hit _score
+                         is the rerank score)
 POST /{index}/_count     exact match count
 GET  /{index}/_doc/{id}  fetch one document by _id
 GET  /{index}/_mapping   the search-index declaration as ES properties

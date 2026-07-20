@@ -1234,6 +1234,7 @@ impl Parser {
                 distinct,
                 nearest: None,
                 rrf: None,
+                rerank: None,
                 items,
                 from: String::new(),
                 from_alias: String::new(),
@@ -1304,6 +1305,39 @@ impl Parser {
             None
         };
 
+        // `RERANK [ON <col>] [WITH '<model>'] [QUERY '<text>'] [TOP <n>]` —
+        // second-stage cross-encoder reranking of the top candidates.
+        // `rerank`/`query`/`top` are contextual idents, like `rank`.
+        let rerank = if self.eat_ident_ci("rerank") {
+            let column = if self.eat_keyword(Keyword::On) {
+                Some(self.parse_path()?)
+            } else {
+                None
+            };
+            let model = if self.eat_ident_ci("with") {
+                Some(self.expect_string()?)
+            } else {
+                None
+            };
+            let query = if self.eat_ident_ci("query") {
+                Some(self.expect_string()?)
+            } else {
+                None
+            };
+            let top = if self.eat_ident_ci("top") {
+                let n = self.expect_u64()?;
+                if n == 0 {
+                    return Err(ParseError::Other("RERANK TOP must be >= 1".into()));
+                }
+                n
+            } else {
+                DEFAULT_RERANK_TOP
+            };
+            Some(Rerank { column, model, query, top })
+        } else {
+            None
+        };
+
         let mut group_by = Vec::new();
         let mut group_top = None;
         if self.eat_keyword(Keyword::Group) {
@@ -1342,6 +1376,7 @@ impl Parser {
             distinct,
             nearest,
             rrf,
+            rerank,
             items,
             from,
             from_alias,
@@ -2602,6 +2637,55 @@ mod tests {
             "SELECT id FROM docs NEAREST (emb, [1.0], 5) WHERE MATCH(body,'x') RANK BY RRF (0)"
         )
         .is_err());
+    }
+
+    #[test]
+    fn parse_rerank_clause() {
+        // Full form.
+        match parse(
+            "SELECT id FROM docs WHERE MATCH(body, 'rust database') \
+             RERANK ON body WITH 'rerank-v3' QUERY 'rust db engines' TOP 50 LIMIT 5",
+        )
+        .unwrap()
+        {
+            Statement::Select(s) => {
+                let rr = s.rerank.expect("rerank parsed");
+                assert_eq!(rr.column.as_deref(), Some("body"));
+                assert_eq!(rr.model.as_deref(), Some("rerank-v3"));
+                assert_eq!(rr.query.as_deref(), Some("rust db engines"));
+                assert_eq!(rr.top, 50);
+                assert_eq!(s.limit, Some(5));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Minimal form: everything defaulted.
+        match parse("SELECT id FROM docs WHERE MATCH(body, 'x') RERANK").unwrap() {
+            Statement::Select(s) => {
+                let rr = s.rerank.expect("rerank parsed");
+                assert!(rr.column.is_none() && rr.model.is_none() && rr.query.is_none());
+                assert_eq!(rr.top, DEFAULT_RERANK_TOP);
+            }
+            other => panic!("{other:?}"),
+        }
+        // Composes after RANK BY RRF.
+        match parse(
+            "SELECT id FROM docs NEAREST (emb, [1.0], 20) WHERE MATCH(body, 'x') \
+             RANK BY RRF RERANK TOP 10 LIMIT 3",
+        )
+        .unwrap()
+        {
+            Statement::Select(s) => {
+                assert!(s.rrf.is_some());
+                assert_eq!(s.rerank.expect("rerank parsed").top, 10);
+            }
+            other => panic!("{other:?}"),
+        }
+        // A plain select leaves rerank None; TOP 0 is rejected.
+        match parse("SELECT id FROM docs WHERE MATCH(body, 'x')").unwrap() {
+            Statement::Select(s) => assert!(s.rerank.is_none()),
+            other => panic!("{other:?}"),
+        }
+        assert!(parse("SELECT id FROM docs WHERE MATCH(body, 'x') RERANK TOP 0").is_err());
     }
 
     #[test]

@@ -103,3 +103,6 @@ batch_size = 32
 timeout_secs = 30
 tls_verify = "ca"            # "ca" (verify against tls_ca) | "system" | "insecure"
 tls_ca = ""                  # CA cert (PEM) when tls_verify = "ca"
+rerank_url = ""              # cross-encoder endpoint for RERANK (Cohere/Jina/TEI wire);
+                             # empty = reranking off. Shares api_key/timeout/TLS above.
+rerank_model = ""            # default model; RERANK WITH '<model>' overrides per query

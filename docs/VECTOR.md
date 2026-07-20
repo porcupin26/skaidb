@@ -96,6 +96,8 @@ mismatch).
 | `timeout_secs` | per-request timeout (default 30) |
 | `tls_verify` | `"ca"` (verify against `tls_ca`), `"system"` (public CAs — not built in yet), or `"insecure"` (skip — dev only). An HTTPS endpoint today needs `"ca"` + `tls_ca`, or `"insecure"` |
 | `tls_ca` | CA certificate (PEM) when `tls_verify = "ca"` |
+| `rerank_url` | cross-encoder rerank endpoint for the `RERANK` query clause (see below); empty = reranking off. `url` and `rerank_url` are independent — either may be set alone |
+| `rerank_model` | default rerank model sent in the request body; a query's `RERANK WITH '<model>'` overrides it |
 
 Example — OpenAI:
 
@@ -118,6 +120,34 @@ url = "http://127.0.0.1:8080/v1/embeddings"
 model = "BAAI/bge-base-en-v1.5"
 dim = 768
 ```
+
+### The rerank endpoint (`RERANK`)
+
+The same `[inference]` block also configures the **cross-encoder reranker**
+behind the SQL `RERANK` clause and the ES `text_similarity_reranker`
+retriever (see [SEARCH.md](SEARCH.md#reranking-rerank)). It is a separate
+endpoint (`rerank_url`) sharing `api_key`, `timeout_secs`, and the TLS
+settings. The wire contract (Cohere/Jina rerank API; the candidate texts are
+sent under both `documents` and `texts` so a TEI `/rerank` route works too):
+
+```
+POST <inference.rerank_url>
+
+{ "model": "<model>", "query": "<query text>",
+  "documents": ["candidate one", ...], "texts": ["candidate one", ...] }
+```
+
+expecting either shape (order-independent, `index` refers to the request
+order; `relevance_score`/`score`, higher = more relevant):
+
+```json
+{ "results": [ {"index": 0, "relevance_score": 0.98}, ... ] }   // Cohere/Jina
+[ {"index": 0, "score": 0.98}, ... ]                            // TEI
+```
+
+Reranking is invoked **only** by queries that say `RERANK` — never at ingest
+and never by ordinary searches — so the endpoint being down fails exactly
+those queries.
 
 **Model is pinned per index.** The `DIM` you declare fixes the vector geometry;
 the `[inference].model` is the model actually called. Changing the model (or its

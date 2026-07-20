@@ -461,6 +461,12 @@ pub struct Select {
     /// residual (non-search) part of `WHERE` filters both legs. Requires both a
     /// `NEAREST` clause and a search predicate in `WHERE`.
     pub rrf: Option<Rrf>,
+    /// `RERANK [ON <col>] [WITH '<model>'] [QUERY '<text>'] [TOP <n>]` —
+    /// second-stage reranking: the top `n` candidates of the search (or
+    /// hybrid) retrieval are re-scored by an external cross-encoder reranker
+    /// and returned in the reranker's order. Requires a search predicate in
+    /// `WHERE`; incompatible with `ORDER BY` and grouping.
+    pub rerank: Option<Rerank>,
     pub items: Vec<SelectItem>,
     pub from: String,
     /// Alias for the `FROM` table (defaults to the table name).
@@ -508,6 +514,30 @@ pub struct Rrf {
 
 /// The default RRF rank constant (the value TREC/Elasticsearch use).
 pub const DEFAULT_RRF_CONSTANT: u32 = 60;
+
+/// The `RERANK [ON <col>] [WITH '<model>'] [QUERY '<text>'] [TOP <n>]` clause
+/// of a [`Select`] — second-stage reranking of a search/hybrid retrieval by an
+/// external cross-encoder model (docs/SEARCH.md "Reranking").
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rerank {
+    /// `ON <col>` — the column whose text is sent as each candidate's
+    /// document. Default: the columns the search predicate targets (all
+    /// string fields for a field-less `SEARCH()`).
+    pub column: Option<String>,
+    /// `WITH '<model>'` — the model name sent to the rerank endpoint.
+    /// Default: the configured `inference.rerank_model`.
+    pub model: Option<String>,
+    /// `QUERY '<text>'` — the query text the reranker scores documents
+    /// against. Default: the text of the search predicate.
+    pub query: Option<String>,
+    /// `TOP <n>` — how many top-ranked candidates are sent to the reranker
+    /// (the rerank window; ES `rank_window_size`). Default
+    /// [`DEFAULT_RERANK_TOP`], capped by the engine.
+    pub top: u64,
+}
+
+/// The default `RERANK … TOP` candidate window.
+pub const DEFAULT_RERANK_TOP: u64 = 100;
 
 /// The `NEAREST (<path>, <query>, <k>)` clause of a [`Select`].
 #[derive(Debug, Clone, PartialEq)]

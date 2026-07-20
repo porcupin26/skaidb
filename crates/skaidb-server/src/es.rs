@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{json, Map, Value as Json};
 use skaidb_sql::ast::{
-    AggArg, AggFunc, BinaryOp, Expr, Nearest, OrderKey, Rrf, Select, SelectItem, Statement,
-    UnaryOp, DEFAULT_RRF_CONSTANT,
+    AggArg, AggFunc, BinaryOp, Expr, Nearest, OrderKey, Rerank, Rrf, Select, SelectItem,
+    Statement, UnaryOp, DEFAULT_RRF_CONSTANT,
 };
 use skaidb_types::Value;
 
@@ -73,6 +73,7 @@ fn select_from(table: &str) -> Select {
         distinct: false,
         nearest: None,
         rrf: None,
+        rerank: None,
         items: Vec::new(),
         from: table.to_string(),
         from_alias: table.to_string(),
@@ -328,6 +329,73 @@ fn query_expr(q: &Json) -> Result<Option<Expr>, String> {
                 negated: true,
             }))
         }
+        // Geo queries map onto the SQL geo predicates (docs/GEO.md), which the
+        // geo-index pruner recognizes when they land as top-level conjuncts —
+        // exactly where a `bool.filter`/`must` geo clause ends up.
+        "geo_distance" => {
+            let obj = body.as_object().ok_or("geo_distance expects an object")?;
+            let meters = geo_distance_meters(
+                obj.get("distance").ok_or("geo_distance needs `distance`")?,
+            )?;
+            let (col, point) = geo_field(obj, "geo_distance")?;
+            let (lat, lon) = geo_point(point)
+                .map_err(|e| format!("geo_distance.{col}: {e}"))?;
+            Ok(Some(Expr::Binary {
+                op: BinaryOp::LtEq,
+                left: Box::new(func(
+                    "geo_distance",
+                    vec![
+                        Expr::Column(col),
+                        Expr::Literal(Value::Float(lat)),
+                        Expr::Literal(Value::Float(lon)),
+                    ],
+                )),
+                right: Box::new(Expr::Literal(Value::Float(meters))),
+            }))
+        }
+        "geo_bounding_box" => {
+            let obj = body
+                .as_object()
+                .ok_or("geo_bounding_box expects an object")?;
+            let (col, spec) = geo_field(obj, "geo_bounding_box")?;
+            let bo = spec
+                .as_object()
+                .ok_or("geo_bounding_box field spec must be an object")?;
+            let corner = |name: &str| -> Result<Option<(f64, f64)>, String> {
+                bo.get(name)
+                    .map(|v| geo_point(v).map_err(|e| format!("geo_bounding_box.{name}: {e}")))
+                    .transpose()
+            };
+            // ES gives (top_left, bottom_right) or (top_right, bottom_left)
+            // corners, or flat top/left/bottom/right edges; skaidb's
+            // `geo_bbox` takes (min_lat, min_lon, max_lat, max_lon). A
+            // left > right box crosses the antimeridian — passed through:
+            // the exact predicate handles the wrap (the geo index leaves it
+            // to the scan).
+            let edges = if let (Some(tl), Some(br)) = (corner("top_left")?, corner("bottom_right")?)
+            {
+                (br.0, tl.1, tl.0, br.1)
+            } else if let (Some(tr), Some(bl)) = (corner("top_right")?, corner("bottom_left")?) {
+                (bl.0, bl.1, tr.0, tr.1)
+            } else {
+                let edge = |name: &str| -> Result<f64, String> {
+                    bo.get(name)
+                        .and_then(|v| v.as_f64())
+                        .ok_or_else(|| format!("geo_bounding_box needs corners or `{name}`"))
+                };
+                (edge("bottom")?, edge("left")?, edge("top")?, edge("right")?)
+            };
+            Ok(Some(func(
+                "geo_bbox",
+                vec![
+                    Expr::Column(col),
+                    Expr::Literal(Value::Float(edges.0)),
+                    Expr::Literal(Value::Float(edges.1)),
+                    Expr::Literal(Value::Float(edges.2)),
+                    Expr::Literal(Value::Float(edges.3)),
+                ],
+            )))
+        }
         "bool" => {
             let mut parts = Vec::new();
             for clause in ["must", "filter"] {
@@ -407,12 +475,130 @@ fn query_expr(q: &Json) -> Result<Option<Expr>, String> {
     }
 }
 
-/// A parsed vector-retrieval request: the `NEAREST` clause, an optional WHERE
-/// filter, and (for `retriever { rrf }`) the fusion constant.
+/// The `(field, spec)` entry of a geo query body — the one key that is not a
+/// per-query option.
+fn geo_field<'j>(
+    obj: &'j Map<String, Json>,
+    what: &str,
+) -> Result<(String, &'j Json), String> {
+    const OPTS: [&str; 6] = [
+        "distance",
+        "distance_type",
+        "type",
+        "validation_method",
+        "ignore_unmapped",
+        "_name",
+    ];
+    obj.iter()
+        .find(|(k, _)| !OPTS.contains(&k.as_str()) && k.as_str() != "boost")
+        .map(|(k, v)| (k.clone(), v))
+        .ok_or_else(|| format!("{what} needs a field entry"))
+}
+
+/// An ES distance value in metres: a bare number, or a string with an
+/// optional unit suffix (`"5km"`, `"500m"`, `"1mi"`; no unit = metres).
+fn geo_distance_meters(v: &Json) -> Result<f64, String> {
+    let meters = if let Some(n) = v.as_f64() {
+        n
+    } else {
+        let s = v
+            .as_str()
+            .ok_or("`distance` must be a number (metres) or a string like \"5km\"")?
+            .trim();
+        let unit_at = s
+            .find(|c: char| c.is_ascii_alphabetic())
+            .unwrap_or(s.len());
+        let (num, unit) = s.split_at(unit_at);
+        let n: f64 = num
+            .trim()
+            .parse()
+            .map_err(|_| format!("bad distance '{s}'"))?;
+        let factor = match unit.trim().to_ascii_lowercase().as_str() {
+            "" | "m" | "meters" | "meter" => 1.0,
+            "km" | "kilometers" | "kilometer" => 1000.0,
+            "mi" | "miles" | "mile" => 1609.344,
+            "yd" | "yards" | "yard" => 0.9144,
+            "ft" | "feet" | "foot" => 0.3048,
+            "in" | "inch" | "inches" => 0.0254,
+            "cm" | "centimeters" | "centimeter" => 0.01,
+            "mm" | "millimeters" | "millimeter" => 0.001,
+            // ES `NM` (nautical miles) arrives lowercased here.
+            "nm" | "nmi" | "nauticalmiles" | "nauticalmile" => 1852.0,
+            other => return Err(format!("unsupported distance unit '{other}'")),
+        };
+        n * factor
+    };
+    if !(meters.is_finite() && meters >= 0.0) {
+        return Err("`distance` must be a non-negative finite number".into());
+    }
+    Ok(meters)
+}
+
+/// An ES point as `(lat, lon)`: a `{lat, lon}` object, a **[lon, lat]** array
+/// (GeoJSON order), a `"lat,lon"` string, or WKT `POINT (lon lat)`. Geohash
+/// strings are not supported.
+fn geo_point(v: &Json) -> Result<(f64, f64), String> {
+    match v {
+        Json::Object(o) => {
+            let coord = |k: &str| -> Result<f64, String> {
+                o.get(k)
+                    .and_then(|x| x.as_f64())
+                    .ok_or_else(|| format!("point object needs numeric `{k}`"))
+            };
+            Ok((coord("lat")?, coord("lon")?))
+        }
+        Json::Array(a) => match a.as_slice() {
+            [lon, lat] => {
+                let lon = lon.as_f64().ok_or("point array must be [lon, lat] numbers")?;
+                let lat = lat.as_f64().ok_or("point array must be [lon, lat] numbers")?;
+                Ok((lat, lon))
+            }
+            _ => Err("point array must be [lon, lat]".into()),
+        },
+        Json::String(s) => {
+            let s = s.trim();
+            // WKT: `POINT (lon lat)`.
+            if let Some(rest) = s
+                .strip_prefix("POINT")
+                .or_else(|| s.strip_prefix("point"))
+            {
+                let inner = rest
+                    .trim()
+                    .strip_prefix('(')
+                    .and_then(|r| r.strip_suffix(')'))
+                    .ok_or("bad WKT point")?;
+                let mut it = inner.split_whitespace();
+                let lon: f64 = it
+                    .next()
+                    .and_then(|x| x.parse().ok())
+                    .ok_or("bad WKT point")?;
+                let lat: f64 = it
+                    .next()
+                    .and_then(|x| x.parse().ok())
+                    .ok_or("bad WKT point")?;
+                return Ok((lat, lon));
+            }
+            // `"lat,lon"`.
+            let (lat, lon) = s.split_once(',').ok_or(
+                "point string must be \"lat,lon\" or WKT POINT (geohash is not supported)",
+            )?;
+            let lat: f64 = lat.trim().parse().map_err(|_| "bad point latitude")?;
+            let lon: f64 = lon.trim().parse().map_err(|_| "bad point longitude")?;
+            Ok((lat, lon))
+        }
+        _ => Err("unsupported point shape".into()),
+    }
+}
+
+/// A parsed retriever request: an optional `NEAREST` clause, an optional
+/// WHERE filter, (for `retriever { rrf }`) the fusion constant, and (for
+/// `retriever { text_similarity_reranker }`) the `RERANK` clause. `nearest`
+/// is `None` only for a reranked `standard` retriever (search-only).
 struct VectorSpec {
-    nearest: Nearest,
+    nearest: Option<Nearest>,
     filter: Option<Expr>,
     rrf: Option<Rrf>,
+    rerank: Option<Rerank>,
 }
 
 /// Translate an ES `knn` block into a `NEAREST` clause + optional filter.
@@ -467,21 +653,90 @@ fn knn_query_text(obj: &Map<String, Json>) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Parse the vector-retrieval part of a `_search` body: a top-level `knn`
-/// block (pure/semantic kNN), or a `retriever { rrf { retrievers: [standard,
-/// knn] } }` block (hybrid → `NEAREST … WHERE <search> RANK BY RRF`). `None`
-/// when the body has neither.
+/// Parse the vector/retriever part of a `_search` body: a top-level `knn`
+/// block (pure/semantic kNN), or a `retriever` block — `rrf { retrievers:
+/// [standard, knn] }` (hybrid → `NEAREST … WHERE <search> RANK BY RRF`) or
+/// `text_similarity_reranker { retriever, … }` (→ `RERANK`). `None` when the
+/// body has neither.
 fn parse_vector(body: &Json) -> Result<Option<VectorSpec>, String> {
     if let Some(knn) = body.get("knn") {
         let (nearest, filter) = knn_nearest(knn)?;
-        return Ok(Some(VectorSpec { nearest, filter, rrf: None }));
+        return Ok(Some(VectorSpec {
+            nearest: Some(nearest),
+            filter,
+            rrf: None,
+            rerank: None,
+        }));
     }
     let Some(retriever) = body.get("retriever") else {
         return Ok(None);
     };
-    let rrf = retriever
-        .get("rrf")
-        .ok_or("only the `rrf` retriever is supported")?;
+    retriever_spec(retriever).map(Some)
+}
+
+/// One `retriever` object: `rrf`, `text_similarity_reranker`, `knn`, or (only
+/// meaningful nested under a reranker) `standard`.
+fn retriever_spec(retriever: &Json) -> Result<VectorSpec, String> {
+    if let Some(rrf) = retriever.get("rrf") {
+        return rrf_spec(rrf);
+    }
+    if let Some(tsr) = retriever.get("text_similarity_reranker") {
+        let inner = tsr
+            .get("retriever")
+            .ok_or("text_similarity_reranker needs a `retriever`")?;
+        let mut spec = if let Some(standard) = inner.get("standard") {
+            let q = match standard.get("query") {
+                Some(q) => query_expr(q)?,
+                None => None,
+            };
+            VectorSpec {
+                nearest: None,
+                filter: q,
+                rrf: None,
+                rerank: None,
+            }
+        } else {
+            retriever_spec(inner)?
+        };
+        if spec.rerank.is_some() {
+            return Err("text_similarity_reranker cannot nest another reranker".into());
+        }
+        let top = match tsr.get("rank_window_size") {
+            // ES's rank_window_size default.
+            None => 10,
+            Some(v) => match v.as_u64() {
+                Some(n) if n >= 1 => n,
+                _ => return Err("rank_window_size must be a positive integer".into()),
+            },
+        };
+        spec.rerank = Some(Rerank {
+            column: tsr.get("field").and_then(|v| v.as_str()).map(String::from),
+            model: tsr
+                .get("inference_id")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            query: tsr
+                .get("inference_text")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            top,
+        });
+        return Ok(spec);
+    }
+    if let Some(knn) = retriever.get("knn") {
+        let (nearest, filter) = knn_nearest(knn)?;
+        return Ok(VectorSpec {
+            nearest: Some(nearest),
+            filter,
+            rrf: None,
+            rerank: None,
+        });
+    }
+    Err("only the `rrf`, `text_similarity_reranker`, and `knn` retrievers are supported".into())
+}
+
+/// `retriever { rrf }` → hybrid `NEAREST … RANK BY RRF`.
+fn rrf_spec(rrf: &Json) -> Result<VectorSpec, String> {
     let constant = rrf
         .get("rank_constant")
         .and_then(|v| v.as_u64())
@@ -509,11 +764,12 @@ fn parse_vector(body: &Json) -> Result<Option<VectorSpec>, String> {
         }
     }
     let nearest = nearest.ok_or("rrf needs a `knn` retriever leg")?;
-    Ok(Some(VectorSpec {
-        nearest,
+    Ok(VectorSpec {
+        nearest: Some(nearest),
         filter,
         rrf: Some(Rrf { constant }),
-    }))
+        rerank: None,
+    })
 }
 
 /// AND two optional WHERE expressions (either may be absent).
@@ -644,12 +900,14 @@ fn search(ctx: &Shared, role: &str, index: &str, body: &[u8]) -> Result<(u16, Js
             }
         }
         if let Some(v) = vector {
-            // kNN / hybrid: NEAREST (+ RANK BY RRF) already returns rows ranked
-            // (nearest-first, or fused rrf_score desc), so no ORDER BY — the
-            // engine rejects ORDER BY alongside NEAREST. The knn/standard-leg
-            // filter is the WHERE.
-            sel.nearest = Some(Box::new(v.nearest));
+            // kNN / hybrid / reranked: NEAREST (+ RANK BY RRF) and RERANK
+            // already return rows ranked (nearest-first, fused rrf_score
+            // desc, or reranker order), so no ORDER BY — the engine rejects
+            // ORDER BY alongside them. The knn/standard-leg filter is the
+            // WHERE.
+            sel.nearest = v.nearest.map(Box::new);
             sel.rrf = v.rrf;
+            sel.rerank = v.rerank;
             sel.filter = v.filter;
         } else {
             sel.filter = filter.clone();
@@ -1500,9 +1758,10 @@ mod tests {
         });
         let spec = parse_vector(&body).unwrap().expect("vector spec");
         assert!(spec.rrf.is_none());
-        assert_eq!(spec.nearest.path, "embedding");
-        assert!(matches!(spec.nearest.k, Expr::Literal(Value::Int(5))));
-        match &spec.nearest.query {
+        let nearest = spec.nearest.expect("nearest");
+        assert_eq!(nearest.path, "embedding");
+        assert!(matches!(nearest.k, Expr::Literal(Value::Int(5))));
+        match &nearest.query {
             Expr::Literal(Value::Array(v)) => assert_eq!(v.len(), 3),
             other => panic!("expected array literal vector, got {other:?}"),
         }
@@ -1527,7 +1786,7 @@ mod tests {
             }
         });
         let spec = parse_vector(&body).unwrap().expect("vector spec");
-        match &spec.nearest.query {
+        match &spec.nearest.expect("nearest").query {
             Expr::Literal(Value::String(s)) => assert_eq!(s, "natural language query"),
             other => panic!("expected string query, got {other:?}"),
         }
@@ -1551,7 +1810,7 @@ mod tests {
         });
         let spec = parse_vector(&body).unwrap().expect("vector spec");
         assert_eq!(spec.rrf, Some(Rrf { constant: 20 }));
-        assert_eq!(spec.nearest.path, "embedding");
+        assert_eq!(spec.nearest.expect("nearest").path, "embedding");
         // standard leg → a MATCH() search predicate as the WHERE
         match spec.filter {
             Some(Expr::Func { ref name, .. }) if name == "match" => {}
@@ -1631,5 +1890,159 @@ mod tests {
         assert!(parse_vector(&json!({ "retriever": { "unknown": {} } })).is_err());
         // No knn / retriever at all → not a vector query.
         assert!(parse_vector(&json!({ "query": { "match_all": {} } })).unwrap().is_none());
+    }
+
+    #[test]
+    fn geo_distance_maps_to_sql_predicate() {
+        // Object point + unit string → geo_distance(col, lat, lon) <= metres.
+        let e = query_expr(&json!({
+            "geo_distance": { "distance": "5km", "loc": { "lat": 40.7, "lon": -74.0 } }
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            e,
+            Expr::Binary {
+                op: BinaryOp::LtEq,
+                left: Box::new(func(
+                    "geo_distance",
+                    vec![
+                        Expr::Column("loc".into()),
+                        Expr::Literal(Value::Float(40.7)),
+                        Expr::Literal(Value::Float(-74.0)),
+                    ]
+                )),
+                right: Box::new(Expr::Literal(Value::Float(5000.0))),
+            }
+        );
+        // Array points are GeoJSON [lon, lat]; a bare number is metres.
+        let e = query_expr(&json!({
+            "geo_distance": { "distance": 250, "loc": [-74.0, 40.7] }
+        }))
+        .unwrap()
+        .unwrap();
+        let Expr::Binary { left, right, .. } = e else { panic!() };
+        assert_eq!(
+            *left,
+            func(
+                "geo_distance",
+                vec![
+                    Expr::Column("loc".into()),
+                    Expr::Literal(Value::Float(40.7)),
+                    Expr::Literal(Value::Float(-74.0)),
+                ]
+            )
+        );
+        assert_eq!(*right, Expr::Literal(Value::Float(250.0)));
+        // Option keys are skipped when finding the field entry.
+        assert!(query_expr(&json!({
+            "geo_distance": {
+                "distance": "1mi", "distance_type": "arc",
+                "loc": "40.7,-74.0"
+            }
+        }))
+        .unwrap()
+        .is_some());
+        // Errors: missing distance, bad unit, geohash points.
+        assert!(query_expr(&json!({ "geo_distance": { "loc": [0.0, 0.0] } })).is_err());
+        assert!(query_expr(&json!({
+            "geo_distance": { "distance": "3 parsecs", "loc": [0.0, 0.0] }
+        }))
+        .is_err());
+        assert!(query_expr(&json!({
+            "geo_distance": { "distance": "1km", "loc": "drm3btev3e86" }
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn geo_bounding_box_maps_to_geo_bbox() {
+        // top_left/bottom_right corners → geo_bbox(col, min_lat, min_lon,
+        // max_lat, max_lon).
+        let e = query_expr(&json!({
+            "geo_bounding_box": { "loc": {
+                "top_left":     { "lat": 40.9, "lon": -74.3 },
+                "bottom_right": { "lat": 40.4, "lon": -73.7 }
+            } }
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            e,
+            func(
+                "geo_bbox",
+                vec![
+                    Expr::Column("loc".into()),
+                    Expr::Literal(Value::Float(40.4)),
+                    Expr::Literal(Value::Float(-74.3)),
+                    Expr::Literal(Value::Float(40.9)),
+                    Expr::Literal(Value::Float(-73.7)),
+                ]
+            )
+        );
+        // top_right/bottom_left and flat edges express the same box; WKT
+        // points work for corners.
+        for body in [
+            json!({ "geo_bounding_box": { "loc": {
+                "top_right":   { "lat": 40.9, "lon": -73.7 },
+                "bottom_left": { "lat": 40.4, "lon": -74.3 }
+            } } }),
+            json!({ "geo_bounding_box": { "loc": {
+                "top": 40.9, "left": -74.3, "bottom": 40.4, "right": -73.7
+            } } }),
+            json!({ "geo_bounding_box": { "loc": {
+                "top_left":     "POINT (-74.3 40.9)",
+                "bottom_right": "POINT (-73.7 40.4)"
+            } } }),
+        ] {
+            assert_eq!(query_expr(&body).unwrap().unwrap(), e, "{body}");
+        }
+        // Incomplete boxes error.
+        assert!(query_expr(&json!({
+            "geo_bounding_box": { "loc": { "top_left": { "lat": 1.0, "lon": 2.0 } } }
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn text_similarity_reranker_maps_to_rerank() {
+        // Over a standard (search) retriever: no NEAREST, RERANK carries the
+        // field/model/query/window.
+        let spec = parse_vector(&json!({ "retriever": { "text_similarity_reranker": {
+            "retriever": { "standard": { "query": { "match": { "body": "rust db" } } } },
+            "field": "body",
+            "inference_id": "rerank-v3",
+            "inference_text": "rust database engines",
+            "rank_window_size": 50
+        } } }))
+        .unwrap()
+        .unwrap();
+        assert!(spec.nearest.is_none() && spec.rrf.is_none());
+        assert!(spec.filter.is_some());
+        let rr = spec.rerank.unwrap();
+        assert_eq!(rr.column.as_deref(), Some("body"));
+        assert_eq!(rr.model.as_deref(), Some("rerank-v3"));
+        assert_eq!(rr.query.as_deref(), Some("rust database engines"));
+        assert_eq!(rr.top, 50);
+        // Over an rrf retriever: hybrid + rerank compose; the window defaults
+        // to ES's 10.
+        let spec = parse_vector(&json!({ "retriever": { "text_similarity_reranker": {
+            "retriever": { "rrf": { "retrievers": [
+                { "standard": { "query": { "match": { "body": "x" } } } },
+                { "knn": { "field": "emb", "query_vector": [1.0], "k": 20 } }
+            ] } },
+            "inference_text": "q"
+        } } }))
+        .unwrap()
+        .unwrap();
+        assert!(spec.nearest.is_some() && spec.rrf.is_some());
+        assert_eq!(spec.rerank.unwrap().top, 10);
+        // A reranker cannot nest another reranker.
+        assert!(parse_vector(&json!({ "retriever": { "text_similarity_reranker": {
+            "retriever": { "text_similarity_reranker": {
+                "retriever": { "standard": {} }
+            } },
+        } } }))
+        .is_err());
     }
 }

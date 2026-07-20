@@ -1,5 +1,7 @@
-//! HTTP embeddings client — the server-side [`skaidb_engine::Embedder`] for
-//! managed (`EMBED`) vector indexes. Calls an OpenAI/TEI-compatible endpoint:
+//! HTTP inference clients — the server-side [`skaidb_engine::Embedder`] for
+//! managed (`EMBED`) vector indexes, plus the shared endpoint transport the
+//! rerank client (`rerank_http`) reuses. The embedder calls an OpenAI/TEI-
+//! compatible endpoint:
 //!
 //! ```text
 //! POST <url>  {"model": <model>, "input": [<texts>]}
@@ -25,26 +27,25 @@ fn err(msg: impl Into<String>) -> EngineError {
     EngineError::Unsupported(format!("inference: {}", msg.into()))
 }
 
-/// An embeddings endpoint reachable over HTTP(S).
+/// One JSON-over-HTTP(S) inference endpoint: parsed URL, TLS material, auth,
+/// and timeout — the transport shared by the embeddings and rerank clients.
 #[derive(Debug)]
-pub struct HttpEmbedder {
+pub(crate) struct Endpoint {
     tls: Option<Arc<rustls::ClientConfig>>, // Some = https
     host: String,
     port: u16,
     path: String,
-    model: String,
-    dim: usize,
     api_key: String,
     timeout: Duration,
 }
 
-impl HttpEmbedder {
-    /// Build from `[inference]`. Errors on a malformed URL or TLS material.
-    pub fn from_config(c: &InferenceConfig) -> Result<Self, String> {
-        let (scheme, rest) = c
-            .url
+impl Endpoint {
+    /// Parse `url` and build the TLS/auth transport from the `[inference]`
+    /// settings. Errors on a malformed URL or TLS material.
+    pub(crate) fn from_config(url: &str, c: &InferenceConfig) -> Result<Self, String> {
+        let (scheme, rest) = url
             .split_once("://")
-            .ok_or("inference.url must be http://… or https://…")?;
+            .ok_or("inference URL must be http://… or https://…")?;
         let (hostport, path) = match rest.split_once('/') {
             Some((hp, p)) => (hp, format!("/{p}")),
             None => (rest, "/".to_string()),
@@ -52,7 +53,7 @@ impl HttpEmbedder {
         let (host, port) = match hostport.rsplit_once(':') {
             Some((h, p)) => (
                 h.to_string(),
-                p.parse::<u16>().map_err(|_| "bad port in inference.url")?,
+                p.parse::<u16>().map_err(|_| "bad port in inference URL")?,
             ),
             None => (
                 hostport.to_string(),
@@ -60,7 +61,7 @@ impl HttpEmbedder {
             ),
         };
         if host.is_empty() {
-            return Err("inference.url has no host".into());
+            return Err("inference URL has no host".into());
         }
         let tls = if scheme == "https" {
             let verify = match c.tls_verify.as_str() {
@@ -72,25 +73,19 @@ impl HttpEmbedder {
         } else {
             None
         };
-        Ok(HttpEmbedder {
+        Ok(Endpoint {
             tls,
             host,
             port,
             path,
-            model: c.model.clone(),
-            dim: c.dim as usize,
             api_key: c.api_key.clone(),
             timeout: Duration::from_secs(c.timeout_secs.max(1)),
         })
     }
-}
 
-impl Embedder for HttpEmbedder {
-    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EngineError> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-        let body = serde_json::json!({ "model": self.model, "input": texts }).to_string();
+    /// POST `body` (JSON) and parse the JSON response. `what` names the
+    /// endpoint in error messages ("embeddings" / "rerank").
+    pub(crate) fn post_json(&self, body: &str, what: &str) -> Result<serde_json::Value, EngineError> {
         let addr = format!("{}:{}", self.host, self.port);
         let tcp = TcpStream::connect(&addr).map_err(|e| err(format!("connect {addr}: {e}")))?;
         tcp.set_read_timeout(Some(self.timeout)).ok();
@@ -129,10 +124,38 @@ impl Embedder for HttpEmbedder {
         let resp = text.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
         if status != 200 {
             let snippet: String = resp.chars().take(200).collect();
-            return Err(err(format!("embeddings endpoint returned HTTP {status}: {snippet}")));
+            return Err(err(format!("{what} endpoint returned HTTP {status}: {snippet}")));
         }
-        let json: serde_json::Value =
-            serde_json::from_str(resp.trim()).map_err(|e| err(format!("bad JSON response: {e}")))?;
+        serde_json::from_str(resp.trim()).map_err(|e| err(format!("bad JSON response: {e}")))
+    }
+}
+
+/// An embeddings endpoint reachable over HTTP(S).
+#[derive(Debug)]
+pub struct HttpEmbedder {
+    endpoint: Endpoint,
+    model: String,
+    dim: usize,
+}
+
+impl HttpEmbedder {
+    /// Build from `[inference]`. Errors on a malformed URL or TLS material.
+    pub fn from_config(c: &InferenceConfig) -> Result<Self, String> {
+        Ok(HttpEmbedder {
+            endpoint: Endpoint::from_config(&c.url, c).map_err(|e| format!("url: {e}"))?,
+            model: c.model.clone(),
+            dim: c.dim as usize,
+        })
+    }
+}
+
+impl Embedder for HttpEmbedder {
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EngineError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let body = serde_json::json!({ "model": self.model, "input": texts }).to_string();
+        let json = self.endpoint.post_json(&body, "embeddings")?;
         let data = json
             .get("data")
             .and_then(|d| d.as_array())
