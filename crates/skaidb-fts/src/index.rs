@@ -1043,7 +1043,7 @@ impl SearchIndex {
         &self,
         query: &SearchQuery,
         field: &str,
-        max_chars: usize,
+        opts: &HighlightOpts,
     ) -> Result<Highlighter, FtsError> {
         let rt = self
             .runtimes
@@ -1070,8 +1070,13 @@ impl SearchIndex {
         )?;
         let searcher = self.reader.searcher();
         let mut generator = SnippetGenerator::create(&searcher, &*q, rt.field)?;
-        generator.set_max_num_chars(max_chars.max(1));
-        Ok(Highlighter { generator })
+        generator.set_max_num_chars(opts.max_chars.max(1));
+        Ok(Highlighter {
+            generator,
+            pre_tag: opts.pre_tag.clone(),
+            post_tag: opts.post_tag.clone(),
+            no_match_size: opts.no_match_size,
+        })
     }
 
     pub fn stats(&self) -> SearchIndexStats {
@@ -1107,10 +1112,41 @@ pub struct Suggestion {
     pub doc_freq: u64,
 }
 
+/// Highlighting options for one `(query, column)` pair — the tunables the
+/// `HIGHLIGHT()` SQL function and the ES `_search` `highlight` block expose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HighlightOpts {
+    /// Fragment length budget (ES `fragment_size`); the snippet is the best
+    /// scoring passage within this many characters.
+    pub max_chars: usize,
+    /// Opening/closing marker around each matched term (ES `pre_tags`/
+    /// `post_tags`); default `<b>`/`</b>`.
+    pub pre_tag: String,
+    pub post_tag: String,
+    /// When the column has no match, return the first `no_match_size`
+    /// characters of its text instead of an empty string (ES `no_match_size`);
+    /// `0` = empty (the default).
+    pub no_match_size: usize,
+}
+
+impl Default for HighlightOpts {
+    fn default() -> Self {
+        HighlightOpts {
+            max_chars: 150,
+            pre_tag: "<b>".to_string(),
+            post_tag: "</b>".to_string(),
+            no_match_size: 0,
+        }
+    }
+}
+
 /// Generates highlighted snippets of row text for one (query, column) pair
 /// (from [`SearchIndex::highlighter`]).
 pub struct Highlighter {
     generator: SnippetGenerator,
+    pre_tag: String,
+    post_tag: String,
+    no_match_size: usize,
 }
 
 impl fmt::Debug for Highlighter {
@@ -1120,15 +1156,24 @@ impl fmt::Debug for Highlighter {
 }
 
 impl Highlighter {
-    /// The best-scoring fragment of `text` with matching terms wrapped in
-    /// `<b>…</b>` (HTML-escaped otherwise); empty string when nothing in
-    /// `text` matches.
+    /// The best-scoring fragment of `text` with matching terms wrapped in the
+    /// configured tags (`<b>…</b>` by default), other text HTML-escaped. On no
+    /// match: the first `no_match_size` characters of `text` (escaped), or an
+    /// empty string when that is `0`.
     pub fn snippet(&self, text: &str) -> String {
         let snippet = self.generator.snippet(text);
         if snippet.is_empty() {
-            String::new()
+            return no_match_snippet(text, self.no_match_size);
+        }
+        // tantivy escapes fragment text and wraps matches in `<b>`/`</b>`; those
+        // are the only unescaped tags in the output, so a literal substitution
+        // is safe (escaped content can never contain `<b>`/`</b>`). `<b>` is not
+        // a substring of `</b>`, so the two replacements are order-independent.
+        let html = snippet.to_html();
+        if self.pre_tag == "<b>" && self.post_tag == "</b>" {
+            html
         } else {
-            snippet.to_html()
+            html.replace("<b>", &self.pre_tag).replace("</b>", &self.post_tag)
         }
     }
 
@@ -1154,6 +1199,32 @@ impl Highlighter {
         }
         self.snippet(&text)
     }
+}
+
+/// The `no_match_size` fallback: the first `n` characters of `text`,
+/// HTML-escaped (matching the escaping of a real snippet's plain text); empty
+/// when `n == 0` or `text` is empty.
+fn no_match_snippet(text: &str, n: usize) -> String {
+    if n == 0 || text.is_empty() {
+        return String::new();
+    }
+    let head: String = text.chars().take(n).collect();
+    html_escape(&head)
+}
+
+/// Escape the HTML text-content metacharacters (`&`, `<`, `>`), so a
+/// no-match fallback is as safe to render as a highlighted snippet.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// The query-side view of every addressable field — declared columns,
@@ -2172,16 +2243,49 @@ mod tests {
         .unwrap();
         idx.commit().unwrap();
         let query = matches("body", "jumping foxes");
-        let h = idx.highlighter(&query, "body", 60).unwrap();
-        // Stemmed query terms highlight the row's original inflections.
-        let snippet = h.snippet("the quick brown fox jumps over the lazy dog");
+        let text = "the quick brown fox jumps over the lazy dog";
+        let opts = |max_chars| HighlightOpts { max_chars, ..Default::default() };
+
+        // Default tags: stemmed query terms highlight the row's inflections.
+        let h = idx.highlighter(&query, "body", &opts(60)).unwrap();
+        let snippet = h.snippet(text);
         assert!(snippet.contains("<b>fox</b>"), "{snippet}");
         assert!(snippet.contains("<b>jumps</b>"), "{snippet}");
-        // Non-matching text yields no snippet.
+        // Non-matching text yields no snippet by default.
         assert_eq!(h.snippet("completely unrelated words"), "");
+
+        // Custom pre/post tags replace the <b> markers.
+        let custom = HighlightOpts {
+            max_chars: 60,
+            pre_tag: "<mark>".into(),
+            post_tag: "</mark>".into(),
+            no_match_size: 0,
+        };
+        let h = idx.highlighter(&query, "body", &custom).unwrap();
+        let snippet = h.snippet(text);
+        assert!(snippet.contains("<mark>fox</mark>"), "{snippet}");
+        assert!(!snippet.contains("<b>"), "{snippet}");
+
+        // no_match_size returns the first N chars (HTML-escaped) when nothing
+        // matched, instead of an empty string.
+        let nm = HighlightOpts {
+            max_chars: 60,
+            no_match_size: 5,
+            ..Default::default()
+        };
+        let h = idx.highlighter(&query, "body", &nm).unwrap();
+        assert_eq!(h.snippet("hello world"), "hello"); // first 5 chars, nothing to escape
+        let nm3 = HighlightOpts {
+            max_chars: 60,
+            no_match_size: 3,
+            ..Default::default()
+        };
+        let h = idx.highlighter(&query, "body", &nm3).unwrap();
+        assert_eq!(h.snippet("<a>bc"), "&lt;a&gt;"); // first 3 chars "<a>", escaped
+
         // Unknown or non-text columns are config errors.
         assert!(matches!(
-            idx.highlighter(&query, "nope", 60),
+            idx.highlighter(&query, "nope", &opts(60)),
             Err(FtsError::Config(_))
         ));
     }

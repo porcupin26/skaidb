@@ -706,10 +706,13 @@ WHERE (MATCH(body, 'rust') OR MATCH(title, 'rust'))
   vector search). Only valid together with a search predicate — else an
   error. Multi-field matches score dis-max (best field wins, ES
   `best_fields`).
-- **`HIGHLIGHT(<col> [, <max_chars>])`** projects the best-scoring snippet
-  of the column's text (default 150 chars), matches wrapped in `<b>…</b>`
-  (HTML-escaped otherwise; empty string if the column didn't match). Only
-  valid together with a search predicate.
+- **`HIGHLIGHT(<col> [, <max_chars> [, <pre_tag>, <post_tag> [, <no_match_size>]]])`**
+  projects the best-scoring snippet of the column's text (default fragment
+  size 150 chars), matches wrapped in tags (`<b>…</b>` by default, HTML-escaped
+  otherwise; empty string if the column didn't match). A `pre_tag`/`post_tag`
+  string pair overrides the markers (ES `pre_tags`/`post_tags`); a trailing
+  `no_match_size` returns that many leading characters when nothing matched
+  (ES `no_match_size`). Only valid together with a search predicate.
 - **`ORDER BY score() DESC LIMIT k`** pushes BM25 top-k retrieval into the
   index (no full scan); it requires `LIMIT`, and `score()` orders only
   descending. Without `ORDER BY`, matches return in unspecified order.

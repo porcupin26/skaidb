@@ -3851,6 +3851,18 @@ mod tests {
             rs.rows[0][0],
             Value::String("slow roasted <b>vegetables</b>".into())
         );
+        // Custom pre/post tags (ES pre_tags/post_tags) replace the <b> markers.
+        let rs = rows(
+            db.execute(
+                "SELECT HIGHLIGHT(body, 40, '<em>', '</em>') AS s FROM articles \
+                 WHERE MATCH(body, 'vegetables')",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            rs.rows[0][0],
+            Value::String("slow roasted <em>vegetables</em>".into())
+        );
         // Outside a search query there is nothing to highlight.
         assert!(db.execute("SELECT HIGHLIGHT(body) FROM articles").is_err());
         // Bad arguments are clear errors.

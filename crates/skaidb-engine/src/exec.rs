@@ -52,6 +52,11 @@ pub type GeoScanPlan = (String, Vec<(Vec<u8>, Option<Vec<u8>>)>);
 
 /// `(key, document)` rows — the engine's standard row-gather result.
 type KeyedRows = Vec<(Vec<u8>, Document)>;
+
+/// One `HIGHLIGHT()` request: the column and its resolved highlight options
+/// (fragment size, pre/post tags, no-match size). Threaded through the search
+/// gather so each hit gets a `_highlight_<column>` field.
+type HighlightReq = (String, skaidb_fts::HighlightOpts);
 /// `DESCRIBE`'s catalog half: the primary-key columns (in key order) and, per
 /// column, the descriptors of the indexes covering it.
 type DescribeCatalog = (Vec<String>, BTreeMap<String, Vec<String>>);
@@ -1788,7 +1793,7 @@ impl Database {
         query: &SearchQuery,
         k: Option<usize>,
         filter: &Option<Expr>,
-        highlights: &[(String, usize)],
+        highlights: &[HighlightReq],
     ) -> Result<Vec<(Vec<u8>, Document, f32)>> {
         let name = self.search_index_for_query(table, query)?;
         if let Some(live) = self.search_indexes.get_mut(&name) {
@@ -1899,7 +1904,7 @@ impl Database {
         sort: &skaidb_fts::SortSpec,
         k: usize,
         filter: &Option<Expr>,
-        highlights: &[(String, usize)],
+        highlights: &[HighlightReq],
         ownership: Option<&[(u64, u64)]>,
     ) -> Result<Option<SortedSearchRows>> {
         let name = self.search_index_for_query(table, query)?;
@@ -1918,7 +1923,7 @@ impl Database {
         sort: &skaidb_fts::SortSpec,
         k: usize,
         filter: &Option<Expr>,
-        highlights: &[(String, usize)],
+        highlights: &[HighlightReq],
         ownership: Option<&[(u64, u64)]>,
     ) -> Result<Option<SortedSearchRows>> {
         let name = self.search_index_for_query(table, query)?;
@@ -1940,8 +1945,8 @@ impl Database {
         };
         let highlighters = highlights
             .iter()
-            .map(|(col, max_chars)| {
-                let h = live.index.highlighter(query, col, *max_chars)?;
+            .map(|(col, opts)| {
+                let h = live.index.highlighter(query, col, opts)?;
                 Ok((col.as_str(), h))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2437,14 +2442,14 @@ impl Database {
         table: &str,
         query: &SearchQuery,
         column: &str,
-        max_chars: usize,
+        opts: &skaidb_fts::HighlightOpts,
     ) -> Result<skaidb_fts::Highlighter> {
         let name = self.search_index_for_query(table, query)?;
         let live = self
             .search_indexes
             .get(&name)
             .ok_or(EngineError::IndexNotFound(name))?;
-        Ok(live.index.highlighter(query, column, max_chars)?)
+        Ok(live.index.highlighter(query, column, opts)?)
     }
 
     /// Full-text search over the last-committed index state (see
@@ -2455,7 +2460,7 @@ impl Database {
         query: &SearchQuery,
         k: Option<usize>,
         filter: &Option<Expr>,
-        highlights: &[(String, usize)],
+        highlights: &[HighlightReq],
     ) -> Result<Vec<(Vec<u8>, Document, f32)>> {
         let name = self.search_index_for_query(table, query)?;
         self.search_with_index(&name, table, query, k, filter, highlights)
@@ -2474,7 +2479,7 @@ impl Database {
         query: &SearchQuery,
         k: Option<usize>,
         filter: &Option<Expr>,
-        highlights: &[(String, usize)],
+        highlights: &[HighlightReq],
     ) -> Result<Vec<(Vec<u8>, Document, f32)>> {
         let live = self
             .search_indexes
@@ -2494,8 +2499,8 @@ impl Database {
         // to each hit's authoritative row text.
         let highlighters = highlights
             .iter()
-            .map(|(col, max_chars)| {
-                let h = live.index.highlighter(query, col, *max_chars)?;
+            .map(|(col, opts)| {
+                let h = live.index.highlighter(query, col, opts)?;
                 Ok((col.as_str(), h))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -8259,7 +8264,7 @@ pub trait Cluster {
         _query: &SearchQuery,
         _k: Option<usize>,
         _filter: &Option<Expr>,
-        _highlights: &[(String, usize)],
+        _highlights: &[HighlightReq],
     ) -> Result<Vec<(Vec<u8>, Document, f32)>> {
         Err(EngineError::Unsupported(
             "full-text search is not supported on this deployment".into(),
@@ -8292,7 +8297,7 @@ pub trait Cluster {
         _sort: &skaidb_fts::SortSpec,
         _k: usize,
         _filter: &Option<Expr>,
-        _highlights: &[(String, usize)],
+        _highlights: &[HighlightReq],
     ) -> Result<Option<SortedSearchRows>> {
         Ok(None)
     }
@@ -9532,35 +9537,62 @@ fn finish_agg_pushdown(
     Ok(ResultSet { columns, rows: out })
 }
 
-/// The `HIGHLIGHT(column [, max_chars])` requests in a search SELECT's
-/// projection, as `(column, max_chars)` (default 150 chars, the ES-ish
-/// fragment size). The search gather answers each with a
-/// `_highlight_<column>` snippet field on every hit.
-fn collect_highlights(sel: &Select) -> Result<Vec<(String, usize)>> {
-    fn walk(expr: &Expr, out: &mut Vec<(String, usize)>) -> Result<()> {
+/// Parse a `HIGHLIGHT(column [, max_chars [, pre_tag, post_tag [, no_match_size]]])`
+/// call into its column and options. `max_chars` is the fragment size (ES
+/// `fragment_size`); the `pre_tag`/`post_tag` string pair replaces the default
+/// `<b>`/`</b>` markers (ES `pre_tags`/`post_tags`); `no_match_size` returns
+/// that many leading characters when nothing matched (ES `no_match_size`).
+fn parse_highlight_args(args: &[Expr]) -> Result<HighlightReq> {
+    let bad = || {
+        EngineError::Type(
+            "HIGHLIGHT(column [, max_chars [, pre_tag, post_tag [, no_match_size]]]) takes a \
+             column, an optional positive fragment size, an optional pre/post tag string pair, \
+             and an optional non-negative no-match size"
+                .into(),
+        )
+    };
+    let Some(Expr::Column(col)) = args.first() else {
+        return Err(bad());
+    };
+    let mut opts = skaidb_fts::HighlightOpts::default();
+    match &args[1..] {
+        [] => {}
+        [Expr::Literal(Value::Int(n))] if *n > 0 => opts.max_chars = *n as usize,
+        [Expr::Literal(Value::Int(n)), Expr::Literal(Value::String(pre)), Expr::Literal(Value::String(post))]
+            if *n > 0 =>
+        {
+            opts.max_chars = *n as usize;
+            opts.pre_tag = pre.clone();
+            opts.post_tag = post.clone();
+        }
+        [Expr::Literal(Value::Int(n)), Expr::Literal(Value::String(pre)), Expr::Literal(Value::String(post)), Expr::Literal(Value::Int(nm))]
+            if *n > 0 && *nm >= 0 =>
+        {
+            opts.max_chars = *n as usize;
+            opts.pre_tag = pre.clone();
+            opts.post_tag = post.clone();
+            opts.no_match_size = *nm as usize;
+        }
+        _ => return Err(bad()),
+    }
+    Ok((col.clone(), opts))
+}
+
+/// The `HIGHLIGHT(...)` requests in a search SELECT's projection. The search
+/// gather answers each with a `_highlight_<column>` snippet field on every hit.
+fn collect_highlights(sel: &Select) -> Result<Vec<HighlightReq>> {
+    fn walk(expr: &Expr, out: &mut Vec<HighlightReq>) -> Result<()> {
         if let Expr::Func { name, args } = expr {
             if name == "highlight" {
-                let (col, max_chars) = match args.as_slice() {
-                    [Expr::Column(col)] => (col.clone(), 150),
-                    [Expr::Column(col), Expr::Literal(Value::Int(n))] if *n > 0 => {
-                        (col.clone(), *n as usize)
-                    }
-                    _ => {
-                        return Err(EngineError::Type(
-                            "HIGHLIGHT(column [, max_chars]) takes a column and an optional \
-                             positive integer"
-                                .into(),
-                        ))
-                    }
-                };
+                let (col, opts) = parse_highlight_args(args)?;
                 match out.iter().find(|(c, _)| *c == col) {
-                    Some((_, prev)) if *prev != max_chars => {
+                    Some((_, prev)) if *prev != opts => {
                         return Err(EngineError::Type(format!(
-                            "conflicting HIGHLIGHT lengths for column '{col}'"
+                            "conflicting HIGHLIGHT options for column '{col}'"
                         )))
                     }
                     Some(_) => {}
-                    None => out.push((col, max_chars)),
+                    None => out.push((col, opts)),
                 }
                 return Ok(());
             }
@@ -10458,7 +10490,7 @@ impl Cluster for LocalCluster<'_> {
         query: &SearchQuery,
         k: Option<usize>,
         filter: &Option<Expr>,
-        highlights: &[(String, usize)],
+        highlights: &[HighlightReq],
     ) -> Result<Vec<(Vec<u8>, Document, f32)>> {
         self.db
             .search_commit_if_dirty(table, query, k, filter, highlights)
@@ -10481,7 +10513,7 @@ impl Cluster for LocalCluster<'_> {
         sort: &skaidb_fts::SortSpec,
         k: usize,
         filter: &Option<Expr>,
-        highlights: &[(String, usize)],
+        highlights: &[HighlightReq],
     ) -> Result<Option<SortedSearchRows>> {
         self.db
             .search_sorted(table, query, sort, k, filter, highlights, None)
@@ -10641,7 +10673,7 @@ impl Cluster for LocalRead<'_> {
         query: &SearchQuery,
         k: Option<usize>,
         filter: &Option<Expr>,
-        highlights: &[(String, usize)],
+        highlights: &[HighlightReq],
     ) -> Result<Vec<(Vec<u8>, Document, f32)>> {
         // Shared access: serve the last-committed index state (NRT — at most
         // `refresh_ms` stale) rather than committing pending writes.
@@ -10664,7 +10696,7 @@ impl Cluster for LocalRead<'_> {
         sort: &skaidb_fts::SortSpec,
         k: usize,
         filter: &Option<Expr>,
-        highlights: &[(String, usize)],
+        highlights: &[HighlightReq],
     ) -> Result<Option<SortedSearchRows>> {
         self.db
             .search_sorted_read(table, query, sort, k, filter, highlights, None)

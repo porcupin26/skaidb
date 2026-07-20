@@ -425,7 +425,9 @@ OR/NOT is rejected):
 - `score()` projects BM25 (also injected as `_score`); `ORDER BY score()
   DESC LIMIT k` is the pushed top-k (LIMIT required, DESC only).
   `ORDER BY <fast column> LIMIT k` also pushes down.
-- `HIGHLIGHT(col [, max_chars])` — snippet with `<b>…</b>` marks.
+- `HIGHLIGHT(col [, max_chars [, pre_tag, post_tag [, no_match_size]]])` —
+  snippet with matches marked (`<b>…</b>` default; a pre/post string pair =
+  ES pre_tags/post_tags; trailing no_match_size = leading chars when unmatched).
 - Per-group top documents: `SELECT region, title, score() FROM t WHERE
   MATCH(title, 'q') GROUP BY region TOP 3 BY score()` — each group's 3
   best-scoring rows (ES `top_hits` equivalent).

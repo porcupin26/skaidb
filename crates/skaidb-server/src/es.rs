@@ -524,6 +524,53 @@ fn merge_and(a: Option<Expr>, b: Option<Expr>) -> Option<Expr> {
     }
 }
 
+/// Positional args for `HIGHLIGHT(col, …)` from an ES highlight field spec
+/// (`field_opts`) with block-level fallback (`block`). Maps `fragment_size` →
+/// the size arg, `pre_tags`/`post_tags` (arrays — first element used) → the tag
+/// pair, and `no_match_size` → the trailing arg. Emits the minimal form so a
+/// bare `{}` stays `HIGHLIGHT(col)`.
+fn highlight_args(col: &str, field_opts: &Json, block: &Json) -> Vec<Expr> {
+    let num = |key: &str| -> Option<u64> {
+        field_opts
+            .get(key)
+            .and_then(|v| v.as_u64())
+            .or_else(|| block.get(key).and_then(|v| v.as_u64()))
+    };
+    // pre_tags/post_tags are arrays in ES; accept a bare string too.
+    fn first_tag(v: &Json) -> Option<String> {
+        v.as_array()
+            .and_then(|a| a.first())
+            .and_then(|x| x.as_str())
+            .or_else(|| v.as_str())
+            .map(|s| s.to_string())
+    }
+    let tag = |key: &str| -> Option<String> {
+        field_opts
+            .get(key)
+            .and_then(first_tag)
+            .or_else(|| block.get(key).and_then(first_tag))
+    };
+
+    let mut args = vec![Expr::Column(col.to_string())];
+    let size = num("fragment_size").unwrap_or(150);
+    let pre = tag("pre_tags");
+    let post = tag("post_tags");
+    let no_match = num("no_match_size");
+    let want_tags = pre.is_some() || post.is_some();
+    let want_no_match = no_match.is_some();
+    if size != 150 || want_tags || want_no_match {
+        args.push(Expr::Literal(Value::Int(size as i64)));
+    }
+    if want_tags || want_no_match {
+        args.push(str_lit(&pre.unwrap_or_else(|| "<b>".to_string())));
+        args.push(str_lit(&post.unwrap_or_else(|| "</b>".to_string())));
+    }
+    if let Some(n) = no_match {
+        args.push(Expr::Literal(Value::Int(n as i64)));
+    }
+    args
+}
+
 // ---- _search ----
 
 fn search(ctx: &Shared, role: &str, index: &str, body: &[u8]) -> Result<(u16, Json), String> {
@@ -580,16 +627,20 @@ fn search(ctx: &Shared, role: &str, index: &str, body: &[u8]) -> Result<(u16, Js
     if size > 0 {
         let mut sel = select_from(index);
         sel.items = vec![SelectItem::Wildcard];
-        // highlight: {fields: {col: {}}} → HIGHLIGHT(col) triggers; the
-        // snippets come back as injected `_highlight_<col>` fields.
+        // highlight: {fields: {col: {…}}} → HIGHLIGHT(col, …); the snippets
+        // come back as injected `_highlight_<col>` fields. Per-field options
+        // (fragment_size, pre_tags, post_tags, no_match_size) fall back to the
+        // block-level ones, then to skaidb's defaults.
         let mut hl_cols = Vec::new();
-        if let Some(fields) = body["highlight"]["fields"].as_object() {
-            for col in fields.keys() {
-                hl_cols.push(col.clone());
-                sel.items.push(SelectItem::Expr {
-                    expr: func("highlight", vec![Expr::Column(col.clone())]),
-                    alias: Some(format!("_es_hl_{col}")),
-                });
+        if let Some(hl) = body.get("highlight") {
+            if let Some(fields) = hl.get("fields").and_then(|f| f.as_object()) {
+                for (col, field_opts) in fields {
+                    hl_cols.push(col.clone());
+                    sel.items.push(SelectItem::Expr {
+                        expr: func("highlight", highlight_args(col, field_opts, hl)),
+                        alias: Some(format!("_es_hl_{col}")),
+                    });
+                }
             }
         }
         if let Some(v) = vector {
@@ -1519,6 +1570,50 @@ mod tests {
         });
         let spec = parse_vector(&body).unwrap().unwrap();
         assert_eq!(spec.rrf, Some(Rrf { constant: DEFAULT_RRF_CONSTANT }));
+    }
+
+    // ES highlight options map to HIGHLIGHT() positional args, with per-field
+    // values overriding block-level ones and the minimal form for a bare {}.
+    #[test]
+    fn highlight_args_map_es_options() {
+        let block = json!({});
+        // Bare `{}` → HIGHLIGHT(col) only.
+        assert_eq!(
+            highlight_args("body", &json!({}), &block),
+            vec![Expr::Column("body".into())]
+        );
+        // fragment_size → HIGHLIGHT(col, size).
+        assert_eq!(
+            highlight_args("body", &json!({ "fragment_size": 80 }), &block),
+            vec![Expr::Column("body".into()), Expr::Literal(Value::Int(80))]
+        );
+        // pre/post tags (arrays, first element) → HIGHLIGHT(col, size, pre, post).
+        let args = highlight_args(
+            "body",
+            &json!({ "pre_tags": ["<em>"], "post_tags": ["</em>"] }),
+            &block,
+        );
+        assert_eq!(
+            args,
+            vec![
+                Expr::Column("body".into()),
+                Expr::Literal(Value::Int(150)),
+                Expr::Literal(Value::String("<em>".into())),
+                Expr::Literal(Value::String("</em>".into())),
+            ]
+        );
+        // no_match_size → the trailing arg (tags default to <b>/</b>).
+        let args = highlight_args("body", &json!({ "no_match_size": 20 }), &block);
+        assert_eq!(args.len(), 5);
+        assert_eq!(args[4], Expr::Literal(Value::Int(20)));
+        assert_eq!(args[2], Expr::Literal(Value::String("<b>".into())));
+        // Block-level fallback when the field spec omits an option.
+        let args = highlight_args(
+            "body",
+            &json!({}),
+            &json!({ "pre_tags": ["<x>"], "post_tags": ["</x>"] }),
+        );
+        assert_eq!(args[2], Expr::Literal(Value::String("<x>".into())));
     }
 
     // Error shapes: missing field, no query, an rrf with no knn leg, and a

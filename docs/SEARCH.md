@@ -193,19 +193,30 @@ in-index IDF, OR-ed — permissive defaults so short like-texts work).
 the index dictionary (Levenshtein ≤ 2, doc-frequency ranked); completion
 /search-as-you-type is the `edge_ngram` + `MATCH_PREFIX` pattern.
 
-**Highlighting**: `HIGHLIGHT(col [, max_chars])` in the projection returns
-the best-scoring snippet of the column's text (default 150 chars) with
-matching terms wrapped in `<b>…</b>` (HTML-escaped otherwise, empty string
-when the column didn't match). Stemming is respected — a query for
-`jumping` highlights `jumps`. Only valid together with a search predicate.
-Highlight multiple columns by calling `HIGHLIGHT()` once per column. The
-snippet comes from re-reading the row's live text (not stored offsets), so
-it always reflects the current document. Scope vs Elasticsearch: skaidb
-returns **one** best passage per column with fixed `<b>` tags — the ES
-`unified`-style default. Not yet supported: custom `pre_tags`/`post_tags`,
-multiple fragments (`number_of_fragments`), `no_match_size`, a separate
-`highlight_query`, sentence/word boundary scanners, and the `plain`/`fvh`
-highlighter types (`fvh` would need stored term-vector offsets).
+**Highlighting**: `HIGHLIGHT(col [, max_chars [, pre_tag, post_tag [, no_match_size]]])`
+in the projection returns the best-scoring snippet of the column's text
+(default fragment size 150 chars) with matching terms wrapped in tags
+(`<b>…</b>` by default), other text HTML-escaped. Stemming is respected —
+a query for `jumping` highlights `jumps`. Only valid together with a
+search predicate; highlight multiple columns by calling `HIGHLIGHT()`
+once per column. The snippet re-reads the row's live text (not stored
+offsets), so it always reflects the current document.
+
+- **Custom tags** (ES `pre_tags`/`post_tags`): pass a string pair after the
+  fragment size, e.g. `HIGHLIGHT(body, 40, '<em>', '</em>')` →
+  `slow roasted <em>vegetables</em>`.
+- **`no_match_size`** (ES): a trailing integer returns that many leading
+  characters (HTML-escaped) when the column had no match, instead of an
+  empty string — `HIGHLIGHT(body, 40, '<b>', '</b>', 80)`.
+
+Scope vs Elasticsearch: skaidb returns **one** best passage per column
+(the ES `unified`-style default) and now covers custom tags and
+`no_match_size`. Still not supported: multiple fragments
+(`number_of_fragments`), a separate `highlight_query`, sentence/word
+boundary scanners, and the `plain`/`fvh` highlighter types (`fvh` would
+need stored term-vector offsets). On the RF<members sorted-scan scatter,
+remote shards use default tags (the wire carries only the fragment size);
+full-replica clusters and the primary search path use the full options.
 
 ## Aggregations
 

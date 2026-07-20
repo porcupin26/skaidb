@@ -66,6 +66,14 @@ pub struct NodeConfig {
 /// Resolved rows of a sorted search shard: `(key, row document)`.
 type SortedRows = Vec<(Vec<u8>, Document)>;
 
+/// One `HIGHLIGHT()` request threaded to the search paths: the column and its
+/// resolved options (fragment size, pre/post tags, no-match size). Matches the
+/// engine's `Cluster`-trait highlight parameter. Note the internode wire
+/// (`Request::SearchSorted`) still carries only the fragment size, so the
+/// RF<members sorted-scan scatter uses default `<b>` tags on remote shards;
+/// the coordinator's own shard and full-replica clusters use the full options.
+type HlReq = (String, skaidb_fts::HighlightOpts);
+
 #[derive(Debug)]
 struct Topology {
     /// Membership version: a higher epoch supersedes a lower one, so stale or
@@ -2157,7 +2165,7 @@ impl Node {
         query: &skaidb_fts::SearchQuery,
         sort: &skaidb_fts::SortSpec,
         k: usize,
-        highlights: &[(String, usize)],
+        highlights: &[HlReq],
         epoch: u64,
     ) -> EngineResult<Option<SortedRows>> {
         let arcs = {
@@ -2191,7 +2199,7 @@ impl Node {
         sort: &skaidb_fts::SortSpec,
         k: usize,
         filter: &Option<Expr>,
-        highlights: &[(String, usize)],
+        highlights: &[HlReq],
     ) -> EngineResult<Option<SortedRows>> {
         if filter.is_some() {
             return Ok(None);
@@ -2212,9 +2220,11 @@ impl Node {
             .map_err(|e| EngineError::Cluster(format!("encode query: {e}")))?;
         let sort_json = serde_json::to_string(sort)
             .map_err(|e| EngineError::Cluster(format!("encode sort: {e}")))?;
+        // Only the fragment size travels over the wire (see `HlReq`); remote
+        // shards highlight with default tags.
         let wire_highlights: Vec<(String, u32)> = highlights
             .iter()
-            .map(|(c, m)| (c.clone(), *m as u32))
+            .map(|(c, opts)| (c.clone(), opts.max_chars as u32))
             .collect();
         let shards = scatter(&peers, |(_, addr)| {
             self.counters.peer_requests.fetch_add(1, Ordering::Relaxed);
@@ -5361,9 +5371,20 @@ impl Node {
                 );
                 match parsed {
                     (Ok(query), Ok(sort)) => {
-                        let highlights: Vec<(String, usize)> = highlights
+                        // The wire carries only the fragment size; a shard
+                        // highlights with default tags (custom tags are applied
+                        // coordinator-side on the primary search path).
+                        let highlights: Vec<HlReq> = highlights
                             .into_iter()
-                            .map(|(c, m)| (c, m as usize))
+                            .map(|(c, m)| {
+                                (
+                                    c,
+                                    skaidb_fts::HighlightOpts {
+                                        max_chars: m as usize,
+                                        ..Default::default()
+                                    },
+                                )
+                            })
                             .collect();
                         match self.search_sorted_shard(
                             &table,
@@ -7516,7 +7537,7 @@ impl Node {
         query: &skaidb_fts::SearchQuery,
         k: Option<usize>,
         filter: &Option<Expr>,
-        highlights: &[(String, usize)],
+        highlights: &[HlReq],
     ) -> EngineResult<Vec<(Vec<u8>, Document, f32)>> {
         // Over-fetch per shard so the merge (and any filtering) still yields k.
         let fetch = k.map(|k| {
@@ -7576,8 +7597,8 @@ impl Node {
                 .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
             highlights
                 .iter()
-                .map(|(col, max_chars)| {
-                    db.search_highlighter(table, query, col, *max_chars)
+                .map(|(col, opts)| {
+                    db.search_highlighter(table, query, col, opts)
                         .map(|h| (col.clone(), h))
                 })
                 .collect::<EngineResult<Vec<_>>>()?
@@ -8425,7 +8446,7 @@ impl Cluster for Coordinator {
         query: &skaidb_fts::SearchQuery,
         k: Option<usize>,
         filter: &Option<Expr>,
-        highlights: &[(String, usize)],
+        highlights: &[HlReq],
     ) -> EngineResult<Vec<(Vec<u8>, Document, f32)>> {
         // Multi-node: scatter to every member's local shard and merge
         // (per-shard BM25, re-read at read consistency).
@@ -8448,7 +8469,7 @@ impl Cluster for Coordinator {
         sort: &skaidb_fts::SortSpec,
         k: usize,
         filter: &Option<Expr>,
-        highlights: &[(String, usize)],
+        highlights: &[HlReq],
     ) -> EngineResult<Option<Vec<(Vec<u8>, Document)>>> {
         // One index holding every row serves locally; a sharded corpus
         // scatters per-shard sorted top-k over ownership arcs and merges —
