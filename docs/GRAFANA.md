@@ -73,13 +73,20 @@ SELECT rate(value) FROM metrics WHERE name = 'http_requests_total' AND job = 'ap
 ### Supported PromQL (v1 subset)
 
 Instant selectors with `=`/`!=`/`=~`/`!~` label matchers (regex forms
-anchored, Prometheus-style), `offset`, `rate` / `increase` / `delta` and
-`avg/min/max/sum/count/last_over_time` over range selectors (`[5m]` —
-the `*_over_time` family is what Grafana's Metrics Drilldown tiles use),
-`sum/avg/min/max/count/stddev [by|without (...)]` and `quantile(φ, v)`
-(the drilldown's "Standard deviation" / "Percentiles" previews), vector
-arithmetic (`+ - * /`, one-to-one matching), number-only expressions (the
-`1+1` datasource health check), `histogram_quantile`, and
+anchored, Prometheus-style), `offset`, `rate` / `increase` / `delta` /
+`irate` / `idelta` and `avg/min/max/sum/count/last_over_time` over range
+selectors (`[5m]` — the `*_over_time` family is what Grafana's Metrics
+Drilldown tiles use), `sum/avg/min/max/count/stddev [by|without (...)]`,
+`quantile(φ, v)` (the drilldown's "Standard deviation" / "Percentiles"
+previews) and `topk(k, v)` / `bottomk(k, v)`, vector arithmetic
+(`+ - * /`, one-to-one matching), comparison operators
+(`== != > < >= <=`, filtering by default, 0/1-valued with `bool`), the
+set operators `and` / `or` / `unless` (the drilldown's extreme-values
+filter emits `<expr> and <expr> > -Inf`), `Inf`/`NaN` literals,
+number-only expressions (the `1+1` datasource health check),
+`histogram_quantile`, `label_replace` / `label_join`, `sort` /
+`sort_desc` (instant queries), `absent(v)` (labels derived from the
+selector's `=` matchers — the standard missing-data alert), and
 `timestamp(<selector>)` / `time()` (the "last reading" / staleness stat
 patterns: `max(timestamp(m)) * 1000`, `time() - max(timestamp(m))`). Trailing commas
 in matcher blocks are accepted, Prometheus-style. The drilldown's full
@@ -88,9 +95,10 @@ query catalog is pinned by the `grafana_promql_compatibility` test. Typical dash
 `histogram_quantile(0.9, sum by (le) (rate(req_bucket[5m])))` — work
 as-is.
 
-**Not supported (yet)**: subqueries, `group_left`/`group_right`
-many-to-one matching, `topk`/`bottomk` and friends. Panels using those
-need the fallback below.
+**Not supported (yet)**: subqueries, `on()/ignoring()` +
+`group_left`/`group_right` matching modifiers, the per-sample math
+family (`abs`, `ceil`, `clamp_*`, …), `absent_over_time`, and the `@`
+modifier. Panels using those need the fallback below.
 
 ### Monitoring skaidb itself
 

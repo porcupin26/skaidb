@@ -126,9 +126,12 @@ enum PExpr {
     },
     /// `lhs + rhs` and friends: scalar∘scalar, scalar∘vector, and
     /// vector∘vector matched one-to-one on identical label sets
-    /// (ignoring `__name__`, which the result drops — PromQL semantics).
+    /// (ignoring `__name__`, which arithmetic drops — PromQL semantics).
+    /// `bool_mod` is the comparison `bool` modifier (0/1 values instead of
+    /// filtering).
     Binary {
         op: BinOp,
+        bool_mod: bool,
         lhs: Box<PExpr>,
         rhs: Box<PExpr>,
     },
@@ -141,6 +144,28 @@ enum PExpr {
     /// `time()` — the evaluation timestamp as a scalar (unix seconds);
     /// `time() - max(timestamp(m))` is data staleness.
     Time,
+    /// `label_replace(v, dst, replacement, src, regex)`. The pattern is kept
+    /// as source text (PExpr is PartialEq for tests); it is validated at
+    /// parse and compiled once per evaluation.
+    LabelReplace {
+        arg: Box<PExpr>,
+        dst: String,
+        repl: String,
+        src: String,
+        pattern: String,
+    },
+    /// `label_join(v, dst, sep, src1, src2, ...)`.
+    LabelJoin {
+        arg: Box<PExpr>,
+        dst: String,
+        sep: String,
+        srcs: Vec<String>,
+    },
+    /// `sort(v)` / `sort_desc(v)` — order series by value within each step.
+    Sort { desc: bool, arg: Box<PExpr> },
+    /// `absent(v)` — empty vector when v has samples; otherwise a single
+    /// 1-valued sample carrying the labels derivable from v's `=` matchers.
+    Absent { arg: Box<PExpr>, labels: Labels },
     /// A bare number.
     Number(f64),
 }
@@ -151,6 +176,19 @@ enum BinOp {
     Sub,
     Mul,
     Div,
+    /// Comparisons: filters without `bool` (keep the sample when true),
+    /// 0/1-valued with it. Grafana's drilldown emits `<expr> > -Inf`
+    /// (extreme-values filtering); alert rules live on `== 0` etc.
+    Gt,
+    Lt,
+    Ge,
+    Le,
+    CmpEq,
+    CmpNe,
+    /// Set operators, one-to-one on the label set sans `__name__`.
+    And,
+    Or,
+    Unless,
 }
 
 impl BinOp {
@@ -160,6 +198,30 @@ impl BinOp {
             BinOp::Sub => l - r,
             BinOp::Mul => l * r,
             BinOp::Div => l / r,
+            _ => unreachable!("comparison/set ops route through apply_binary"),
+        }
+    }
+
+    fn is_arithmetic(self) -> bool {
+        matches!(self, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
+    }
+
+    fn is_comparison(self) -> bool {
+        matches!(
+            self,
+            BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::CmpEq | BinOp::CmpNe
+        )
+    }
+
+    fn cmp(self, l: f64, r: f64) -> bool {
+        match self {
+            BinOp::Gt => l > r,
+            BinOp::Lt => l < r,
+            BinOp::Ge => l >= r,
+            BinOp::Le => l <= r,
+            BinOp::CmpEq => l == r,
+            BinOp::CmpNe => l != r,
+            _ => unreachable!("cmp() is only called for comparison ops"),
         }
     }
 }
@@ -179,6 +241,10 @@ enum RangeFn {
     CountOverTime,
     /// Keeps the metric name (returns a raw sample), Prometheus-style.
     LastOverTime,
+    /// `irate` / `idelta` — instantaneous forms over the LAST TWO samples
+    /// in the window (irate is counter-reset-aware and per-second).
+    IRate,
+    IDelta,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -194,6 +260,27 @@ enum AggOp {
     /// `quantile(φ, v)` — φ-quantile across the group, linear interpolation;
     /// the drilldown's "Percentiles" preview (P50/P90/P99 …).
     Quantile(f64),
+    /// `topk(k, v)` / `bottomk(k, v)` — SELECT the k best/worst samples per
+    /// group (original labels and values, `__name__` kept), unlike the
+    /// folding aggregations above.
+    TopK(f64),
+    BottomK(f64),
+}
+
+impl AggOp {
+    /// Aggregations taking a leading scalar parameter (`op(param, v)`).
+    fn takes_param(self) -> bool {
+        matches!(self, AggOp::Quantile(_) | AggOp::TopK(_) | AggOp::BottomK(_))
+    }
+
+    fn with_param(self, p: f64) -> AggOp {
+        match self {
+            AggOp::Quantile(_) => AggOp::Quantile(p),
+            AggOp::TopK(_) => AggOp::TopK(p),
+            AggOp::BottomK(_) => AggOp::BottomK(p),
+            other => other,
+        }
+    }
 }
 
 // ---- parser ----
@@ -333,8 +420,85 @@ impl<'a> P<'a> {
         }
     }
 
-    /// `expr := term (('+'|'-') term)*`
+    /// PromQL precedence, loosest first: `or` → `and`/`unless` →
+    /// comparisons (`== != <= < >= >`, optional `bool`) → `+ -` → `* /`.
     fn expr(&mut self) -> Result<PExpr, String> {
+        let mut lhs = self.and_expr()?;
+        while self.keyword("or") {
+            let rhs = self.and_expr()?;
+            lhs = PExpr::Binary {
+                op: BinOp::Or,
+                bool_mod: false,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(lhs)
+    }
+
+    fn and_expr(&mut self) -> Result<PExpr, String> {
+        let mut lhs = self.cmp_expr()?;
+        loop {
+            let op = if self.keyword("and") {
+                BinOp::And
+            } else if self.keyword("unless") {
+                BinOp::Unless
+            } else {
+                return Ok(lhs);
+            };
+            let rhs = self.cmp_expr()?;
+            lhs = PExpr::Binary {
+                op,
+                bool_mod: false,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+    }
+
+    fn cmp_expr(&mut self) -> Result<PExpr, String> {
+        let mut lhs = self.add_expr()?;
+        loop {
+            let op = match self.peek() {
+                Some(b'=') if self.s.get(self.i + 1) == Some(&b'=') => {
+                    self.i += 2;
+                    BinOp::CmpEq
+                }
+                Some(b'!') if self.s.get(self.i + 1) == Some(&b'=') => {
+                    self.i += 2;
+                    BinOp::CmpNe
+                }
+                Some(b'<') => {
+                    self.i += 1;
+                    if self.eat(b'=') {
+                        BinOp::Le
+                    } else {
+                        BinOp::Lt
+                    }
+                }
+                Some(b'>') => {
+                    self.i += 1;
+                    if self.eat(b'=') {
+                        BinOp::Ge
+                    } else {
+                        BinOp::Gt
+                    }
+                }
+                _ => return Ok(lhs),
+            };
+            let bool_mod = self.keyword("bool");
+            let rhs = self.add_expr()?;
+            lhs = PExpr::Binary {
+                op,
+                bool_mod,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+    }
+
+    /// `add_expr := term (('+'|'-') term)*`
+    fn add_expr(&mut self) -> Result<PExpr, String> {
         let mut lhs = self.term()?;
         loop {
             let op = match self.peek() {
@@ -346,6 +510,7 @@ impl<'a> P<'a> {
             let rhs = self.term()?;
             lhs = PExpr::Binary {
                 op,
+                bool_mod: false,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
             };
@@ -365,6 +530,7 @@ impl<'a> P<'a> {
             let rhs = self.factor()?;
             lhs = PExpr::Binary {
                 op,
+                bool_mod: false,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
             };
@@ -387,6 +553,18 @@ impl<'a> P<'a> {
             let start = self.i;
             if self.s[self.i] == b'-' {
                 self.i += 1;
+            }
+            // `Inf`/`NaN` are number literals in PromQL (case-insensitive);
+            // Grafana's drilldown filters extreme values with `> -Inf`.
+            for (word, value) in [("inf", f64::INFINITY), ("nan", f64::NAN)] {
+                let end = self.i + word.len();
+                if self.s.get(self.i..end).is_some_and(|s| s.eq_ignore_ascii_case(word.as_bytes()))
+                    && !self.s.get(end).is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                {
+                    self.i = end;
+                    let neg = self.s[start] == b'-';
+                    return Ok(PExpr::Number(if neg { -value } else { value }));
+                }
             }
             while self
                 .s
@@ -411,6 +589,12 @@ impl<'a> P<'a> {
             return self.selector_tail(matchers);
         }
         let name = self.ident().ok_or("expected expression")?;
+        if name.eq_ignore_ascii_case("inf") {
+            return Ok(PExpr::Number(f64::INFINITY));
+        }
+        if name.eq_ignore_ascii_case("nan") {
+            return Ok(PExpr::Number(f64::NAN));
+        }
         // histogram_quantile(φ, expr).
         if name == "timestamp" {
             self.expect(b'(')?;
@@ -427,6 +611,100 @@ impl<'a> P<'a> {
             self.expect(b'(')?;
             self.expect(b')')?;
             return Ok(PExpr::Time);
+        }
+        if name == "label_replace" || name == "label_join" {
+            // A label-name argument; `__name__` maps to the storage label.
+            let label_arg = |p: &mut Self| -> Result<String, String> {
+                p.ws();
+                let s = p.string()?;
+                Ok(if s == "__name__" { "name".into() } else { s })
+            };
+            self.expect(b'(')?;
+            let arg = Box::new(self.expr()?);
+            self.expect(b',')?;
+            let dst = label_arg(self)?;
+            if !valid_label_name(&dst) {
+                return Err(format!("{name}: invalid destination label {dst:?}"));
+            }
+            self.expect(b',')?;
+            let out = if name == "label_replace" {
+                self.ws();
+                let repl = self.string()?;
+                self.expect(b',')?;
+                let src = label_arg(self)?;
+                self.expect(b',')?;
+                self.ws();
+                let pattern = self.string()?;
+                compile_anchored(&pattern)?;
+                PExpr::LabelReplace {
+                    arg,
+                    dst,
+                    repl,
+                    src,
+                    pattern,
+                }
+            } else {
+                self.ws();
+                let sep = self.string()?;
+                let mut srcs = Vec::new();
+                while self.eat(b',') {
+                    srcs.push(label_arg(self)?);
+                }
+                PExpr::LabelJoin {
+                    arg,
+                    dst,
+                    sep,
+                    srcs,
+                }
+            };
+            self.expect(b')')?;
+            return Ok(out);
+        }
+        if name == "sort" || name == "sort_desc" {
+            self.expect(b'(')?;
+            let arg = self.expr()?;
+            self.expect(b')')?;
+            return Ok(PExpr::Sort {
+                desc: name == "sort_desc",
+                arg: Box::new(arg),
+            });
+        }
+        if name == "absent" {
+            self.expect(b'(')?;
+            let arg = self.expr()?;
+            self.expect(b')')?;
+            // Labels Prometheus derives for the "absent" sample: every
+            // unambiguous `=` matcher of a plain selector (name excluded).
+            let mut labels: Labels = Vec::new();
+            if let PExpr::Selector { matchers, .. } = &arg {
+                for m in matchers {
+                    if let Matcher::Eq(k, v) = m {
+                        if k != "name" && !v.is_empty() {
+                            labels.push((k.clone(), v.clone()));
+                        }
+                    }
+                }
+                labels.sort();
+                labels.dedup();
+                // A label `=`-matched against two different values is
+                // ambiguous — Prometheus omits it from the absent sample.
+                let mut i = 0;
+                while i < labels.len() {
+                    let dups = labels[i..]
+                        .iter()
+                        .take_while(|(k, _)| *k == labels[i].0)
+                        .count();
+                    if dups > 1 {
+                        labels.drain(i..i + dups);
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            return Ok(PExpr::Absent {
+                arg: Box::new(arg),
+                labels,
+            });
         }
         if name == "histogram_quantile" {
             self.expect(b'(')?;
@@ -449,8 +727,10 @@ impl<'a> P<'a> {
             "max" => Some(AggOp::Max),
             "count" => Some(AggOp::Count),
             "stddev" => Some(AggOp::Stddev),
-            // φ parsed below, after the optional by/without modifier.
+            // Scalar params parsed below, after the optional by/without.
             "quantile" => Some(AggOp::Quantile(f64::NAN)),
+            "topk" => Some(AggOp::TopK(f64::NAN)),
+            "bottomk" => Some(AggOp::BottomK(f64::NAN)),
             _ => None,
         };
         if let Some(mut op) = agg {
@@ -479,16 +759,16 @@ impl<'a> P<'a> {
                 }
             }
             self.expect(b'(')?;
-            // `quantile(φ, v)`: the scalar φ leads the argument list.
-            if matches!(op, AggOp::Quantile(_)) {
-                let PExpr::Number(phi) = self.factor()? else {
-                    return Err(
-                        "quantile needs a number as its first argument, e.g. quantile(0.95, m)"
-                            .into(),
-                    );
+            // `quantile(φ, v)` / `topk(k, v)` / `bottomk(k, v)`: the scalar
+            // parameter leads the argument list.
+            if op.takes_param() {
+                let PExpr::Number(p) = self.factor()? else {
+                    return Err(format!(
+                        "{name} needs a number as its first argument, e.g. {name}(5, m)"
+                    ));
                 };
                 self.expect(b',')?;
-                op = AggOp::Quantile(phi);
+                op = op.with_param(p);
             }
             let arg = self.expr()?;
             self.expect(b')')?;
@@ -510,6 +790,8 @@ impl<'a> P<'a> {
             "sum_over_time" => Some(RangeFn::SumOverTime),
             "count_over_time" => Some(RangeFn::CountOverTime),
             "last_over_time" => Some(RangeFn::LastOverTime),
+            "irate" => Some(RangeFn::IRate),
+            "idelta" => Some(RangeFn::IDelta),
             _ => None,
         };
         if let Some(func) = func {
@@ -640,7 +922,11 @@ fn assign_slots(expr: &mut PExpr, specs: &mut Vec<(Vec<Matcher>, Option<i64>, i6
         PExpr::RangeFn { arg, .. }
         | PExpr::Agg { arg, .. }
         | PExpr::HistogramQuantile { arg, .. }
-        | PExpr::Timestamp { arg } => assign_slots(arg, specs),
+        | PExpr::Timestamp { arg }
+        | PExpr::LabelReplace { arg, .. }
+        | PExpr::LabelJoin { arg, .. }
+        | PExpr::Sort { arg, .. }
+        | PExpr::Absent { arg, .. } => assign_slots(arg, specs),
         PExpr::Binary { lhs, rhs, .. } => {
             assign_slots(lhs, specs);
             assign_slots(rhs, specs);
@@ -656,12 +942,29 @@ fn selector_of(expr: &PExpr) -> Result<&Vec<Matcher>, String> {
         PExpr::RangeFn { arg, .. }
         | PExpr::Agg { arg, .. }
         | PExpr::HistogramQuantile { arg, .. }
-        | PExpr::Timestamp { arg } => selector_of(arg),
+        | PExpr::Timestamp { arg }
+        | PExpr::LabelReplace { arg, .. }
+        | PExpr::LabelJoin { arg, .. }
+        | PExpr::Sort { arg, .. }
+        | PExpr::Absent { arg, .. } => selector_of(arg),
         PExpr::Binary { lhs, .. } => selector_of(lhs),
         PExpr::Time | PExpr::Number(_) => {
             Err("number-only expressions are not supported".into())
         }
     }
+}
+
+/// Anchored regex, PromQL-style: `label_replace`'s pattern must match the
+/// WHOLE source value.
+fn compile_anchored(pattern: &str) -> Result<regex::Regex, String> {
+    regex::Regex::new(&format!("^(?:{pattern})$")).map_err(|e| format!("bad regex: {e}"))
+}
+
+fn valid_label_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .enumerate()
+            .all(|(i, b)| b.is_ascii_alphabetic() || b == b'_' || (i > 0 && b.is_ascii_digit()))
 }
 
 /// Match-key for binary operations: labels sans `__name__` (PromQL drops
@@ -672,6 +975,123 @@ fn match_key(labels: &Labels) -> Labels {
         .filter(|(k, _)| k != "__name__")
         .cloned()
         .collect()
+}
+
+/// One step of a binary operation. Arithmetic maps values (dropping
+/// `__name__`, PromQL-style); comparisons FILTER (keep the sample, labels
+/// intact, when true) unless `bool` makes them 0/1-valued (name dropped);
+/// `and`/`or`/`unless` are label-set operations over vectors.
+fn apply_binary(op: BinOp, bool_mod: bool, lv: StepVal, rv: StepVal) -> Result<StepVal, String> {
+    if op.is_arithmetic() {
+        return Ok(match (lv, rv) {
+            (StepVal::Scalar(a), StepVal::Scalar(b)) => StepVal::Scalar(op.apply(a, b)),
+            (StepVal::Scalar(a), StepVal::Vector(v)) => StepVal::Vector(
+                v.into_iter()
+                    .map(|(labels, b)| (match_key(&labels), op.apply(a, b)))
+                    .collect(),
+            ),
+            (StepVal::Vector(v), StepVal::Scalar(b)) => StepVal::Vector(
+                v.into_iter()
+                    .map(|(labels, a)| (match_key(&labels), op.apply(a, b)))
+                    .collect(),
+            ),
+            (StepVal::Vector(lv), StepVal::Vector(rv)) => {
+                // One-to-one on identical label sets sans __name__.
+                let rhs_by: BTreeMap<Labels, f64> = rv
+                    .into_iter()
+                    .map(|(labels, v)| (match_key(&labels), v))
+                    .collect();
+                StepVal::Vector(
+                    lv.into_iter()
+                        .filter_map(|(labels, a)| {
+                            let key = match_key(&labels);
+                            rhs_by.get(&key).map(|b| (key, op.apply(a, *b)))
+                        })
+                        .collect(),
+                )
+            }
+        });
+    }
+    if op.is_comparison() {
+        let as01 = |b: bool| if b { 1.0 } else { 0.0 };
+        return Ok(match (lv, rv) {
+            (StepVal::Scalar(a), StepVal::Scalar(b)) => {
+                if !bool_mod {
+                    return Err(
+                        "comparisons between scalars must use BOOL modifier".into(),
+                    );
+                }
+                StepVal::Scalar(as01(op.cmp(a, b)))
+            }
+            (StepVal::Vector(v), StepVal::Scalar(b)) => StepVal::Vector(
+                v.into_iter()
+                    .filter_map(|(labels, a)| {
+                        if bool_mod {
+                            Some((match_key(&labels), as01(op.cmp(a, b))))
+                        } else {
+                            op.cmp(a, b).then_some((labels, a))
+                        }
+                    })
+                    .collect(),
+            ),
+            (StepVal::Scalar(a), StepVal::Vector(v)) => StepVal::Vector(
+                v.into_iter()
+                    .filter_map(|(labels, b)| {
+                        if bool_mod {
+                            Some((match_key(&labels), as01(op.cmp(a, b))))
+                        } else {
+                            op.cmp(a, b).then_some((labels, b))
+                        }
+                    })
+                    .collect(),
+            ),
+            (StepVal::Vector(lv), StepVal::Vector(rv)) => {
+                let rhs_by: BTreeMap<Labels, f64> = rv
+                    .into_iter()
+                    .map(|(labels, v)| (match_key(&labels), v))
+                    .collect();
+                StepVal::Vector(
+                    lv.into_iter()
+                        .filter_map(|(labels, a)| {
+                            let b = *rhs_by.get(&match_key(&labels))?;
+                            if bool_mod {
+                                Some((match_key(&labels), as01(op.cmp(a, b))))
+                            } else {
+                                op.cmp(a, b).then_some((labels, a))
+                            }
+                        })
+                        .collect(),
+                )
+            }
+        });
+    }
+    // Set operators: vectors only.
+    let (StepVal::Vector(lv), StepVal::Vector(rv)) = (lv, rv) else {
+        return Err("and/or/unless require vector operands on both sides".into());
+    };
+    let rhs_keys: std::collections::BTreeSet<Labels> =
+        rv.iter().map(|(labels, _)| match_key(labels)).collect();
+    Ok(StepVal::Vector(match op {
+        BinOp::And => lv
+            .into_iter()
+            .filter(|(labels, _)| rhs_keys.contains(&match_key(labels)))
+            .collect(),
+        BinOp::Unless => lv
+            .into_iter()
+            .filter(|(labels, _)| !rhs_keys.contains(&match_key(labels)))
+            .collect(),
+        BinOp::Or => {
+            let lhs_keys: std::collections::BTreeSet<Labels> =
+                lv.iter().map(|(labels, _)| match_key(labels)).collect();
+            let mut out = lv;
+            out.extend(
+                rv.into_iter()
+                    .filter(|(labels, _)| !lhs_keys.contains(&match_key(labels))),
+            );
+            out
+        }
+        _ => unreachable!("arithmetic/comparison handled above"),
+    }))
 }
 
 /// Evaluate `expr` at each step in `steps` (ms). Returns per-step values.
@@ -707,40 +1127,13 @@ fn eval_steps(expr: &PExpr, fetched: &[Fetched], steps: &[i64]) -> Result<Vec<St
                 })
                 .collect())
         }
-        PExpr::Binary { op, lhs, rhs } => {
+        PExpr::Binary { op, bool_mod, lhs, rhs } => {
             let l = eval_steps(lhs, fetched, steps)?;
             let r = eval_steps(rhs, fetched, steps)?;
-            Ok(l.into_iter()
+            l.into_iter()
                 .zip(r)
-                .map(|(lv, rv)| match (lv, rv) {
-                    (StepVal::Scalar(a), StepVal::Scalar(b)) => StepVal::Scalar(op.apply(a, b)),
-                    (StepVal::Scalar(a), StepVal::Vector(v)) => StepVal::Vector(
-                        v.into_iter()
-                            .map(|(labels, b)| (match_key(&labels), op.apply(a, b)))
-                            .collect(),
-                    ),
-                    (StepVal::Vector(v), StepVal::Scalar(b)) => StepVal::Vector(
-                        v.into_iter()
-                            .map(|(labels, a)| (match_key(&labels), op.apply(a, b)))
-                            .collect(),
-                    ),
-                    (StepVal::Vector(lv), StepVal::Vector(rv)) => {
-                        // One-to-one on identical label sets sans __name__.
-                        let rhs_by: BTreeMap<Labels, f64> = rv
-                            .into_iter()
-                            .map(|(labels, v)| (match_key(&labels), v))
-                            .collect();
-                        StepVal::Vector(
-                            lv.into_iter()
-                                .filter_map(|(labels, a)| {
-                                    let key = match_key(&labels);
-                                    rhs_by.get(&key).map(|b| (key, op.apply(a, *b)))
-                                })
-                                .collect(),
-                        )
-                    }
-                })
-                .collect())
+                .map(|(lv, rv)| apply_binary(*op, *bool_mod, lv, rv))
+                .collect()
         }
         PExpr::HistogramQuantile { phi, arg } => {
             let inner = eval_steps(arg, fetched, steps)?;
@@ -803,6 +1196,28 @@ fn eval_steps(expr: &PExpr, fetched: &[Fetched], steps: &[i64]) -> Result<Vec<St
                         let hi = samples.partition_point(|s| s.ts <= t);
                         let win = &samples[lo..hi];
                         let value = match func {
+                            // Instantaneous forms: the last two samples only.
+                            RangeFn::IRate | RangeFn::IDelta => {
+                                if win.len() < 2 {
+                                    continue;
+                                }
+                                let (a, b) = (&win[win.len() - 2], &win[win.len() - 1]);
+                                if *func == RangeFn::IDelta {
+                                    b.value - a.value
+                                } else {
+                                    // Counter-reset-aware, per-second.
+                                    let inc = if b.value >= a.value {
+                                        b.value - a.value
+                                    } else {
+                                        b.value
+                                    };
+                                    let dt = (b.ts - a.ts) as f64 / 1000.0;
+                                    if dt <= 0.0 {
+                                        continue;
+                                    }
+                                    inc / dt
+                                }
+                            }
                             // Change-over-window family: needs two samples.
                             RangeFn::Rate | RangeFn::Increase | RangeFn::Delta => {
                                 if win.len() < 2 {
@@ -885,6 +1300,119 @@ fn eval_steps(expr: &PExpr, fetched: &[Fetched], steps: &[i64]) -> Result<Vec<St
                 .map(StepVal::Vector)
                 .collect())
         }
+        PExpr::LabelReplace {
+            arg,
+            dst,
+            repl,
+            src,
+            pattern,
+        } => {
+            let re = compile_anchored(pattern)?;
+            let inner = eval_steps(arg, fetched, steps)?;
+            inner
+                .into_iter()
+                .map(|val| {
+                    let StepVal::Vector(v) = val else {
+                        return Err("label_replace() requires an instant vector".into());
+                    };
+                    Ok(StepVal::Vector(
+                        v.into_iter()
+                            .map(|(mut labels, value)| {
+                                let srcval = label_value(&labels, src).to_string();
+                                if let Some(caps) = re.captures(&srcval) {
+                                    let mut expanded = String::new();
+                                    caps.expand(repl, &mut expanded);
+                                    set_label(&mut labels, dst, expanded);
+                                }
+                                (labels, value)
+                            })
+                            .collect(),
+                    ))
+                })
+                .collect()
+        }
+        PExpr::LabelJoin {
+            arg,
+            dst,
+            sep,
+            srcs,
+        } => {
+            let inner = eval_steps(arg, fetched, steps)?;
+            inner
+                .into_iter()
+                .map(|val| {
+                    let StepVal::Vector(v) = val else {
+                        return Err("label_join() requires an instant vector".into());
+                    };
+                    Ok(StepVal::Vector(
+                        v.into_iter()
+                            .map(|(mut labels, value)| {
+                                let joined = srcs
+                                    .iter()
+                                    .map(|s| label_value(&labels, s))
+                                    .collect::<Vec<_>>()
+                                    .join(sep);
+                                set_label(&mut labels, dst, joined);
+                                (labels, value)
+                            })
+                            .collect(),
+                    ))
+                })
+                .collect()
+        }
+        PExpr::Sort { desc, arg } => {
+            let inner = eval_steps(arg, fetched, steps)?;
+            Ok(inner
+                .into_iter()
+                .map(|val| match val {
+                    StepVal::Vector(mut v) => {
+                        v.sort_by(|a, b| {
+                            if *desc {
+                                b.1.total_cmp(&a.1)
+                            } else {
+                                a.1.total_cmp(&b.1)
+                            }
+                        });
+                        StepVal::Vector(v)
+                    }
+                    scalar => scalar,
+                })
+                .collect())
+        }
+        PExpr::Absent { arg, labels } => {
+            let inner = eval_steps(arg, fetched, steps)?;
+            Ok(inner
+                .into_iter()
+                .map(|val| {
+                    // A scalar always "exists"; only an empty vector is absent.
+                    let absent = matches!(&val, StepVal::Vector(v) if v.is_empty());
+                    StepVal::Vector(if absent {
+                        vec![(labels.clone(), 1.0)]
+                    } else {
+                        Vec::new()
+                    })
+                })
+                .collect())
+        }
+    }
+}
+
+/// A label's value, missing = "" (PromQL treats absent labels as empty).
+fn label_value<'a>(labels: &'a Labels, key: &str) -> &'a str {
+    labels
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("")
+}
+
+/// Set `dst` to `val` on a sorted label set; the empty string REMOVES the
+/// label (empty value == absent, PromQL-style).
+fn set_label(labels: &mut Labels, dst: &str, val: String) {
+    labels.retain(|(k, _)| k != dst);
+    if !val.is_empty() {
+        labels.push((dst.to_string(), val));
+        labels.sort();
     }
 }
 
@@ -951,9 +1479,8 @@ fn fold_agg(
     without: &Option<Vec<String>>,
     vector: Vector,
 ) -> Vector {
-    let mut groups: BTreeMap<Labels, Vec<f64>> = BTreeMap::new();
-    for (labels, value) in vector {
-        let key: Labels = match (by, without) {
+    let group_key = |labels: &Labels| -> Labels {
+        match (by, without) {
             (Some(by), _) => labels
                 .iter()
                 .filter(|(k, _)| by.contains(k))
@@ -965,7 +1492,34 @@ fn fold_agg(
                 .cloned()
                 .collect(),
             (None, None) => Vec::new(),
-        };
+        }
+    };
+    // topk/bottomk SELECT samples (original labels, `__name__` intact)
+    // instead of folding each group to one value.
+    if let AggOp::TopK(k) | AggOp::BottomK(k) = op {
+        let desc = matches!(op, AggOp::TopK(_));
+        let k = if k.is_finite() && k >= 1.0 { k as usize } else { 0 };
+        let mut groups: BTreeMap<Labels, Vector> = BTreeMap::new();
+        for (labels, value) in vector {
+            groups.entry(group_key(&labels)).or_default().push((labels, value));
+        }
+        let mut out = Vec::new();
+        for (_, mut members) in groups {
+            members.sort_by(|a, b| {
+                if desc {
+                    b.1.total_cmp(&a.1)
+                } else {
+                    a.1.total_cmp(&b.1)
+                }
+            });
+            members.truncate(k);
+            out.append(&mut members);
+        }
+        return out;
+    }
+    let mut groups: BTreeMap<Labels, Vec<f64>> = BTreeMap::new();
+    for (labels, value) in vector {
+        let key = group_key(&labels);
         groups.entry(key).or_default().push(value);
     }
     groups
@@ -997,6 +1551,9 @@ fn fold_agg(
                         let (lo, hi) = (rank.floor() as usize, rank.ceil() as usize);
                         sorted[lo] + (sorted[hi] - sorted[lo]) * (rank - lo as f64)
                     }
+                }
+                AggOp::TopK(_) | AggOp::BottomK(_) => {
+                    unreachable!("selected, not folded — handled above")
                 }
             };
             (labels, value)
@@ -1490,6 +2047,84 @@ mod tests {
         // answer; quantile without a scalar first argument likewise.
         assert!(eval("timestamp(avg(aqi))").is_err());
         assert!(eval("quantile(aqi)").is_err());
+
+        // ---- comparisons (filter vs bool) ----
+        // aqi at t=10s: device a = 12, device b = 22.
+        let gt = eval("aqi > 15").unwrap();
+        assert_eq!(gt.len(), 1, "{gt:?}");
+        assert_eq!(gt[0].1, 22.0);
+        // Filtering keeps the sample untouched, metric name included.
+        assert!(gt[0].0.iter().any(|(k, v)| k == "__name__" && v == "aqi"));
+        // `bool` turns the comparison 0/1-valued (and drops the name).
+        let gtb = eval("aqi > bool 15").unwrap();
+        assert_eq!(gtb.len(), 2);
+        let mut bools: Vec<f64> = gtb.iter().map(|(_, v)| *v).collect();
+        bools.sort_by(f64::total_cmp);
+        assert_eq!(bools, vec![0.0, 1.0]);
+        assert!(gtb[0].0.iter().all(|(k, _)| k != "__name__"));
+        // Scalar comparisons demand `bool`, like Prometheus.
+        assert_eq!(one("2 > bool 1"), 1.0);
+        assert!(eval("2 > 1").is_err());
+        // The drilldown's extreme-values filter — its exact production shape.
+        assert_eq!(
+            eval(r#"aqi{__ignore_usage__="", } and aqi{__ignore_usage__="", } > -Inf"#)
+                .map(|v| v.len()),
+            Ok(2)
+        );
+
+        // ---- set operators ----
+        assert_eq!(eval("aqi or reqs_total").unwrap().len(), 3);
+        assert_eq!(eval(r#"aqi and aqi{device_id="a"}"#).unwrap().len(), 1);
+        let unless = eval(r#"aqi unless aqi{device_id="a"}"#).unwrap();
+        assert_eq!(unless.len(), 1);
+        assert_eq!(unless[0].1, 22.0);
+        // `or` keeps lhs on key collisions.
+        assert_eq!(eval("aqi or aqi").unwrap().len(), 2);
+
+        // ---- topk / bottomk (select, don't fold) ----
+        let top = eval("topk(1, aqi)").unwrap();
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].1, 22.0);
+        assert!(top[0].0.iter().any(|(k, v)| k == "__name__" && v == "aqi"));
+        assert!(top[0].0.iter().any(|(k, v)| k == "device_id" && v == "b"));
+        assert_eq!(one("bottomk(1, aqi)"), 12.0);
+        assert_eq!(eval("topk(5, aqi)").unwrap().len(), 2, "k > n keeps all");
+
+        // ---- irate / idelta (last two samples in the window) ----
+        // reqs_total: … (5s, 140), (9s, 200) → (200-140)/4s and a raw diff.
+        assert_eq!(one("irate(reqs_total[10s])"), 15.0);
+        assert_eq!(one("idelta(reqs_total[10s])"), 60.0);
+
+        // ---- label_replace / label_join ----
+        // (${1}, not $1X — `$1X` reads as the group named "1X", like Go.)
+        let lr = eval(r#"label_replace(aqi{device_id="a"}, "dev", "${1}X", "device_id", "(.*)")"#)
+            .unwrap();
+        assert!(lr[0].0.iter().any(|(k, v)| k == "dev" && v == "aX"), "{lr:?}");
+        // A non-matching regex leaves the series untouched.
+        let lr = eval(r#"label_replace(aqi{device_id="a"}, "dev", "X", "device_id", "zzz")"#)
+            .unwrap();
+        assert!(lr[0].0.iter().all(|(k, _)| k != "dev"));
+        // An invalid regex or destination label is a parse error.
+        assert!(eval(r#"label_replace(aqi, "dev", "X", "device_id", "[")"#).is_err());
+        assert!(eval(r#"label_replace(aqi, "not-a-label!", "X", "device_id", ".*")"#).is_err());
+        let lj = eval(r#"label_join(aqi{device_id="a"}, "combo", "-", "device_id", "device_id")"#)
+            .unwrap();
+        assert!(lj[0].0.iter().any(|(k, v)| k == "combo" && v == "a-a"), "{lj:?}");
+
+        // ---- sort / sort_desc (instant-query ordering) ----
+        let sorted = eval("sort_desc(aqi)").unwrap();
+        assert_eq!(sorted.iter().map(|(_, v)| *v).collect::<Vec<_>>(), vec![22.0, 12.0]);
+        let sorted = eval("sort(aqi)").unwrap();
+        assert_eq!(sorted.iter().map(|(_, v)| *v).collect::<Vec<_>>(), vec![12.0, 22.0]);
+
+        // ---- absent() (alerting on missing data) ----
+        assert_eq!(eval("absent(aqi)").unwrap().len(), 0);
+        let ab = eval(r#"absent(nope{job="x"})"#).unwrap();
+        assert_eq!(ab, vec![(vec![("job".to_string(), "x".to_string())], 1.0)]);
+        assert_eq!(eval("absent(nope)").unwrap(), vec![(Vec::new(), 1.0)]);
+        // Ambiguous `=` constraints drop out of the derived labels.
+        let ab = eval(r#"absent(nope{job="x", job="y", dc="ny"})"#).unwrap();
+        assert_eq!(ab, vec![(vec![("dc".to_string(), "ny".to_string())], 1.0)]);
     }
 
     /// Grafana's Metrics Drilldown emits `{__ignore_usage__="", }` — a

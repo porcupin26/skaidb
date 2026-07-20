@@ -1368,6 +1368,7 @@ version = "0.124.0"
 dependencies = [
  "clap",
  "rcgen",
+ "regex",
  "rustls",
  "serde_json",
  "signal-hook",

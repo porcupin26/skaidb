@@ -530,13 +530,17 @@ WHERE ts >= now() - 6h GROUP BY t;
   table, whose FIELDS are the metric names (`pm25{sensor="pi1"}`) —
   point a Grafana datasource base URL at the prefix; permission =
   Select on the scoped table. PromQL subset: selectors with `= != =~ !~` (regex anchored),
-  bare `{name=~"..."}` selectors, `offset`, `rate/increase/delta[5m]`,
+  bare `{name=~"..."}` selectors, `offset`, `rate/increase/delta/irate/idelta[5m]`,
   `avg/min/max/sum/count/last_over_time[5m]` (Grafana drilldown tiles),
-  `stddev` + `quantile(φ, v)` aggs, trailing commas in matcher blocks,
+  `stddev` + `quantile(φ, v)` + `topk/bottomk(k, v)` aggs, trailing commas in matcher blocks,
   `timestamp(<selector>)` + `time()` (last-reading/staleness stats),
-  number-only exprs (`1+1` health check),
+  number-only exprs (`1+1` health check), comparisons `== != > < >= <=`
+  (filter; 0/1 with `bool`), `and/or/unless` (drilldown emits
+  `<e> and <e> > -Inf`), `Inf`/`NaN` literals,
   `sum/avg/min/max/count [by|without]`, vector arithmetic `+ - * /`,
-  `histogram_quantile`. Not supported: subqueries, `group_left/right`, `topk`.
+  `histogram_quantile`, `label_replace/label_join`, `sort/sort_desc`,
+  `absent(v)`. Not supported: subqueries, `on/ignoring` + `group_left/right`,
+  per-sample math (`abs/ceil/clamp_*` …), `absent_over_time`, `@`.
 - **Self-scrape**: `config set observability.self_scrape true` (live) makes
   the node ingest its own `/metrics` every
   `observability.self_scrape_interval_secs` — self-dashboarding without an

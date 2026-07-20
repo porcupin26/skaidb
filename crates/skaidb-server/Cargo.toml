@@ -31,6 +31,7 @@ skaidb-config.workspace = true
 skaidb-gssapi = { workspace = true, optional = true }
 skaidb-engine.workspace = true
 skaidb-tsdb.workspace = true
+regex.workspace = true
 skaidb-cluster.workspace = true
 skaidb-net.workspace = true
 rustls.workspace = true
