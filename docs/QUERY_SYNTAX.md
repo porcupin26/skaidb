@@ -129,6 +129,8 @@ ALTER TABLE <table> SET (witness = <bool>     -- toggle witness mirroring
                        | replication = <n>    -- online placement transition
                        | nodes = ['<ref>',..] -- online pin change
                        | placement_finalized = true)  -- operator escape hatch
+ALTER TABLE <ts-table> SET (retention = <dur> -- live retention change (0 clears)
+                          | ooo = <dur>)      -- live out-of-order window change
 
 -- Session (binary-protocol connections)
 SET CONSISTENCY { ONE | QUORUM | ALL }        -- per-connection override
@@ -870,6 +872,17 @@ WHERE ts >= now() - 6h GROUP BY t;
   declares an out-of-order window (`OOO 10m`): samples within the window of
   the series' newest are buffered and merged in time order; an equal
   timestamp overwrites (last write wins).
+- **Dropped points are reported.** An INSERT whose samples fall outside the
+  OOO window succeeds but returns the count that actually landed —
+  `affected: 0` when everything was discarded (one count per numeric field
+  when rows carry several). Ingest code should compare `affected` against
+  what it sent.
+- **Retention and OOO are live-tunable.** `ALTER TABLE cpu SET
+  (retention = 60d)` / `SET (ooo = 1h)` apply without recreating the table:
+  retention takes effect at the next flush (widening it cannot resurrect
+  already-dropped blocks), the OOO window on subsequent inserts —
+  temporarily widening it is the supported way to backfill history into a
+  live table. `retention = 0` clears retention (keep forever).
 - **Pushdown.** `AND`-combined `ts` comparisons and label `=`/`!=`
   predicates narrow the storage read; any other predicate still applies with
   full SQL semantics afterward.

@@ -259,6 +259,7 @@ REBUILD SEARCH INDEX s
 ALTER SEARCH INDEX s SET (opts)             -- query-time opts only, live
 CREATE TIMESERIES TABLE [IF NOT EXISTS] t
        (SERIES KEY (label [, ...]) [, RETENTION dur] [, OOO dur])
+ALTER TABLE ts_table SET (retention = dur | ooo = dur)  -- live-tunable; 0 clears retention
 CREATE ROLLUP [IF NOT EXISTS] r ON ts_table BUCKET dur [RETENTION dur]
 
 -- DML (UPDATE/DELETE rejected on time-series tables — append-only)
@@ -506,6 +507,13 @@ WHERE ts >= now() - 6h GROUP BY t;
   required (timestamp or int ms, increasing per series unless within the
   `OOO` window; equal ts = last-write-wins); other columns are numeric
   fields. Append-only: UPDATE/DELETE rejected; `RETENTION` expires blocks.
+- **`ALTER TABLE <ts> SET (retention = 60d | ooo = 1h)`** — both
+  live-tunable (retention applies at next flush, `0` clears it; ooo applies
+  to subsequent inserts — widen it temporarily to backfill a live table).
+- **INSERT reports drops**: points outside the OOO window are discarded and
+  `affected` counts only what landed (`0` = all dropped; per-field counts
+  when a row has several numeric fields). Check `affected` in ingest code;
+  `timeseries.<t>.samples_rejected` in SHOW STATUS is the cumulative view.
 - `rate/increase/delta` are counter-reset-aware, computed per series then
   summed across the group (PromQL `sum(rate(...))` semantics); `first/last`
   take the earliest/latest value. GROUP BY/ORDER BY may reference output

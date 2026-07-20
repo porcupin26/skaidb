@@ -97,8 +97,19 @@ pub(crate) fn run_ts_insert(
             ));
         }
     }
-    let affected = ins.rows.len();
-    cluster.ts_append(&ins.table, &rows)?;
+    // `affected` reflects what actually LANDED: samples outside the table's
+    // OOO window are dropped per-sample by the store, and a success ack that
+    // says `affected: 1` for a vanished point makes that data loss invisible
+    // to ingest code. Samples and rows coincide for single-field rows (the
+    // common shape); multi-field rows contribute one count per field.
+    let samples = rows.len();
+    let appended = cluster.ts_append(&ins.table, &rows)?;
+    let affected = if appended == samples {
+        // Everything landed: report in row units, as INSERT always has.
+        ins.rows.len()
+    } else {
+        appended
+    };
     Ok(QueryOutput::Mutation { affected })
 }
 

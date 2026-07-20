@@ -950,7 +950,14 @@ mod tests {
             1,
             "within the 2m window"
         );
-        db.execute("INSERT INTO m (h, ts, value) VALUES ('x', 100000, 99)").unwrap();
+        // A beyond-window point is dropped — and the ack SAYS so (affected
+        // 0), so ingest code can detect the loss instead of trusting a
+        // phantom `affected: 1`.
+        assert_eq!(
+            affected(db.execute("INSERT INTO m (h, ts, value) VALUES ('x', 100000, 99)").unwrap()),
+            0,
+            "beyond the 2m window: dropped, and reported as such"
+        );
         let rs = rows(db.execute("SELECT ts, value FROM m ORDER BY ts").unwrap());
         // Beyond-window sample (ts=100000) was rejected; the OOO one merged
         // in time order.
@@ -969,6 +976,47 @@ mod tests {
             .iter()
             .any(|r| r[0] == Value::String("timeseries.m.samples_rejected".into())
                 && r[1] == Value::Int(1)));
+    }
+
+    /// `ALTER TABLE <ts> SET (retention = ..., ooo = ...)` — retention and
+    /// the OOO window are live-tunable (per-org retention settings change;
+    /// backfill into a live table needs a window), no
+    /// create-new/backfill/swap dance.
+    #[test]
+    fn timeseries_alter_retention_and_ooo() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TIMESERIES TABLE m (SERIES KEY (h), RETENTION 30d)")
+            .unwrap();
+        db.execute("INSERT INTO m (h, ts, value) VALUES ('x', 600000, 6)").unwrap();
+        // Strict monotonic by default: a late point drops (and says so).
+        assert_eq!(
+            affected(db.execute("INSERT INTO m (h, ts, value) VALUES ('x', 500000, 5)").unwrap()),
+            0
+        );
+        // Widen the window: the same-aged point now lands.
+        db.execute("ALTER TABLE m SET (ooo = 5m)").unwrap();
+        assert_eq!(
+            affected(db.execute("INSERT INTO m (h, ts, value) VALUES ('x', 500000, 5)").unwrap()),
+            1
+        );
+        // Retention changes reflect in the catalog def (enforcement rides
+        // the flush cadence) and both survive reopen; 0 clears it.
+        db.execute("ALTER TABLE m SET (retention = 60d)").unwrap();
+        let dir = db.dir().to_path_buf();
+        drop(db);
+        let mut db = Database::open(&dir).unwrap();
+        let def = db.ts_table_def("m").unwrap();
+        assert_eq!(def.retention_ms, Some(60 * 24 * 3600 * 1000));
+        assert_eq!(def.ooo_window_ms, 5 * 60 * 1000);
+        db.execute("ALTER TABLE m SET (retention = 0)").unwrap();
+        assert_eq!(db.ts_table_def("m").unwrap().retention_ms, None);
+        // Unknown options and placement options are clear errors on TS
+        // tables; retention on a regular table likewise.
+        let err = db.execute("ALTER TABLE m SET (replication = 2)").unwrap_err();
+        assert!(err.to_string().contains("retention, ooo"), "{err}");
+        db.execute("CREATE TABLE plain (PRIMARY KEY (id))").unwrap();
+        let err = db.execute("ALTER TABLE plain SET (retention = 60d)").unwrap_err();
+        assert!(err.to_string().contains("TIMESERIES"), "{err}");
     }
 
     #[test]

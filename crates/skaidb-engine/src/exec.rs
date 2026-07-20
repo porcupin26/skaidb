@@ -4523,6 +4523,16 @@ impl Database {
     // ---- ALTER ----
 
     fn alter_table(&mut self, alt: AlterTable) -> Result<QueryOutput> {
+        if self.catalog.timeseries.contains_key(&alt.name) {
+            return match alt.action {
+                AlterAction::SetOptions { options } => {
+                    self.set_ts_table_options(&alt.name, &options)
+                }
+                _ => Err(EngineError::Unsupported(
+                    "timeseries tables support ALTER TABLE ... SET (retention/ooo) only".into(),
+                )),
+            };
+        }
         if !self.catalog.tables.contains_key(&alt.name) {
             return Err(EngineError::TableNotFound(alt.name.clone()));
         }
@@ -4531,6 +4541,57 @@ impl Database {
             AlterAction::RenameColumn { from, to } => self.rename_column(&alt.name, &from, &to),
             AlterAction::SetOptions { options } => self.set_table_options(&alt.name, &options),
         }
+    }
+
+    /// `ALTER TABLE <ts> SET (retention = <dur> | ooo = <dur>, ...)`:
+    /// retention and OOO acceptance are LIVE-tunable on time-series tables
+    /// (per-org retention settings change; backfills need a window). Both
+    /// update the catalog def and the open store — retention applies at the
+    /// next flush (it cannot resurrect already-dropped blocks), the OOO
+    /// window to subsequent appends. `retention = 0` clears it (keep
+    /// forever).
+    fn set_ts_table_options(
+        &mut self,
+        table: &str,
+        options: &[(String, String)],
+    ) -> Result<QueryOutput> {
+        for (opt, val) in options {
+            let ms: i64 = val.parse().map_err(|_| {
+                EngineError::Constraint(format!(
+                    "{opt} must be a duration like 60d (or integer ms), got '{val}'"
+                ))
+            })?;
+            if ms < 0 {
+                return Err(EngineError::Constraint(format!("{opt} must not be negative")));
+            }
+            let def = self
+                .catalog
+                .timeseries
+                .get_mut(table)
+                .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+            match opt.as_str() {
+                "retention" => {
+                    def.retention_ms = (ms > 0).then_some(ms);
+                    if let Some(store) = self.timeseries.get_mut(table) {
+                        store.set_retention_ms((ms > 0).then_some(ms));
+                    }
+                }
+                "ooo" => {
+                    def.ooo_window_ms = ms;
+                    if let Some(store) = self.timeseries.get_mut(table) {
+                        store.set_ooo_window_ms(ms);
+                    }
+                }
+                other => {
+                    return Err(EngineError::Unsupported(format!(
+                        "unknown ALTER TABLE option '{other}' for a timeseries table \
+                         (supported: retention, ooo)"
+                    )));
+                }
+            }
+        }
+        self.save_catalog()?;
+        Ok(QueryOutput::Ddl)
     }
 
     /// `ALTER TABLE t SET (...)`: `witness` toggles freely (pull-side only,
@@ -4647,7 +4708,8 @@ impl Database {
                 other => {
                     return Err(EngineError::Unsupported(format!(
                         "unknown ALTER TABLE option '{other}' \
-                         (supported: witness, nodes, replication, placement_finalized)"
+                         (supported: witness, nodes, replication, placement_finalized; \
+                         retention/ooo apply to TIMESERIES tables)"
                     )));
                 }
             }
@@ -6522,6 +6584,11 @@ impl Database {
     /// Whether any time-series table exists (topology-change guard).
     pub fn has_timeseries_tables(&self) -> bool {
         !self.catalog.timeseries.is_empty()
+    }
+
+    /// The full time-series definition when `table` is a time-series table.
+    pub fn ts_table_def(&self, table: &str) -> Option<&crate::catalog::TsTableDef> {
+        self.catalog.timeseries.get(table)
     }
 
     /// Series-key columns when `table` is a time-series table.

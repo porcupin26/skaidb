@@ -1041,7 +1041,16 @@ impl Parser {
     fn parse_option_list(&mut self) -> Result<Vec<(String, String)>, ParseError> {
         let mut options = Vec::new();
         loop {
-            let name = self.parse_path()?.to_ascii_lowercase();
+            // RETENTION and OOO lex as keywords (the CREATE TIMESERIES
+            // grammar), so `ALTER TABLE ts SET (retention = 60d)` reaches
+            // here with a keyword where an option name belongs.
+            let name = if self.eat_keyword(Keyword::Retention) {
+                "retention".to_string()
+            } else if self.eat_keyword(Keyword::Ooo) {
+                "ooo".to_string()
+            } else {
+                self.parse_path()?.to_ascii_lowercase()
+            };
             self.expect(&Token::Eq)?;
             let value = match self.advance() {
                 Token::Str(s) => s,
@@ -2316,6 +2325,20 @@ mod tests {
                 action: AlterAction::RenameColumn {
                     from: "a".into(),
                     to: "b".into()
+                },
+            })
+        );
+        // RETENTION/OOO are keywords (the CREATE TIMESERIES grammar) but
+        // still valid option names — durations carry as integer ms.
+        assert_eq!(
+            parse("ALTER TABLE m SET (retention = 60d, ooo = 10m)").unwrap(),
+            Statement::AlterTable(AlterTable {
+                name: "m".into(),
+                action: AlterAction::SetOptions {
+                    options: vec![
+                        ("retention".into(), (60 * 24 * 3600 * 1000i64).to_string()),
+                        ("ooo".into(), (10 * 60 * 1000i64).to_string()),
+                    ]
                 },
             })
         );

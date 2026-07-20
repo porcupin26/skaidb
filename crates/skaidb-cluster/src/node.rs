@@ -8347,6 +8347,13 @@ impl Cluster for Coordinator {
         let mut appended = 0usize;
         for (replicas, batch) in groups {
             let mut acks = 0usize;
+            // The true accepted count (late points outside the OOO window
+            // are dropped per-sample): use the local replica's count when
+            // this coordinator holds the series — replicas of a series see
+            // the same appends, so their accept/reject decisions agree.
+            // Remote-only groups keep the optimistic count (the Ack carries
+            // none; a wire change here isn't rolling-upgrade-safe).
+            let mut local_appended: Option<usize> = None;
             for replica in &replicas {
                 if *replica == self.node.cfg.id {
                     let db = self
@@ -8354,7 +8361,7 @@ impl Cluster for Coordinator {
                         .local
                         .read()
                         .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
-                    db.ts_append(table, &batch)?;
+                    local_appended = Some(db.ts_append(table, &batch)?);
                     acks += 1;
                 } else if let Some(addr) = self.node.peer_addr(replica) {
                     self.node
@@ -8390,7 +8397,7 @@ impl Cluster for Coordinator {
                     "write quorum not met: {acks}/{needed} replicas acked"
                 )));
             }
-            appended += batch.len();
+            appended += local_appended.unwrap_or(batch.len());
         }
         Ok(appended)
     }

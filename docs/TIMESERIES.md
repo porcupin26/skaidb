@@ -63,6 +63,19 @@ stored as its own compressed stream. Full grammar and semantics:
   table auto-creates with `OOO 1h` for HA Prometheus pairs); plain
   `DROP TABLE`; listed by `SHOW TABLES` with the implicit `(series key, ts)`
   key; survives restart (catalog + WAL replay).
+- **`ALTER TABLE <ts> SET (retention = <dur> | ooo = <dur>)`** — both are
+  live-tunable, no create-new/backfill/swap: retention changes apply at the
+  next flush (widening cannot resurrect already-dropped blocks; `0` clears
+  retention), the OOO window applies to subsequent inserts. Temporarily
+  widening `ooo` is the supported way to backfill history into a table
+  that already takes live writes.
+- **INSERT reports dropped points.** Samples older than a series' OOO
+  window are discarded per sample, and the INSERT's `affected` count
+  reflects only what landed — `{"affected": 0}` when every point was late
+  (one count per numeric field when rows carry several; full-success
+  inserts keep reporting the row count). Compare `affected` with what you
+  sent to detect loss; `timeseries.<t>.samples_rejected` in `SHOW STATUS`
+  tracks the cumulative total per node.
 - Duration literals (`250ms`, `15s`, `5m`, `2h`, `30d`, `1w`),
   `time_bucket(step, ts)`, `now()` (one instant per statement).
 - Time-series aggregates: `rate(f)` / `increase(f)` (counter-reset-aware,

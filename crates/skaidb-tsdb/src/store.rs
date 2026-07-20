@@ -561,6 +561,19 @@ impl Tsdb {
         self.inner.lock().expect("tsdb lock").head.max_ts
     }
 
+    /// Live retention update (`ALTER TABLE ... SET (retention = ...)`).
+    /// Takes effect at the next flush; a widened retention cannot resurrect
+    /// already-dropped blocks.
+    pub fn set_retention_ms(&mut self, ms: Option<i64>) {
+        self.opts.retention_ms = ms;
+    }
+
+    /// Live out-of-order-window update (`ALTER TABLE ... SET (ooo = ...)`).
+    /// Applies to subsequent appends; points already rejected are gone.
+    pub fn set_ooo_window_ms(&mut self, ms: i64) {
+        self.opts.ooo_window_ms = ms;
+    }
+
     /// Remove whole series (a post-resharding reclaim): flush the head so
     /// the WAL cannot resurrect them, then rewrite every block that holds a
     /// target series without it. Returns how many of `targets` were
