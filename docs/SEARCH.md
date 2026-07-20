@@ -205,7 +205,8 @@ in-index IDF, OR-ed — permissive defaults so short like-texts work).
 the index dictionary (Levenshtein ≤ 2, doc-frequency ranked); completion
 /search-as-you-type is the `edge_ngram` + `MATCH_PREFIX` pattern.
 
-**Highlighting**: `HIGHLIGHT(col [, max_chars [, pre_tag, post_tag [, no_match_size]]])`
+**Highlighting**: `HIGHLIGHT(col [, max_chars [, pre_tag, post_tag
+[, no_match_size [, fragments]]]])`
 in the projection returns the best-scoring snippet of the column's text
 (default fragment size 150 chars) with matching terms wrapped in tags
 (`<b>…</b>` by default), other text HTML-escaped. Stemming is respected —
@@ -220,14 +221,17 @@ offsets), so it always reflects the current document.
 - **`no_match_size`** (ES): a trailing integer returns that many leading
   characters (HTML-escaped) when the column had no match, instead of an
   empty string — `HIGHLIGHT(body, 40, '<b>', '</b>', 80)`.
+- **Multiple fragments** (ES `number_of_fragments`): a final fragment count
+  (2–10) switches the highlight value to an **array** of up to that many
+  fragments, in text order, best match-density windows first —
+  `HIGHLIGHT(body, 40, '<b>', '</b>', 0, 3)`. The default (1, or the count
+  omitted) keeps the classic single-string best passage.
 
-skaidb returns **one** best passage per column
-(the ES `unified`-style default) and now covers custom tags and
-`no_match_size`. Still not supported: multiple fragments
-(`number_of_fragments`), a separate `highlight_query`, sentence/word
-boundary scanners, and the `plain`/`fvh` highlighter types (`fvh` would
-need stored term-vector offsets). On the RF<members sorted-scan scatter,
-remote shards use default tags (the wire carries only the fragment size);
+Still not supported: a separate `highlight_query`, sentence/word
+boundary scanners, ES `number_of_fragments: 0` (whole-field mode), and the
+`plain`/`fvh` highlighter types (`fvh` would need stored term-vector
+offsets). On the RF<members sorted-scan scatter, remote shards use default
+tags and a single fragment (the wire carries only the fragment size);
 full-replica clusters and the primary search path use the full options.
 
 ## Aggregations
@@ -415,7 +419,8 @@ POST /{index}/_search    query DSL: match, match_phrase, prefix, wildcard,
                          or knn/retriever; needs a full-text query),
                          _source with
                          include/exclude lists (trailing-* globs),
-                         highlight, exact totals; aggs: terms,
+                         highlight (incl. number_of_fragments > 1 →
+                         fragment arrays), exact totals; aggs: terms,
                          date_histogram (+ sum/avg/min/max/value_count/
                          cardinality/percentiles sub-aggs and top_hits —
                          top_hits runs one relevance-ordered query per

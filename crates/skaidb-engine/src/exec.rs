@@ -2057,7 +2057,7 @@ impl Database {
             }
             for (col, h) in &highlighters {
                 let snippet = h.snippet_doc(&doc, col);
-                doc.insert(format!("_highlight_{col}"), Value::String(snippet));
+                doc.insert(format!("_highlight_{col}"), snippet);
             }
             out.push((key, doc));
             if out.len() >= k {
@@ -2636,7 +2636,7 @@ impl Database {
                     Ok(Value::Document(mut doc)) if matches_filter(filter, &doc)? => {
                         for (col, h) in &highlighters {
                             let snippet = h.snippet_doc(&doc, col);
-                            doc.insert(format!("_highlight_{col}"), Value::String(snippet));
+                            doc.insert(format!("_highlight_{col}"), snippet);
                         }
                         Ok(Some(doc))
                     }
@@ -10130,9 +10130,10 @@ fn finish_agg_pushdown(
 fn parse_highlight_args(args: &[Expr]) -> Result<HighlightReq> {
     let bad = || {
         EngineError::Type(
-            "HIGHLIGHT(column [, max_chars [, pre_tag, post_tag [, no_match_size]]]) takes a \
-             column, an optional positive fragment size, an optional pre/post tag string pair, \
-             and an optional non-negative no-match size"
+            "HIGHLIGHT(column [, max_chars [, pre_tag, post_tag [, no_match_size \
+             [, fragments]]]]) takes a column, an optional positive fragment size, an \
+             optional pre/post tag string pair, an optional non-negative no-match size, \
+             and an optional fragment count (1-10; > 1 returns an array of fragments)"
                 .into(),
         )
     };
@@ -10157,6 +10158,15 @@ fn parse_highlight_args(args: &[Expr]) -> Result<HighlightReq> {
             opts.pre_tag = pre.clone();
             opts.post_tag = post.clone();
             opts.no_match_size = *nm as usize;
+        }
+        [Expr::Literal(Value::Int(n)), Expr::Literal(Value::String(pre)), Expr::Literal(Value::String(post)), Expr::Literal(Value::Int(nm)), Expr::Literal(Value::Int(fr))]
+            if *n > 0 && *nm >= 0 && (1..=10).contains(fr) =>
+        {
+            opts.max_chars = *n as usize;
+            opts.pre_tag = pre.clone();
+            opts.post_tag = post.clone();
+            opts.no_match_size = *nm as usize;
+            opts.fragments = *fr as usize;
         }
         _ => return Err(bad()),
     }

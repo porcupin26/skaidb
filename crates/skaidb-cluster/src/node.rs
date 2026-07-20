@@ -7646,7 +7646,7 @@ impl Node {
             if let Some((_, mut doc)) = rows.into_iter().next() {
                 for (col, h) in &highlighters {
                     let snippet = h.snippet_doc(&doc, col);
-                    doc.insert(format!("_highlight_{col}"), Value::String(snippet));
+                    doc.insert(format!("_highlight_{col}"), snippet);
                 }
                 out.push((key, doc, score));
                 if k.is_some_and(|k| out.len() >= k) {

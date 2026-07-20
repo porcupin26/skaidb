@@ -4272,6 +4272,76 @@ mod tests {
         assert!(db.execute("SELECT id FROM articles WHERE REGEXP(body, 'ro(')").is_err());
     }
 
+    /// `HIGHLIGHT(col, size, pre, post, no_match, fragments)` with
+    /// fragments > 1 returns an ARRAY of up to that many fragments, in text
+    /// order, each with every matched term tagged; single-fragment calls keep
+    /// the classic string value.
+    #[test]
+    fn search_highlight_multiple_fragments() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE docs (PRIMARY KEY (id))").unwrap();
+        // Two widely-separated match clusters and one lone match: with
+        // max_chars 40 and fragments 2, the two best windows come back.
+        let filler = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do ";
+        db.execute(&format!(
+            "INSERT INTO docs (id, body) VALUES (1, 'alpha rust here {f}{f}rust and rust again {f}{f}last rust mention')",
+            f = filler
+        ))
+        .unwrap();
+        db.execute("CREATE SEARCH INDEX docs_fts ON docs (body)").unwrap();
+        let rs = rows(
+            db.execute(
+                "SELECT HIGHLIGHT(body, 40, '<em>', '</em>', 0, 2) AS hl FROM docs \
+                 WHERE MATCH(body, 'rust')",
+            )
+            .unwrap(),
+        );
+        let Value::Array(frags) = &rs.rows[0][0] else {
+            panic!("expected array of fragments, got {:?}", rs.rows[0][0]);
+        };
+        assert_eq!(frags.len(), 2, "{frags:?}");
+        for f in frags {
+            let Value::String(s) = f else { panic!("fragment must be a string") };
+            assert!(s.contains("<em>rust</em>"), "{s}");
+            assert!(s.len() < 120, "fragment too long: {s}");
+        }
+        // The double-match window ranks first but output is text order: the
+        // first fragment is the "alpha rust here" cluster only if selected —
+        // with 2 fragments both clusters appear; the middle window has 2
+        // matches so it MUST be one of them.
+        assert!(frags.iter().any(
+            |f| matches!(f, Value::String(s) if s.matches("<em>rust</em>").count() >= 2)
+        ), "{frags:?}");
+
+        // fragments = 1 (or omitted) keeps the string shape.
+        let rs = rows(
+            db.execute(
+                "SELECT HIGHLIGHT(body, 40, '<em>', '</em>', 0, 1) AS hl FROM docs \
+                 WHERE MATCH(body, 'rust')",
+            )
+            .unwrap(),
+        );
+        assert!(matches!(&rs.rows[0][0], Value::String(_)));
+        // A term with a single occurrence yields exactly one fragment even
+        // when more were requested.
+        let rs = rows(
+            db.execute(
+                "SELECT HIGHLIGHT(body, 40, '<em>', '</em>', 12, 3) AS hl, score() FROM docs \
+                 WHERE MATCH(body, 'alpha')",
+            )
+            .unwrap(),
+        );
+        let Value::Array(frags) = &rs.rows[0][0] else { panic!() };
+        assert_eq!(frags.len(), 1);
+        // An out-of-range fragment count errors.
+        assert!(db
+            .execute(
+                "SELECT HIGHLIGHT(body, 40, '<em>', '</em>', 0, 99) FROM docs \
+                 WHERE MATCH(body, 'rust')"
+            )
+            .is_err());
+    }
+
     #[test]
     fn search_highlight_projects_snippets() {
         let mut db = search_db();

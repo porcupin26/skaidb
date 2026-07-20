@@ -1071,8 +1071,28 @@ impl SearchIndex {
         let searcher = self.reader.searcher();
         let mut generator = SnippetGenerator::create(&searcher, &*q, rt.field)?;
         generator.set_max_num_chars(opts.max_chars.max(1));
+        // Multi-fragment mode re-tokenizes the stored text with the field's
+        // index-time analyzer and highlights every query term occurrence —
+        // tantivy's SnippetGenerator only exposes the single best fragment.
+        let multi = (opts.fragments > 1).then(|| {
+            let mut terms = std::collections::HashSet::new();
+            q.query_terms(&mut |term, _| {
+                if term.field() == rt.field {
+                    if let Some(s) = term.value().as_str() {
+                        terms.insert(s.to_string());
+                    }
+                }
+            });
+            MultiFragmenter {
+                terms,
+                analyzer: rt.index_analyzer.build(),
+                max_chars: opts.max_chars.max(8),
+                fragments: opts.fragments,
+            }
+        });
         Ok(Highlighter {
             generator,
+            multi,
             pre_tag: opts.pre_tag.clone(),
             post_tag: opts.post_tag.clone(),
             no_match_size: opts.no_match_size,
@@ -1127,6 +1147,12 @@ pub struct HighlightOpts {
     /// characters of its text instead of an empty string (ES `no_match_size`);
     /// `0` = empty (the default).
     pub no_match_size: usize,
+    /// How many fragments to return (ES `number_of_fragments`). `1` (the
+    /// default) keeps the classic single-best-passage snippet as a string
+    /// value; `> 1` switches the highlight value to an ARRAY of up to this
+    /// many fragments, each at most `max_chars`, ordered by position in the
+    /// text.
+    pub fragments: usize,
 }
 
 impl Default for HighlightOpts {
@@ -1136,6 +1162,7 @@ impl Default for HighlightOpts {
             pre_tag: "<b>".to_string(),
             post_tag: "</b>".to_string(),
             no_match_size: 0,
+            fragments: 1,
         }
     }
 }
@@ -1144,9 +1171,100 @@ impl Default for HighlightOpts {
 /// (from [`SearchIndex::highlighter`]).
 pub struct Highlighter {
     generator: SnippetGenerator,
+    /// `Some` when `fragments > 1` — the multi-fragment path.
+    multi: Option<MultiFragmenter>,
     pre_tag: String,
     post_tag: String,
     no_match_size: usize,
+}
+
+/// Multi-fragment highlighting (`number_of_fragments` > 1): re-tokenize the
+/// stored text with the index-time analyzer, mark every query-term
+/// occurrence, group neighbouring occurrences into `max_chars` windows, and
+/// keep the best `fragments` windows (most matches first; ties by position),
+/// returned in text order.
+struct MultiFragmenter {
+    terms: std::collections::HashSet<String>,
+    analyzer: tantivy::tokenizer::TextAnalyzer,
+    max_chars: usize,
+    fragments: usize,
+}
+
+impl MultiFragmenter {
+    fn fragments(&self, text: &str, pre: &str, post: &str) -> Vec<String> {
+        if text.is_empty() || self.terms.is_empty() {
+            return Vec::new();
+        }
+        // Match ranges, sorted and overlap-merged (ngram analyzers emit
+        // overlapping tokens; a merged range highlights the union once).
+        let mut analyzer = self.analyzer.clone();
+        let mut stream = analyzer.token_stream(text);
+        let mut raw: Vec<(usize, usize)> = Vec::new();
+        while let Some(tok) = stream.next() {
+            if self.terms.contains(&tok.text) && tok.offset_to > tok.offset_from {
+                raw.push((tok.offset_from, tok.offset_to));
+            }
+        }
+        drop(stream);
+        if raw.is_empty() {
+            return Vec::new();
+        }
+        raw.sort_unstable();
+        let mut matches: Vec<(usize, usize)> = Vec::new();
+        for (s, e) in raw {
+            match matches.last_mut() {
+                Some((_, le)) if s <= *le => *le = (*le).max(e),
+                _ => matches.push((s, e)),
+            }
+        }
+        // Greedy grouping into windows of at most `max_chars`.
+        let mut groups: Vec<(usize, usize, usize)> = Vec::new(); // (count, first, last)
+        let mut i = 0;
+        while i < matches.len() {
+            let mut j = i;
+            while j + 1 < matches.len()
+                && matches[j + 1].1.saturating_sub(matches[i].0) <= self.max_chars
+            {
+                j += 1;
+            }
+            groups.push((j - i + 1, i, j));
+            i = j + 1;
+        }
+        // Best `fragments` windows, then back to text order.
+        groups.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        groups.truncate(self.fragments);
+        groups.sort_by_key(|g| g.1);
+        groups
+            .into_iter()
+            .map(|(_, i, j)| self.render(text, &matches[i..=j], pre, post))
+            .collect()
+    }
+
+    /// One fragment: the matches plus surrounding context padded to
+    /// `max_chars`, matched spans wrapped in tags, everything else escaped.
+    fn render(&self, text: &str, ms: &[(usize, usize)], pre: &str, post: &str) -> String {
+        let (core_start, core_end) = (ms[0].0, ms[ms.len() - 1].1);
+        let pad = self.max_chars.saturating_sub(core_end - core_start);
+        let mut fs = core_start.saturating_sub(pad / 2);
+        let mut fe = (core_end + pad.div_ceil(2)).min(text.len());
+        while fs > 0 && !text.is_char_boundary(fs) {
+            fs -= 1;
+        }
+        while fe < text.len() && !text.is_char_boundary(fe) {
+            fe += 1;
+        }
+        let mut out = String::new();
+        let mut cursor = fs;
+        for &(s, e) in ms {
+            out.push_str(&html_escape(&text[cursor..s]));
+            out.push_str(pre);
+            out.push_str(&html_escape(&text[s..e]));
+            out.push_str(post);
+            cursor = e;
+        }
+        out.push_str(&html_escape(&text[cursor..fe]));
+        out
+    }
 }
 
 impl fmt::Debug for Highlighter {
@@ -1177,10 +1295,12 @@ impl Highlighter {
         }
     }
 
-    /// [`Highlighter::snippet`] over every string reachable at `path` in
-    /// the row (arrays are multi-valued fields), space-joined — the same
-    /// text the index saw at write time.
-    pub fn snippet_doc(&self, doc: &Document, path: &str) -> String {
+    /// The highlight value for the row text at `path` (every reachable
+    /// string, space-joined — the same text the index saw at write time):
+    /// a snippet **string** in single-fragment mode, an **array** of up to
+    /// `fragments` snippets (text order; the `no_match_size` prefix as a
+    /// one-element array, else empty) in multi-fragment mode.
+    pub fn snippet_doc(&self, doc: &Document, path: &str) -> Value {
         fn collect(v: &Value, out: &mut String) {
             match v {
                 Value::String(s) => {
@@ -1197,7 +1317,22 @@ impl Highlighter {
         if let Some(v) = doc.get_path(path) {
             collect(v, &mut text);
         }
-        self.snippet(&text)
+        match &self.multi {
+            None => Value::String(self.snippet(&text)),
+            Some(m) => {
+                let frags = m.fragments(&text, &self.pre_tag, &self.post_tag);
+                if frags.is_empty() {
+                    let nm = no_match_snippet(&text, self.no_match_size);
+                    if nm.is_empty() {
+                        Value::Array(Vec::new())
+                    } else {
+                        Value::Array(vec![Value::String(nm)])
+                    }
+                } else {
+                    Value::Array(frags.into_iter().map(Value::String).collect())
+                }
+            }
+        }
     }
 }
 
@@ -1245,7 +1380,11 @@ fn build_runtimes(config: &SearchIndexConfig, schema: &Schema) -> Vec<FieldRunti
             path: fc.path.clone(),
             field: field_of(&fc.path),
             ftype: fc.ftype,
-            query_analyzer: fc.search_analyzer.clone().unwrap_or(index_analyzer),
+            query_analyzer: fc
+                .search_analyzer
+                .clone()
+                .unwrap_or_else(|| index_analyzer.clone()),
+            index_analyzer,
             boost: fc.boost,
         });
         if fc.keyword_twin {
@@ -1255,6 +1394,7 @@ fn build_runtimes(config: &SearchIndexConfig, schema: &Schema) -> Vec<FieldRunti
                 field: field_of(&twin_path),
                 ftype: FieldType::Keyword,
                 query_analyzer: Analyzer::Keyword,
+                index_analyzer: Analyzer::Keyword,
                 boost: 1.0,
             });
         }
@@ -1273,6 +1413,7 @@ fn build_runtimes(config: &SearchIndexConfig, schema: &Schema) -> Vec<FieldRunti
             field: field_of(target),
             ftype: FieldType::Text,
             query_analyzer: config.default_analyzer.clone(),
+            index_analyzer: config.default_analyzer.clone(),
             boost: 1.0,
         });
     }
@@ -2259,7 +2400,7 @@ mod tests {
             max_chars: 60,
             pre_tag: "<mark>".into(),
             post_tag: "</mark>".into(),
-            no_match_size: 0,
+            ..Default::default()
         };
         let h = idx.highlighter(&query, "body", &custom).unwrap();
         let snippet = h.snippet(text);

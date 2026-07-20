@@ -105,6 +105,9 @@ pub(crate) struct FieldRuntime {
     /// Query-time analyzer (already resolved: search_analyzer, else the
     /// index-time analyzer, else the index default).
     pub query_analyzer: Analyzer,
+    /// Index-time analyzer — the one whose token offsets describe the stored
+    /// text (multi-fragment highlighting re-tokenizes with it).
+    pub index_analyzer: Analyzer,
     pub boost: f32,
 }
 

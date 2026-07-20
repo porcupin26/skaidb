@@ -457,9 +457,11 @@ OR/NOT is rejected):
 - `score()` projects BM25 (also injected as `_score`); `ORDER BY score()
   DESC LIMIT k` is the pushed top-k (LIMIT required, DESC only).
   `ORDER BY <fast column> LIMIT k` also pushes down.
-- `HIGHLIGHT(col [, max_chars [, pre_tag, post_tag [, no_match_size]]])` —
-  snippet with matches marked (`<b>…</b>` default; a pre/post string pair =
-  ES pre_tags/post_tags; trailing no_match_size = leading chars when unmatched).
+- `HIGHLIGHT(col [, max_chars [, pre_tag, post_tag [, no_match_size
+  [, fragments]]]])` — snippet with matches marked (`<b>…</b>` default; a
+  pre/post string pair = ES pre_tags/post_tags; no_match_size = leading
+  chars when unmatched; fragments 2-10 = ES number_of_fragments → the value
+  becomes an ARRAY of fragments in text order; default 1 = single string).
 - Per-group top documents: `SELECT region, title, score() FROM t WHERE
   MATCH(title, 'q') GROUP BY region TOP 3 BY score()` — each group's 3
   best-scoring rows (ES `top_hits` equivalent).
@@ -855,7 +857,8 @@ POST /{index}/_search    query DSL: match, match_phrase, prefix, wildcard,
                          {"_id":"asc"}] + echo the last hit's sort array;
                          full-text queries only, not with from/knn),
                          _source include/exclude (trailing-* globs),
-                         highlight, "explain": true, exact totals;
+                         highlight (number_of_fragments > 1 → arrays),
+                         "explain": true, exact totals;
                          aggs: terms, date_histogram + sum/avg/min/max/
                          value_count/cardinality (EXACT distinct)/
                          percentiles (exact percentile_cont)/top_hits;

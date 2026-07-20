@@ -813,17 +813,25 @@ fn highlight_args(col: &str, field_opts: &Json, block: &Json) -> Vec<Expr> {
     let pre = tag("pre_tags");
     let post = tag("post_tags");
     let no_match = num("no_match_size");
+    // number_of_fragments > 1 → multi-fragment (array-valued highlight);
+    // 0 (ES whole-field mode) is not supported; absent keeps skaidb's
+    // single-best-passage default.
+    let frags = num("number_of_fragments");
     let want_tags = pre.is_some() || post.is_some();
     let want_no_match = no_match.is_some();
-    if size != 150 || want_tags || want_no_match {
+    let want_frags = frags.is_some_and(|f| f > 1);
+    if size != 150 || want_tags || want_no_match || want_frags {
         args.push(Expr::Literal(Value::Int(size as i64)));
     }
-    if want_tags || want_no_match {
+    if want_tags || want_no_match || want_frags {
         args.push(str_lit(&pre.unwrap_or_else(|| "<b>".to_string())));
         args.push(str_lit(&post.unwrap_or_else(|| "</b>".to_string())));
     }
-    if let Some(n) = no_match {
-        args.push(Expr::Literal(Value::Int(n as i64)));
+    if want_no_match || want_frags {
+        args.push(Expr::Literal(Value::Int(no_match.unwrap_or(0) as i64)));
+    }
+    if want_frags {
+        args.push(Expr::Literal(Value::Int(frags.unwrap_or(1).min(10) as i64)));
     }
     args
 }
@@ -1000,11 +1008,17 @@ fn search(ctx: &Shared, role: &str, index: &str, body: &[u8]) -> Result<(u16, Js
                     }
                 } else if let Some(hl) = col.strip_prefix("_es_hl_") {
                     if !matches!(val, Value::Null) {
-                        highlight.insert(hl.to_string(), json!([val.to_json()]));
+                        // Multi-fragment highlights are already arrays; a
+                        // single snippet wraps ES-style.
+                        let j = val.to_json();
+                        let j = if j.is_array() { j } else { json!([j]) };
+                        highlight.insert(hl.to_string(), j);
                     }
                 } else if let Some(hl) = col.strip_prefix("_highlight_") {
                     if !matches!(val, Value::Null) && hl_cols.iter().any(|c| c == hl) {
-                        highlight.insert(hl.to_string(), json!([val.to_json()]));
+                        let j = val.to_json();
+                        let j = if j.is_array() { j } else { json!([j]) };
+                        highlight.insert(hl.to_string(), j);
                     }
                 } else {
                     if col == &pk {
@@ -2179,6 +2193,17 @@ mod tests {
             &json!({ "pre_tags": ["<x>"], "post_tags": ["</x>"] }),
         );
         assert_eq!(args[2], Expr::Literal(Value::String("<x>".into())));
+        // number_of_fragments > 1 → the full positional form with the count
+        // (capped at 10) as the 6th arg; 1 (or absent) keeps the short forms.
+        let args = highlight_args("body", &json!({ "number_of_fragments": 3 }), &block);
+        assert_eq!(args.len(), 6);
+        assert_eq!(args[1], Expr::Literal(Value::Int(150)));
+        assert_eq!(args[4], Expr::Literal(Value::Int(0)));
+        assert_eq!(args[5], Expr::Literal(Value::Int(3)));
+        let args = highlight_args("body", &json!({ "number_of_fragments": 99 }), &block);
+        assert_eq!(args[5], Expr::Literal(Value::Int(10)));
+        let args = highlight_args("body", &json!({ "number_of_fragments": 1 }), &block);
+        assert_eq!(args.len(), 1);
     }
 
     // Error shapes: missing field, no query, an rrf with no knn leg, and a
