@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{json, Map, Value as Json};
 use skaidb_sql::ast::{
-    AggArg, AggFunc, BinaryOp, Expr, OrderKey, Select, SelectItem, Statement, UnaryOp,
+    AggArg, AggFunc, BinaryOp, Expr, Nearest, OrderKey, Rrf, Select, SelectItem, Statement,
+    UnaryOp, DEFAULT_RRF_CONSTANT,
 };
 use skaidb_types::Value;
 
@@ -406,6 +407,123 @@ fn query_expr(q: &Json) -> Result<Option<Expr>, String> {
     }
 }
 
+/// A parsed vector-retrieval request: the `NEAREST` clause, an optional WHERE
+/// filter, and (for `retriever { rrf }`) the fusion constant.
+struct VectorSpec {
+    nearest: Nearest,
+    filter: Option<Expr>,
+    rrf: Option<Rrf>,
+}
+
+/// Translate an ES `knn` block into a `NEAREST` clause + optional filter.
+/// `query_vector` (a float array) searches a plain vector index; a
+/// `query_vector_builder.text_embedding.model_text` (or a convenience `text`)
+/// string searches a **managed (`EMBED`) index** and is auto-embedded by the
+/// engine. `num_candidates` has no per-query knob (HNSW breadth is set on the
+/// index via `ALTER VECTOR INDEX`), so it is accepted and ignored.
+fn knn_nearest(knn: &Json) -> Result<(Nearest, Option<Expr>), String> {
+    let obj = knn.as_object().ok_or("knn must be an object")?;
+    let field = obj
+        .get("field")
+        .and_then(|v| v.as_str())
+        .ok_or("knn.field is required")?
+        .to_string();
+    let k = obj.get("k").and_then(|v| v.as_u64()).unwrap_or(10);
+    let query = if let Some(qv) = obj.get("query_vector") {
+        if !qv.is_array() {
+            return Err("knn.query_vector must be an array of numbers".into());
+        }
+        Expr::Literal(Value::from_json(qv.clone()))
+    } else if let Some(text) = knn_query_text(obj) {
+        Expr::Literal(Value::String(text))
+    } else {
+        return Err(
+            "knn needs a query_vector array or a query_vector_builder text (managed EMBED index)"
+                .into(),
+        );
+    };
+    let filter = match obj.get("filter") {
+        Some(f) => query_expr(f)?,
+        None => None,
+    };
+    Ok((
+        Nearest {
+            path: field,
+            query,
+            k: Expr::Literal(Value::Int(k as i64)),
+        },
+        filter,
+    ))
+}
+
+/// The text of a semantic `knn` (ES `query_vector_builder.text_embedding.
+/// model_text`, or a convenience bare `text` key).
+fn knn_query_text(obj: &Map<String, Json>) -> Option<String> {
+    obj.get("query_vector_builder")
+        .and_then(|b| b.get("text_embedding"))
+        .and_then(|t| t.get("model_text"))
+        .and_then(|v| v.as_str())
+        .or_else(|| obj.get("text").and_then(|v| v.as_str()))
+        .map(|s| s.to_string())
+}
+
+/// Parse the vector-retrieval part of a `_search` body: a top-level `knn`
+/// block (pure/semantic kNN), or a `retriever { rrf { retrievers: [standard,
+/// knn] } }` block (hybrid → `NEAREST … WHERE <search> RANK BY RRF`). `None`
+/// when the body has neither.
+fn parse_vector(body: &Json) -> Result<Option<VectorSpec>, String> {
+    if let Some(knn) = body.get("knn") {
+        let (nearest, filter) = knn_nearest(knn)?;
+        return Ok(Some(VectorSpec { nearest, filter, rrf: None }));
+    }
+    let Some(retriever) = body.get("retriever") else {
+        return Ok(None);
+    };
+    let rrf = retriever
+        .get("rrf")
+        .ok_or("only the `rrf` retriever is supported")?;
+    let constant = rrf
+        .get("rank_constant")
+        .and_then(|v| v.as_u64())
+        .map(|c| c as u32)
+        .unwrap_or(DEFAULT_RRF_CONSTANT);
+    let legs = rrf
+        .get("retrievers")
+        .and_then(|v| v.as_array())
+        .ok_or("rrf.retrievers must be an array")?;
+    let mut nearest: Option<Nearest> = None;
+    let mut filter: Option<Expr> = None;
+    for leg in legs {
+        if let Some(standard) = leg.get("standard") {
+            let q = match standard.get("query") {
+                Some(q) => query_expr(q)?,
+                None => None,
+            };
+            filter = merge_and(filter, q);
+        } else if let Some(knn) = leg.get("knn") {
+            let (n, f) = knn_nearest(knn)?;
+            nearest = Some(n);
+            filter = merge_and(filter, f);
+        } else {
+            return Err("rrf.retrievers entries must be `standard` or `knn`".into());
+        }
+    }
+    let nearest = nearest.ok_or("rrf needs a `knn` retriever leg")?;
+    Ok(Some(VectorSpec {
+        nearest,
+        filter,
+        rrf: Some(Rrf { constant }),
+    }))
+}
+
+/// AND two optional WHERE expressions (either may be absent).
+fn merge_and(a: Option<Expr>, b: Option<Expr>) -> Option<Expr> {
+    match (a, b) {
+        (Some(a), Some(b)) => and(vec![a, b]),
+        (a, b) => a.or(b),
+    }
+}
+
 // ---- _search ----
 
 fn search(ctx: &Shared, role: &str, index: &str, body: &[u8]) -> Result<(u16, Json), String> {
@@ -420,31 +538,41 @@ fn search(ctx: &Shared, role: &str, index: &str, body: &[u8]) -> Result<(u16, Js
     };
     let size = body["size"].as_u64().unwrap_or(10);
     let from = body["from"].as_u64().unwrap_or(0);
+    // Vector / hybrid retrieval: a top-level `knn` block or a `retriever { rrf }`
+    // block maps to a `NEAREST` clause (+ optional `RANK BY RRF`), which takes a
+    // different execution path than a WHERE-only search.
+    let vector = parse_vector(&body)?;
+    let is_vector = vector.is_some();
     let uses_search = filter
         .as_ref()
         .map(expr_uses_search)
         .unwrap_or(false);
 
-    // Exact total, ES `track_total_hits: true` semantics (a COUNT(*) is a
-    // cheap pushdown either way).
-    let mut count_sel = select_from(index);
-    count_sel.items = vec![SelectItem::Expr {
-        expr: Expr::Aggregate {
-            func: AggFunc::Count,
-            arg: AggArg::Star,
-        },
-        alias: None,
-    }];
-    count_sel.filter = filter.clone();
-    let (_, count_rows) = rows_of(run(ctx, role, Statement::Select(count_sel), "es:_search#count")?)?;
-    let total = count_rows
-        .first()
-        .and_then(|r| r.first())
-        .and_then(|v| match v {
-            Value::Int(n) => Some(*n),
-            _ => None,
-        })
-        .unwrap_or(0);
+    // Exact total for the plain path, ES `track_total_hits: true` semantics (a
+    // COUNT(*) is a cheap pushdown). A kNN/hybrid query returns at most `k`
+    // ranked hits, so its total is the retrieved-hit count, set after the fetch.
+    let mut total = 0i64;
+    if !is_vector {
+        let mut count_sel = select_from(index);
+        count_sel.items = vec![SelectItem::Expr {
+            expr: Expr::Aggregate {
+                func: AggFunc::Count,
+                arg: AggArg::Star,
+            },
+            alias: None,
+        }];
+        count_sel.filter = filter.clone();
+        let (_, count_rows) =
+            rows_of(run(ctx, role, Statement::Select(count_sel), "es:_search#count")?)?;
+        total = count_rows
+            .first()
+            .and_then(|r| r.first())
+            .and_then(|v| match v {
+                Value::Int(n) => Some(*n),
+                _ => None,
+            })
+            .unwrap_or(0);
+    }
 
     // Hits (skipped for size 0, the aggregations-only shape).
     let mut hits = Vec::new();
@@ -464,33 +592,43 @@ fn search(ctx: &Shared, role: &str, index: &str, body: &[u8]) -> Result<(u16, Js
                 });
             }
         }
-        sel.filter = filter.clone();
-        sel.limit = Some(size);
-        sel.offset = (from > 0).then_some(from);
-        match body.get("sort") {
-            // Default: relevance order for search queries, unspecified
-            // otherwise (like SQL without ORDER BY).
-            None if uses_search => {
-                sel.order_by = vec![OrderKey {
-                    expr: func("score", vec![]),
-                    descending: true,
-                }];
-            }
-            None => {}
-            Some(sort) => {
-                sel.order_by = parse_sort(sort)?
-                    .into_iter()
-                    .map(|(col, desc)| OrderKey {
-                        expr: if col == "_score" {
-                            func("score", vec![])
-                        } else {
-                            Expr::Column(col)
-                        },
-                        descending: desc,
-                    })
-                    .collect();
+        if let Some(v) = vector {
+            // kNN / hybrid: NEAREST (+ RANK BY RRF) already returns rows ranked
+            // (nearest-first, or fused rrf_score desc), so no ORDER BY — the
+            // engine rejects ORDER BY alongside NEAREST. The knn/standard-leg
+            // filter is the WHERE.
+            sel.nearest = Some(Box::new(v.nearest));
+            sel.rrf = v.rrf;
+            sel.filter = v.filter;
+        } else {
+            sel.filter = filter.clone();
+            match body.get("sort") {
+                // Default: relevance order for search queries, unspecified
+                // otherwise (like SQL without ORDER BY).
+                None if uses_search => {
+                    sel.order_by = vec![OrderKey {
+                        expr: func("score", vec![]),
+                        descending: true,
+                    }];
+                }
+                None => {}
+                Some(sort) => {
+                    sel.order_by = parse_sort(sort)?
+                        .into_iter()
+                        .map(|(col, desc)| OrderKey {
+                            expr: if col == "_score" {
+                                func("score", vec![])
+                            } else {
+                                Expr::Column(col)
+                            },
+                            descending: desc,
+                        })
+                        .collect();
+                }
             }
         }
+        sel.limit = Some(size);
+        sel.offset = (from > 0).then_some(from);
         let pk = ctx
             .backend
             .table_primary_key(index)
@@ -506,6 +644,20 @@ fn search(ctx: &Shared, role: &str, index: &str, body: &[u8]) -> Result<(u16, Js
             for (col, val) in columns.iter().zip(row) {
                 if col == "_score" {
                     score = val.to_json();
+                } else if col == "_rrf_score" {
+                    // Hybrid fused score (higher = better, like ES rrf).
+                    score = val.to_json();
+                } else if col == "_distance" {
+                    // Pure kNN: expose an ES-style similarity (higher = better)
+                    // derived from the distance, but let a fused score win.
+                    if score.is_null() {
+                        if let Value::Float(d) = &val {
+                            score = json!(1.0 / (1.0 + d.max(0.0)));
+                        }
+                    }
+                    if source_allows(col, &includes, &excludes) {
+                        source.insert(col.clone(), val.to_json());
+                    }
                 } else if let Some(hl) = col.strip_prefix("_es_hl_") {
                     if !matches!(val, Value::Null) {
                         highlight.insert(hl.to_string(), json!([val.to_json()]));
@@ -536,10 +688,9 @@ fn search(ctx: &Shared, role: &str, index: &str, body: &[u8]) -> Result<(u16, Js
             if !highlight.is_empty() {
                 hit["highlight"] = Json::Object(highlight);
             }
-            // "explain": true — per-hit BM25 breakdown from the index.
-            // The string _id first, then the numeric form (numeric-keyed
-            // tables), like GET /_doc/{id}.
-            if body["explain"].as_bool() == Some(true) {
+            // "explain": true — per-hit BM25 breakdown from the index (a
+            // full-text notion; skipped for kNN/hybrid retrieval).
+            if !is_vector && body["explain"].as_bool() == Some(true) {
                 if let Some(id_str) = id.as_str() {
                     let mut keys = vec![Value::String(id_str.to_string())];
                     if let Ok(n) = id_str.parse::<i64>() {
@@ -559,6 +710,10 @@ fn search(ctx: &Shared, role: &str, index: &str, body: &[u8]) -> Result<(u16, Js
                 }
             }
             hits.push(hit);
+        }
+        // kNN/hybrid total = retrieved ranked hits (≤ k).
+        if is_vector {
+            total = hits.len() as i64;
         }
     }
 
@@ -1272,4 +1427,114 @@ fn bulk_item(verb: &str, index: &str, id: &str, status: u16, error: Option<&str>
         body["error"] = json!({"type": "illegal_argument_exception", "reason": e});
     }
     json!({ verb: body })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // A top-level `knn` block with a raw query vector maps to a NEAREST clause
+    // over an array literal, with the knn filter as the WHERE and no RRF.
+    #[test]
+    fn knn_vector_maps_to_nearest() {
+        let body = json!({
+            "knn": {
+                "field": "embedding",
+                "query_vector": [0.1, 0.2, 0.3],
+                "k": 5,
+                "num_candidates": 100,
+                "filter": { "term": { "cat": "news" } }
+            }
+        });
+        let spec = parse_vector(&body).unwrap().expect("vector spec");
+        assert!(spec.rrf.is_none());
+        assert_eq!(spec.nearest.path, "embedding");
+        assert!(matches!(spec.nearest.k, Expr::Literal(Value::Int(5))));
+        match &spec.nearest.query {
+            Expr::Literal(Value::Array(v)) => assert_eq!(v.len(), 3),
+            other => panic!("expected array literal vector, got {other:?}"),
+        }
+        // knn.filter → WHERE cat = 'news'
+        match spec.filter {
+            Some(Expr::Binary { op: BinaryOp::Eq, .. }) => {}
+            other => panic!("expected an equality filter, got {other:?}"),
+        }
+    }
+
+    // A semantic knn (query_vector_builder text) maps to a STRING NEAREST query,
+    // which the engine auto-embeds against a managed EMBED index.
+    #[test]
+    fn knn_semantic_text_maps_to_string_nearest() {
+        let body = json!({
+            "knn": {
+                "field": "body",
+                "k": 3,
+                "query_vector_builder": {
+                    "text_embedding": { "model_id": "m", "model_text": "natural language query" }
+                }
+            }
+        });
+        let spec = parse_vector(&body).unwrap().expect("vector spec");
+        match &spec.nearest.query {
+            Expr::Literal(Value::String(s)) => assert_eq!(s, "natural language query"),
+            other => panic!("expected string query, got {other:?}"),
+        }
+        assert!(spec.filter.is_none());
+    }
+
+    // A `retriever { rrf { retrievers: [standard, knn] } }` block maps to
+    // NEAREST + a WHERE search predicate + RANK BY RRF with the given constant.
+    #[test]
+    fn retriever_rrf_maps_to_hybrid() {
+        let body = json!({
+            "retriever": {
+                "rrf": {
+                    "rank_constant": 20,
+                    "retrievers": [
+                        { "standard": { "query": { "match": { "body": "quick fox" } } } },
+                        { "knn": { "field": "embedding", "query_vector": [0.1, 0.2], "k": 50 } }
+                    ]
+                }
+            }
+        });
+        let spec = parse_vector(&body).unwrap().expect("vector spec");
+        assert_eq!(spec.rrf, Some(Rrf { constant: 20 }));
+        assert_eq!(spec.nearest.path, "embedding");
+        // standard leg → a MATCH() search predicate as the WHERE
+        match spec.filter {
+            Some(Expr::Func { ref name, .. }) if name == "match" => {}
+            other => panic!("expected a match() predicate, got {other:?}"),
+        }
+    }
+
+    // Default RRF constant when rank_constant is omitted.
+    #[test]
+    fn retriever_rrf_default_constant() {
+        let body = json!({
+            "retriever": { "rrf": { "retrievers": [
+                { "standard": { "query": { "match": { "body": "x" } } } },
+                { "knn": { "field": "e", "query_vector": [1.0], "k": 10 } }
+            ] } }
+        });
+        let spec = parse_vector(&body).unwrap().unwrap();
+        assert_eq!(spec.rrf, Some(Rrf { constant: DEFAULT_RRF_CONSTANT }));
+    }
+
+    // Error shapes: missing field, no query, an rrf with no knn leg, and a
+    // body with neither knn nor retriever.
+    #[test]
+    fn vector_parse_errors_and_absence() {
+        assert!(parse_vector(&json!({ "knn": { "query_vector": [1.0] } })).is_err()); // no field
+        assert!(parse_vector(&json!({ "knn": { "field": "e" } })).is_err()); // no vector/text
+        assert!(parse_vector(&json!({
+            "retriever": { "rrf": { "retrievers": [
+                { "standard": { "query": { "match": { "b": "x" } } } }
+            ] } }
+        }))
+        .is_err()); // rrf without a knn leg
+        assert!(parse_vector(&json!({ "retriever": { "unknown": {} } })).is_err());
+        // No knn / retriever at all → not a vector query.
+        assert!(parse_vector(&json!({ "query": { "match_all": {} } })).unwrap().is_none());
+    }
 }

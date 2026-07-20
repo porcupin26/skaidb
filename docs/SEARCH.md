@@ -341,7 +341,14 @@ POST /{index}/_search    query DSL: match, match_phrase, prefix, wildcard,
                          date_histogram (+ sum/avg/min/max/value_count/
                          cardinality/top_hits sub-aggs — top_hits runs
                          one relevance-ordered query per retained
-                         bucket)
+                         bucket);
+                         vector retrieval: a top-level knn block
+                         {field, query_vector | query_vector_builder,
+                         k, filter} → NEAREST (a query_vector_builder
+                         text searches a managed EMBED index, auto-
+                         embedded); a retriever {rrf {retrievers:
+                         [standard, knn]}} block → NEAREST + WHERE-search
+                         RANK BY RRF (rank_constant → the RRF constant)
 POST /{index}/_count     exact match count
 GET  /{index}/_doc/{id}  fetch one document by _id
 GET  /{index}/_mapping   the search-index declaration as ES properties
@@ -355,7 +362,11 @@ must/filter with **no search clause** cannot be scored (set
 `minimum_should_match: 1` to make the shoulds required); clients that
 hard-check the `X-elastic-product` header need that check disabled.
 `cardinality` is skaidb's **exact** `COUNT(DISTINCT)`, not an HLL
-approximation.
+approximation. For `knn`/`retriever` queries `num_candidates` is ignored
+(HNSW breadth is an index property — tune it with `ALTER VECTOR INDEX …
+SET (ef = n)`), the hit `_score` is the fused `rrf_score()` for a
+retriever or a `1/(1+distance)` similarity for a plain knn, and the
+`total` is the number of ranked hits (≤ `k`), not a full match count.
 
 ## Architecture
 

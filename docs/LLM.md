@@ -812,7 +812,14 @@ POST /{index}/_search    query DSL: match, match_phrase, prefix, wildcard,
                          sort, _source include/exclude (trailing-* globs),
                          highlight, "explain": true, exact totals;
                          aggs: terms, date_histogram + sum/avg/min/max/
-                         value_count/cardinality (EXACT distinct)/top_hits
+                         value_count/cardinality (EXACT distinct)/top_hits;
+                         VECTOR: top-level knn {field, query_vector |
+                         query_vector_builder(text→managed EMBED), k,
+                         filter} → NEAREST; retriever {rrf {retrievers:
+                         [standard, knn]}} → NEAREST + WHERE-search RANK
+                         BY RRF. num_candidates ignored (ef is on the
+                         index); _score = rrf_score() (hybrid) or
+                         1/(1+distance) (knn); total = #hits (≤ k)
 POST /{index}/_count
 GET  /{index}/_doc/{id}
 GET  /{index}/_mapping
