@@ -1240,14 +1240,14 @@ dependencies = [
 
 [[package]]
 name = "skaidb-auth"
-version = "0.120.0"
+version = "0.121.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "skaidb-cli"
-version = "0.120.0"
+version = "0.121.0"
 dependencies = [
  "clap",
  "rcgen",
@@ -1264,7 +1264,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-cluster"
-version = "0.120.0"
+version = "0.121.0"
 dependencies = [
  "rcgen",
  "rustls",
@@ -1285,7 +1285,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-config"
-version = "0.120.0"
+version = "0.121.0"
 dependencies = [
  "clap",
  "serde",
@@ -1296,7 +1296,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-driver"
-version = "0.120.0"
+version = "0.121.0"
 dependencies = [
  "rustls",
  "skaidb-auth",
@@ -1309,7 +1309,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-engine"
-version = "0.120.0"
+version = "0.121.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1324,7 +1324,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-fts"
-version = "0.120.0"
+version = "0.121.0"
 dependencies = [
  "levenshtein_automata",
  "serde",
@@ -1339,7 +1339,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-gssapi"
-version = "0.120.0"
+version = "0.121.0"
 dependencies = [
  "cross-krb5",
  "thiserror",
@@ -1347,7 +1347,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-net"
-version = "0.120.0"
+version = "0.121.0"
 dependencies = [
  "rcgen",
  "rustls",
@@ -1356,7 +1356,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-proto"
-version = "0.120.0"
+version = "0.121.0"
 dependencies = [
  "skaidb-types",
  "thiserror",
@@ -1364,7 +1364,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-server"
-version = "0.120.0"
+version = "0.121.0"
 dependencies = [
  "clap",
  "rcgen",
@@ -1389,7 +1389,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-sql"
-version = "0.120.0"
+version = "0.121.0"
 dependencies = [
  "skaidb-types",
  "thiserror",
@@ -1397,7 +1397,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-storage"
-version = "0.120.0"
+version = "0.121.0"
 dependencies = [
  "brotli",
  "lz4_flex 0.11.6",
@@ -1408,7 +1408,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-tsdb"
-version = "0.120.0"
+version = "0.121.0"
 dependencies = [
  "regex",
  "serde",
@@ -1418,7 +1418,7 @@ dependencies = [
 
 [[package]]
 name = "skaidb-types"
-version = "0.120.0"
+version = "0.121.0"
 dependencies = [
  "serde",
  "serde_json",
