@@ -82,6 +82,20 @@ Set the index default with `analyzer = '...'`, or per column with
 - `ngram(min,max)` — lowercased character ngrams (substring matching).
 - `edge_ngram(min,max)` — lowercased prefix ngrams (search-as-you-type);
   pair with `search_analyzer = 'standard'` so queries aren't ngrammed too.
+- **Custom pipelines** — compose your own chain (ES custom analyzers):
+  `'<tokenizer> | <filter> | …'`, e.g.
+  `'unicode | lowercase | stopwords(the,a,an) | stem(english)'` or
+  `'whitespace | lowercase | ascii_folding'`. Tokenizers: `unicode`
+  (UAX §29, the `standard` base), `whitespace`, `keyword`,
+  `ngram(min,max)`, `edge_ngram(min,max)`, `regex(<pattern>)` (each
+  pattern match is a token; a `|` inside the parens is pattern payload).
+  Filters, applied in order: `lowercase`, `ascii_folding`,
+  `alphanum_only`, `remove_long(<max chars>)`, `stop(<language>)`,
+  `stopwords(w1, w2, …)`, `stem(<language>)`. Note pipeline tokenizers
+  are bare — add `lowercase`/`remove_long` yourself (the built-in
+  `standard`/`ngram` names include them). Char filters (html_strip,
+  pattern_replace) are not supported — they change source offsets, which
+  would corrupt highlighting.
 
 Query text is analyzed with the field's **query-time** analyzer:
 `<column>.search_analyzer` if set, else the index-time analyzer.
@@ -403,9 +417,14 @@ POST /{index}/_search    query DSL: match, match_phrase, prefix, wildcard,
                          include/exclude lists (trailing-* globs),
                          highlight, exact totals; aggs: terms,
                          date_histogram (+ sum/avg/min/max/value_count/
-                         cardinality/top_hits sub-aggs — top_hits runs
-                         one relevance-ordered query per retained
-                         bucket);
+                         cardinality/percentiles sub-aggs and top_hits —
+                         top_hits runs one relevance-ordered query per
+                         retained bucket), bare metrics incl.
+                         percentiles (exact, linear-interpolated;
+                         percents default to ES's), composite
+                         (multi-source terms/date_histogram buckets,
+                         ascending keys, after/after_key pagination;
+                         metric sub-aggs yes, top_hits no);
                          vector retrieval: a top-level knn block
                          {field, query_vector | query_vector_builder,
                          k, filter} → NEAREST (a query_vector_builder

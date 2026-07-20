@@ -38,6 +38,32 @@ const M_PER_DEG_LAT: f64 = 111_320.0;
 /// cells past the budget are emitted whole (a looser superset).
 pub const DEFAULT_MAX_RANGES: usize = 32;
 
+/// Parse a distance with an optional unit suffix into **metres** — `"5km"`,
+/// `"500m"`, `"1mi"`, `"3.5 NM"`; a bare number is metres. `None` on an
+/// unknown unit or a non-finite/negative value. Shared by the SQL
+/// `distance('…')` scalar and the ES `_search` geo DSL.
+pub fn parse_distance_m(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let unit_at = s.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(s.len());
+    let (num, unit) = s.split_at(unit_at);
+    let n: f64 = num.trim().parse().ok()?;
+    let factor = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "m" | "meters" | "meter" => 1.0,
+        "km" | "kilometers" | "kilometer" => 1000.0,
+        "mi" | "miles" | "mile" => 1609.344,
+        "yd" | "yards" | "yard" => 0.9144,
+        "ft" | "feet" | "foot" => 0.3048,
+        "in" | "inch" | "inches" => 0.0254,
+        "cm" | "centimeters" | "centimeter" => 0.01,
+        "mm" | "millimeters" | "millimeter" => 0.001,
+        // ES `NM` (nautical miles); arrives lowercased here.
+        "nm" | "nmi" | "nauticalmiles" | "nauticalmile" => 1852.0,
+        _ => return None,
+    };
+    let meters = n * factor;
+    (meters.is_finite() && meters >= 0.0).then_some(meters)
+}
+
 /// Quantize `v` from `[min, max]` onto the full `u32` range (clamped).
 fn quantize(v: f64, min: f64, max: f64) -> u32 {
     let t = ((v - min) / (max - min)).clamp(0.0, 1.0);
@@ -106,12 +132,43 @@ impl BBox {
         } else {
             (radius_m / (M_PER_DEG_LAT * cos)).min(360.0)
         };
+        // A circle near ±180° WRAPS (min_lon > max_lon — the split convention),
+        // it does not clamp: clamping cut the far-side half of the envelope,
+        // so an index-served radius query near the antimeridian missed rows
+        // the exact (scan) predicate matched.
+        let (min_lon, max_lon) = if dlon >= 180.0 {
+            (LON_MIN, LON_MAX)
+        } else {
+            let wrap = |x: f64| {
+                if x < LON_MIN {
+                    x + 360.0
+                } else if x > LON_MAX {
+                    x - 360.0
+                } else {
+                    x
+                }
+            };
+            (wrap(lon - dlon), wrap(lon + dlon))
+        };
         BBox {
             min_lat: (lat - dlat).max(LAT_MIN),
-            min_lon: (lon - dlon).max(LON_MIN),
+            min_lon,
             max_lat: (lat + dlat).min(LAT_MAX),
-            max_lon: (lon + dlon).min(LON_MAX),
+            max_lon,
         }
+    }
+
+    /// Split an antimeridian-crossing box (`min_lon > max_lon`) into two
+    /// non-wrapping boxes; a normal box passes through unsplit. The planner
+    /// covers each half separately (`cover_ranges` assumes `min <= max`).
+    pub fn split_antimeridian(&self) -> (BBox, Option<BBox>) {
+        if self.min_lon <= self.max_lon {
+            return (*self, None);
+        }
+        (
+            BBox { min_lon: self.min_lon, max_lon: LON_MAX, ..*self },
+            Some(BBox { min_lon: LON_MIN, max_lon: self.max_lon, ..*self }),
+        )
     }
 
     /// The quantized rectangle `(qla_min, qlo_min, qla_max, qlo_max)`.
@@ -247,6 +304,31 @@ mod tests {
                 assert!(lo <= c && c <= hi, "code {c} outside [{lo},{hi}]");
             }
         }
+    }
+
+    /// Antimeridian handling: `around` near ±180° WRAPS instead of clamping,
+    /// `split_antimeridian` yields two boxes whose combined cover is a
+    /// superset of every point within the radius — including the far side.
+    #[test]
+    fn antimeridian_split_covers_both_sides() {
+        // 300 km around (0, 179.5): reaches past +180 to ≈ -177.8.
+        let bbox = BBox::around(0.0, 179.5, 300_000.0);
+        assert!(bbox.min_lon > bbox.max_lon, "envelope must wrap: {bbox:?}");
+        let (east, west) = bbox.split_antimeridian();
+        let west = west.expect("wrapping box splits");
+        assert!(east.min_lon <= east.max_lon && west.min_lon <= west.max_lon);
+        let mut ranges = cover_ranges(&east, DEFAULT_MAX_RANGES);
+        ranges.extend(cover_ranges(&west, DEFAULT_MAX_RANGES));
+        for lon in [179.0, 179.9, 180.0, -180.0, -179.5, -178.0] {
+            assert!(
+                haversine_m(0.0, 179.5, 0.0, lon) < 300_000.0,
+                "test point not in radius"
+            );
+            assert!(in_ranges(&ranges, morton(0.0, lon)), "dropped lon {lon}");
+        }
+        // A non-wrapping box passes through unsplit.
+        let plain = BBox { min_lat: 0.0, min_lon: 10.0, max_lat: 1.0, max_lon: 11.0 };
+        assert_eq!(plain.split_antimeridian(), (plain, None));
     }
 
     #[test]

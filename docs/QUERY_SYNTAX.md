@@ -482,13 +482,21 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   search-index pushdown may answer from an HLL sketch — never truncates,
   ~±1–2% at high cardinality; every other path answers exactly), `SUM`,
   `AVG`,
-  `MIN`, `MAX`, and the time-series aggregates `RATE`, `INCREASE`, `DELTA`,
+  `MIN`, `MAX`, `PERCENTILE(<expr>, <p>)` (the linear-interpolated
+  `percentile_cont` quantile of the group's numeric values; `<p>` is a
+  literal fraction in `(0, 1]`, e.g. `PERCENTILE(latency_ms, 0.95)` —
+  computed exactly over the gathered rows), and the time-series aggregates
+  `RATE`, `INCREASE`, `DELTA`,
   `FIRST`, `LAST` (see *Time-series tables* below). Using an aggregate (or
   `GROUP BY`) puts the query in aggregate mode.
 - **Duration literals:** an integer immediately followed by a unit — `250ms`,
   `15s`, `5m`, `2h`, `30d`, `1w` — is a duration, valued as integer
   milliseconds (`5m` = `300000`). Usable anywhere an integer is.
-- **Scalar functions:** `now()` (the query's start time, as a timestamp —
+- **Scalar functions:** `distance('<n><unit>')` (a distance literal in
+  metres — `'500m'`, `'5km'`, `'1mi'`, `'3NM'`; the natural radius for
+  `geo_distance` comparisons, and constant, so the geo index still prunes:
+  `WHERE geo_distance(loc, 40.7, -74.0) <= distance('5km')`),
+  `now()` (the query's start time, as a timestamp —
   one instant per statement), `time_bucket(<step>, <ts>)` (floors `<ts>`
   to a `<step>`-wide bucket: `time_bucket(5m, ts)`), and
   `to_timestamp(<value>)` — coerce to a timestamp: numeric epoch-ms passes

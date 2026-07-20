@@ -226,6 +226,35 @@ fn eval_func(name: &str, args: &[Expr], row: &Document) -> Result<Value> {
                 EngineError::Type("rrf_score() is only valid in a RANK BY RRF query".into())
             })
         }
+        // `distance('<n><unit>')` — a distance literal with an ES-style unit
+        // suffix ("5km", "1mi", "3 NM", …; bare number = metres) evaluated to
+        // METRES, for use as a `geo_distance` radius:
+        // `WHERE geo_distance(loc, ..) <= distance('5km')`. Constant when its
+        // argument is, so the geo-index planner sees it as a plain radius. A
+        // bad unit is an ERROR (a typo'd radius must not silently match
+        // nothing); a numeric argument passes through as metres.
+        "distance" => {
+            let [arg] = args else {
+                return Err(EngineError::Type(
+                    "distance('<n><unit>') takes exactly one argument".into(),
+                ));
+            };
+            match eval(arg, row)? {
+                Value::String(s) => match crate::geo::parse_distance_m(&s) {
+                    Some(m) => Ok(Value::Float(m)),
+                    None => Err(EngineError::Type(format!(
+                        "distance(): cannot parse '{s}' (use e.g. '500m', '5km', '1mi', '3NM')"
+                    ))),
+                },
+                Value::Int(i) => Ok(Value::Float(i as f64)),
+                Value::Float(f) => Ok(Value::Float(f)),
+                Value::Null => Ok(Value::Null),
+                other => Err(EngineError::Type(format!(
+                    "distance() takes a string like '5km' or a number of metres, got {:?}",
+                    other.type_of()
+                ))),
+            }
+        }
         // `geo_distance(point, lat, lon)` — great-circle (haversine) distance in
         // METERS from the row's `point` field to `(lat, lon)`. `point` is a
         // `{lat, lon}` object or a `[lat, lon]` array; a non-point value (or a
@@ -354,7 +383,7 @@ pub(crate) fn as_int_ms(v: &Value) -> Option<i64> {
 }
 
 /// A numeric value as `f64` (`Int`/`Float`/`Decimal`), else `None`.
-fn as_f64(v: &Value) -> Option<f64> {
+pub(crate) fn as_f64(v: &Value) -> Option<f64> {
     match v {
         Value::Int(i) => Some(*i as f64),
         Value::Float(f) => Some(*f),

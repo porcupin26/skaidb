@@ -1252,7 +1252,80 @@ fn metric_item(func_name: AggFunc, field: &str) -> SelectItem {
 /// A `top_hits` sub-aggregation request: `(name, size, include_source)`.
 type TopHitsSpec = (String, u64, bool);
 
-type ParsedSubAggs = (Vec<(String, SelectItem)>, Vec<TopHitsSpec>);
+/// One named metric sub-agg lowered to SQL select items: a single-value
+/// metric (`{"value": …}`) or a `percentiles` fan-out (`{"values": {…}}`,
+/// one item per requested percent).
+enum MetricSql {
+    Single(SelectItem),
+    Percentiles(Vec<(f64, SelectItem)>),
+}
+
+impl MetricSql {
+    fn items(&self) -> Vec<&SelectItem> {
+        match self {
+            MetricSql::Single(it) => vec![it],
+            MetricSql::Percentiles(ps) => ps.iter().map(|(_, it)| it).collect(),
+        }
+    }
+
+    /// Shape this metric's JSON from `row` starting at column `col`,
+    /// returning the value and how many columns were consumed.
+    fn shape(&self, row: &[Value], col: usize) -> (Json, usize) {
+        match self {
+            MetricSql::Single(_) => (json!({"value": row[col].to_json()}), 1),
+            MetricSql::Percentiles(ps) => {
+                let mut values = Map::new();
+                for (i, (p, _)) in ps.iter().enumerate() {
+                    values.insert(percent_key(*p), row[col + i].to_json());
+                }
+                (json!({"values": values}), ps.len())
+            }
+        }
+    }
+}
+
+/// ES formats percentile keys as `"50.0"` / `"99.9"`.
+fn percent_key(p: f64) -> String {
+    if p.fract() == 0.0 {
+        format!("{p:.1}")
+    } else {
+        format!("{p}")
+    }
+}
+
+/// `percentiles` percents (default = ES's) → one `PERCENTILE` item each.
+fn percentile_items(field: &str, body: &Json) -> Result<Vec<(f64, SelectItem)>, String> {
+    let percents: Vec<f64> = match body.get("percents") {
+        None => vec![1.0, 5.0, 25.0, 50.0, 75.0, 95.0, 99.0],
+        Some(v) => v
+            .as_array()
+            .ok_or("percentiles.percents must be an array")?
+            .iter()
+            .map(|p| p.as_f64().ok_or("percents must be numbers"))
+            .collect::<Result<_, _>>()?,
+    };
+    percents
+        .into_iter()
+        .map(|p| {
+            if !(p > 0.0 && p <= 100.0) {
+                return Err(format!("percentile {p} out of range (0, 100]"));
+            }
+            Ok((
+                p,
+                SelectItem::Expr {
+                    expr: Expr::Aggregate {
+                        // The SQL fraction is stored in basis points.
+                        func: AggFunc::Percentile((p * 100.0).round() as u16),
+                        arg: AggArg::Expr(Box::new(Expr::Column(field.to_string()))),
+                    },
+                    alias: None,
+                },
+            ))
+        })
+        .collect()
+}
+
+type ParsedSubAggs = (Vec<(String, MetricSql)>, Vec<TopHitsSpec>);
 
 fn parse_metrics(spec: &Json) -> Result<ParsedSubAggs, String> {
     let mut out = Vec::new();
@@ -1281,22 +1354,29 @@ fn parse_metrics(spec: &Json) -> Result<ParsedSubAggs, String> {
                 "min" => AggFunc::Min,
                 "max" => AggFunc::Max,
                 "value_count" => AggFunc::Count,
+                "percentiles" => {
+                    out.push((
+                        mname.clone(),
+                        MetricSql::Percentiles(percentile_items(field, body)?),
+                    ));
+                    continue;
+                }
                 "cardinality" => {
                     out.push((
                         mname.clone(),
-                        SelectItem::Expr {
+                        MetricSql::Single(SelectItem::Expr {
                             expr: Expr::Aggregate {
                                 func: AggFunc::Count,
                                 arg: AggArg::Distinct(Box::new(Expr::Column(field.to_string()))),
                             },
                             alias: None,
-                        },
+                        }),
                     ));
                     continue;
                 }
                 other => return Err(format!("unsupported sub-aggregation '{other}'")),
             };
-            out.push((mname.clone(), metric_item(f, field)));
+            out.push((mname.clone(), MetricSql::Single(metric_item(f, field))));
         }
     }
     Ok((out, top_hits))
@@ -1346,8 +1426,10 @@ fn run_one_agg(
                 },
             ];
             let (metrics, top_specs) = parse_metrics(spec)?;
-            for (_, item) in &metrics {
-                sel.items.push(item.clone());
+            for (_, m) in &metrics {
+                for item in m.items() {
+                    sel.items.push(item.clone());
+                }
             }
             let (_, rows) = rows_of(run(ctx, role, Statement::Select(sel), "es:aggs")?)?;
             let mut buckets: Vec<Json> = rows
@@ -1357,8 +1439,11 @@ fn run_one_agg(
                         "key": row[0].to_json(),
                         "doc_count": row[1].to_json(),
                     });
-                    for (i, (mname, _)) in metrics.iter().enumerate() {
-                        bucket[mname.as_str()] = json!({"value": row[2 + i].to_json()});
+                    let mut col = 2;
+                    for (mname, m) in &metrics {
+                        let (value, used) = m.shape(&row, col);
+                        bucket[mname.as_str()] = value;
+                        col += used;
                     }
                     bucket
                 })
@@ -1400,6 +1485,126 @@ fn run_one_agg(
                 }
             }
             Ok(json!({"buckets": buckets}))
+        }
+        // Paginated multi-source buckets (ES `composite`): sources become one
+        // multi-column GROUP BY; buckets sort ascending by the composite key
+        // tuple (the order-preserving key encoding compares tuples exactly)
+        // and page via `after` — echo the returned `after_key` to continue.
+        "composite" => {
+            let sources = body["sources"]
+                .as_array()
+                .ok_or("composite needs sources: [...]")?;
+            let mut names: Vec<String> = Vec::new();
+            let mut exprs: Vec<Expr> = Vec::new();
+            for src in sources {
+                let (sname, sspec) = src
+                    .as_object()
+                    .and_then(|o| o.iter().next())
+                    .ok_or("empty composite source")?;
+                let (skind, sbody) = sspec
+                    .as_object()
+                    .and_then(|o| o.iter().next())
+                    .ok_or("empty composite source")?;
+                if sbody["order"].as_str().unwrap_or("asc") != "asc" {
+                    return Err("composite sources support ascending order only".into());
+                }
+                let field = sbody["field"].as_str().ok_or("composite source needs field")?;
+                exprs.push(match skind.as_str() {
+                    "terms" => Expr::Column(field.to_string()),
+                    "date_histogram" => {
+                        let interval = sbody["fixed_interval"]
+                            .as_str()
+                            .ok_or("composite date_histogram needs fixed_interval")?;
+                        let ms = parse_interval_ms(interval)?;
+                        func(
+                            "time_bucket",
+                            vec![Expr::Literal(Value::Int(ms)), Expr::Column(field.to_string())],
+                        )
+                    }
+                    other => {
+                        return Err(format!(
+                            "composite source '{other}' is not supported (terms, date_histogram)"
+                        ))
+                    }
+                });
+                names.push(sname.clone());
+            }
+            if names.is_empty() {
+                return Err("composite needs at least one source".into());
+            }
+            let (metrics, top_specs) = parse_metrics(spec)?;
+            if !top_specs.is_empty() {
+                return Err("top_hits under composite is not supported".into());
+            }
+            sel.group_by = exprs.clone();
+            sel.items = exprs
+                .into_iter()
+                .map(|expr| SelectItem::Expr { expr, alias: None })
+                .collect();
+            sel.items.push(SelectItem::Expr {
+                expr: Expr::Aggregate { func: AggFunc::Count, arg: AggArg::Star },
+                alias: None,
+            });
+            for (_, m) in &metrics {
+                for item in m.items() {
+                    sel.items.push(item.clone());
+                }
+            }
+            let (_, mut rows) = rows_of(run(ctx, role, Statement::Select(sel), "es:aggs")?)?;
+            let n = names.len();
+            let tuple_key = |row: &[Value]| Value::Array(row[..n].to_vec()).encode_key();
+            rows.sort_by_key(|row| tuple_key(row));
+            if let Some(after) = body.get("after") {
+                let ao = after.as_object().ok_or("composite.after must be an object")?;
+                // Values should be echoed from the previous page's after_key,
+                // so JSON types round-trip exactly.
+                let vals: Vec<Value> = names
+                    .iter()
+                    .map(|nm| ao.get(nm).cloned().map(Value::from_json).unwrap_or(Value::Null))
+                    .collect();
+                let after_key = Value::Array(vals).encode_key();
+                rows.retain(|row| tuple_key(row) > after_key);
+            }
+            let size = body["size"].as_u64().unwrap_or(10) as usize;
+            rows.truncate(size);
+            let buckets: Vec<Json> = rows
+                .into_iter()
+                .map(|row| {
+                    let mut key = Map::new();
+                    for (nm, v) in names.iter().zip(&row) {
+                        key.insert(nm.clone(), v.to_json());
+                    }
+                    let mut bucket = json!({
+                        "key": Json::Object(key),
+                        "doc_count": row[n].to_json(),
+                    });
+                    let mut col = n + 1;
+                    for (mname, m) in &metrics {
+                        let (value, used) = m.shape(&row, col);
+                        bucket[mname.as_str()] = value;
+                        col += used;
+                    }
+                    bucket
+                })
+                .collect();
+            let mut out = json!({"buckets": buckets});
+            if let Some(last) = out["buckets"].as_array().and_then(|b| b.last()) {
+                out["after_key"] = last["key"].clone();
+            }
+            Ok(out)
+        }
+        "percentiles" => {
+            let field = body["field"].as_str().ok_or("metric agg needs field")?;
+            let items = percentile_items(field, body)?;
+            sel.items = items.iter().map(|(_, it)| it.clone()).collect();
+            let (_, rows) = rows_of(run(ctx, role, Statement::Select(sel), "es:aggs")?)?;
+            let mut values = Map::new();
+            if let Some(row) = rows.first() {
+                for (i, (p, _)) in items.iter().enumerate() {
+                    values.insert(percent_key(*p), row[i].to_json());
+                }
+            }
+            Ok(json!({"values": values}))
         }
         "sum" | "avg" | "min" | "max" | "value_count" | "cardinality" => {
             let field = body["field"].as_str().ok_or("metric agg needs field")?;

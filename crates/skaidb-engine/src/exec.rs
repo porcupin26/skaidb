@@ -816,6 +816,21 @@ impl Database {
         if Metric::parse(metric).is_none() {
             return Err(EngineError::Constraint(format!("unknown vector metric '{metric}'")));
         }
+        // One vector index per (table, path): `NEAREST` resolves by path, so a
+        // second differently-named index over the same column would be
+        // maintained but never queried — reject it instead of silently
+        // shadowing.
+        if let Some((other, _)) = self
+            .catalog
+            .vector_indexes
+            .iter()
+            .find(|(n, d)| n.as_str() != name && d.table == table && d.path == path)
+        {
+            return Err(EngineError::Constraint(format!(
+                "vector index '{}' already covers {table} ({path}) — drop it first",
+                namespace::split(other).1
+            )));
+        }
         // Explicit dimension: the graph can be sized without scanning a
         // single row, so DDL acks with an empty index marked `building` and
         // the backfill runs in pages afterwards — inline for a single-node
@@ -6021,10 +6036,21 @@ impl Database {
             if def.table != table || def.building || def.path != col {
                 continue;
             }
-            let ranges = crate::geo::cover_ranges(&bbox, crate::geo::DEFAULT_MAX_RANGES)
-                .into_iter()
-                .map(|(lo, hi)| crate::geo::range_bytes(lo, hi))
-                .collect();
+            // An antimeridian-crossing box covers as two non-wrapping halves;
+            // the gather dedups keys across ranges, so concatenation is safe.
+            let (east, west) = bbox.split_antimeridian();
+            let mut ranges: Vec<_> =
+                crate::geo::cover_ranges(&east, crate::geo::DEFAULT_MAX_RANGES)
+                    .into_iter()
+                    .map(|(lo, hi)| crate::geo::range_bytes(lo, hi))
+                    .collect();
+            if let Some(w) = west {
+                ranges.extend(
+                    crate::geo::cover_ranges(&w, crate::geo::DEFAULT_MAX_RANGES)
+                        .into_iter()
+                        .map(|(lo, hi)| crate::geo::range_bytes(lo, hi)),
+                );
+            }
             return Some((name.clone(), ranges));
         }
         None
@@ -8973,8 +8999,9 @@ fn geo_bbox_predicate(args: &[Expr]) -> Option<(String, crate::geo::BBox)> {
     let min_lon = const_f64(&args[2])?;
     let max_lat = const_f64(&args[3])?;
     let max_lon = const_f64(&args[4])?;
-    // A wrapping (min_lon > max_lon) or degenerate box is left to the scan path.
-    if min_lat > max_lat || min_lon > max_lon {
+    // A degenerate latitude box is left to the scan path. `min_lon > max_lon`
+    // (antimeridian wrap) is fine: the planner splits it into two halves.
+    if min_lat > max_lat {
         return None;
     }
     Some((col, crate::geo::BBox { min_lat, min_lon, max_lat, max_lon }))
@@ -12543,6 +12570,7 @@ pub(crate) fn expr_name(expr: &Expr) -> String {
             AggFunc::Delta => "delta",
             AggFunc::First => "first",
             AggFunc::Last => "last",
+            AggFunc::Percentile(_) => "percentile",
         }
         .to_string(),
         Expr::Func { name, .. } => name.clone(),
@@ -12901,6 +12929,31 @@ fn eval_aggregate(func: AggFunc, arg: &AggArg, docs: &[Document]) -> Result<Valu
                 ));
             };
             eval_ts_change(func, e, docs)?
+        }
+        AggFunc::Percentile(bp) => {
+            if !matches!(arg, AggArg::Expr(_)) {
+                return Err(EngineError::Type(
+                    "percentile() takes a field argument, not * or DISTINCT".into(),
+                ));
+            }
+            // Linear interpolation over the sorted numeric values
+            // (`percentile_cont` semantics); non-numeric values are skipped,
+            // an empty group is NULL.
+            let mut nums: Vec<f64> = values
+                .iter()
+                .filter_map(crate::eval::as_f64)
+                .filter(|x| x.is_finite())
+                .collect();
+            if nums.is_empty() {
+                return Ok(Value::Null);
+            }
+            nums.sort_by(|a, b| a.total_cmp(b));
+            let p = f64::from(bp) / 10_000.0;
+            let rank = p * (nums.len() - 1) as f64;
+            let lo = rank.floor() as usize;
+            let hi = rank.ceil() as usize;
+            let frac = rank - lo as f64;
+            Value::Float(nums[lo] + (nums[hi] - nums[lo]) * frac)
         }
         AggFunc::First | AggFunc::Last => {
             let AggArg::Expr(e) = arg else {

@@ -1926,6 +1926,32 @@ impl Parser {
                             )),
                         });
                     }
+                    if path.eq_ignore_ascii_case("percentile") {
+                        // PERCENTILE(expr, p) — p a literal fraction in (0, 1].
+                        let [_, p] = args.as_slice() else {
+                            return Err(ParseError::Other(
+                                "PERCENTILE(expr, p) takes exactly two arguments".into(),
+                            ));
+                        };
+                        let p = match p {
+                            Expr::Literal(Value::Float(f)) => *f,
+                            Expr::Literal(Value::Int(i)) => *i as f64,
+                            _ => {
+                                return Err(ParseError::Other(
+                                    "PERCENTILE fraction must be a numeric literal".into(),
+                                ))
+                            }
+                        };
+                        if !(p > 0.0 && p <= 1.0) {
+                            return Err(ParseError::Other(
+                                "PERCENTILE fraction must be in (0, 1] (e.g. 0.95)".into(),
+                            ));
+                        }
+                        return Ok(Expr::Aggregate {
+                            func: AggFunc::Percentile((p * 10_000.0).round() as u16),
+                            arg: AggArg::Expr(Box::new(args.into_iter().next().unwrap())),
+                        });
+                    }
                     if let Some(func) = ts_agg_func(&path) {
                         if args.len() != 1 {
                             return Err(ParseError::Other(format!(
@@ -2741,6 +2767,29 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(parse("SELECT id FROM docs WHERE MATCH(body, 'x') LIMIT 5 AFTER ()").is_err());
+    }
+
+    #[test]
+    fn parse_percentile_aggregate() {
+        match parse("SELECT percentile(latency, 0.95) FROM reqs").unwrap() {
+            Statement::Select(s) => {
+                let SelectItem::Expr { expr, .. } = &s.items[0] else { panic!() };
+                assert_eq!(
+                    *expr,
+                    Expr::Aggregate {
+                        func: AggFunc::Percentile(9500),
+                        arg: AggArg::Expr(Box::new(Expr::Column("latency".into()))),
+                    }
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // p = 1 (the max) parses; out-of-range and non-literal fractions error.
+        assert!(parse("SELECT percentile(v, 1) FROM t").is_ok());
+        assert!(parse("SELECT percentile(v, 0.0) FROM t").is_err());
+        assert!(parse("SELECT percentile(v, 1.5) FROM t").is_err());
+        assert!(parse("SELECT percentile(v, p) FROM t").is_err());
+        assert!(parse("SELECT percentile(v) FROM t").is_err());
     }
 
     #[test]

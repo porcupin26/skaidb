@@ -571,6 +571,10 @@ fn plan_expr_ok(e: &Expr, plan: &mut PartialsPlan) -> bool {
             if f == "ts" || f.contains('.') || f.starts_with("__") {
                 return false;
             }
+            // No partial exists for a percentile — exact row path only.
+            if matches!(func, AggFunc::Percentile(_)) {
+                return false;
+            }
             if !plan.agg_fields.contains(f) {
                 plan.agg_fields.push(f.clone());
             }
@@ -997,6 +1001,8 @@ fn rewrite_aggs(e: &mut Expr) {
                 AggFunc::Rate => agg(AggFunc::Sum, "__prate_"),
                 AggFunc::Increase => agg(AggFunc::Sum, "__pinc_"),
                 AggFunc::Delta => agg(AggFunc::Sum, "__pdel_"),
+                // Excluded from the partials plan (`plan_expr_ok`).
+                AggFunc::Percentile(_) => unreachable!("percentile never plans partials"),
             };
         }
         Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => rewrite_aggs(expr),

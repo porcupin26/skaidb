@@ -30,8 +30,9 @@ bad row can't fail a query.
 ## Querying (works with or without an index)
 
 ```sql
--- Everything within 5 km of a point (metres):
+-- Everything within 5 km of a point (metres, or a distance('…') literal):
 SELECT id FROM places WHERE geo_distance(loc, 40.71, -74.0) <= 5000;
+SELECT id FROM places WHERE geo_distance(loc, 40.71, -74.0) <= distance('5km');
 
 -- Nearest-first, bounded:
 SELECT id, geo_distance(loc, 40.71, -74.0) AS m
@@ -45,7 +46,9 @@ SELECT id FROM places WHERE geo_bbox(loc, 40.4, -74.3, 40.9, -73.7);
 
 `geo_distance(point, lat, lon)` is the great-circle (haversine) distance in
 **metres**; `geo_bbox(point, min_lat, min_lon, max_lat, max_lon)` is a boolean
-point-in-rectangle test. Full grammar in
+point-in-rectangle test; `distance('<n><unit>')` converts a unit-suffixed
+distance literal (`m`/`km`/`mi`/`yd`/`ft`/`NM`/…) to metres — constant, so
+the geo index prunes through it. Full grammar in
 [`QUERY_SYNTAX.md`](QUERY_SYNTAX.md).
 
 ES clients get the same predicates through the `_search` DSL — `geo_distance`
@@ -95,12 +98,15 @@ vector index.
   index, the coordinator unions the candidate keys, re-reads each at the read
   quorum (authoritative last-writer-wins point), and applies the exact filter.
 
+## Antimeridian
+
+A `geo_bbox` with `min_lon > max_lon` crosses the antimeridian (±180°); the
+planner splits it into two non-wrapping halves and the index serves both. A
+`geo_distance` radius straddling ±180° likewise wraps its envelope (it used
+to clamp, so an index-served radius query near the antimeridian missed
+far-side rows).
+
 ## Limits (v1)
 
 - Points only — `geo_shape` polygons are not supported.
-- A `geo_bbox` that crosses the antimeridian (`min_lon > max_lon`) or is
-  degenerate falls back to a **scan** for that query (still correct, just not
-  index-accelerated) — split it into two non-wrapping boxes to keep the index.
-- Metres only for `geo_distance` in SQL; there is no SQL unit suffix syntax
-  (the ES `_search` DSL accepts `"5km"`-style units and converts to metres).
 - No geo aggregations (geohash-grid / geo-bounds facets) yet.

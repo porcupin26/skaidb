@@ -120,11 +120,13 @@ Key facts an agent must know:
   array; non-point/NULL → NULL. Use in `WHERE geo_distance(loc,..) <= <metres>`
   and `ORDER BY geo_distance(loc,..) LIMIT k` (nearest-first). `CREATE GEO INDEX
   <name> ON <t>(<point-col>)` makes both predicates prune via a Morton/Z-order
-  index (transparent — no query change; a single non-wrapping `geo_bbox` box or
-  a `geo_distance <= r` radius routes to code-range scans, exact-filtered on
-  re-read); without one they scan. Broadcast DDL, self-maintaining, on-disk
-  (no rebuild on restart), cluster-wide via the secondary-index scatter. A
-  wrapping/degenerate box falls back to a scan. See [GEO.md](GEO.md).
+  index (transparent — no query change; `geo_bbox` boxes and `geo_distance <= r`
+  radii route to code-range scans, exact-filtered on re-read — an
+  antimeridian-crossing box/radius splits into two covered halves); without
+  one they scan. Broadcast DDL, self-maintaining, on-disk (no rebuild on
+  restart), cluster-wide via the secondary-index scatter. `distance('5km')`
+  → metres (unit literal: m/km/mi/yd/ft/NM/…; constant, index-prunable
+  radius). See [GEO.md](GEO.md).
 - **`SELECT <expr>` without FROM**: constant projection, one row
   (`SELECT 1` = liveness probe; needs no privilege). `*` and other
   clauses still require a table; a FROM-less leg works inside UNION.
@@ -178,7 +180,9 @@ Key facts an agent must know:
   bounded memory (at consistency "one" on a full-copy cluster: a single
   local pass, like DISTINCT),
   `APPROX_COUNT_DISTINCT(expr)` (opt-in HLL on the search pushdown, exact
-  everywhere else), `SUM`, `AVG`, `MIN`, `MAX`; time-series only: `RATE`,
+  everywhere else), `SUM`, `AVG`, `MIN`, `MAX`, `PERCENTILE(expr, p)`
+  (exact percentile_cont, p a literal fraction in (0,1], row-gather path
+  only — no pushdown/partials); time-series only: `RATE`,
   `INCREASE`, `DELTA`, `FIRST`, `LAST`.
 - **`GROUP BY` memory**: a plain `GROUP BY`/aggregate query (no `TOP k
   BY`, `*`, join, or set op) decodes only the columns the filter,
@@ -422,7 +426,11 @@ ORDER BY score() DESC LIMIT 10;
 **Index options** — global: `analyzer` (default `'standard'` = UAX§29 +
 lowercase; `'folding'`, `'whitespace'`, `'keyword'`, `'ngram(min,max)'`,
 `'edge_ngram(min,max)'`, languages `'english'`, `'german'`, … with
-stopwords+stemming), `refresh_ms` (NRT visibility, default 1000; `0` =
+stopwords+stemming; or a CUSTOM PIPELINE `'<tokenizer> | <filter> | …'` —
+tokenizers unicode/whitespace/keyword/ngram/edge_ngram/regex(pat), filters
+lowercase/ascii_folding/alphanum_only/remove_long(n)/stop(lang)/
+stopwords(w1,w2)/stem(lang); NO char filters — they'd skew highlight
+offsets), `refresh_ms` (NRT visibility, default 1000; `0` =
 commit every write), `synonyms` (`'quick,fast; new york,nyc'` — multi-word
 entries match as phrases, both directions, hot-reloadable via `ALTER`).
 Per-column: `<col>.type` (`text` default, `keyword`, `long`, `double`,
@@ -620,7 +628,8 @@ WHERE cat = 'news';
 
 HNSW (snapshot-persisted; reload + watermark replay on open), metrics
 `cosine` (default) / `l2` / `dot`; `_distance` injected; `QUANTIZED` for
-int8 in-RAM vectors with exact rescore (see §5 DDL note);
+int8 in-RAM vectors with exact rescore (see §5 DDL note); ONE vector
+index per (table, path) — a duplicate is rejected at CREATE;
 `ALTER VECTOR INDEX v SET (ef = n)` retunes search-time recall/latency
 live (persisted; build-time knobs need a rebuild);
 `WHERE` filters candidates (over-fetch + filter); `LIMIT/OFFSET` apply
@@ -848,7 +857,10 @@ POST /{index}/_search    query DSL: match, match_phrase, prefix, wildcard,
                          _source include/exclude (trailing-* globs),
                          highlight, "explain": true, exact totals;
                          aggs: terms, date_histogram + sum/avg/min/max/
-                         value_count/cardinality (EXACT distinct)/top_hits;
+                         value_count/cardinality (EXACT distinct)/
+                         percentiles (exact percentile_cont)/top_hits;
+                         composite (multi-source terms/date_histogram,
+                         asc keys, after/after_key paging; no top_hits);
                          VECTOR: top-level knn {field, query_vector |
                          query_vector_builder(text→managed EMBED), k,
                          filter} → NEAREST; retriever {rrf {retrievers:

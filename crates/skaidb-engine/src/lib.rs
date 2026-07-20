@@ -2601,6 +2601,160 @@ mod tests {
         assert_eq!(ids(rs), vec![3]);
     }
 
+    /// A custom analyzer pipeline (`'<tokenizer> | <filter> | …'`) drives a
+    /// search index end-to-end: `whitespace | lowercase` keeps `Foo-Bar` one
+    /// case-folded token, unlike `standard`.
+    #[test]
+    fn custom_analyzer_pipeline_indexes_and_queries() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE tags (PRIMARY KEY (id))").unwrap();
+        db.execute("INSERT INTO tags (id, body) VALUES (1, 'Foo-Bar baz'), (2, 'plain foo')")
+            .unwrap();
+        db.execute(
+            "CREATE SEARCH INDEX tags_fts ON tags (body) \
+             WITH (body.analyzer = 'whitespace | lowercase')",
+        )
+        .unwrap();
+        let ids = |db: &mut Database, q: &str| {
+            sorted_ids(rows(
+                db.execute(&format!("SELECT id FROM tags WHERE MATCH(body, '{q}')")).unwrap(),
+            ))
+        };
+        // The hyphenated token stays whole (standard would split it)…
+        assert_eq!(ids(&mut db, "Foo-Bar"), vec![1]);
+        // …so its halves do not match doc 1, and case folds.
+        assert_eq!(ids(&mut db, "bar"), Vec::<i64>::new());
+        assert_eq!(ids(&mut db, "BAZ"), vec![1]);
+        assert_eq!(ids(&mut db, "foo"), vec![2]);
+        // An invalid pipeline errors at CREATE with the stage name.
+        let err = db
+            .execute(
+                "CREATE SEARCH INDEX bad_fts ON tags (body) \
+                 WITH (body.analyzer = 'whitespace | frobnicate')",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("frobnicate"), "{err}");
+    }
+
+    /// `PERCENTILE(col, p)` — linear-interpolated quantile, plain and grouped.
+    #[test]
+    fn percentile_aggregate() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE reqs (PRIMARY KEY (id))").unwrap();
+        for i in 1..=10 {
+            db.execute(&format!(
+                "INSERT INTO reqs (id, svc, ms) VALUES ({i}, '{}', {})",
+                if i % 2 == 0 { "a" } else { "b" },
+                i * 10
+            ))
+            .unwrap();
+        }
+        // Values 10..100: p50 = 55 (interpolated), p100 = max.
+        let rs = rows(
+            db.execute("SELECT percentile(ms, 0.5), percentile(ms, 1) FROM reqs").unwrap(),
+        );
+        assert_eq!(rs.rows[0], vec![Value::Float(55.0), Value::Float(100.0)]);
+        // Grouped: svc 'a' has 20,40,60,80,100 → p50 = 60.
+        let rs = rows(
+            db.execute(
+                "SELECT svc, percentile(ms, 0.5) FROM reqs GROUP BY svc ORDER BY svc",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows[0], vec![Value::String("a".into()), Value::Float(60.0)]);
+        // An empty group is NULL; * is rejected.
+        let rs = rows(db.execute("SELECT percentile(ms, 0.9) FROM reqs WHERE id > 99").unwrap());
+        assert_eq!(rs.rows[0], vec![Value::Null]);
+    }
+
+    /// `distance('5km')` — unit-suffixed radius literal in metres; constant,
+    /// so the geo-index planner treats it as a plain radius.
+    #[test]
+    fn distance_literal_radius() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE places (PRIMARY KEY (id))").unwrap();
+        db.execute(
+            "INSERT INTO places (id, loc) VALUES \
+             (1, {\"lat\": 40.70, \"lon\": -74.00}), (2, {\"lat\": 40.73, \"lon\": -73.99}), \
+             (3, {\"lat\": 51.50, \"lon\": -0.12})",
+        )
+        .unwrap();
+        let rs = rows(db.execute("SELECT distance('5km'), distance('1mi'), distance(250)").unwrap());
+        assert_eq!(
+            rs.rows[0],
+            vec![Value::Float(5000.0), Value::Float(1609.344), Value::Float(250.0)]
+        );
+        let rs = rows(
+            db.execute(
+                "SELECT id FROM places WHERE geo_distance(loc, 40.71, -74.0) <= distance('5km')",
+            )
+            .unwrap(),
+        );
+        assert_eq!(sorted_ids(rs), vec![1, 2]);
+        // With a geo index, EXPLAIN routes the distance('…') radius through
+        // the Morton pruner.
+        db.execute("CREATE GEO INDEX places_geo ON places (loc)").unwrap();
+        let rs = rows(
+            db.execute(
+                "EXPLAIN SELECT id FROM places WHERE geo_distance(loc, 40.71, -74.0) <= distance('5km')",
+            )
+            .unwrap(),
+        );
+        let plan = format!("{:?}", rs.rows);
+        assert!(plan.contains("geo index scan"), "{plan}");
+        // A typo'd unit errors instead of matching nothing.
+        assert!(db
+            .execute("SELECT id FROM places WHERE geo_distance(loc, 0, 0) <= distance('5 parsecs')")
+            .is_err());
+    }
+
+    /// A `geo_bbox`/`geo_distance` crossing the antimeridian is served by the
+    /// geo index (two split covers), returning rows on BOTH sides of ±180°.
+    #[test]
+    fn antimeridian_geo_queries_use_index() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE isles (PRIMARY KEY (id))").unwrap();
+        db.execute(
+            "INSERT INTO isles (id, loc) VALUES \
+             (1, {\"lat\": 0.0, \"lon\": 179.8}), (2, {\"lat\": 0.0, \"lon\": -179.7}), \
+             (3, {\"lat\": 0.0, \"lon\": 10.0})",
+        )
+        .unwrap();
+        db.execute("CREATE GEO INDEX isles_geo ON isles (loc)").unwrap();
+        // Wrapping bbox (min_lon 179 > max_lon -179): both sides, index-served.
+        let sql = "SELECT id FROM isles WHERE geo_bbox(loc, -1.0, 179.0, 1.0, -179.0)";
+        let rs = rows(db.execute(sql).unwrap());
+        assert_eq!(sorted_ids(rs), vec![1, 2]);
+        let plan = format!("{:?}", rows(db.execute(&format!("EXPLAIN {sql}")).unwrap()).rows);
+        assert!(plan.contains("geo index scan"), "{plan}");
+        // A radius straddling ±180° finds the far-side row too (the envelope
+        // wraps instead of clamping).
+        let rs = rows(
+            db.execute("SELECT id FROM isles WHERE geo_distance(loc, 0.0, 179.9) <= distance('60km')")
+                .unwrap(),
+        );
+        assert_eq!(sorted_ids(rs), vec![1, 2]);
+    }
+
+    /// A second vector index on the same `(table, path)` is rejected —
+    /// `NEAREST` resolves by path, so it could never be queried.
+    #[test]
+    fn duplicate_vector_index_rejected() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE docs (PRIMARY KEY (id))").unwrap();
+        db.execute("INSERT INTO docs (id, emb) VALUES (1, [1.0, 0.0])").unwrap();
+        db.execute("CREATE VECTOR INDEX docs_emb ON docs (emb) DIM 2").unwrap();
+        let err = db
+            .execute("CREATE VECTOR INDEX docs_emb2 ON docs (emb) DIM 2")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already covers"), "{err}");
+        // Same name + IF NOT EXISTS stays a no-op, and a different path is fine.
+        db.execute("CREATE VECTOR INDEX IF NOT EXISTS docs_emb ON docs (emb) DIM 2").unwrap();
+        db.execute("CREATE VECTOR INDEX docs_other ON docs (other_emb) DIM 2").unwrap();
+    }
+
     /// Geospatial scalar functions: `geo_distance` (haversine metres) filters
     /// and sorts, `geo_bbox` tests a bounding box, and a non-point value yields
     /// NULL (excluded) rather than an error.

@@ -709,6 +709,11 @@ pub enum AggFunc {
     First,
     /// Value at the latest timestamp in the group (time-series tables only).
     Last,
+    /// `PERCENTILE(expr, p)` — the linear-interpolated (`percentile_cont`)
+    /// p-quantile of the group's numeric values. The fraction `p ∈ (0, 1]`
+    /// is stored as basis points (`9500` = 0.95) so the variant stays
+    /// `Copy + Eq`.
+    Percentile(u16),
 }
 
 /// Unary operators.
