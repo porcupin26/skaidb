@@ -198,6 +198,14 @@ the best-scoring snippet of the column's text (default 150 chars) with
 matching terms wrapped in `<b>…</b>` (HTML-escaped otherwise, empty string
 when the column didn't match). Stemming is respected — a query for
 `jumping` highlights `jumps`. Only valid together with a search predicate.
+Highlight multiple columns by calling `HIGHLIGHT()` once per column. The
+snippet comes from re-reading the row's live text (not stored offsets), so
+it always reflects the current document. Scope vs Elasticsearch: skaidb
+returns **one** best passage per column with fixed `<b>` tags — the ES
+`unified`-style default. Not yet supported: custom `pre_tags`/`post_tags`,
+multiple fragments (`number_of_fragments`), `no_match_size`, a separate
+`highlight_query`, sentence/word boundary scanners, and the `plain`/`fvh`
+highlighter types (`fvh` would need stored term-vector offsets).
 
 ## Aggregations
 

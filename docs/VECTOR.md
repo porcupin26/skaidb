@@ -54,15 +54,95 @@ SELECT id FROM docs NEAREST (body, 'natural language query', 10);  -- query auto
 query is auto-embedded. `DIM` must match the model; the index errors at create
 if `[inference]` is off or the dimension disagrees.
 
-**Never blocks a write.** Embedding is out of band: a write commits with the
-raw text (the source of truth) and a background worker embeds it — a batch of
-texts POSTed to the endpoint OFF the engine lock, the returned vectors inserted
-after. If the model server is down, rows stay queued and searchability lags, but
-no write is ever blocked or failed. Each node embeds its own shard; a crash-
-window delta (rows not yet in the HNSW snapshot) is re-queued on restart. Config
-(`[inference]`): `url` (OpenAI/TEI-compatible `{"model","input":[…]}` →
-`{"data":[{"embedding":[…]}]}`), `model`, `dim`, `api_key`, `batch_size`,
-`timeout_secs`, `tls_verify`/`tls_ca`.
+### How the embedding model is used
+
+skaidb never runs an ML model in-process — the single static binary stays. An
+"embedding model" is always an **external HTTP model server** that skaidb calls
+as a client. This keeps the database free of Python/CUDA/model weights and lets
+you point at whatever provider you run.
+
+**The wire contract (OpenAI embeddings API).** For a batch of texts skaidb sends:
+
+```
+POST <inference.url>
+Authorization: Bearer <inference.api_key>     # only when api_key is set
+Content-Type: application/json
+
+{ "model": "<inference.model>", "input": ["text one", "text two", ...] }
+```
+
+and expects the OpenAI-shaped response (order preserved, one entry per input):
+
+```json
+{ "data": [ {"embedding": [0.01, -0.02, ...]}, {"embedding": [...]} ] }
+```
+
+Any server that speaks this shape works — **OpenAI**, **Azure OpenAI**, a local
+**text-embeddings-inference (TEI)** server, **Ollama** (`/v1/embeddings`),
+**Cohere**/others behind an OpenAI-compatible proxy, or your own endpoint. The
+returned vector length must equal the index `DIM` (skaidb validates and rejects a
+mismatch).
+
+**Configuration (`[inference]` block, see `config/skaidb.toml`):**
+
+| key | meaning |
+|---|---|
+| `enabled` | master switch; `EMBED` DDL errors if this is off |
+| `url` | full embeddings endpoint, e.g. `https://api.openai.com/v1/embeddings` or `http://tei-host:8080/embed`-style OpenAI route |
+| `model` | model name sent in the request body (e.g. `text-embedding-3-small`) |
+| `dim` | the model's output dimension — must equal every `EMBED` index's `DIM` |
+| `api_key` | bearer token; sent as `Authorization: Bearer …` only when non-empty (leave empty for a local unauthenticated server) |
+| `batch_size` | max texts per request (default 32); the background worker batches queued rows up to this |
+| `timeout_secs` | per-request timeout (default 30) |
+| `tls_verify` | `"ca"` (verify against `tls_ca`), `"system"` (public CAs — not built in yet), or `"insecure"` (skip — dev only). An HTTPS endpoint today needs `"ca"` + `tls_ca`, or `"insecure"` |
+| `tls_ca` | CA certificate (PEM) when `tls_verify = "ca"` |
+
+Example — OpenAI:
+
+```toml
+[inference]
+enabled = true
+url = "https://api.openai.com/v1/embeddings"
+model = "text-embedding-3-small"
+dim = 1536
+api_key = "sk-..."
+tls_verify = "system"   # or "ca" + a tls_ca bundle until system roots land
+```
+
+Example — a local TEI/Ollama server (no auth, plaintext):
+
+```toml
+[inference]
+enabled = true
+url = "http://127.0.0.1:8080/v1/embeddings"
+model = "BAAI/bge-base-en-v1.5"
+dim = 768
+```
+
+**Model is pinned per index.** The `DIM` you declare fixes the vector geometry;
+the `[inference].model` is the model actually called. Changing the model (or its
+dimension) means the stored vectors no longer match — `DROP` and re-`CREATE` the
+index (a fresh backfill re-embeds every row with the new model). Keep `dim`
+consistent across the config and every `EMBED` index.
+
+**When it runs (two moments):**
+- **Ingest** — on `INSERT`/`UPDATE` of the text column, the row commits with the
+  raw text and the vector is produced later (see below). Each node embeds its own
+  shard's rows.
+- **Query** — a **string** `NEAREST(text_col, 'some query', k)` embeds the query
+  string once (a single-input call to the same endpoint) and searches with the
+  returned vector. A numeric-array `NEAREST` skips inference entirely.
+
+**Never blocks a write (out-of-band embedding).** The write path never calls the
+model server. A write commits with the raw text (the source of truth); a
+background worker then drains a queue: it gathers a batch of pending texts under
+a brief lock, POSTs them to the endpoint **off** the engine lock, and inserts the
+returned vectors under a brief lock afterward. So if the model server is slow or
+**down**, rows simply stay queued and searchability lags — **no write is ever
+blocked or failed**, and the queue drains when the server returns. Each node
+embeds its own shard; a crash-window delta (rows written but not yet in the HNSW
+snapshot) is re-queued on restart, and a freshly created index backfills its
+existing rows the same way.
 
 ## Searching (SQL)
 
