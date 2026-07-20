@@ -2291,11 +2291,11 @@ pub(crate) mod tests {
         let (status, _) = ctx.config_set("server.read_only", "true");
         assert_eq!(status, 200);
         // The gate fires before body decode, so an empty body suffices.
-        let err = crate::promwrite::ingest(&ctx, "carol", &[]).unwrap_err();
+        let err = crate::promwrite::ingest(&ctx, "carol", &[], skaidb_engine::DEFAULT_DATABASE).unwrap_err();
         assert!(err.contains("read-only node"), "{err}");
         // Superuser-exempt, so the request proceeds to (and fails at)
         // snappy decode instead — proving the gate didn't fire.
-        let err = crate::promwrite::ingest(&ctx, "superuser", &[]).unwrap_err();
+        let err = crate::promwrite::ingest(&ctx, "superuser", &[], skaidb_engine::DEFAULT_DATABASE).unwrap_err();
         assert!(err.contains("snappy"), "{err}");
     }
 

@@ -30,6 +30,6 @@ pub fn ring_hash(bytes: &[u8]) -> u64 {
 }
 mod value;
 
-pub use slog::{init_server_log, server_log};
+pub use slog::{init_server_log, log_timestamp, server_log};
 pub use ternary::Ternary;
 pub use value::{Decimal, Document, Uuid, Value, ValueError, ValueType};

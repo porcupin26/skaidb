@@ -16,6 +16,26 @@ In Grafana: *Connections → Data sources → Add data source → Prometheus*:
   `metrics` table; a database-level grant satisfies it). Without auth
   enabled, leave it off.
 
+### Scoping a datasource to a database — or to any time-series table
+
+The bare URL serves the `metrics` table in the **default** database. A
+path prefix on the datasource URL scopes the whole API (Grafana just
+appends `/api/v1/…` to the base URL, so this works with the stock
+Prometheus datasource):
+
+- `http://<node>:7080/db/<database>` — that database's `metrics` table
+  (same remote_write semantics; `remote_write` to
+  `/db/<database>/api/v1/write` ingests there too).
+- `http://<node>:7080/db/<database>/table/<table>` — **any time-series
+  table**: the table's *fields* become the metric names. E.g. a table
+  `air_quality (SERIES KEY (sensor))` with fields `pm25`/`co2` serves
+  PromQL like `pm25{sensor="pi1"}` and `rate(co2[5m])`.
+
+The permission check follows the scope: `Select` on that table (a grant
+on its database satisfies it) — so a database-scoped account works
+against its own data without any grant in the default database. A 403
+from the API names the exact table and database it checked.
+
 Grafana health-checks the datasource via `/api/v1/status/buildinfo` and
 `/api/v1/metadata` — both answered. Queries hit:
 

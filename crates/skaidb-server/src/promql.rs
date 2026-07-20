@@ -20,6 +20,86 @@ use crate::shared::Shared;
 
 /// The table PromQL evaluates over (the remote_write ingest table).
 const TABLE: &str = "metrics";
+
+/// Which time-series table a Prometheus-API request evaluates over. The
+/// default scope is the classic remote_write `metrics` table in the default
+/// database; a path prefix (`/db/<database>[/table/<table>]/api/v1/*`)
+/// scopes to another database — and, with `table`, to any TS table, whose
+/// **fields** then become the metric names (`pm25{...}` selects the `pm25`
+/// field; the remote_write `name`-label convention only applies to tables
+/// named `metrics`).
+pub struct Scope {
+    /// Backend table name, already database-qualified.
+    pub table: String,
+    /// The bare table name (for permission checks / messages).
+    pub bare: String,
+    /// The database the scope resolves in.
+    pub db: String,
+    /// Generic-table mode: metric names are the table's fields (the
+    /// `__field__` series label) instead of the `name` label.
+    pub field_metrics: bool,
+}
+
+impl Default for Scope {
+    fn default() -> Scope {
+        Scope::new(skaidb_engine::DEFAULT_DATABASE, None)
+    }
+}
+
+impl Scope {
+    pub fn new(db: &str, table: Option<&str>) -> Scope {
+        let bare = table.unwrap_or(TABLE);
+        Scope {
+            table: skaidb_engine::namespace::qualify(db, bare),
+            bare: bare.to_string(),
+            db: db.to_string(),
+            field_metrics: bare != TABLE,
+        }
+    }
+
+    /// The storage label a metric-name matcher targets in this scope.
+    fn metric_label(&self) -> &'static str {
+        if self.field_metrics {
+            "__field__"
+        } else {
+            "name"
+        }
+    }
+}
+
+/// Rewrite parsed metric-name matchers (the parser emits label `name`) onto
+/// the scope's metric label.
+fn scope_matchers(matchers: &mut [Matcher], scope: &Scope) {
+    if !scope.field_metrics {
+        return;
+    }
+    for m in matchers {
+        let label = match m {
+            Matcher::Eq(l, _) | Matcher::Ne(l, _) | Matcher::Re(l, _) | Matcher::NotRe(l, _) => l,
+        };
+        if label == "name" {
+            "__field__".clone_into(label);
+        }
+    }
+}
+
+/// In field-metrics mode, rename each fetched series' `__field__` label to
+/// `name` — downstream (the evaluator, `clean_labels`' `name` → `__name__`
+/// rendering, `rate()`'s name-dropping) then behaves exactly as it does for
+/// the remote_write table.
+fn normalize_series(series: &mut [(Labels, Vec<Sample>)], scope: &Scope) {
+    if !scope.field_metrics {
+        return;
+    }
+    for (labels, _) in series {
+        for (k, _) in labels.iter_mut() {
+            if k == "__field__" {
+                "name".clone_into(k);
+            }
+        }
+        labels.sort();
+    }
+}
 /// Instant selectors look back this far for a series' latest sample.
 const LOOKBACK_MS: i64 = 5 * 60 * 1000;
 
@@ -837,18 +917,21 @@ fn labels_json(labels: &Labels) -> Json {
 /// amount, so the evaluator's step arithmetic needs no offset awareness.
 fn fetch_all(
     ctx: &Shared,
+    scope: &Scope,
     specs: &[(Vec<Matcher>, Option<i64>, i64)],
     t0: i64,
     t1: i64,
 ) -> Result<Vec<Fetched>, String> {
     let mut out = Vec::with_capacity(specs.len());
     for (matchers, range, offset) in specs {
+        let mut matchers = matchers.clone();
+        scope_matchers(&mut matchers, scope);
         // The evaluator needs history behind the first step: the range
         // window (or instant lookback), whichever the selector uses.
         let back = range.unwrap_or(LOOKBACK_MS) + offset;
         let mut series = match ctx.backend.ts_query(
-            TABLE,
-            matchers,
+            &scope.table,
+            &matchers,
             t0.saturating_sub(back),
             t1.saturating_sub(*offset),
         ) {
@@ -866,13 +949,14 @@ fn fetch_all(
                 }
             }
         }
+        normalize_series(&mut series, scope);
         out.push(Fetched { series });
     }
     Ok(out)
 }
 
 /// `/api/v1/query`: evaluate at one instant.
-pub fn query(ctx: &Shared, params: &BTreeMap<String, String>) -> (u16, Json) {
+pub fn query(ctx: &Shared, scope: &Scope, params: &BTreeMap<String, String>) -> (u16, Json) {
     let Some(q) = params.get("query") else {
         return err_json("missing query parameter");
     };
@@ -889,7 +973,7 @@ pub fn query(ctx: &Shared, params: &BTreeMap<String, String>) -> (u16, Json) {
     if specs.is_empty() {
         return err_json("number-only expressions are not supported");
     }
-    let fetched = match fetch_all(ctx, &specs, t, t) {
+    let fetched = match fetch_all(ctx, scope, &specs, t, t) {
         Ok(f) => f,
         Err(e) => return err_json(&e),
     };
@@ -928,7 +1012,7 @@ pub fn query(ctx: &Shared, params: &BTreeMap<String, String>) -> (u16, Json) {
 }
 
 /// `/api/v1/query_range`: evaluate over `start..=end` at `step`.
-pub fn query_range(ctx: &Shared, params: &BTreeMap<String, String>) -> (u16, Json) {
+pub fn query_range(ctx: &Shared, scope: &Scope, params: &BTreeMap<String, String>) -> (u16, Json) {
     let Some(q) = params.get("query") else {
         return err_json("missing query parameter");
     };
@@ -956,7 +1040,7 @@ pub fn query_range(ctx: &Shared, params: &BTreeMap<String, String>) -> (u16, Jso
         return err_json("number-only expressions are not supported");
     }
     let steps: Vec<i64> = (0..).map(|i| start + i * step_ms).take_while(|t| *t <= end).collect();
-    let fetched = match fetch_all(ctx, &specs, start, end) {
+    let fetched = match fetch_all(ctx, scope, &specs, start, end) {
         Ok(f) => f,
         Err(e) => return err_json(&e),
     };
@@ -967,27 +1051,32 @@ pub fn query_range(ctx: &Shared, params: &BTreeMap<String, String>) -> (u16, Jso
 }
 
 /// `/api/v1/labels` and `/api/v1/label/<name>/values`.
-pub fn labels(ctx: &Shared, value_of: Option<&str>) -> (u16, Json) {
-    let series = match ctx.backend.ts_query(TABLE, &[], i64::MIN, i64::MAX) {
+pub fn labels(ctx: &Shared, scope: &Scope, value_of: Option<&str>) -> (u16, Json) {
+    let series = match ctx.backend.ts_query(&scope.table, &[], i64::MIN, i64::MAX) {
         Ok(s) => s,
         Err(e) if e.to_string().contains("does not exist") => Vec::new(),
         Err(e) => return err_json(&e.to_string()),
     };
+    let metric = scope.metric_label();
     let mut out: Vec<String> = Vec::new();
     for (labels, _) in &series {
         for (k, v) in labels {
-            if k.starts_with("__") {
+            // The scope's metric label surfaces as `__name__`; other internal
+            // (`__`-prefixed) labels stay hidden.
+            let k = if k == metric {
+                "__name__"
+            } else if k.starts_with("__") {
                 continue;
-            }
+            } else {
+                k.as_str()
+            };
             match value_of {
                 None => {
-                    let name = if k == "name" { "__name__" } else { k.as_str() };
-                    if !out.iter().any(|o| o == name) {
-                        out.push(name.to_string());
+                    if !out.iter().any(|o| o == k) {
+                        out.push(k.to_string());
                     }
                 }
                 Some(want) => {
-                    let k = if k == "name" { "__name__" } else { k.as_str() };
                     if k == want && !out.contains(v) {
                         out.push(v.clone());
                     }
@@ -1000,8 +1089,8 @@ pub fn labels(ctx: &Shared, value_of: Option<&str>) -> (u16, Json) {
 }
 
 /// `/api/v1/series`: label sets matching `match[]` selectors.
-pub fn series(ctx: &Shared, params: &BTreeMap<String, String>) -> (u16, Json) {
-    let matchers = match params.get("match[]") {
+pub fn series(ctx: &Shared, scope: &Scope, params: &BTreeMap<String, String>) -> (u16, Json) {
+    let mut matchers = match params.get("match[]") {
         Some(sel) => match P::new(sel).parse() {
             Ok(expr) => match selector_of(&expr) {
                 Ok(m) => m.clone(),
@@ -1011,11 +1100,14 @@ pub fn series(ctx: &Shared, params: &BTreeMap<String, String>) -> (u16, Json) {
         },
         None => Vec::new(),
     };
-    let series = match ctx.backend.ts_query(TABLE, &matchers, i64::MIN, i64::MAX) {
+    scope_matchers(&mut matchers, scope);
+    let series = match ctx.backend.ts_query(&scope.table, &matchers, i64::MIN, i64::MAX) {
         Ok(s) => s,
         Err(e) if e.to_string().contains("does not exist") => Vec::new(),
         Err(e) => return err_json(&e.to_string()),
     };
+    let mut series = series;
+    normalize_series(&mut series, scope);
     let mut seen: Vec<Labels> = Vec::new();
     for (labels, _) in &series {
         let cleaned = clean_labels(labels, true);

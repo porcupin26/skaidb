@@ -248,6 +248,12 @@ interleave safely. All of these keys are runtime-mutable (`config set`,
 `--*` flags, and `SKAIDB_*_LOG_FILE` env vars), and a path that can't be opened
 falls back to stderr with a one-line warning rather than failing startup.
 
+**Every log line carries a timestamp**: text-format lines (and every
+operational `skaidb:` line in the server log) are prefixed with an
+ISO-8601 UTC instant (`2026-07-20T18:42:13.123Z …`); JSON-format lines
+(`observability.log_format = "json"`) carry it as a `ts` field instead, so
+each line stays independently parseable.
+
 ## REST request activity
 
 - `skaidb_rest_requests_total{path="query"|"insert"|"es"|"prom"|"ui"|"ops"|"admin"|"other"}`

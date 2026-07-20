@@ -288,9 +288,23 @@ fn handle_connection(
     }
 
     // Prometheus HTTP query API (GET with a query string, or POST with a
-    // form body — Grafana uses both).
+    // form body — Grafana uses both). A `/db/<database>[/table/<table>]`
+    // path prefix scopes the API to that database (and optionally to any
+    // TS table, whose FIELDS then serve as the metric names) — point a
+    // Grafana Prometheus datasource's base URL at the prefix and it works
+    // per database/table (docs/GRAFANA.md).
     let bare_path = req.path.split('?').next().unwrap_or(&req.path).to_string();
-    if bare_path.starts_with("/api/v1/") && bare_path != "/api/v1/write" {
+    let (prom_scope, prom_path) = match prom_scope_of(&bare_path) {
+        Ok(v) => v,
+        Err(msg) => {
+            return write_response(
+                &mut stream,
+                400,
+                &json!({"status": "error", "error": msg}),
+            )
+        }
+    };
+    if prom_path.starts_with("/api/v1/") && prom_path != "/api/v1/write" {
         let role = if ctx.authn.required {
             match auth_role(&ctx, req.authorization.as_deref()) {
                 Some(role) => role,
@@ -299,18 +313,20 @@ fn handle_connection(
         } else {
             ctx.superuser_role.clone()
         };
-        // Reading metrics requires Select on the ingest table (a grant on
-        // its database also satisfies it).
+        // Reading requires Select on the scoped table (a grant on its
+        // database also satisfies it).
         if !ctx.allowed_on_table(
             &role,
             skaidb_auth::Privilege::Select,
-            "metrics",
-            skaidb_engine::DEFAULT_DATABASE,
+            &prom_scope.bare,
+            &prom_scope.db,
         ) {
             return write_response(
                 &mut stream,
                 403,
-                &json!({"status": "error", "error": "permission denied: Select on metrics"}),
+                &json!({"status": "error",
+                        "error": format!("permission denied: Select on {} (database {})",
+                                          prom_scope.bare, prom_scope.db)}),
             );
         }
         // Merge query-string and form-body params (body wins on conflict).
@@ -322,11 +338,11 @@ fn handle_connection(
                 params.insert(k, v);
             }
         }
-        let (status, payload) = match bare_path.as_str() {
-            "/api/v1/query" => crate::promql::query(&ctx, &params),
-            "/api/v1/query_range" => crate::promql::query_range(&ctx, &params),
-            "/api/v1/labels" => crate::promql::labels(&ctx, None),
-            "/api/v1/series" => crate::promql::series(&ctx, &params),
+        let (status, payload) = match prom_path.as_str() {
+            "/api/v1/query" => crate::promql::query(&ctx, &prom_scope, &params),
+            "/api/v1/query_range" => crate::promql::query_range(&ctx, &prom_scope, &params),
+            "/api/v1/labels" => crate::promql::labels(&ctx, &prom_scope, None),
+            "/api/v1/series" => crate::promql::series(&ctx, &prom_scope, &params),
             "/api/v1/status/buildinfo" => (
                 200,
                 json!({"status": "success",
@@ -338,7 +354,7 @@ fn handle_connection(
                     .strip_prefix("/api/v1/label/")
                     .and_then(|rest| rest.strip_suffix("/values"))
                 {
-                    crate::promql::labels(&ctx, Some(label))
+                    crate::promql::labels(&ctx, &prom_scope, Some(label))
                 } else {
                     (404, json!({"status": "error", "error": "unknown api route"}))
                 }
@@ -348,7 +364,18 @@ fn handle_connection(
     }
 
     // Prometheus remote_write: snappy-compressed protobuf WriteRequest.
-    if req.method == "POST" && req.path == "/api/v1/write" {
+    // Database-scoped via the same `/db/<database>` prefix; a `/table/`
+    // scope is rejected (remote_write's shape IS the metrics table).
+    if req.method == "POST" && prom_path == "/api/v1/write" {
+        if prom_scope.field_metrics {
+            return write_response(
+                &mut stream,
+                400,
+                &json!({"status": "error",
+                        "error": "remote_write ingests into the metrics table; \
+                                  a /table/ scope cannot receive writes"}),
+            );
+        }
         let role = if ctx.authn.required {
             match auth_role(&ctx, req.authorization.as_deref()) {
                 Some(role) => role,
@@ -357,7 +384,7 @@ fn handle_connection(
         } else {
             ctx.superuser_role.clone()
         };
-        return match crate::promwrite::ingest(&ctx, &role, &req.body) {
+        return match crate::promwrite::ingest(&ctx, &role, &req.body, &prom_scope.db) {
             Ok(accepted) => {
                 ctx.metrics.add_rows_returned(0); // no rows out; count via queries metric
                 write_response(&mut stream, 200, &json!({"accepted": accepted}))
@@ -543,6 +570,76 @@ struct HttpRequest {
 /// The gateway serves one request per connection (`Connection: close`), so a
 /// per-call `BufReader` is already per-connection; borrowing the stream avoids
 /// the `try_clone` (dup) syscall entirely.
+/// The Prometheus-API path-prefix scope: `/db/<database>[/table/<table>]`
+/// before `/api/v1/*`, stripped to `(scope, remaining path)`. Paths without
+/// the prefix keep the default scope (the `metrics` table, default database).
+fn prom_scope_of(path: &str) -> Result<(crate::promql::Scope, String), String> {
+    let Some(rest) = path.strip_prefix("/db/") else {
+        return Ok((crate::promql::Scope::default(), path.to_string()));
+    };
+    let ok_name = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    };
+    let (db, rest) = rest
+        .split_once('/')
+        .ok_or("expected /db/<database>/api/v1/…")?;
+    if !ok_name(db) {
+        return Err("bad database name in /db/ prefix".into());
+    }
+    let (table, rest) = match rest.strip_prefix("table/") {
+        Some(r) => {
+            let (t, rr) = r.split_once('/').ok_or("expected /table/<table>/api/v1/…")?;
+            if !ok_name(t) {
+                return Err("bad table name in /table/ prefix".into());
+            }
+            (Some(t), rr)
+        }
+        None => (None, rest),
+    };
+    let rest = format!("/{rest}");
+    if !rest.starts_with("/api/v1/") {
+        return Err("the /db/ prefix scopes only the Prometheus /api/v1/* endpoints".into());
+    }
+    Ok((crate::promql::Scope::new(db, table), rest))
+}
+
+#[cfg(test)]
+mod prom_scope_tests {
+    use super::prom_scope_of;
+
+    #[test]
+    fn scope_prefix_parses_and_validates() {
+        // No prefix → default scope, path untouched.
+        let (s, p) = prom_scope_of("/api/v1/query").unwrap();
+        assert_eq!((s.table.as_str(), s.field_metrics), ("metrics", false));
+        assert_eq!(p, "/api/v1/query");
+        // Database-only scope keeps the metrics-table semantics.
+        let (s, p) = prom_scope_of("/db/telemetry/api/v1/query").unwrap();
+        assert_eq!(s.db, "telemetry");
+        assert_eq!(s.bare, "metrics");
+        assert!(!s.field_metrics);
+        assert_eq!(p, "/api/v1/query");
+        // Table scope switches to field-name metrics.
+        let (s, p) = prom_scope_of("/db/pi_air_quality/table/air_quality/api/v1/query_range")
+            .unwrap();
+        assert_eq!(s.db, "pi_air_quality");
+        assert_eq!(s.bare, "air_quality");
+        assert!(s.field_metrics);
+        assert_eq!(p, "/api/v1/query_range");
+        // An explicit `metrics` table scope keeps name-label semantics.
+        let (s, _) = prom_scope_of("/db/telemetry/table/metrics/api/v1/query").unwrap();
+        assert!(!s.field_metrics);
+        // Malformed prefixes are clear errors.
+        assert!(prom_scope_of("/db/x/status").is_err()); // not /api/v1/*
+        assert!(prom_scope_of("/db//api/v1/query").is_err());
+        assert!(prom_scope_of("/db/a b/api/v1/query").is_err());
+        assert!(prom_scope_of("/db/x/table//api/v1/query").is_err());
+        assert!(prom_scope_of("/db/x/table/../api/v1/query").is_err());
+    }
+}
+
 /// Which activity class a REST request lands in (see `RestPath`).
 fn classify_rest(method: &str, path: &str) -> RestPath {
     let bare = path.split('?').next().unwrap_or(path);
@@ -551,6 +648,7 @@ fn classify_rest(method: &str, path: &str) -> RestPath {
         (_, p) if p.starts_with("/insert") => RestPath::Insert,
         (_, "/api/v1/write") => RestPath::Prom,
         (_, p) if p.starts_with("/api/v1/") => RestPath::Prom,
+        (_, p) if p.starts_with("/db/") => RestPath::Prom,
         (_, p) if p == "/ui" || p.starts_with("/ui/") => RestPath::Ui,
         (_, "/metrics" | "/health" | "/healthz" | "/ready" | "/readyz" | "/status") => {
             RestPath::Ops

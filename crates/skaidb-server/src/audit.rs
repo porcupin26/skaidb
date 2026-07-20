@@ -25,7 +25,18 @@ impl LogSink {
     /// Write one already-formatted line. Logging is best-effort: a write error
     /// (full disk, revoked permissions) must never take down a query, so
     /// failures are dropped silently after the initial open.
+    /// Write one line, prefixed with the shared log timestamp. JSON-format
+    /// lines carry the timestamp as a `ts` field instead (added by the
+    /// caller), so `json` skips the prefix to keep every line parseable.
     fn write_line(&self, line: &str) {
+        self.write_stamped(&format!("{} {line}", skaidb_types::log_timestamp()));
+    }
+
+    fn write_json(&self, line: &str) {
+        self.write_stamped(line);
+    }
+
+    fn write_stamped(&self, line: &str) {
         match self {
             LogSink::Stderr => eprintln!("{line}"),
             LogSink::File(f) => {
@@ -136,41 +147,52 @@ impl AuditSettings {
             } else {
                 sql.to_string()
             };
-            let line = if self.json {
-                serde_json::json!({
-                    "event": "query",
-                    "elapsed_ms": elapsed_ms,
-                    "slow": slow,
-                    "error": error,
-                    "sql": shown,
-                })
-                .to_string()
+            if self.json {
+                self.query_sink.write_json(
+                    &serde_json::json!({
+                        "ts": skaidb_types::log_timestamp(),
+                        "event": "query",
+                        "elapsed_ms": elapsed_ms,
+                        "slow": slow,
+                        "error": error,
+                        "sql": shown,
+                    })
+                    .to_string(),
+                );
             } else {
-                format!("[query] {elapsed_ms}ms {shown}")
-            };
-            self.query_sink.write_line(&line);
+                self.query_sink.write_line(&format!("[query] {elapsed_ms}ms {shown}"));
+            }
         }
         if slow {
-            let line = if self.json {
-                serde_json::json!({
-                    "event": "slow_query",
-                    "elapsed_ms": elapsed_ms,
-                    "sql": mask_sql(sql),
-                })
-                .to_string()
+            if self.json {
+                self.slow_sink.write_json(
+                    &serde_json::json!({
+                        "ts": skaidb_types::log_timestamp(),
+                        "event": "slow_query",
+                        "elapsed_ms": elapsed_ms,
+                        "sql": mask_sql(sql),
+                    })
+                    .to_string(),
+                );
             } else {
-                format!("[slow-query] {elapsed_ms}ms {}", mask_sql(sql))
-            };
-            self.slow_sink.write_line(&line);
+                self.slow_sink
+                    .write_line(&format!("[slow-query] {elapsed_ms}ms {}", mask_sql(sql)));
+            }
         }
         if let Some(msg) = error {
             if self.error_log {
-                let line = if self.json {
-                    serde_json::json!({"event": "error", "message": msg}).to_string()
+                if self.json {
+                    self.error_sink.write_json(
+                        &serde_json::json!({
+                            "ts": skaidb_types::log_timestamp(),
+                            "event": "error",
+                            "message": msg,
+                        })
+                        .to_string(),
+                    );
                 } else {
-                    format!("[error] {msg}")
-                };
-                self.error_sink.write_line(&line);
+                    self.error_sink.write_line(&format!("[error] {msg}"));
+                }
             }
         }
     }
@@ -183,18 +205,21 @@ impl AuditSettings {
         if !self.login_log {
             return;
         }
-        let line = if self.json {
-            serde_json::json!({
-                "event": "auth_ddl",
-                "actor": actor,
-                "ok": ok,
-                "stmt": summary,
-            })
-            .to_string()
+        if self.json {
+            self.login_sink.write_json(
+                &serde_json::json!({
+                    "ts": skaidb_types::log_timestamp(),
+                    "event": "auth_ddl",
+                    "actor": actor,
+                    "ok": ok,
+                    "stmt": summary,
+                })
+                .to_string(),
+            );
         } else {
-            format!("[auth-ddl] actor={actor} ok={ok} {summary}")
-        };
-        self.login_sink.write_line(&line);
+            self.login_sink
+                .write_line(&format!("[auth-ddl] actor={actor} ok={ok} {summary}"));
+        }
     }
 
     /// Record a login outcome per the configured login log (text or JSON).
@@ -202,19 +227,22 @@ impl AuditSettings {
         if !self.login_log {
             return;
         }
-        let line = if self.json {
-            serde_json::json!({
-                "event": if ok { "login" } else { "login_failed" },
-                "user": user,
-                "role": role,
-            })
-            .to_string()
+        if self.json {
+            self.login_sink.write_json(
+                &serde_json::json!({
+                    "ts": skaidb_types::log_timestamp(),
+                    "event": if ok { "login" } else { "login_failed" },
+                    "user": user,
+                    "role": role,
+                })
+                .to_string(),
+            );
         } else if ok {
-            format!("[login] user={user} role={}", role.unwrap_or(""))
+            self.login_sink
+                .write_line(&format!("[login] user={user} role={}", role.unwrap_or("")));
         } else {
-            format!("[login-failed] user={user}")
-        };
-        self.login_sink.write_line(&line);
+            self.login_sink.write_line(&format!("[login-failed] user={user}"));
+        }
     }
 }
 

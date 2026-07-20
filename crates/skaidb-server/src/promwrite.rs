@@ -14,15 +14,12 @@ use crate::shared::{execute_session_as, Shared};
 /// The time-series table remote_write ingests into.
 const TABLE: &str = "metrics";
 
-/// Decode, map, and append a remote_write body. Returns accepted samples.
-pub fn ingest(ctx: &Shared, role: &str, body: &[u8]) -> Result<usize, String> {
-    if !ctx.allowed_on_table(
-        role,
-        skaidb_auth::Privilege::Insert,
-        TABLE,
-        skaidb_engine::DEFAULT_DATABASE,
-    ) {
-        return Err(format!("permission denied: Insert on {TABLE}"));
+/// Decode, map, and append a remote_write body into `db`'s `metrics` table
+/// (`db` comes from the `/db/<database>/api/v1/write` path prefix; the
+/// default database otherwise). Returns accepted samples.
+pub fn ingest(ctx: &Shared, role: &str, body: &[u8], db: &str) -> Result<usize, String> {
+    if !ctx.allowed_on_table(role, skaidb_auth::Privilege::Insert, TABLE, db) {
+        return Err(format!("permission denied: Insert on {TABLE} (database {db})"));
     }
     // remote_write bypasses the SQL statement path (`ts_append` directly),
     // so the read-only gate in `execute_session_statement_as` never sees
@@ -38,25 +35,26 @@ pub fn ingest(ctx: &Shared, role: &str, body: &[u8]) -> Result<usize, String> {
     if rows.is_empty() {
         return Ok(0);
     }
-    append_rows(ctx, role, &rows)
+    append_rows(ctx, role, db, &rows)
 }
 
-/// Append pre-decoded samples into the ingest table, creating it on first
+/// Append pre-decoded samples into `db`'s ingest table, creating it on first
 /// write (broadcast in a cluster) under the caller's role so RBAC still
 /// applies. Shared by remote_write and the self-scrape loop.
-fn append_rows(ctx: &Shared, role: &str, rows: &[(Labels, i64, f64)]) -> Result<usize, String> {
-    match ctx.backend.ts_append(TABLE, rows) {
+fn append_rows(ctx: &Shared, role: &str, db: &str, rows: &[(Labels, i64, f64)]) -> Result<usize, String> {
+    let table = skaidb_engine::namespace::qualify(db, TABLE);
+    match ctx.backend.ts_append(&table, rows) {
         Ok(n) => Ok(n),
         Err(e) if e.to_string().contains("does not exist") => {
-            let mut db = skaidb_engine::DEFAULT_DATABASE.to_string();
+            let mut session_db = db.to_string();
             let create = format!(
                 "CREATE TIMESERIES TABLE IF NOT EXISTS {TABLE} (SERIES KEY (name), OOO 1h)"
             );
-            let resp = execute_session_as(ctx, role, &mut db, &create, None);
+            let resp = execute_session_as(ctx, role, &mut session_db, &create, None);
             if let skaidb_proto::Response::Error(e) = resp {
                 return Err(format!("auto-creating {TABLE}: {e}"));
             }
-            ctx.backend.ts_append(TABLE, rows).map_err(|e| e.to_string())
+            ctx.backend.ts_append(&table, rows).map_err(|e| e.to_string())
         }
         Err(e) => Err(e.to_string()),
     }
@@ -78,7 +76,7 @@ pub fn self_scrape_tick(ctx: &Shared) -> Result<usize, String> {
         return Ok(0);
     }
     let role = ctx.superuser_role.clone();
-    append_rows(ctx, &role, &rows)
+    append_rows(ctx, &role, skaidb_engine::DEFAULT_DATABASE, &rows)
 }
 
 /// Parse Prometheus exposition text into ingest rows, mapping labels the
