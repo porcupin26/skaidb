@@ -12,6 +12,7 @@ members = [
     "crates/skaidb-cluster",
     "crates/skaidb-net",
     "crates/skaidb-proto",
+    "crates/skaidb-gssapi",
     "crates/skaidb-server",
     "crates/skaidb-driver",
     "crates/skaidb-cli",
@@ -36,6 +37,7 @@ skaidb-engine = { path = "crates/skaidb-engine" }
 skaidb-cluster = { path = "crates/skaidb-cluster" }
 skaidb-net = { path = "crates/skaidb-net" }
 skaidb-proto = { path = "crates/skaidb-proto" }
+skaidb-gssapi = { path = "crates/skaidb-gssapi" }
 skaidb-driver = { path = "crates/skaidb-driver" }
 
 thiserror = "2"

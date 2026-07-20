@@ -1,0 +1,25 @@
+[package]
+name = "skaidb-gssapi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Off by default: pulls in the krb5 C library (cross-krb5), which links only
+# on glibc/macOS/Windows — never on the static-musl build. The server enables
+# this transitively via its own `kerberos` feature.
+default = []
+kerberos = ["dep:cross-krb5"]
+
+[dependencies]
+thiserror = { workspace = true }
+# Safe wrapper over MIT krb5 (Linux) / SSPI (Windows) / GSS.framework (macOS).
+# Optional so a build without the `kerberos` feature (e.g. musl) never links
+# a C Kerberos library. The `unsafe` FFI lives entirely inside this dep, so
+# skaidb-gssapi keeps the workspace `unsafe_code = "forbid"` lint.
+cross-krb5 = { version = "0.5", optional = true }
