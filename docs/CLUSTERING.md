@@ -505,7 +505,7 @@ at_rest_keyfile = "/etc/skaidb/at-rest.key"
   migration). To fully encrypt an existing node, do a **rolling per-node
   resync**: wipe the node's data dir and let it rebuild from peers onto the
   encrypted engine — one node at a time, RF keeps the cluster serving (the
-  same shape as re-encrypting a MongoDB replica set).
+  same shape as re-encrypting any replicated store).
 - A **missing or bad keyfile fails startup loud** — the node never comes up
   silently unencrypted. `at_rest_enabled` is restart-scoped. The effective
   state shows at `GET /status` as `at_rest`.

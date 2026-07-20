@@ -140,8 +140,8 @@ Design details, internals, and the phase history: [GLOBAL_INDEXES.md](GLOBAL_IND
 - **Index-only counts.** A filtered `COUNT(*)` whose conjunctive
   equality/range filter is fully consumed by one index is answered from
   index-range cardinality — no row reads, safe at any table size. One
-  NULL-safe negated equality (`col != v OR col IS NULL`, the Mongo-`$ne`
-  shape) beside a covering conjunction counts by complement (two range
+  NULL-safe negated equality (`col != v OR col IS NULL`)
+  beside a covering conjunction counts by complement (two range
   cardinalities).
 - **Multikey gate.** A multikey index is used only when every column through
   the `[]` component is equality-pinned (the element probe). Under that

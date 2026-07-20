@@ -399,7 +399,7 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
 ## Expressions
 
 - **Array membership:** comparing an array-valued column to a non-array
-  scalar tests containment, Mongo-style: `labels = 'work'` matches rows
+  scalar tests containment: `labels = 'work'` matches rows
   whose array holds `'work'`; `!=` is not-contains. Array-to-array
   comparison remains whole-value equality.
 - **Literals:** integer (`42`), float (`3.14`, scientific `1.2e-5`/`3E8`), string (`'ada'`), `TRUE`,
@@ -488,7 +488,7 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   through and an ISO-8601 string is parsed (`YYYY-MM-DD`,
   `YYYY-MM-DD[T ]HH:MM[:SS[.fff]]`, optional `Z`/`±HH[:MM]` offset; no offset
   = UTC). Unparseable or mistyped input yields `NULL`, never an error — so
-  string timestamps (e.g. from a Mongo migration) range-filter in-query:
+  string timestamps (e.g. from a document-store migration) range-filter in-query:
   `WHERE to_timestamp(created_at) >= now() - 30d`. The standard spelling
   **`CAST(<expr> AS <type>)`** (types: `INT`, `FLOAT`, `STRING`, `BOOL`,
   `TIMESTAMP`) desugars to the matching coercion (`to_int`, `to_float`,
@@ -737,7 +737,7 @@ WHERE (MATCH(body, 'rust') OR MATCH(title, 'rust'))
 - Cannot combine with `JOIN`, `UNION`, `DISTINCT`, or `NEAREST`. Residual
   `WHERE` conditions, `LIMIT`, and `OFFSET` apply normally, post-search.
 - **Visibility:** writes become searchable within `refresh_ms` (default
-  1 s, Elasticsearch-style near-real-time); on the single-node write path a
+  1 s, near-real-time); on the single-node write path a
   search after a write sees it immediately. The index is derived data — the
   table is the source of truth, and a lost or stale index rebuilds from it
   (automatically on restart, or via `REBUILD SEARCH INDEX`).

@@ -53,7 +53,7 @@ DROP SEARCH INDEX articles_fts;
   value that doesn't fit its column's declared type is simply not indexed
   for that column.
 - `refresh_ms` (default 1000) controls how quickly writes become
-  searchable — Elasticsearch-style near-real-time. On the single-node
+  searchable — near-real-time. On the single-node
   write path, a search after a write commits the index first, so you read
   your own writes immediately; the server also runs a background refresher
   tick (200 ms), so even a table receiving no further traffic becomes
@@ -67,12 +67,11 @@ DROP SEARCH INDEX articles_fts;
 Set the index default with `analyzer = '...'`, or per column with
 `<column>.analyzer = '...'`:
 
-- `standard` — Unicode word split (UAX §29, the same segmentation ES's
-  `standard` uses: `dog's` stays one token) + lowercase (the default).
-  Measured at 98.5% strict top-10 result-set overlap with ES on a 280 k
-  article corpus (see [BENCHMARKS.md](BENCHMARKS.md)). Indexes built
-  before v0.39 (simple tokenizer) rebuild from the table automatically on
-  first open.
+- `standard` — Unicode word split (UAX §29: `dog's` stays one token) +
+  lowercase (the default). Measured at 98.5% strict top-10 result-set
+  overlap with Elasticsearch on a 280 k article corpus (see
+  [BENCHMARKS.md](BENCHMARKS.md)). Indexes built before v0.39 (simple
+  tokenizer) rebuild from the table automatically on first open.
 - `folding` — `standard` + ASCII folding (`café` → `cafe`) for
   accent-insensitive matching without stemming.
 - **Languages** (standard + stopwords where a list exists + Snowball
@@ -172,7 +171,7 @@ indexed terms, so with a lowercasing analyzer write patterns lowercase):
 **Composition**: search predicates combine freely with `AND`/`OR`/`NOT`
 among themselves (ES bool `must`/`should`/`must_not`); ordinary SQL
 conditions join at the top level with `AND` and filter the hits afterward.
-`BOOSTED(required, optional…)` adds ES's optional-scoring shape: the
+`BOOSTED(required, optional…)` adds an optional-scoring shape: the
 `required` predicate decides which rows match, and each `optional`
 predicate only raises the score of rows that already match (tantivy
 Must + Should — ES bool `must` + `should` under the default
@@ -209,7 +208,7 @@ offsets), so it always reflects the current document.
   characters (HTML-escaped) when the column had no match, instead of an
   empty string — `HIGHLIGHT(body, 40, '<b>', '</b>', 80)`.
 
-Scope vs Elasticsearch: skaidb returns **one** best passage per column
+skaidb returns **one** best passage per column
 (the ES `unified`-style default) and now covers custom tags and
 `no_match_size`. Still not supported: multiple fragments
 (`number_of_fragments`), a separate `highlight_query`, sentence/word
@@ -267,8 +266,8 @@ Two serving paths produce identical results:
   a search predicate to aggregate off-index columns row-side.
 
 SQL semantics hold on both paths: rows missing the group column form the
-NULL group, `SUM` over no values is NULL (ES-style aggregations would say
-0), and metric types follow the column declarations (`SUM` of a `long` is
+NULL group, `SUM` over no values is NULL (not 0), and metric types
+follow the column declarations (`SUM` of a `long` is
 an integer). The pushdown is **exact or declined** — on a truncated bucket
 list or any count mismatch (e.g. a date histogram that would lose rows
 missing the date column) it silently falls back rather than approximate.
@@ -438,7 +437,7 @@ retriever or a `1/(1+distance)` similarity for a plain knn, and the
   applies the residual filter, and generates highlight snippets from its
   own index. An unreachable member is skipped — its rows still surface
   through reachable replicas. Scoring uses **per-shard BM25 statistics**
-  (Elasticsearch's default across shards); a two-phase global-stats mode is
+  (the standard distributed-index default); a two-phase global-stats mode is
   a later phase. Post-resharding `Reclaim` leaves stale postings for
   moved-away keys — harmless (the authoritative re-read resolves them) and
   reclaimed by `REBUILD SEARCH INDEX`.
@@ -465,7 +464,7 @@ retriever or a `1/(1+distance)` similarity for a plain knn, and the
 - No `JOIN`, `UNION`, `DISTINCT` in the same query. A search predicate
   combines with `NEAREST` (vector) only through **hybrid `RANK BY RRF`** (see
   below), not as a boolean sibling.
-- Per-shard BM25 statistics (like Elasticsearch's default across shards);
-  a global-stats mode remains future work. "Parity" with ES is defined as
-  result-set parity, not identical score floats — BM25 constants and
+- Per-shard BM25 statistics (the standard distributed-index default); a
+  global-stats mode remains future work. Scoring targets result-set
+  stability, not identical score floats — BM25 constants and
   length normalization differ subtly between engines.

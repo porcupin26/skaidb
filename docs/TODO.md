@@ -35,9 +35,9 @@ git history.
   the original scale; also re-run the cluster leg (3-node ingest/scatter
   latency/kill-rejoin) and the sharded-scatter kill/reshard resilience
   demos, neither re-verified this pass either.
-- [ ] **[fts] Global BM25 statistics mode** — per-shard stats today (like
-  ES across shards); an optional global-stats mode if result-set parity
-  tests ever care.
+- [ ] **[fts] Global BM25 statistics mode** — per-shard stats today (each
+  shard scores against its own stats); an optional global-stats mode if
+  result-set parity tests ever care.
 - [ ] **[fts] ES-REST extras on demand**: `minimum_should_match` > 1,
   multi_match per-field `^boosts` (declined today with a pointer to
   `<col>.boost`), `top_hits` explicit sort, `_mget`, index templates —

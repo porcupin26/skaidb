@@ -172,8 +172,8 @@ Key facts an agent must know:
 - **Aggregates**: `COUNT(*)`, `COUNT(expr)`, `COUNT(DISTINCT expr)` (exact),
   filtered `COUNT(*)` is answered index-only when a secondary index fully
   covers a conjunctive equality/range filter (no row reads — safe on tables
-  of any size); one NULL-safe negated equality (`col != v OR col IS NULL`,
-  the Mongo-`$ne` shape) beside a covering conjunction counts by complement
+  of any size); one NULL-safe negated equality (`col != v OR col IS NULL`)
+  beside a covering conjunction counts by complement
   (two index-range cardinalities); other filtered counts stream with
   bounded memory (at consistency "one" on a full-copy cluster: a single
   local pass, like DISTINCT),

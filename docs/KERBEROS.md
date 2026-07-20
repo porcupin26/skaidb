@@ -1,7 +1,7 @@
 # Kerberos (GSSAPI) authentication
 
 skaidb can authenticate clients with a **Kerberos ticket** instead of a
-password, following MongoDB Enterprise's `$external` model: a KDC vouches for
+password, following an external-authentication model: a KDC vouches for
 the principal, and skaidb only maps that principal to a role. Both the binary
 protocol (drivers, `skaidbsh`) and REST/HTTP (browser SSO via SPNEGO) support
 it, alongside — not instead of — SCRAM password auth.
