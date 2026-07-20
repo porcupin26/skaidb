@@ -62,6 +62,39 @@ fn load_at_rest_kek(config: &Config) -> Result<Option<skaidb_engine::Kek>, Box<d
     }
 }
 
+/// Validate and apply the GSSAPI (Kerberos) config at startup. Fails LOUD so
+/// the server never comes up unable to honor `auth.gssapi_enabled` — a build
+/// without the `kerberos` feature (e.g. static-musl) or a missing keytab is a
+/// hard error, not a silent "GSSAPI just won't work".
+#[cfg(feature = "kerberos")]
+fn configure_gssapi(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    if !config.auth.gssapi_enabled {
+        return Ok(());
+    }
+    let keytab = &config.auth.gssapi_keytab;
+    if keytab.is_empty() {
+        return Err("auth.gssapi_enabled = true requires auth.gssapi_keytab (the service \
+                    keytab path)"
+            .into());
+    }
+    if !std::path::Path::new(keytab).exists() {
+        return Err(format!("auth.gssapi_keytab {keytab:?} does not exist or is not readable").into());
+    }
+    // Point the acceptor at the keytab once, process-wide, before serving.
+    skaidb_gssapi::set_keytab(keytab);
+    Ok(())
+}
+
+#[cfg(not(feature = "kerberos"))]
+fn configure_gssapi(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    if config.auth.gssapi_enabled {
+        return Err("auth.gssapi_enabled = true but this build lacks the `kerberos` feature \
+                    (the static-musl binary ships without Kerberos — use a glibc build)"
+            .into());
+    }
+    Ok(())
+}
+
 fn build_backend(db: Database, config: &Config) -> Result<Backend, Box<dyn std::error::Error>> {
     if config.cluster.seeds.is_empty() {
         return Ok(Backend::Local(Box::new(RwLock::new(db))));
@@ -190,6 +223,9 @@ pub fn run(
     // new files are encrypted only when at_rest_enabled. A configured-but-bad
     // keyfile fails startup LOUD — never silently plaintext.
     let kek = load_at_rest_kek(&config)?;
+    // GSSAPI (Kerberos) client auth: validate the feature/keytab and arm the
+    // acceptor's keytab before serving. Fails startup loud on misconfiguration.
+    configure_gssapi(&config)?;
     let storage_opts = skaidb_engine::EngineOptions {
         flush_threshold_bytes,
         read_cache_capacity,
@@ -1849,6 +1885,133 @@ pub(crate) mod tests {
         match AuthOutcome::decode(&read_frame(&mut conn).unwrap()).unwrap() {
             AuthOutcome::Denied { reason } => assert!(reason.contains("GSSAPI"), "{reason}"),
             other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    /// Startup GSSAPI validation fails LOUD on misconfiguration: enabled
+    /// without the `kerberos` feature, or (with it) without a readable keytab.
+    /// Disabled is always fine.
+    #[test]
+    fn gssapi_startup_config_is_validated() {
+        let mut cfg = Config::default();
+        assert!(!cfg.auth.gssapi_enabled, "default is disabled");
+        assert!(configure_gssapi(&cfg).is_ok(), "disabled must be ok");
+
+        cfg.auth.gssapi_enabled = true;
+
+        #[cfg(not(feature = "kerberos"))]
+        {
+            let err = configure_gssapi(&cfg).unwrap_err().to_string();
+            assert!(err.contains("kerberos"), "want feature hint, got: {err}");
+        }
+
+        #[cfg(feature = "kerberos")]
+        {
+            // Enabled but no keytab configured.
+            let err = configure_gssapi(&cfg).unwrap_err().to_string();
+            assert!(err.contains("gssapi_keytab"), "want keytab hint, got: {err}");
+            // Enabled with a nonexistent keytab.
+            cfg.auth.gssapi_keytab = "/nonexistent/skaidb.keytab".into();
+            let err = configure_gssapi(&cfg).unwrap_err().to_string();
+            assert!(
+                err.contains("does not exist") || err.contains("not readable"),
+                "want missing-file error, got: {err}"
+            );
+            // Enabled with a readable keytab file: accepted (arms the acceptor).
+            let kt = std::env::temp_dir().join(format!("skaidb-kt-{}", std::process::id()));
+            std::fs::write(&kt, b"keytab").unwrap();
+            cfg.auth.gssapi_keytab = kt.to_string_lossy().into_owned();
+            assert!(configure_gssapi(&cfg).is_ok(), "readable keytab must be ok");
+            let _ = std::fs::remove_file(&kt);
+        }
+    }
+
+    /// Full server GSSAPI accept path against a real KDC: a kinit'd client
+    /// drives the `AuthToken` frame exchange through the server's accept loop
+    /// and authenticates as the external user's role — no password. CI-skipped
+    /// (`#[ignore]`); run manually with the bench KDC:
+    ///
+    /// ```text
+    /// export KRB5_CONFIG=... KRB5CCNAME=... KRB5_KTNAME=/path/skaidb.keytab
+    /// export SKAIDB_TEST_SPN=skaidb/krb-kdc.skaidb.test@SKAIDB.TEST
+    /// kinit alice@SKAIDB.TEST
+    /// cargo test -p skaidb-server --features kerberos \
+    ///     gssapi_end_to_end_against_kdc -- --ignored --nocapture
+    /// ```
+    #[cfg(feature = "kerberos")]
+    #[test]
+    #[ignore = "requires a live KDC + service keytab + kinit ticket (see doc comment)"]
+    fn gssapi_end_to_end_against_kdc() {
+        use crate::shared::execute;
+        use skaidb_gssapi::{ClientHandshake, ClientStep};
+        use skaidb_proto::{read_frame, write_frame, AuthMechanism, AuthOutcome, AuthStart, AuthToken};
+        use std::net::TcpStream;
+
+        let keytab = std::env::var("KRB5_KTNAME").expect("set KRB5_KTNAME");
+        let spn = std::env::var("SKAIDB_TEST_SPN").expect("set SKAIDB_TEST_SPN");
+        skaidb_gssapi::set_keytab(&keytab);
+
+        let mut cfg = Config::default();
+        cfg.auth.gssapi_enabled = true;
+        cfg.auth.gssapi_keytab = keytab;
+        let ctx: Shared = Arc::new(Context {
+            backend: Backend::Local(Box::new(RwLock::new(Database::open(temp_dir()).unwrap()))),
+            metrics: Metrics::new(),
+            audit: RwLock::new(quiet_audit()),
+            authn: AuthState::disabled(),
+            superuser_role: "superuser".into(),
+            admin_lock: Mutex::new(()),
+            start: Instant::now(),
+            slow_log: crate::slowlog::SlowLog::new(),
+            config: RwLock::new(cfg),
+            config_path: None,
+            drivers_table_ensured: std::sync::atomic::AtomicBool::new(false),
+        });
+        // The external user the KDC vouches for.
+        assert_eq!(
+            execute(&ctx, r#"CREATE USER "alice@SKAIDB.TEST" GSSAPI"#),
+            Response::Ddl
+        );
+
+        let (addr, _h) = binary::spawn("127.0.0.1:0", ctx).unwrap();
+        let mut conn = TcpStream::connect(addr).unwrap();
+
+        // Client opens the mechanism and sends its first GSS token.
+        let (client, token0) =
+            ClientHandshake::new(&spn, None).expect("client init (did you kinit?)");
+        write_frame(
+            &mut conn,
+            &AuthStart {
+                username: "alice@SKAIDB.TEST".into(),
+                client_nonce: "c".into(),
+                mechanism: AuthMechanism::Gssapi,
+            }
+            .encode(),
+        )
+        .unwrap();
+        write_frame(&mut conn, &AuthToken { token: token0 }.encode()).unwrap();
+
+        // Drive server frames — an AuthToken advances the context; an
+        // AuthOutcome ends it.
+        let mut client = Some(client);
+        loop {
+            let frame = read_frame(&mut conn).expect("server frame");
+            if let Ok(tok) = AuthToken::decode(&frame) {
+                match client.take().expect("client present").step(&tok.token).expect("client step") {
+                    ClientStep::Continue { next, token } => {
+                        client = Some(next);
+                        write_frame(&mut conn, &AuthToken { token }.encode()).unwrap();
+                    }
+                    ClientStep::Done { .. } => { /* server sends AuthOutcome next */ }
+                }
+            } else if let Ok(outcome) = AuthOutcome::decode(&frame) {
+                match outcome {
+                    AuthOutcome::Ok { .. } => break, // authenticated as the principal's role
+                    AuthOutcome::Denied { reason } => panic!("GSSAPI denied: {reason}"),
+                }
+            } else {
+                panic!("unexpected handshake frame");
+            }
         }
     }
 

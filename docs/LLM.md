@@ -672,7 +672,12 @@ rest_port, data_dir, node_role, read_only (reject client mutations,
 superuser exempt — witness/maintenance mode); `[cluster]` seeds, internode_port,
 replication_factor, vnodes_per_node, default_read/write_consistency,
 anti_entropy_interval_secs; `[auth]` scram_enabled, superuser,
-superuser_password, internode_auth (`none`/`token`/`cert` — `cert` is mutual
+superuser_password, gssapi_enabled + gssapi_keytab (+ optional
+gssapi_service_principal) — accept Kerberos (SASL GSSAPI) client auth for
+external users (`CREATE USER "u@REALM" GSSAPI`); needs a `kerberos`-feature
+build (glibc/macOS/Windows — the static-musl binary ships WITHOUT it, and
+`gssapi_enabled=true` on such a build fails startup loud) and a readable
+keytab. SCRAM stays available alongside it. internode_auth (`none`/`token`/`cert` — `cert` is mutual
 TLS and the only mode that ENCRYPTS internode traffic; `token` authenticates
 only. `internode_tls_{cert,key,ca}` for cert mode; mint them with
 `skaidbsh certs gen --out DIR --nodes N`. Effective mode shows at `/status` as

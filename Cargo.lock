@@ -1375,6 +1375,7 @@ dependencies = [
  "skaidb-config",
  "skaidb-driver",
  "skaidb-engine",
+ "skaidb-gssapi",
  "skaidb-net",
  "skaidb-proto",
  "skaidb-sql",

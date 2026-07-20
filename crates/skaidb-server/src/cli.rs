@@ -70,6 +70,12 @@ pub struct Cli {
     pub x509_enabled: Option<bool>,
     #[arg(long, env = "SKAIDB_X509_CA_FILE")]
     pub x509_ca_file: Option<String>,
+    #[arg(long, env = "SKAIDB_GSSAPI_ENABLED")]
+    pub gssapi_enabled: Option<bool>,
+    #[arg(long, env = "SKAIDB_GSSAPI_KEYTAB")]
+    pub gssapi_keytab: Option<String>,
+    #[arg(long, env = "SKAIDB_GSSAPI_SERVICE_PRINCIPAL")]
+    pub gssapi_service_principal: Option<String>,
     #[arg(long, value_enum, ignore_case = true, env = "SKAIDB_INTERNODE_AUTH")]
     pub internode_auth: Option<InternodeAuth>,
     #[arg(long, env = "SKAIDB_INTERNODE_TOKEN")]
@@ -197,6 +203,9 @@ impl Cli {
             scram_enabled => config.auth.scram_enabled,
             x509_enabled => config.auth.x509_enabled,
             x509_ca_file => config.auth.x509_ca_file,
+            gssapi_enabled => config.auth.gssapi_enabled,
+            gssapi_keytab => config.auth.gssapi_keytab,
+            gssapi_service_principal => config.auth.gssapi_service_principal,
             internode_auth => config.auth.internode_auth,
             internode_token => config.auth.internode_token,
             internode_keyfile => config.auth.internode_keyfile,

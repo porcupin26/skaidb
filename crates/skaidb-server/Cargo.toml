@@ -17,8 +17,18 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+default = []
+# Kerberos (SASL GSSAPI) client auth. Pulls in skaidb-gssapi -> cross-krb5, a
+# C library that links only on glibc/macOS/Windows — never the static-musl
+# build. The release matrix enables this on those targets and leaves it off
+# for musl. Without it, a client requesting GSSAPI is refused cleanly.
+kerberos = ["dep:skaidb-gssapi", "skaidb-gssapi/kerberos"]
+
 [dependencies]
 skaidb-config.workspace = true
+# Optional: only compiled with the `kerberos` feature (see above).
+skaidb-gssapi = { workspace = true, optional = true }
 skaidb-engine.workspace = true
 skaidb-tsdb.workspace = true
 skaidb-cluster.workspace = true

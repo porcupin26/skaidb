@@ -24,6 +24,14 @@ max_staleness_ms = 5000
 scram_enabled = true
 x509_enabled = false
 x509_ca_file = ""
+# Kerberos (SASL GSSAPI) client auth. Requires a build with the `kerberos`
+# feature (glibc/macOS/Windows — the static-musl binary ships without it) and a
+# readable service keytab. Clients then log in as external users created with
+# `CREATE USER "user@REALM" GSSAPI` (no password). SCRAM stays available too.
+gssapi_enabled = false
+gssapi_keytab = ""              # e.g. "/etc/skaidb/skaidb.keytab"
+# Optional explicit service principal; empty accepts whatever the keytab holds.
+gssapi_service_principal = ""   # e.g. "skaidb/host.example.com@REALM"
 # Internode authentication: "none" (trusted network), "token" (shared secret),
 # or "cert" (mutual TLS). Every node must use the same mode and material.
 internode_auth = "none"

@@ -112,10 +112,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Kerberos (skaidb-server/kerberos -> cross-krb5) is enabled only
+          # where the C krb5 library links cleanly: x86_64 glibc (prod's .deb),
+          # macOS (GSS.framework), and Windows (SSPI). It is OFF for musl (the
+          # static binary must not link a C krb5) and for aarch64-linux (avoids
+          # cross-compiling libkrb5 for arm64). Entries with no `features` build
+          # without it.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             packaging: linux
             nfpm_arch: amd64
+            features: skaidb-server/kerberos
+            apt: libkrb5-dev
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             packaging: linux
@@ -129,12 +137,15 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-latest
             packaging: macos
+            features: skaidb-server/kerberos
           - target: aarch64-apple-darwin
             os: macos-latest
             packaging: macos
+            features: skaidb-server/kerberos
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             packaging: windows
+            features: skaidb-server/kerberos
     steps:
       - uses: actions/checkout@v6
         with:
@@ -167,7 +178,10 @@ jobs:
           echo "CC_$(echo '${{ matrix.target }}' | tr '-' '_')=${{ matrix.linker }}" >>"$GITHUB_ENV"
 
       - name: Build release binaries
-        run: cargo build --release --target ${{ matrix.target }} -p skaidb-server -p skaidb-cli
+        # `--features ""` (targets with no `features` matrix value) is a no-op;
+        # `--features skaidb-server/kerberos` enables Kerberos on that package
+        # only (skaidb-cli has no such feature).
+        run: cargo build --release --target ${{ matrix.target }} -p skaidb-server -p skaidb-cli --features "${{ matrix.features }}"
 
       # ---- packaging: Linux (tarball + .deb + .rpm) ----
       - name: Install nfpm

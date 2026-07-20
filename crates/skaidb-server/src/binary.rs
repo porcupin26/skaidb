@@ -391,21 +391,119 @@ fn authenticate_scram<C: io::Read + io::Write>(
     }
 }
 
+/// Write a GSSAPI denial, record the failed login, and drop the connection.
+fn deny_gssapi<C: io::Write>(
+    conn: &mut C,
+    ctx: &Shared,
+    username: &str,
+    reason: &str,
+) -> Result<String, ()> {
+    let _ = write_frame(conn, &AuthOutcome::Denied { reason: reason.to_string() }.encode());
+    ctx.metrics.incr_login_failure();
+    ctx.audit().log_login(username, None, false);
+    Err(())
+}
+
 /// GSSAPI (Kerberos): an N-round `AuthToken` exchange driving the GSS accept
-/// loop, ending in `AuthOutcome`. The accept loop lands in phase 3 behind the
-/// `kerberos` cargo feature (glibc targets only); until then — and on any
-/// build without the feature — the mechanism is refused cleanly so a client
-/// that requests it gets a definite answer rather than a hang.
+/// loop, ending in `AuthOutcome`. The client sends the first token; each side
+/// shuttles tokens until the context is established, then the server maps the
+/// authenticated principal to an external user's role (the phase-2 identity
+/// seam). Compiled only with the `kerberos` feature (glibc/macOS/Windows).
+#[cfg(feature = "kerberos")]
 fn authenticate_gssapi<C: io::Read + io::Write>(
     conn: &mut C,
     ctx: &Shared,
     start: &AuthStart,
 ) -> Result<String, ()> {
-    let reason = "GSSAPI authentication is not enabled on this server".to_string();
-    let _ = write_frame(conn, &AuthOutcome::Denied { reason }.encode());
-    ctx.metrics.incr_login_failure();
-    ctx.audit().log_login(&start.username, None, false);
-    Err(())
+    use skaidb_gssapi::{ServerHandshake, ServerStep};
+    use skaidb_proto::AuthToken;
+
+    // Config gate + optional explicit SPN (empty = accept any keytab key).
+    let (enabled, spn) = {
+        let cfg = ctx.config.read().unwrap_or_else(|e| e.into_inner());
+        (
+            cfg.auth.gssapi_enabled,
+            (!cfg.auth.gssapi_service_principal.is_empty())
+                .then(|| cfg.auth.gssapi_service_principal.clone()),
+        )
+    };
+    if !enabled {
+        return deny_gssapi(conn, ctx, &start.username, "GSSAPI authentication is not enabled");
+    }
+
+    let read_token = |conn: &mut C| -> Option<Vec<u8>> {
+        AuthToken::decode(&read_frame(conn).ok()?).ok().map(|t| t.token)
+    };
+    let Some(mut client_token) = read_token(conn) else {
+        return deny_gssapi(conn, ctx, &start.username, "expected an initial GSSAPI token");
+    };
+    let mut handshake = match ServerHandshake::new(spn.as_deref()) {
+        Ok(h) => h,
+        Err(e) => {
+            return deny_gssapi(conn, ctx, &start.username, &format!("GSSAPI unavailable: {e}"));
+        }
+    };
+    let principal = loop {
+        match handshake.step(&client_token) {
+            Ok(ServerStep::Continue { next, token }) => {
+                if write_frame(conn, &AuthToken { token }.encode()).is_err() {
+                    return Err(());
+                }
+                handshake = next;
+                match read_token(conn) {
+                    Some(t) => client_token = t,
+                    None => return Err(()),
+                }
+            }
+            Ok(ServerStep::Done { principal, token }) => {
+                // Final mutual-auth token to the client, if the mechanism
+                // produced one.
+                if let Some(token) = token {
+                    let _ = write_frame(conn, &AuthToken { token }.encode());
+                }
+                break principal;
+            }
+            Err(e) => {
+                return deny_gssapi(
+                    conn,
+                    ctx,
+                    &start.username,
+                    &format!("GSSAPI authentication failed: {e}"),
+                );
+            }
+        }
+    };
+
+    // Map the cryptographically-authenticated principal to a role. The
+    // AuthStart username is untrusted here — only the GSS principal counts.
+    match ctx.lookup_external_role(&principal) {
+        Some(role) => {
+            // GSSAPI has no SCRAM server signature; the GSS mutual-auth token
+            // already proved the server. Send a zero signature for the shared
+            // AuthOutcome shape.
+            let _ = write_frame(conn, &AuthOutcome::Ok { server_signature: [0u8; 32] }.encode());
+            ctx.metrics.incr_login();
+            ctx.audit().log_login(&principal, Some(&role), true);
+            Ok(role)
+        }
+        None => deny_gssapi(
+            conn,
+            ctx,
+            &principal,
+            &format!("no GSSAPI user for principal {principal:?} (create one with CREATE USER … GSSAPI)"),
+        ),
+    }
+}
+
+/// Without the `kerberos` feature (e.g. the static-musl build), GSSAPI is
+/// refused cleanly so a client that requests it gets a definite answer.
+#[cfg(not(feature = "kerberos"))]
+fn authenticate_gssapi<C: io::Read + io::Write>(
+    conn: &mut C,
+    ctx: &Shared,
+    start: &AuthStart,
+) -> Result<String, ()> {
+    deny_gssapi(conn, ctx, &start.username, "GSSAPI authentication is not enabled on this server")
 }
 
 /// Intercept `SET CONSISTENCY { ONE | QUORUM | ALL }` — per-connection

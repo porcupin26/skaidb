@@ -271,6 +271,19 @@ pub struct AuthConfig {
     pub scram_enabled: bool,
     pub x509_enabled: bool,
     pub x509_ca_file: String,
+    /// Accept Kerberos (SASL GSSAPI) client authentication. Requires a build
+    /// with the `kerberos` feature (glibc/macOS/Windows — the static-musl
+    /// binary ships without it) and a readable `gssapi_keytab`. Clients then
+    /// authenticate as external users (`CREATE USER "<principal>" GSSAPI`) with
+    /// no password. SCRAM stays available alongside it.
+    pub gssapi_enabled: bool,
+    /// Path to the service keytab holding the skaidb service principal's
+    /// long-term key (the GSSAPI `KRB5_KTNAME`). Read once at startup.
+    pub gssapi_keytab: String,
+    /// Service principal to accept as, e.g. `skaidb/host.example.com@REALM`.
+    /// Empty accepts whatever principals the keytab holds (the usual case —
+    /// the acceptor tries every key in the keytab).
+    pub gssapi_service_principal: String,
     pub internode_auth: InternodeAuth,
     /// Token mode: inline shared secret. Takes precedence over `internode_keyfile`.
     pub internode_token: String,
@@ -569,6 +582,9 @@ impl Default for AuthConfig {
             scram_enabled: true,
             x509_enabled: false,
             x509_ca_file: String::new(),
+            gssapi_enabled: false,
+            gssapi_keytab: String::new(),
+            gssapi_service_principal: String::new(),
             internode_auth: InternodeAuth::None,
             internode_token: String::new(),
             internode_keyfile: String::new(),
