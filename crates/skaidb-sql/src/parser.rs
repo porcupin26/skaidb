@@ -1179,6 +1179,17 @@ impl Parser {
                 Err(idx) => query.offset_param = Some(idx),
             }
         }
+        // `AFTER (<sort-value>, <pk-value>)` — deep-pagination keyset cursor
+        // (contextual ident, like `rank`/`rerank`).
+        if self.eat_ident_ci("after") {
+            self.expect(&Token::LParen)?;
+            let mut values = vec![self.parse_expr()?];
+            while self.eat(&Token::Comma) {
+                values.push(self.parse_expr()?);
+            }
+            self.expect(&Token::RParen)?;
+            query.after = Some(values);
+        }
         Ok(query)
     }
 
@@ -1247,6 +1258,7 @@ impl Parser {
                 order_by: Vec::new(),
                 limit: None,
                 offset: None,
+                after: None,
                 limit_param: None,
                 offset_param: None,
             });
@@ -1389,6 +1401,7 @@ impl Parser {
             order_by: Vec::new(),
             limit: None,
             offset: None,
+            after: None,
             limit_param: None,
             offset_param: None,
         })
@@ -2686,6 +2699,44 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(parse("SELECT id FROM docs WHERE MATCH(body, 'x') RERANK TOP 0").is_err());
+    }
+
+    #[test]
+    fn parse_after_clause() {
+        match parse(
+            "SELECT id FROM docs WHERE MATCH(body, 'x') ORDER BY score() DESC \
+             LIMIT 10 AFTER (0.53, 42)",
+        )
+        .unwrap()
+        {
+            Statement::Select(s) => {
+                let after = s.after.expect("after parsed");
+                assert_eq!(after.len(), 2);
+                assert_eq!(after[0], Expr::Literal(Value::Float(0.53)));
+                assert_eq!(after[1], Expr::Literal(Value::Int(42)));
+                assert_eq!(s.limit, Some(10));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Bind parameters work as cursor values.
+        match parse(
+            "SELECT id FROM docs WHERE MATCH(body, 'x') ORDER BY ts DESC \
+             LIMIT 5 AFTER (?, ?)",
+        )
+        .unwrap()
+        {
+            Statement::Select(s) => {
+                let after = s.after.expect("after parsed");
+                assert_eq!(after, vec![Expr::Parameter(0), Expr::Parameter(1)]);
+            }
+            other => panic!("{other:?}"),
+        }
+        // No AFTER → None; empty parens are malformed.
+        match parse("SELECT id FROM docs WHERE MATCH(body, 'x') LIMIT 5").unwrap() {
+            Statement::Select(s) => assert!(s.after.is_none()),
+            other => panic!("{other:?}"),
+        }
+        assert!(parse("SELECT id FROM docs WHERE MATCH(body, 'x') LIMIT 5 AFTER ()").is_err());
     }
 
     #[test]

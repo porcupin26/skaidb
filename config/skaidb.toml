@@ -94,6 +94,8 @@ login_log_file = ""
 # NEAREST query. OpenAI/TEI-compatible: POST url {"model","input":[texts]} ->
 # {"data":[{"embedding":[...]}]}.
 [inference]
+# Every key here can also be set via SKAIDB_INFERENCE_<KEY> env vars
+# (e.g. SKAIDB_INFERENCE_API_KEY), applied over this file at startup.
 enabled = false
 url = ""                     # e.g. "https://api.openai.com/v1/embeddings" or a local TEI URL
 model = ""                   # e.g. "text-embedding-3-small"

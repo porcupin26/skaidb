@@ -524,6 +524,30 @@ impl Config {
         obj.insert(field.to_string(), coerced);
         serde_json::from_value(root).map_err(|e| format!("invalid value for `{key}`: {e}"))
     }
+
+    /// Apply `SKAIDB_INFERENCE_<FIELD>` environment overrides to the
+    /// `[inference]` section — e.g. `SKAIDB_INFERENCE_URL`,
+    /// `SKAIDB_INFERENCE_API_KEY`, `SKAIDB_INFERENCE_ENABLED`,
+    /// `SKAIDB_INFERENCE_RERANK_URL`. Values are coerced and validated like
+    /// [`Config::with_key_set`], so an unknown field or ill-typed value fails
+    /// startup loudly. Lets deployments keep secrets (the API key) and
+    /// per-host endpoints out of the shared config file.
+    pub fn with_env_overrides(self) -> Result<Config, String> {
+        const PREFIX: &str = "SKAIDB_INFERENCE_";
+        let mut vars: Vec<(String, String)> = std::env::vars()
+            .filter(|(k, _)| k.starts_with(PREFIX))
+            .collect();
+        // Deterministic application order.
+        vars.sort();
+        let mut cfg = self;
+        for (name, value) in vars {
+            let field = name[PREFIX.len()..].to_ascii_lowercase();
+            cfg = cfg
+                .with_key_set(&format!("inference.{field}"), &value)
+                .map_err(|e| format!("{name}: {e}"))?;
+        }
+        Ok(cfg)
+    }
 }
 
 /// Dotted config keys whose changes take effect immediately, without a restart.
@@ -761,6 +785,34 @@ mod tests {
             .with_key_set("cluster.seeds", "a:7100, b:7100 , c:7100")
             .unwrap();
         assert_eq!(c.cluster.seeds, vec!["a:7100", "b:7100", "c:7100"]);
+    }
+
+    #[test]
+    fn inference_env_overrides_apply_and_validate() {
+        // Typed coercion: strings, bools, and ints all land in [inference].
+        std::env::set_var("SKAIDB_INFERENCE_ENABLED", "true");
+        std::env::set_var("SKAIDB_INFERENCE_URL", "http://tei:8080/v1/embeddings");
+        std::env::set_var("SKAIDB_INFERENCE_DIM", "768");
+        std::env::set_var("SKAIDB_INFERENCE_RERANK_URL", "http://tei:8080/rerank");
+        let c = Config::default().with_env_overrides().unwrap();
+        assert!(c.inference.enabled);
+        assert_eq!(c.inference.url, "http://tei:8080/v1/embeddings");
+        assert_eq!(c.inference.dim, 768);
+        assert_eq!(c.inference.rerank_url, "http://tei:8080/rerank");
+        // An unknown field or ill-typed value fails loudly.
+        std::env::set_var("SKAIDB_INFERENCE_DIM", "lots");
+        assert!(Config::default().with_env_overrides().is_err());
+        std::env::remove_var("SKAIDB_INFERENCE_DIM");
+        std::env::set_var("SKAIDB_INFERENCE_NOPE", "1");
+        assert!(Config::default().with_env_overrides().is_err());
+        for v in [
+            "SKAIDB_INFERENCE_ENABLED",
+            "SKAIDB_INFERENCE_URL",
+            "SKAIDB_INFERENCE_RERANK_URL",
+            "SKAIDB_INFERENCE_NOPE",
+        ] {
+            std::env::remove_var(v);
+        }
     }
 
     #[test]

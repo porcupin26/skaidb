@@ -76,6 +76,7 @@ FROM <table> [[AS] <alias>]
 [ { UNION | UNION ALL } <select> ... ]
 [ORDER BY <expr> [ASC|DESC] [, <expr> [ASC|DESC] ...]]
 [LIMIT <n>] [OFFSET <n>]
+[AFTER (<sort-value>, <pk-value>)]      -- deep pagination: keyset cursor (search queries)
 
 <join> := [INNER | LEFT [OUTER] | RIGHT [OUTER] | CROSS] JOIN <table> [[AS] <alias>] [ON <expr>]
 
@@ -637,6 +638,45 @@ fusion score). Requires a search predicate in `WHERE`; cannot combine with
 is opt-in per query, so a down rerank endpoint fails only queries that ask
 for it. ES clients reach the same path via the `text_similarity_reranker`
 retriever ([SEARCH.md](SEARCH.md)).
+
+## Deep pagination (`AFTER`)
+
+Stable keyset pagination for search queries — the SQL analogue of
+Elasticsearch's `search_after`. Instead of `OFFSET` (which re-fetches and
+discards every earlier row, and shifts under concurrent writes), pass the
+previous page's **last sort value and last primary-key value**:
+
+```sql
+-- page 1
+SELECT id, title, score() FROM docs
+WHERE MATCH(body, 'compaction') ORDER BY score() DESC LIMIT 10;
+-- page 2: strictly after (last score, last id) of page 1
+SELECT id, title, score() FROM docs
+WHERE MATCH(body, 'compaction') ORDER BY score() DESC LIMIT 10
+AFTER (0.7311, 'doc-141');
+```
+
+Works with `ORDER BY score() DESC` (cursor = last score) or `ORDER BY <col>
+[ASC|DESC]` (cursor = last column value). The **primary key is the implicit
+tie-break, always ascending** — every sorted search page is ordered
+`(sort value, pk)` deterministically, so ties never straddle a page boundary
+inconsistently. Rules:
+
+- Requires a search predicate in `WHERE`, exactly one `ORDER BY` key, and
+  `LIMIT`; a **single-column** primary key; mutually exclusive with `OFFSET`,
+  `GROUP BY`/`DISTINCT`, `RANK BY RRF`, and `RERANK`. Filter-only (non-search)
+  queries should keyset-paginate with `WHERE <col> > <last>` instead.
+- The cursor is resolved by re-ranking: the fetch depth doubles until the page
+  fills or the match set is exhausted (capped at 65,536 ranked hits), so a
+  page costs about the same as the equivalent `OFFSET` fetch — the win is
+  **stability** (concurrent writes never shift or duplicate pages; a row
+  inserted before the cursor simply never appears) plus no offset ceiling.
+- Score-sorted deep paging inherits the usual distributed-search caveat
+  (per-shard BM25 statistics; scores move if the index changes between
+  pages) — the same caveat ES documents for `search_after` without a PIT.
+
+ES clients use the `_search` `search_after` parameter, echoing each hit's
+`sort` array ([SEARCH.md](SEARCH.md)).
 
 ## Full-text search (`MATCH` / `SEARCH`)
 

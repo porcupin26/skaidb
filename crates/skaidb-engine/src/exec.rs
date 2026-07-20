@@ -2187,6 +2187,14 @@ impl Database {
                         );
                     }
                 }
+                if sel.after.is_some() {
+                    push(
+                        "page",
+                        "AFTER keyset cursor: ranked fetch (doubling depth) filtered \
+                         strictly after the (sort value, primary key) cursor"
+                            .into(),
+                    );
+                }
                 if let Some(rr) = &sel.rerank {
                     push(
                         "rerank",
@@ -8483,6 +8491,14 @@ pub fn run(stmt: Statement, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
              NEAREST … RANK BY RRF)"
                 .into(),
         )),
+        // AFTER pages a ranked search; a filter-only or NEAREST select has no
+        // stable rank to cursor over — keyset-paginate those with a WHERE
+        // range on the sort column instead.
+        Statement::Select(sel) if sel.after.is_some() => Err(EngineError::Unsupported(
+            "AFTER requires a MATCH()/SEARCH() query ordered by score() DESC or a \
+             column; for filter-only queries page with `WHERE <col> > <last>` instead"
+                .into(),
+        )),
         // SELECT only reads: reborrow shared so the executor's read-only
         // requirements are checked by the compiler.
         Statement::Select(sel) => run_select(&sel, &*cluster).map(QueryOutput::Rows),
@@ -8727,6 +8743,11 @@ fn run_hybrid_select(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSe
     if !sel.order_by.is_empty() {
         return Err(EngineError::Unsupported(
             "RANK BY RRF results are ordered by rrf_score(); ORDER BY is not supported".into(),
+        ));
+    }
+    if sel.after.is_some() {
+        return Err(EngineError::Unsupported(
+            "AFTER is not supported with RANK BY RRF (fused ranks are not a stable cursor)".into(),
         ));
     }
     check_bound_counts(sel)?;
@@ -9024,6 +9045,203 @@ fn collect_search_fields(query: &SearchQuery, out: &mut Vec<String>) {
                 collect_search_fields(sub, out);
             }
         }
+    }
+}
+
+/// Fetch-size ceiling for the `AFTER` keyset-cursor doubling loop: a cursor
+/// deeper than this many ranked hits errors instead of fetching unboundedly.
+const AFTER_FETCH_MAX: usize = 65_536;
+
+/// The parsed `AFTER (<sort-value>, <pk-value>)` cursor: the previous page's
+/// last sort value plus that row's encoded key (the ascending tie-break).
+struct AfterCursor {
+    sort_value: Value,
+    key: Vec<u8>,
+}
+
+/// Evaluate and validate the `AFTER` clause against the table's primary key.
+fn parse_after_cursor(sel: &Select, cluster: &dyn Cluster) -> Result<AfterCursor> {
+    let values = sel.after.as_ref().expect("caller checked");
+    let [sort_expr, pk_expr] = values.as_slice() else {
+        return Err(EngineError::Type(
+            "AFTER takes exactly (last sort value, last primary-key value)".into(),
+        ));
+    };
+    let empty = Document::new();
+    let sort_value = eval(sort_expr, &empty)?;
+    let pk_value = eval(pk_expr, &empty)?;
+    if matches!(pk_value, Value::Null) {
+        return Err(EngineError::Type(
+            "AFTER primary-key value must not be NULL".into(),
+        ));
+    }
+    let pk = cluster.primary_key(&sel.from)?;
+    if pk.len() != 1 {
+        return Err(EngineError::Unsupported(
+            "AFTER requires a single-column primary key (the cursor tie-break)".into(),
+        ));
+    }
+    Ok(AfterCursor {
+        sort_value,
+        key: Value::Array(vec![pk_value]).encode_key(),
+    })
+}
+
+/// Deep pagination (`AFTER` keyset cursor — ES `search_after`) over a search
+/// select ordered by `score() DESC` or a single plain column. The ranked
+/// fetch is filtered to rows strictly after the `(sort value, primary key)`
+/// cursor; because the cursor's rank is unknown, the fetch depth doubles
+/// until a full page is found or the match set is exhausted (per-page cost ≈
+/// an equivalent `OFFSET` fetch — the win is a STABLE cursor: concurrent
+/// writes never shift or duplicate pages — and no depth cap beyond
+/// [`AFTER_FETCH_MAX`]).
+fn run_search_after(
+    sel: &Select,
+    cluster: &mut dyn Cluster,
+    query: &SearchQuery,
+    residual: &Option<Expr>,
+) -> Result<ResultSet> {
+    if sel.offset.is_some() {
+        return Err(EngineError::Unsupported(
+            "AFTER is a keyset cursor; OFFSET is not supported — page with AFTER alone".into(),
+        ));
+    }
+    if sel.rerank.is_some() {
+        return Err(EngineError::Unsupported(
+            "AFTER cannot be combined with RERANK (rerank scores are not a stable cursor)".into(),
+        ));
+    }
+    if is_grouped(sel) || sel.group_top.is_some() || sel.distinct {
+        return Err(EngineError::Unsupported(
+            "AFTER cannot be combined with GROUP BY, aggregates, or DISTINCT".into(),
+        ));
+    }
+    let limit = sel.limit.ok_or_else(|| {
+        EngineError::Unsupported("AFTER requires LIMIT (the page size)".into())
+    })? as usize;
+    let cursor = parse_after_cursor(sel, &*cluster)?;
+    let highlights = collect_highlights(sel)?;
+    let first_fetch = limit.saturating_mul(2).clamp(64, AFTER_FETCH_MAX);
+
+    match sel.order_by.as_slice() {
+        // Relevance pages: ORDER BY score() DESC — cursor = (score, key).
+        [key] if key.descending && is_score_call(&key.expr) => {
+            let c_score = match &cursor.sort_value {
+                Value::Int(i) => *i as f64,
+                Value::Float(f) => *f,
+                _ => {
+                    return Err(EngineError::Type(
+                        "AFTER with ORDER BY score() takes a numeric score cursor".into(),
+                    ))
+                }
+            };
+            let mut k = first_fetch;
+            loop {
+                let mut hits = cluster.search(&sel.from, query, Some(k), residual, &highlights)?;
+                let exhausted = hits.len() < k;
+                // Deterministic page order: score desc, then key asc.
+                hits.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+                let page: Vec<Document> = hits
+                    .into_iter()
+                    .filter(|(hkey, _, score)| {
+                        let s = f64::from(*score);
+                        s < c_score || (s == c_score && hkey.as_slice() > cursor.key.as_slice())
+                    })
+                    .take(limit)
+                    .map(|(_, mut doc, score)| {
+                        doc.insert("_score", Value::Float(f64::from(score)));
+                        doc
+                    })
+                    .collect();
+                if page.len() >= limit || exhausted {
+                    return project(sel, page, &HashSet::new(), true);
+                }
+                if k >= AFTER_FETCH_MAX {
+                    return Err(EngineError::ResourceLimit(format!(
+                        "AFTER cursor is deeper than {AFTER_FETCH_MAX} ranked hits — \
+                         narrow the query"
+                    )));
+                }
+                k = k.saturating_mul(2).min(AFTER_FETCH_MAX);
+            }
+        }
+        // Field-sorted pages: ORDER BY <col> [ASC|DESC] — cursor = (value, key).
+        [key] => {
+            let Expr::Column(col) = &key.expr else {
+                return Err(EngineError::Unsupported(
+                    "AFTER requires ORDER BY score() DESC or ORDER BY <column>".into(),
+                ));
+            };
+            let single = std::slice::from_ref(key);
+            let sort_val = |doc: &Document| doc.get_path(col).cloned().unwrap_or(Value::Null);
+            let strictly_after = |v: &Value, hkey: &[u8]| {
+                match order_compare(
+                    std::slice::from_ref(v),
+                    std::slice::from_ref(&cursor.sort_value),
+                    single,
+                ) {
+                    std::cmp::Ordering::Greater => true,
+                    std::cmp::Ordering::Equal => hkey > cursor.key.as_slice(),
+                    std::cmp::Ordering::Less => false,
+                }
+            };
+            let finish = |mut rows: Vec<(Vec<u8>, Document)>| -> Result<ResultSet> {
+                rows.sort_by(|a, b| {
+                    order_compare(
+                        std::slice::from_ref(&sort_val(&a.1)),
+                        std::slice::from_ref(&sort_val(&b.1)),
+                        single,
+                    )
+                    .then_with(|| a.0.cmp(&b.0))
+                });
+                let page: Vec<Document> = rows
+                    .into_iter()
+                    .filter(|(hkey, doc)| strictly_after(&sort_val(doc), hkey))
+                    .take(limit)
+                    .map(|(_, doc)| doc)
+                    .collect();
+                project(sel, page, &HashSet::new(), true)
+            };
+            let sort = skaidb_fts::SortSpec {
+                column: col.clone(),
+                descending: key.descending,
+            };
+            let mut k = first_fetch;
+            loop {
+                let Some(rows) =
+                    cluster.search_sorted(&sel.from, query, &sort, k, residual, &highlights)?
+                else {
+                    // No index-ordered pushdown for this column/deployment:
+                    // gather every match and page over the exact full order.
+                    let hits = cluster.search(&sel.from, query, None, residual, &highlights)?;
+                    return finish(hits.into_iter().map(|(hkey, doc, _)| (hkey, doc)).collect());
+                };
+                let exhausted = rows.len() < k;
+                // Count the post-cursor rows before committing to this fetch.
+                let found = rows
+                    .iter()
+                    .filter(|(hkey, doc)| strictly_after(&sort_val(doc), hkey))
+                    .count();
+                if found >= limit || exhausted {
+                    return finish(rows);
+                }
+                if k >= AFTER_FETCH_MAX {
+                    return Err(EngineError::ResourceLimit(format!(
+                        "AFTER cursor is deeper than {AFTER_FETCH_MAX} sorted hits — \
+                         narrow the query"
+                    )));
+                }
+                k = k.saturating_mul(2).min(AFTER_FETCH_MAX);
+            }
+        }
+        [] => Err(EngineError::Unsupported(
+            "AFTER requires ORDER BY score() DESC or ORDER BY <column> (plus LIMIT)".into(),
+        )),
+        _ => Err(EngineError::Unsupported(
+            "AFTER supports exactly one ORDER BY key — the primary key is the \
+             implicit ascending tie-break"
+                .into(),
+        )),
     }
 }
 
@@ -9529,6 +9747,10 @@ fn run_search_select(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSe
         1 => queries.pop().expect("len checked"),
         _ => SearchQuery::All(queries),
     };
+    // AFTER: deep pagination by keyset cursor (ES `search_after`).
+    if sel.after.is_some() {
+        return run_search_after(sel, cluster, &query, &residual);
+    }
     // RERANK: fetch the top `TOP` candidates by BM25, re-score them with the
     // external cross-encoder, and serve the page from the reranker's order
     // (the rerank score lands in `_score`, so `score()` reads it).
@@ -9614,25 +9836,47 @@ fn run_search_select(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSe
                         column: col.clone(),
                         descending: key.descending,
                     };
-                    if let Some(hits) = cluster.search_sorted(
+                    if let Some(mut hits) = cluster.search_sorted(
                         &sel.from, &query, &sort, want, &residual, &highlights,
                     )? {
+                        // Deterministic tie-break by key (ascending), so page
+                        // order agrees with the AFTER cursor order.
+                        let single = std::slice::from_ref(key);
+                        hits.sort_by(|a, b| {
+                            let va = a.1.get_path(col).cloned().unwrap_or(Value::Null);
+                            let vb = b.1.get_path(col).cloned().unwrap_or(Value::Null);
+                            order_compare(
+                                std::slice::from_ref(&va),
+                                std::slice::from_ref(&vb),
+                                single,
+                            )
+                            .then_with(|| a.0.cmp(&b.0))
+                        });
                         let docs = hits.into_iter().map(|(_, d)| d).collect();
                         // The generic sort in `project` re-orders the
                         // already-bounded gather identically (the pushdown
-                        // declined if NULL ordering could diverge).
+                        // declined if NULL ordering could diverge; ties keep
+                        // the key order — the doc sort is stable).
                         return project(sel, docs, &HashSet::new(), true);
                     }
                 }
             }
-            // Fallback: every matching row, ordered by the executor.
-            let hits = cluster.search(&sel.from, &query, None, &residual, &highlights)?;
+            // Fallback: every matching row, ordered by the executor. Pre-sort
+            // by key so the executor's stable sort tie-breaks by key
+            // (ascending) — same page order as the AFTER cursor.
+            let mut hits = cluster.search(&sel.from, &query, None, &residual, &highlights)?;
+            hits.sort_by(|a, b| a.0.cmp(&b.0));
             let docs: Vec<Document> = hits.into_iter().map(|(_, d, _)| d).collect();
             return project(sel, docs, &HashSet::new(), true);
         }
     };
     let highlights = collect_highlights(sel)?;
-    let hits = cluster.search(&sel.from, &query, k, &residual, &highlights)?;
+    let mut hits = cluster.search(&sel.from, &query, k, &residual, &highlights)?;
+    if k.is_some() {
+        // Ranked page: deterministic tie-break by key (ascending), so page
+        // order agrees with the AFTER cursor order.
+        hits.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    }
     let docs: Vec<Document> = hits
         .into_iter()
         .map(|(_, mut doc, score)| {
@@ -9641,7 +9885,8 @@ fn run_search_select(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSe
         })
         .collect();
     // `project` with `finalize` applies the ORDER BY (score() reads the
-    // injected `_score`) and the OFFSET/LIMIT page.
+    // injected `_score`; the stable doc sort keeps the key tie-break) and the
+    // OFFSET/LIMIT page.
     project(sel, docs, &HashSet::new(), true)
 }
 

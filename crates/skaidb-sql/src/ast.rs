@@ -484,6 +484,13 @@ pub struct Select {
     pub order_by: Vec<OrderKey>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+    /// `AFTER (<sort-value>, <pk-value>)` — deep-pagination keyset cursor
+    /// (ES `search_after`): resume the page sequence strictly after the row
+    /// identified by the previous page's last sort value plus its primary-key
+    /// value (the tie-break, always ascending). Requires a search query with
+    /// `ORDER BY score() DESC` or `ORDER BY <col>` plus `LIMIT`; mutually
+    /// exclusive with `OFFSET`.
+    pub after: Option<Vec<Expr>>,
     /// `LIMIT ?` — the bind-parameter position when the limit is a
     /// placeholder. `bind` substitutes the bound value into `limit` and
     /// clears this; one surviving to execution is an unbound-parameter error.

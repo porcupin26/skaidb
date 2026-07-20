@@ -153,6 +153,9 @@ fn visit_select(s: &Select, f: &mut impl FnMut(&Expr)) {
     for k in &s.order_by {
         visit_expr(&k.expr, f);
     }
+    for e in s.after.iter().flatten() {
+        visit_expr(e, f);
+    }
 }
 
 fn visit_insert(i: &Insert, f: &mut impl FnMut(&Expr)) {
@@ -244,6 +247,9 @@ fn mutate_select(s: &mut Select, f: &mut impl FnMut(&mut Expr)) {
     }
     for k in &mut s.order_by {
         mutate_expr(&mut k.expr, f);
+    }
+    for e in s.after.iter_mut().flatten() {
+        mutate_expr(e, f);
     }
 }
 
@@ -436,6 +442,22 @@ mod tests {
 
     /// `LIMIT ?` / `OFFSET ?` are bindable positions: counted, substituted
     /// into plain counts, and type-checked.
+    #[test]
+    fn bind_after_cursor_params() {
+        let stmt =
+            parse("SELECT v FROM t WHERE MATCH(b, 'x') ORDER BY v LIMIT 5 AFTER (?, ?)").unwrap();
+        assert_eq!(param_count(&stmt), Some(2));
+        let bound = bind(&stmt, &[Value::Float(0.5), Value::Int(42)]).unwrap();
+        let Statement::Select(s) = &bound else { panic!() };
+        assert_eq!(
+            s.after,
+            Some(vec![
+                Expr::Literal(Value::Float(0.5)),
+                Expr::Literal(Value::Int(42)),
+            ])
+        );
+    }
+
     #[test]
     fn bind_limit_and_offset_params() {
         let stmt = parse("SELECT v FROM t WHERE a = ? ORDER BY v LIMIT ? OFFSET ?").unwrap();

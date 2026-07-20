@@ -264,7 +264,9 @@ SELECT [DISTINCT] item [, ...] FROM t [[AS] a]
 --   NEAREST: kNN over a vector index. MANAGED index (CREATE VECTOR INDEX …
 --   ON t(text_col) EMBED DIM n) embeds the text column via [inference] at
 --   ingest (out of band, never blocks a write) and auto-embeds a STRING query:
---   NEAREST(text_col, 'natural language', k). See docs/VECTOR.md.
+--   NEAREST(text_col, 'natural language', k). [inference] keys can also be
+--   set via SKAIDB_INFERENCE_<KEY> env vars (override the config file at
+--   startup, type-checked). See docs/VECTOR.md.
   [RANK BY RRF [(c)]]
 --   RANK BY RRF: HYBRID search — fuse the NEAREST (vector) leg and the WHERE
 --   search-predicate (text) leg by Reciprocal Rank Fusion (ES `rrf` retriever).
@@ -286,6 +288,14 @@ SELECT [DISTINCT] item [, ...] FROM t [[AS] a]
 --   MATCH + TOP k BY score() it is ES top_hits in SQL
   [{UNION | UNION ALL} SELECT ...]
   [ORDER BY expr [ASC|DESC] [, ...]] [LIMIT n] [OFFSET n]
+  [AFTER (last_sort_value, last_pk_value)]
+--   AFTER: DEEP PAGINATION keyset cursor (ES search_after). Search queries
+--   only, ordered by score() DESC or one column + LIMIT; pk = implicit ASC
+--   tie-break (single-column pk required; every sorted search page is
+--   (sort value, pk)-deterministic). STABLE under concurrent writes (no
+--   shifted/duplicated pages); per-page cost ≈ the OFFSET equivalent
+--   (doubling ranked fetch, cap 65,536). No OFFSET/GROUP BY/RRF/RERANK.
+--   Filter-only queries: use WHERE col > last instead. No PIT.
 -- joins: [INNER|LEFT [OUTER]|RIGHT [OUTER]|CROSS] JOIN t [AS a] [ON expr]
 --   equi-joins hash-join; qualify columns by alias (u.id). No cluster
 --   join pushdown: joins pull both tables to the coordinator — fine for
@@ -826,7 +836,11 @@ POST /{index}/_search    query DSL: match, match_phrase, prefix, wildcard,
                          {lat,lon} | [lon,lat] | "lat,lon" | WKT POINT;
                          corner pairs or flat edges; geo index prunes
                          transparently); from/size, multi-key
-                         sort, _source include/exclude (trailing-* globs),
+                         sort (sorted hits carry `sort` values),
+                         search_after deep paging (sort [<key>,
+                         {"_id":"asc"}] + echo the last hit's sort array;
+                         full-text queries only, not with from/knn),
+                         _source include/exclude (trailing-* globs),
                          highlight, "explain": true, exact totals;
                          aggs: terms, date_histogram + sum/avg/min/max/
                          value_count/cardinality (EXACT distinct)/top_hits;

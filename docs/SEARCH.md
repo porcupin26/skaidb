@@ -349,6 +349,19 @@ properties:
   reads the fusion score.
 - Composes with `RANK BY RRF` (reranks the fused list) and `HIGHLIGHT`.
 
+## Deep pagination (`AFTER` / `search_after`)
+
+Stable keyset pagination beyond `OFFSET` — SQL `AFTER (<last sort value>,
+<last pk>)` on a search query ordered by `score() DESC` or a single column
+(full syntax and rules: [QUERY_SYNTAX.md](QUERY_SYNTAX.md#deep-pagination-after)).
+Every sorted search page tie-breaks by **primary key ascending**, so pages
+and cursors always agree, ties included. ES clients use the standard
+workflow: sort by `[<key>, {"_id": "asc"}]`, then echo the previous page's
+last hit `sort` array as `search_after` — each sorted hit carries its `sort`
+values, with JSON float types round-tripping exactly. A point-in-time (PIT)
+pin is not implemented; the ES caveat about score-sorted deep paging under
+concurrent index changes applies here too.
+
 ## ES-compatible REST subset
 
 The REST endpoint speaks enough Elasticsearch for existing ES client
@@ -381,7 +394,12 @@ POST /{index}/_search    query DSL: match, match_phrase, prefix, wildcard,
                          take corner pairs or flat top/left/bottom/
                          right edges;
                          "explain": true per-hit BM25 breakdowns; from/size,
-                         multi-key sort (incl. _score), _source with
+                         multi-key sort (incl. _score; sorted hits carry
+                         their `sort` values), search_after deep paging
+                         (sort [<key>, {"_id": "asc"}] + the previous
+                         page's last hit `sort` array; not with from > 0
+                         or knn/retriever; needs a full-text query),
+                         _source with
                          include/exclude lists (trailing-* globs),
                          highlight, exact totals; aggs: terms,
                          date_histogram (+ sum/avg/min/max/value_count/

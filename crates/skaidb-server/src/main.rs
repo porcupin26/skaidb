@@ -61,7 +61,10 @@ fn run(args: cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
         None => Config::default(),
     };
 
-    // Overlay: CLI flags (which themselves read from env via clap) win.
+    // Overlay: SKAIDB_INFERENCE_* environment overrides (secrets/endpoints
+    // kept out of the shared config file), then CLI flags (which themselves
+    // read from env via clap) win.
+    config = config.with_env_overrides()?;
     args.apply_overrides(&mut config);
 
     if args.print_config {

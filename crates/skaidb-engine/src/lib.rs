@@ -2415,6 +2415,111 @@ mod tests {
         assert!(matches!(rs.rows[0][2], Value::Float(f) if f > 0.0), "rrf_score kept");
     }
 
+    /// `AFTER` keyset pagination over a column-sorted search: pages are
+    /// disjoint, tie-broken by primary key ascending, stable under concurrent
+    /// inserts, and a short page marks the end.
+    #[test]
+    fn search_after_paginates_column_sort() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE docs (PRIMARY KEY (id))").unwrap();
+        // n ties on 2 exercise the pk tie-break (id 3 < id 5).
+        db.execute(
+            "INSERT INTO docs (id, body, n) VALUES \
+             (1, 'data alpha', 1), (3, 'data beta', 2), (5, 'data gamma', 2), \
+             (2, 'data delta', 3), (4, 'data epsilon', 4)",
+        )
+        .unwrap();
+        db.execute("CREATE SEARCH INDEX docs_fts ON docs (body)").unwrap();
+
+        let page = |db: &mut Database, after: &str| -> Vec<i64> {
+            ids(rows(
+                db.execute(&format!(
+                    "SELECT id FROM docs WHERE MATCH(body, 'data') \
+                     ORDER BY n ASC LIMIT 2{after}"
+                ))
+                .unwrap(),
+            ))
+        };
+        // Full order: (n=1,id1), (n=2,id3), (n=2,id5), (n=3,id2), (n=4,id4).
+        assert_eq!(page(&mut db, ""), vec![1, 3]);
+        assert_eq!(page(&mut db, " AFTER (2, 3)"), vec![5, 2]);
+        // A concurrent insert BEFORE the cursor never shifts later pages…
+        db.execute("INSERT INTO docs (id, body, n) VALUES (9, 'data zeta', 0)")
+            .unwrap();
+        assert_eq!(page(&mut db, " AFTER (3, 2)"), vec![4]);
+        // …and the first page sees it (cursorless queries are live).
+        assert_eq!(page(&mut db, ""), vec![9, 1]);
+    }
+
+    /// `AFTER` over relevance order (`ORDER BY score() DESC`): the cursor is
+    /// (last score, last pk) and the page sequence covers every hit once.
+    #[test]
+    fn search_after_paginates_score_sort() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE docs (PRIMARY KEY (id))").unwrap();
+        db.execute(
+            "INSERT INTO docs (id, body) VALUES \
+             (1, 'data'), (2, 'data data'), (3, 'data data data')",
+        )
+        .unwrap();
+        db.execute("CREATE SEARCH INDEX docs_fts ON docs (body)").unwrap();
+        let rs = rows(
+            db.execute(
+                "SELECT id, score() FROM docs WHERE MATCH(body, 'data') \
+                 ORDER BY score() DESC LIMIT 2",
+            )
+            .unwrap(),
+        );
+        assert_eq!(ids(rs.clone()), vec![3, 2]);
+        let last_score = match &rs.rows[1][1] {
+            Value::Float(f) => *f,
+            other => panic!("expected float score, got {other:?}"),
+        };
+        // Resume strictly after (score of id2, id2) → the remaining hit.
+        let rs2 = rows(
+            db.execute(&format!(
+                "SELECT id FROM docs WHERE MATCH(body, 'data') \
+                 ORDER BY score() DESC LIMIT 2 AFTER ({last_score}, 2)"
+            ))
+            .unwrap(),
+        );
+        assert_eq!(ids(rs2), vec![1]);
+    }
+
+    /// `AFTER` shape checks: needs a search + single ORDER BY + LIMIT, and
+    /// composes with neither OFFSET nor RRF/RERANK nor plain selects.
+    #[test]
+    fn search_after_shape_errors() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE docs (PRIMARY KEY (id))").unwrap();
+        db.execute("INSERT INTO docs (id, body, n) VALUES (1, 'data', 1)").unwrap();
+        db.execute("CREATE SEARCH INDEX docs_fts ON docs (body)").unwrap();
+        let err = |db: &mut Database, sql: &str| db.execute(sql).unwrap_err().to_string();
+        assert!(err(
+            &mut db,
+            "SELECT id FROM docs WHERE MATCH(body, 'data') LIMIT 2 AFTER (1, 1)"
+        )
+        .contains("ORDER BY"));
+        assert!(err(
+            &mut db,
+            "SELECT id FROM docs WHERE MATCH(body, 'data') ORDER BY n LIMIT 2 \
+             OFFSET 1 AFTER (1, 1)"
+        )
+        .contains("OFFSET"));
+        assert!(err(
+            &mut db,
+            "SELECT id FROM docs WHERE MATCH(body, 'data') ORDER BY n AFTER (1, 1)"
+        )
+        .contains("LIMIT"));
+        assert!(err(&mut db, "SELECT id FROM docs WHERE n = 1 ORDER BY n LIMIT 2 AFTER (1, 1)")
+            .contains("MATCH"));
+        assert!(err(
+            &mut db,
+            "SELECT id FROM docs WHERE MATCH(body, 'data') ORDER BY n LIMIT 2 AFTER (1)"
+        )
+        .contains("exactly"));
+    }
+
     /// OFFSET on a NEAREST select pages exactly once (the gather + `project`
     /// used to BOTH apply it, skipping 2× the offset — found adding RERANK).
     #[test]

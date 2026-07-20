@@ -43,7 +43,10 @@ skaidb-driver = { path = "crates/skaidb-driver" }
 thiserror = "2"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# float_roundtrip: parse floats correctly-rounded, so a float printed into a
+# JSON response (an ES hit `sort` value, a `_score`) parses back to the SAME
+# f64 when a client echoes it (search_after cursors compare by equality).
+serde_json = { version = "1", features = ["float_roundtrip"] }
 toml = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 lz4_flex = "0.11"

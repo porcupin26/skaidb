@@ -74,6 +74,7 @@ fn select_from(table: &str) -> Select {
         nearest: None,
         rrf: None,
         rerank: None,
+        after: None,
         items: Vec::new(),
         from: table.to_string(),
         from_alias: table.to_string(),
@@ -877,6 +878,12 @@ fn search(ctx: &Shared, role: &str, index: &str, body: &[u8]) -> Result<(u16, Js
             .unwrap_or(0);
     }
 
+    let pk = ctx
+        .backend
+        .table_primary_key(index)
+        .ok_or_else(|| format!("no such index (table) '{index}'"))?;
+    let pk = pk.first().cloned().unwrap_or_default();
+
     // Hits (skipped for size 0, the aggregations-only shape).
     let mut hits = Vec::new();
     let mut max_score = Json::Null;
@@ -899,6 +906,7 @@ fn search(ctx: &Shared, role: &str, index: &str, body: &[u8]) -> Result<(u16, Js
                 }
             }
         }
+        let mut sort_pairs: Option<Vec<(String, bool)>> = None;
         if let Some(v) = vector {
             // kNN / hybrid / reranked: NEAREST (+ RANK BY RRF) and RERANK
             // already return rows ranked (nearest-first, fused rrf_score
@@ -922,27 +930,48 @@ fn search(ctx: &Shared, role: &str, index: &str, body: &[u8]) -> Result<(u16, Js
                 }
                 None => {}
                 Some(sort) => {
-                    sel.order_by = parse_sort(sort)?
-                        .into_iter()
+                    let pairs = parse_sort(sort)?;
+                    // Ranked/sorted search pages already tie-break by primary
+                    // key ascending, so a trailing `_id asc` sort entry is
+                    // implicit — drop it (it also keeps `_score` sorts legal:
+                    // the engine wants score() as the only sort key). `_id`
+                    // elsewhere maps to the primary-key column.
+                    let mut effective: &[(String, bool)] = &pairs;
+                    if uses_search {
+                        if let [head @ .., (last, false)] = effective {
+                            if last == "_id" || last == &pk {
+                                effective = head;
+                            }
+                        }
+                    }
+                    sel.order_by = effective
+                        .iter()
                         .map(|(col, desc)| OrderKey {
                             expr: if col == "_score" {
                                 func("score", vec![])
+                            } else if col == "_id" {
+                                Expr::Column(pk.clone())
                             } else {
-                                Expr::Column(col)
+                                Expr::Column(col.clone())
                             },
-                            descending: desc,
+                            descending: *desc,
                         })
                         .collect();
+                    sort_pairs = Some(pairs);
                 }
             }
         }
         sel.limit = Some(size);
         sel.offset = (from > 0).then_some(from);
-        let pk = ctx
-            .backend
-            .table_primary_key(index)
-            .ok_or_else(|| format!("no such index (table) '{index}'"))?;
-        let pk = pk.first().cloned().unwrap_or_default();
+        if let Some(sa) = body.get("search_after") {
+            if is_vector {
+                return Err("search_after is not supported with knn/retriever queries".into());
+            }
+            if from > 0 {
+                return Err("search_after cannot be combined with from".into());
+            }
+            apply_search_after(&mut sel, sort_pairs.as_deref().unwrap_or(&[]), sa, &pk)?;
+        }
         let (include_source, includes, excludes) = source_spec(&body);
         let (columns, rows) = rows_of(run(ctx, role, Statement::Select(sel), "es:_search")?)?;
         for row in rows {
@@ -950,6 +979,8 @@ fn search(ctx: &Shared, role: &str, index: &str, body: &[u8]) -> Result<(u16, Js
             let mut id = Json::Null;
             let mut score = Json::Null;
             let mut highlight = Map::new();
+            let mut pk_raw = Json::Null;
+            let mut sort_vals = Map::new();
             for (col, val) in columns.iter().zip(row) {
                 if col == "_score" {
                     score = val.to_json();
@@ -977,10 +1008,17 @@ fn search(ctx: &Shared, role: &str, index: &str, body: &[u8]) -> Result<(u16, Js
                     }
                 } else {
                     if col == &pk {
+                        pk_raw = val.to_json();
                         id = match &val {
                             Value::String(s) => Json::String(s.clone()),
                             other => Json::String(other.to_json().to_string()),
                         };
+                    }
+                    if sort_pairs
+                        .as_ref()
+                        .is_some_and(|ps| ps.iter().any(|(c, _)| c == col))
+                    {
+                        sort_vals.insert(col.clone(), val.to_json());
                     }
                     if source_allows(col, &includes, &excludes) {
                         source.insert(col.clone(), val.to_json());
@@ -991,6 +1029,24 @@ fn search(ctx: &Shared, role: &str, index: &str, body: &[u8]) -> Result<(u16, Js
                 max_score = score.clone();
             }
             let mut hit = json!({"_index": index, "_id": id, "_score": score});
+            // ES parity for sorted queries: each hit carries its sort values,
+            // so clients can echo the last hit's `sort` array back as the next
+            // page's `search_after` (JSON types round-trip exactly).
+            if let Some(pairs) = &sort_pairs {
+                let vals: Vec<Json> = pairs
+                    .iter()
+                    .map(|(c, _)| {
+                        if c == "_score" {
+                            score.clone()
+                        } else if c == "_id" || c == &pk {
+                            pk_raw.clone()
+                        } else {
+                            sort_vals.get(c).cloned().unwrap_or(Json::Null)
+                        }
+                    })
+                    .collect();
+                hit["sort"] = json!(vals);
+            }
             if include_source {
                 hit["_source"] = Json::Object(source);
             }
@@ -1039,6 +1095,51 @@ fn search(ctx: &Shared, role: &str, index: &str, body: &[u8]) -> Result<(u16, Js
         out["aggregations"] = run_aggs(ctx, role, index, &filter, aggs)?;
     }
     Ok((200, out))
+}
+
+/// Map ES `search_after` onto the SQL `AFTER (<sort value>, <pk value>)`
+/// keyset cursor. Accepted sort shapes (the `_id`/primary-key tie-break must
+/// be last and ascending, exactly as ES best practice prescribes):
+/// `[<key>, {"_id": "asc"}]` with two cursor values, or `[{"_id": "asc"}]`
+/// alone (pages by primary key). Values should be echoed from the previous
+/// page's last hit `sort` array, so their JSON types round-trip.
+fn apply_search_after(
+    sel: &mut Select,
+    pairs: &[(String, bool)],
+    vals: &Json,
+    pk: &str,
+) -> Result<(), String> {
+    let vals = vals.as_array().ok_or("search_after must be an array")?;
+    if pairs.is_empty() {
+        return Err("search_after requires an explicit sort".into());
+    }
+    if vals.len() != pairs.len() {
+        return Err("search_after must carry one value per sort key".into());
+    }
+    let lit = |v: &Json| Expr::Literal(Value::from_json(v.clone()));
+    let is_id = |c: &str| c == "_id" || c == pk;
+    match pairs {
+        [(_, _), (id, false)] if is_id(id) => {
+            // The SQL cursor's primary-key tie-break is implicit — drop the
+            // _id sort key and pass its value as the cursor's second half.
+            sel.order_by.truncate(1);
+            sel.after = Some(vec![lit(&vals[0]), lit(&vals[1])]);
+            Ok(())
+        }
+        [(id, false)] if is_id(id) => {
+            sel.order_by = vec![OrderKey {
+                expr: Expr::Column(pk.to_string()),
+                descending: false,
+            }];
+            sel.after = Some(vec![lit(&vals[0]), lit(&vals[0])]);
+            Ok(())
+        }
+        _ => Err(
+            "search_after needs sort [<key>, {\"_id\": \"asc\"}] — the _id (primary key) \
+             tie-break must be the last sort key and ascending"
+                .into(),
+        ),
+    }
 }
 
 /// `_source`: `false` | `true` | `"field"` | `["f1", "f2*"]` |
@@ -2044,5 +2145,48 @@ mod tests {
             } },
         } } }))
         .is_err());
+    }
+
+    #[test]
+    fn search_after_maps_to_after_cursor() {
+        let mut sel = select_from("docs");
+        // sort [created desc, _id asc] + two cursor values → ORDER BY created
+        // (the _id tie-break folds into the implicit AFTER pk half).
+        let pairs = vec![("created".to_string(), true), ("_id".to_string(), false)];
+        sel.order_by = vec![
+            OrderKey { expr: Expr::Column("created".into()), descending: true },
+            OrderKey { expr: Expr::Column("_id".into()), descending: false },
+        ];
+        apply_search_after(&mut sel, &pairs, &json!([1710000000, 42]), "id").unwrap();
+        assert_eq!(sel.order_by.len(), 1);
+        assert_eq!(
+            sel.after,
+            Some(vec![
+                Expr::Literal(Value::Int(1710000000)),
+                Expr::Literal(Value::Int(42)),
+            ])
+        );
+        // The pk column name works as the tie-break too, and _id alone pages
+        // by primary key.
+        let mut sel = select_from("docs");
+        let pairs = vec![("_id".to_string(), false)];
+        apply_search_after(&mut sel, &pairs, &json!(["a41"]), "id").unwrap();
+        assert!(matches!(&sel.order_by[..], [OrderKey { expr: Expr::Column(c), descending: false }] if c == "id"));
+        assert_eq!(
+            sel.after,
+            Some(vec![
+                Expr::Literal(Value::String("a41".into())),
+                Expr::Literal(Value::String("a41".into())),
+            ])
+        );
+        // Errors: no sort, arity mismatch, missing/descending _id tie-break.
+        let mut sel = select_from("docs");
+        assert!(apply_search_after(&mut sel, &[], &json!([1]), "id").is_err());
+        let pairs = vec![("created".to_string(), true), ("_id".to_string(), false)];
+        assert!(apply_search_after(&mut sel, &pairs, &json!([1]), "id").is_err());
+        let no_id = vec![("created".to_string(), true), ("title".to_string(), false)];
+        assert!(apply_search_after(&mut sel, &no_id, &json!([1, 2]), "id").is_err());
+        let desc_id = vec![("created".to_string(), true), ("_id".to_string(), true)];
+        assert!(apply_search_after(&mut sel, &desc_id, &json!([1, 2]), "id").is_err());
     }
 }

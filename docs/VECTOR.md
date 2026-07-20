@@ -83,7 +83,13 @@ Any server that speaks this shape works — **OpenAI**, **Azure OpenAI**, a loca
 returned vector length must equal the index `DIM` (skaidb validates and rejects a
 mismatch).
 
-**Configuration (`[inference]` block, see `config/skaidb.toml`):**
+**Configuration (`[inference]` block, see `config/skaidb.toml`):** every key
+below can also be set (or overridden) via a `SKAIDB_INFERENCE_<KEY>`
+environment variable — e.g. `SKAIDB_INFERENCE_URL`, `SKAIDB_INFERENCE_API_KEY`,
+`SKAIDB_INFERENCE_ENABLED=true`, `SKAIDB_INFERENCE_RERANK_URL` — applied after
+the config file at startup (values are type-checked; an unknown or ill-typed
+variable fails startup loudly). Use this to keep secrets and per-host
+endpoints out of a shared config file.
 
 | key | meaning |
 |---|---|
