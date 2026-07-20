@@ -10308,6 +10308,78 @@ mod tests {
         );
     }
 
+    /// Hybrid retrieval (`RANK BY RRF`) works cluster-wide: both legs scatter
+    /// to every shard and merge at the coordinator, then RRF fuses the two
+    /// ranked lists. The doc that ranks in both legs tops the result from any
+    /// coordinator.
+    #[test]
+    fn distributed_hybrid_rrf() {
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let na = Node::new(Database::open(temp_dir("hyba")).unwrap(), rf1("a", &a, &members));
+        let nb = Node::new(Database::open(temp_dir("hybb")).unwrap(), rf1("b", &b, &members));
+        let nc = Node::new(Database::open(temp_dir("hybc")).unwrap(), rf1("c", &c, &members));
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        nc.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE docs (PRIMARY KEY (id))").unwrap();
+        na.execute("CREATE SEARCH INDEX docs_fts ON docs (body)").unwrap();
+        na.execute("CREATE VECTOR INDEX docs_emb ON docs (emb) DIM 3 USING cosine")
+            .unwrap();
+        // id1: text match + closest vector (both legs). id2: text only.
+        // id3: vector only. Plus filler rows on other shards.
+        na.execute(
+            "INSERT INTO docs (id, body, emb) VALUES \
+             (1, 'quick brown fox', [1.0, 0.0, 0.0]), \
+             (2, 'quick delivery service', [0.0, 1.0, 0.0]), \
+             (3, 'slow roasted meal', [0.9, 0.1, 0.0])",
+        )
+        .unwrap();
+        for i in 4..=20 {
+            na.execute(&format!(
+                "INSERT INTO docs (id, body, emb) VALUES ({i}, 'unrelated filler', [0.0, 0.0, 1.0])"
+            ))
+            .unwrap();
+        }
+
+        // The vector index backfills in the background on each node; wait for
+        // every node to serve before querying (FTS commits at create).
+        for node in [&na, &nb, &nc] {
+            for attempt in 0.. {
+                match node
+                    .local
+                    .read()
+                    .unwrap()
+                    .vector_search_local("docs_emb", &[1.0, 0.0, 0.0], 1)
+                {
+                    Ok(_) => break,
+                    Err(_) if attempt < 100 => thread::sleep(Duration::from_millis(50)),
+                    Err(e) => panic!("vector index never became ready: {e}"),
+                }
+            }
+        }
+
+        // From every coordinator: id1 tops the fused list; the relevant three
+        // are the top-3 (per-shard BM25 can reorder id2/id3, so compare as a set
+        // after pinning id1 first).
+        for coord in [&na, &nb, &nc] {
+            let rs = rows(
+                coord
+                    .execute(
+                        "SELECT id, rrf_score() FROM docs \
+                         NEAREST (emb, [1.0, 0.0, 0.0], 5) \
+                         WHERE MATCH(body, 'quick') RANK BY RRF LIMIT 3",
+                    )
+                    .unwrap(),
+            );
+            assert_eq!(rs.rows.len(), 3, "top-3 fused");
+            assert_eq!(rs.rows[0][0], Value::Int(1), "id1 (both legs) first");
+            assert!(matches!(rs.rows[0][1], Value::Float(s) if s > 0.0), "rrf_score set");
+            assert_eq!(sorted_ids(rs), vec![1, 2, 3], "the three relevant docs");
+        }
+    }
+
     #[test]
     fn distributed_full_text_search() {
         let (a, b, c) = (free_addr(), free_addr(), free_addr());

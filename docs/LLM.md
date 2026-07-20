@@ -250,6 +250,12 @@ DELETE FROM t [WHERE expr]
 -- Query
 SELECT [DISTINCT] item [, ...] FROM t [[AS] a]
   [JOIN ...] [NEAREST (path, [vector], k)] [WHERE expr]
+  [RANK BY RRF [(c)]]
+--   RANK BY RRF: HYBRID search — fuse the NEAREST (vector) leg and the WHERE
+--   search-predicate (text) leg by Reciprocal Rank Fusion (ES `rrf` retriever).
+--   rrf_score() = sum 1/(c+rank) over both legs (c default 60); residual WHERE
+--   filters both legs; ordered rrf_score() desc. Needs a NEAREST + a search
+--   predicate; cluster-wide.
   [GROUP BY expr [, ...] [TOP k BY expr [ASC|DESC]]] [HAVING expr]
 --   GROUP BY ... TOP k BY e: per-group top-k ROWS (not aggregates); with
 --   MATCH + TOP k BY score() it is ES top_hits in SQL

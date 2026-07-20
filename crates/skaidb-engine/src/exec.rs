@@ -7668,6 +7668,12 @@ pub fn statement_is_read_only(stmt: &Statement) -> bool {
 pub fn run(stmt: Statement, cluster: &mut dyn Cluster) -> Result<QueryOutput> {
     match stmt {
         Statement::Insert(ins) => run_insert(ins, cluster),
+        // Hybrid (`RANK BY RRF`) runs both the search leg (needs the `&mut`
+        // read-your-writes seam) and the vector leg, so it takes precedence
+        // over the plain search dispatch below.
+        Statement::Select(sel) if sel.rrf.is_some() => {
+            run_hybrid_select(&sel, cluster).map(QueryOutput::Rows)
+        }
         // A search SELECT keeps the `&mut` seam: `Cluster::search` commits
         // pending index writes first (read-your-writes).
         Statement::Select(sel) if select_uses_search(&sel) => {
@@ -7857,6 +7863,124 @@ fn run_const_select(sel: &Select) -> Result<ResultSet> {
 /// Execute a `NEAREST` (vector search) select: resolve the query vector and
 /// `k`, run the ANN gather (already filtered and nearest-first), expose each
 /// hit's distance as a `_distance` field, and project as usual.
+/// Evaluate a query-vector expression (array literal or bound parameter) to
+/// `Vec<f32>` — shared by the `NEAREST` and hybrid (`RANK BY RRF`) paths.
+fn eval_query_vector(expr: &Expr, row: &Document) -> Result<Vec<f32>> {
+    match eval(expr, row)? {
+        Value::Array(items) => {
+            let mut v = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::Int(i) => v.push(i as f32),
+                    Value::Float(f) => v.push(f as f32),
+                    _ => {
+                        return Err(EngineError::Type(
+                            "query vector must be a numeric array".into(),
+                        ))
+                    }
+                }
+            }
+            Ok(v)
+        }
+        _ => Err(EngineError::Type(
+            "query vector must be a numeric array".into(),
+        )),
+    }
+}
+
+/// Hybrid retrieval (`RANK BY RRF`): fuse the text leg (the `WHERE` search
+/// predicate) and the vector leg (the `NEAREST` clause) by Reciprocal Rank
+/// Fusion. Each leg fetches the `NEAREST` `k` candidates — with the residual
+/// (non-search) part of `WHERE` applied to BOTH legs (as ES applies a filter to
+/// both retrievers) — then `rrf(key) = Σ 1/(c + rank)` over the two ranked
+/// lists decides the order. `rrf_score()` exposes the fused score; `LIMIT`
+/// takes the final top-k. RRF is rank-based, so BM25 scores and vector
+/// distances need no normalization.
+fn run_hybrid_select(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSet> {
+    let rrf = sel.rrf.expect("checked by run()");
+    let Some(nearest) = sel.nearest.as_ref() else {
+        return Err(EngineError::Unsupported(
+            "RANK BY RRF requires a NEAREST (vector) clause".into(),
+        ));
+    };
+    if !sel.joins.is_empty()
+        || !sel.set_ops.is_empty()
+        || sel.distinct
+        || is_grouped(sel)
+        || sel.having.is_some()
+    {
+        return Err(EngineError::Unsupported(
+            "RANK BY RRF cannot be combined with JOIN, UNION, DISTINCT, or GROUP BY".into(),
+        ));
+    }
+    if !sel.order_by.is_empty() {
+        return Err(EngineError::Unsupported(
+            "RANK BY RRF results are ordered by rrf_score(); ORDER BY is not supported".into(),
+        ));
+    }
+    check_bound_counts(sel)?;
+
+    // Split WHERE: the search predicate is the text leg; the residual filters
+    // both legs.
+    let (mut queries, residual) = split_search_filter(&sel.filter)?;
+    if queries.is_empty() {
+        return Err(EngineError::Type(
+            "RANK BY RRF requires a MATCH()/SEARCH() predicate in WHERE (the text leg)".into(),
+        ));
+    }
+    let text_query = match queries.len() {
+        1 => queries.pop().expect("len checked"),
+        _ => SearchQuery::All(queries),
+    };
+
+    // Shared vector-leg query + candidate depth (both legs fetch `k`).
+    let empty = Document::new();
+    let query_vec = eval_query_vector(&nearest.query, &empty)?;
+    let candidate_k = match eval(&nearest.k, &empty)? {
+        Value::Int(k) if k > 0 => k as usize,
+        _ => {
+            return Err(EngineError::Type(
+                "NEAREST k must be a positive integer".into(),
+            ))
+        }
+    };
+
+    // Run both legs — each already scatter-gathers to a coordinator-merged
+    // ranked list, with the residual filter applied.
+    let text_hits = cluster.search(&sel.from, &text_query, Some(candidate_k), &residual, &[])?;
+    let vec_hits = cluster.vector_search(&sel.from, &nearest.path, &query_vec, candidate_k, &residual)?;
+
+    // Reciprocal Rank Fusion over the two ranked lists.
+    let c = rrf.constant as f32;
+    let mut fused: HashMap<Vec<u8>, f32> = HashMap::new();
+    let mut docs: HashMap<Vec<u8>, Document> = HashMap::new();
+    let mut fuse = |key: Vec<u8>, doc: Document, rank: usize| {
+        *fused.entry(key.clone()).or_insert(0.0) += 1.0 / (c + (rank + 1) as f32);
+        docs.entry(key).or_insert(doc);
+    };
+    for (rank, (key, doc, _)) in text_hits.into_iter().enumerate() {
+        fuse(key, doc, rank);
+    }
+    for (rank, (key, doc, _)) in vec_hits.into_iter().enumerate() {
+        fuse(key, doc, rank);
+    }
+
+    // Order by fused score desc; key asc as a deterministic tie-break.
+    let mut ranked: Vec<(Vec<u8>, f32)> = fused.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let out_docs: Vec<Document> = ranked
+        .into_iter()
+        .map(|(key, s)| {
+            let mut doc = docs.remove(&key).expect("doc present for fused key");
+            doc.insert("_rrf_score", Value::Float(f64::from(s)));
+            doc
+        })
+        .collect();
+    let mut rs = project(sel, out_docs, &HashSet::new(), true)?;
+    apply_offset_limit(&mut rs.rows, sel.offset, sel.limit);
+    Ok(rs)
+}
+
 fn run_nearest_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> {
     let nearest = sel.nearest.as_ref().expect("checked by run_select");
     if !sel.joins.is_empty() || !sel.set_ops.is_empty() {
@@ -7875,28 +7999,7 @@ fn run_nearest_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> 
         ));
     }
     let empty = Document::new();
-    let query = match eval(&nearest.query, &empty)? {
-        Value::Array(items) => {
-            let mut v = Vec::with_capacity(items.len());
-            for item in items {
-                match item {
-                    Value::Int(i) => v.push(i as f32),
-                    Value::Float(f) => v.push(f as f32),
-                    _ => {
-                        return Err(EngineError::Type(
-                            "NEAREST query vector must be a numeric array".into(),
-                        ))
-                    }
-                }
-            }
-            v
-        }
-        _ => {
-            return Err(EngineError::Type(
-                "NEAREST query vector must be a numeric array".into(),
-            ))
-        }
-    };
+    let query = eval_query_vector(&nearest.query, &empty)?;
     let k = match eval(&nearest.k, &empty)? {
         Value::Int(k) if k > 0 => k as usize,
         _ => {

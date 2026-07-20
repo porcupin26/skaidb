@@ -216,6 +216,16 @@ fn eval_func(name: &str, args: &[Expr], row: &Document) -> Result<Value> {
                 )
             })
         }
+        // `rrf_score()` reads the fused Reciprocal-Rank-Fusion score the hybrid
+        // (`RANK BY RRF`) gather injects into each hit.
+        "rrf_score" => {
+            if !args.is_empty() {
+                return Err(EngineError::Type("rrf_score() takes no arguments".into()));
+            }
+            row.get("_rrf_score").cloned().ok_or_else(|| {
+                EngineError::Type("rrf_score() is only valid in a RANK BY RRF query".into())
+            })
+        }
         // `HIGHLIGHT(col [, max_chars])` reads the snippet the search gather
         // injects for the column; outside a search query there is nothing to
         // read.

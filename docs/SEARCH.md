@@ -279,6 +279,31 @@ after upgrading. One typing nuance:
 while the fallback preserves each row's stored type — store timestamp
 values (not bare integers) in date columns for consistent typing.
 
+## Hybrid search (`RANK BY RRF`)
+
+Fuse a full-text leg and a [vector](VECTOR.md) leg in one query by **Reciprocal
+Rank Fusion** — the SQL analogue of Elasticsearch's `rrf` retriever. The
+`NEAREST` clause is the vector leg, the `WHERE` search predicate is the text
+leg, and `RANK BY RRF` fuses them:
+
+```sql
+SELECT id, rrf_score() FROM docs
+NEAREST (embedding, [1.0, 0.0, 0.0], 100)   -- vector leg (100 candidates)
+WHERE MATCH(body, 'quick brown fox')         -- text leg
+RANK BY RRF                                  -- default constant 60
+LIMIT 10;
+```
+
+Each leg fetches the `NEAREST` `k` candidates; a hit at 1-based rank `r` in a
+leg contributes `1 / (c + r)` to its fused score (`rrf_score()`), so a doc that
+ranks well in **both** legs beats one strong in only a single leg. Fusion is
+rank-based, so BM25 scores and vector distances need no normalization.
+`RANK BY RRF (c)` overrides the constant. The residual (non-search) part of
+`WHERE` filters **both** legs. Cluster-wide: each leg scatter-gathers to a
+coordinator-merged ranked list, then the coordinator fuses. Requires both a
+`NEAREST` clause and a search predicate; no `JOIN`/`UNION`/`DISTINCT`/`GROUP
+BY`/`ORDER BY` (ordering is `rrf_score()` desc).
+
 ## ES-compatible REST subset
 
 The REST endpoint speaks enough Elasticsearch for existing ES client
@@ -407,8 +432,9 @@ approximation.
   rows lack the sort column — SQL NULL placement differs from the
   index's); anything else gathers and sorts through the ordinary
   executor.
-- No `JOIN`, `UNION`, aggregates/`GROUP BY`, `DISTINCT`, or `NEAREST` in
-  the same query.
+- No `JOIN`, `UNION`, `DISTINCT` in the same query. A search predicate
+  combines with `NEAREST` (vector) only through **hybrid `RANK BY RRF`** (see
+  below), not as a boolean sibling.
 - Per-shard BM25 statistics (like Elasticsearch's default across shards);
   a global-stats mode remains future work. "Parity" with ES is defined as
   result-set parity, not identical score floats — BM25 constants and

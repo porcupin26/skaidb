@@ -71,6 +71,7 @@ fn select_from(table: &str) -> Select {
     Select {
         distinct: false,
         nearest: None,
+        rrf: None,
         items: Vec::new(),
         from: table.to_string(),
         from_alias: table.to_string(),

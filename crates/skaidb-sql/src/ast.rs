@@ -432,6 +432,12 @@ pub struct Select {
     /// on `(table, path)`. Mutually exclusive with joins, grouping, set ops,
     /// and `ORDER BY`.
     pub nearest: Option<Box<Nearest>>,
+    /// `RANK BY RRF [(<k>)]` — hybrid retrieval: fuse the vector leg (the
+    /// `NEAREST` clause) and the text leg (the search predicate in `WHERE`) by
+    /// Reciprocal Rank Fusion. `rrf_score()` exposes the fused score; the
+    /// residual (non-search) part of `WHERE` filters both legs. Requires both a
+    /// `NEAREST` clause and a search predicate in `WHERE`.
+    pub rrf: Option<Rrf>,
     pub items: Vec<SelectItem>,
     pub from: String,
     /// Alias for the `FROM` table (defaults to the table name).
@@ -467,6 +473,18 @@ pub struct GroupTopK {
     /// `true` for `ASC` (smallest first); default `DESC`.
     pub ascending: bool,
 }
+
+/// The `RANK BY RRF [(<k>)]` clause of a [`Select`] — Reciprocal Rank Fusion
+/// of the `NEAREST` (vector) and `WHERE`-search (text) legs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rrf {
+    /// The RRF rank constant `k` (default 60): a hit at 1-based rank `r` in a
+    /// leg contributes `1 / (k + r)` to its fused score.
+    pub constant: u32,
+}
+
+/// The default RRF rank constant (the value TREC/Elasticsearch use).
+pub const DEFAULT_RRF_CONSTANT: u32 = 60;
 
 /// The `NEAREST (<path>, <query>, <k>)` clause of a [`Select`].
 #[derive(Debug, Clone, PartialEq)]

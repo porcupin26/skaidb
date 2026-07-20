@@ -65,6 +65,7 @@ FROM <table> [[AS] <alias>]
 [ <join> ... ]
 [NEAREST (<path>, <query-vector>, <k>)]
 [WHERE <expr>]
+[RANK BY RRF [(<constant>)]]            -- hybrid: fuse NEAREST + WHERE-search by RRF
 [GROUP BY <expr> [, <expr> ...] [TOP <k> BY <expr> [ASC|DESC]]]
 [HAVING <expr>]
 [ { UNION | UNION ALL } <select> ... ]
@@ -535,6 +536,34 @@ prepared statement. Requires a vector index on the path; errors if none
 exists. Cannot combine with `JOIN`, `UNION`, aggregates/`GROUP BY`, or
 `ORDER BY` (results are already ordered by distance) — `WHERE`, `LIMIT`, and
 `OFFSET` apply normally, post-search.
+
+## Hybrid search (`RANK BY RRF`)
+
+Fuse a full-text leg and a vector leg in one query by **Reciprocal Rank
+Fusion**. The `NEAREST` clause supplies the vector leg, the `WHERE` search
+predicate supplies the text leg, and `RANK BY RRF` fuses them:
+
+```sql
+SELECT id, rrf_score() FROM docs
+NEAREST (embedding, [1.0, 0.0, 0.0], 100)   -- vector leg (100 candidates)
+WHERE MATCH(body, 'quick brown fox')         -- text leg
+RANK BY RRF                                  -- fuse (default constant 60)
+LIMIT 10;
+```
+
+Each leg fetches the `NEAREST` `<k>` candidates, then a hit at 1-based rank
+`r` in a leg contributes `1 / (c + r)` to its fused score; `rrf_score()`
+exposes the sum. Because fusion is rank-based, BM25 scores and vector
+distances need no normalization. Results are ordered by `rrf_score()`
+descending; `LIMIT` takes the final top-k.
+
+- `RANK BY RRF (<c>)` overrides the rank constant (default 60; must be ≥ 1).
+- The **residual** (non-search) part of `WHERE` filters **both** legs, e.g.
+  `WHERE MATCH(body, 'fox') AND published = true`.
+- Requires both a `NEAREST` clause and a search predicate in `WHERE`. Cannot
+  combine with `JOIN`, `UNION`, `DISTINCT`, `GROUP BY`, or `ORDER BY`
+  (ordering is `rrf_score()` desc). Works cluster-wide (both legs
+  scatter-gather; the coordinator fuses).
 
 ## Full-text search (`MATCH` / `SEARCH`)
 

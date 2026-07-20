@@ -1204,6 +1204,7 @@ impl Parser {
             return Ok(Select {
                 distinct,
                 nearest: None,
+                rrf: None,
                 items,
                 from: String::new(),
                 from_alias: String::new(),
@@ -1251,6 +1252,29 @@ impl Parser {
             None
         };
 
+        // `RANK BY RRF [(<k>)]` — hybrid Reciprocal Rank Fusion of the NEAREST
+        // (vector) leg and the WHERE search-predicate (text) leg. `rank`/`rrf`
+        // are contextual idents (no reserved keyword), like `TOP`.
+        let rrf = if self.eat_ident_ci("rank") {
+            self.expect_keyword(Keyword::By)?;
+            if !self.eat_ident_ci("rrf") {
+                return Err(ParseError::Other("expected RRF after RANK BY".into()));
+            }
+            let constant = if self.eat(&Token::LParen) {
+                let c = self.expect_u64()?;
+                self.expect(&Token::RParen)?;
+                if c == 0 {
+                    return Err(ParseError::Other("RRF constant must be >= 1".into()));
+                }
+                u32::try_from(c).map_err(|_| ParseError::Other("RRF constant too large".into()))?
+            } else {
+                DEFAULT_RRF_CONSTANT
+            };
+            Some(Rrf { constant })
+        } else {
+            None
+        };
+
         let mut group_by = Vec::new();
         let mut group_top = None;
         if self.eat_keyword(Keyword::Group) {
@@ -1288,6 +1312,7 @@ impl Parser {
         Ok(Select {
             distinct,
             nearest,
+            rrf,
             items,
             from,
             from_alias,
@@ -2511,5 +2536,42 @@ mod tests {
         }
         // A bare CREATE USER with no auth form is still rejected.
         assert!(parse("CREATE USER ghost").is_err());
+    }
+
+    #[test]
+    fn parse_hybrid_rank_by_rrf() {
+        // Default constant.
+        match parse(
+            "SELECT id FROM docs NEAREST (emb, [1.0, 0.0], 5) \
+             WHERE MATCH(body, 'x') RANK BY RRF LIMIT 3",
+        )
+        .unwrap()
+        {
+            Statement::Select(s) => {
+                assert_eq!(s.rrf, Some(Rrf { constant: DEFAULT_RRF_CONSTANT }));
+                assert!(s.nearest.is_some() && s.filter.is_some());
+            }
+            other => panic!("{other:?}"),
+        }
+        // Explicit constant.
+        match parse(
+            "SELECT id FROM docs NEAREST (emb, [1.0], 5) WHERE MATCH(body, 'x') RANK BY RRF (10)",
+        )
+        .unwrap()
+        {
+            Statement::Select(s) => assert_eq!(s.rrf, Some(Rrf { constant: 10 })),
+            other => panic!("{other:?}"),
+        }
+        // A plain (non-RRF) select leaves rrf None.
+        match parse("SELECT id FROM docs WHERE MATCH(body, 'x')").unwrap() {
+            Statement::Select(s) => assert!(s.rrf.is_none()),
+            other => panic!("{other:?}"),
+        }
+        // Malformed: RANK BY <not RRF>, and a zero constant.
+        assert!(parse("SELECT id FROM docs WHERE a = 1 RANK BY FUSION").is_err());
+        assert!(parse(
+            "SELECT id FROM docs NEAREST (emb, [1.0], 5) WHERE MATCH(body,'x') RANK BY RRF (0)"
+        )
+        .is_err());
     }
 }

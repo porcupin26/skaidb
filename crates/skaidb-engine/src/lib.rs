@@ -2236,6 +2236,70 @@ mod tests {
         assert_eq!(ids(rs), vec![1]);
     }
 
+    /// Hybrid retrieval (`RANK BY RRF`) fuses the text leg (MATCH) and the
+    /// vector leg (NEAREST) by Reciprocal Rank Fusion: a doc that ranks well in
+    /// BOTH legs beats one that ranks in only a single leg, `rrf_score()` is
+    /// exposed and monotone with the order, and the residual filter applies to
+    /// both legs.
+    #[test]
+    fn hybrid_rrf_fuses_text_and_vector_legs() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TABLE docs (PRIMARY KEY (id))").unwrap();
+        // id1: matches "quick" AND is the closest vector to [1,0,0] -> both legs.
+        // id2: matches "quick" but a far vector -> text leg (vector rank last).
+        // id3: no "quick" but a close vector -> vector leg only.
+        db.execute(
+            "INSERT INTO docs (id, body, emb, flag) VALUES \
+             (1, 'quick brown fox', [1.0, 0.0, 0.0], true), \
+             (2, 'quick delivery service', [0.0, 1.0, 0.0], false), \
+             (3, 'slow roasted meal', [0.9, 0.1, 0.0], true)",
+        )
+        .unwrap();
+        db.execute("CREATE SEARCH INDEX docs_fts ON docs (body)").unwrap();
+        db.execute("CREATE VECTOR INDEX docs_emb ON docs (emb) DIM 3 USING cosine")
+            .unwrap();
+
+        // Fuse: NEAREST supplies the vector leg, WHERE MATCH the text leg.
+        let rs = rows(
+            db.execute(
+                "SELECT id, rrf_score() FROM docs \
+                 NEAREST (emb, [1.0, 0.0, 0.0], 3) \
+                 WHERE MATCH(body, 'quick') \
+                 RANK BY RRF LIMIT 10",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.columns, vec!["id", "rrf_score"]);
+        let score = |r: usize| match rs.rows[r][1] {
+            Value::Float(f) => f,
+            ref o => panic!("expected float rrf_score, got {o:?}"),
+        };
+        assert!(score(0) > score(1) && score(1) > score(2), "rrf desc");
+        // id1 (both legs, vector rank 1) tops; id2 (both lists) beats id3 (one).
+        assert_eq!(ids(rs), vec![1, 2, 3]);
+
+        // Residual filter (flag = true) applies to BOTH legs: id2 (flag=false)
+        // drops from both; id1 (both legs) + id3 (vector leg, flag=true) remain.
+        let rs = rows(
+            db.execute(
+                "SELECT id FROM docs NEAREST (emb, [1.0, 0.0, 0.0], 3) \
+                 WHERE MATCH(body, 'quick') AND flag = true RANK BY RRF LIMIT 10",
+            )
+            .unwrap(),
+        );
+        assert_eq!(ids(rs), vec![1, 3]);
+
+        // A custom RRF constant parses and still ranks id1 first.
+        let rs = rows(
+            db.execute(
+                "SELECT id FROM docs NEAREST (emb, [1.0, 0.0, 0.0], 3) \
+                 WHERE MATCH(body, 'quick') RANK BY RRF (10) LIMIT 10",
+            )
+            .unwrap(),
+        );
+        assert_eq!(ids(rs)[0], 1);
+    }
+
     /// Failure injection: a torn search-index directory (truncated
     /// meta.json, a deleted segment file, or a wiped directory) must
     /// rebuild from the table on reopen — never error, never lose hits.
