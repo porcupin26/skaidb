@@ -72,6 +72,11 @@ pub struct VectorIndexDef {
     /// higher = better recall, slower queries.
     #[serde(default)]
     pub ef_search: Option<usize>,
+    /// Managed (`EMBED`) index: `path` is a TEXT column embedded via the
+    /// inference provider, not a pre-computed vector field. `#[serde(default)]`
+    /// (false) keeps pre-existing catalogs — plain vector indexes — compatible.
+    #[serde(default)]
+    pub embed: bool,
 }
 
 /// A full-text search index declaration (`CREATE SEARCH INDEX ... ON t(paths)

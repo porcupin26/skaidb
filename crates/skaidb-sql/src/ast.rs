@@ -388,6 +388,11 @@ pub struct CreateVectorIndex {
     pub dim: usize,
     /// `cosine` (default), `l2`, or `dot`.
     pub metric: String,
+    /// `EMBED` — a **managed** index: `path` names a TEXT column, and skaidb
+    /// embeds it via the configured inference provider (rather than reading a
+    /// pre-computed vector array from the row). A string `NEAREST` query on such
+    /// an index is auto-embedded too.
+    pub embed: bool,
 }
 
 /// `CREATE SEARCH INDEX [IF NOT EXISTS] name ON table (path1 [, path2, ...])

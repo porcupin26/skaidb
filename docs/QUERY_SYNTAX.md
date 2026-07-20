@@ -541,7 +541,19 @@ search over a [vector index](VECTOR.md) on `(<table>, <path>)`, returning the
 CREATE VECTOR INDEX docs_emb ON docs (embedding) DIM 3 USING cosine;
 SELECT id, _distance FROM docs NEAREST (embedding, [1.0, 0.0, 0.0], 5);
 SELECT id FROM docs NEAREST (embedding, [1.0, 0.0, 0.0], 5) WHERE cat = 'news';
+
+-- Managed (semantic_text) — embed a TEXT column via the [inference] provider:
+CREATE VECTOR INDEX docs_sem ON docs (body) EMBED DIM 768;
+SELECT id FROM docs NEAREST (body, 'natural language query', 10);  -- query auto-embedded
 ```
+
+`EMBED` makes the index **managed**: `path` names a TEXT column that skaidb
+embeds via the configured `[inference]` endpoint (rather than reading a
+pre-computed vector array), and a **string** `NEAREST` query on it is
+auto-embedded. Embedding is out of band — a write commits with the raw text and
+a background worker embeds it, so the model server being down delays
+searchability but never blocks or fails a write. Needs `[inference]` enabled and
+`DIM` matching the model; a managed index errors at create otherwise.
 
 `<query-vector>` and `<k>` may be literals or bind parameters (`?`) in a
 prepared statement. Requires a vector index on the path; errors if none

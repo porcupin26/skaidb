@@ -101,6 +101,55 @@ pub struct Config {
     pub observability: ObservabilityConfig,
     pub ui: UiConfig,
     pub witness: WitnessConfig,
+    pub inference: InferenceConfig,
+}
+
+/// Inference mode (`[inference]`): an external embeddings endpoint used by
+/// **managed vector indexes** (`CREATE VECTOR INDEX … ON t(text_col) EMBED`) —
+/// skaidb embeds the text column at ingest (out of band, never blocking a
+/// write) and auto-embeds a string `NEAREST` query. Disabled by default; a
+/// managed index errors at create time when it is off.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InferenceConfig {
+    pub enabled: bool,
+    /// Embeddings endpoint, OpenAI-compatible: `POST {url}` with
+    /// `{"model": ..., "input": [texts]}` → `{"data": [{"embedding": [...]}]}`.
+    /// e.g. `https://api.openai.com/v1/embeddings` or a local TEI/Ollama URL.
+    pub url: String,
+    /// Model name sent in the request body.
+    pub model: String,
+    /// Embedding dimension the model returns (must match the index `DIM`).
+    pub dim: u64,
+    /// Bearer token sent as `Authorization: Bearer <api_key>` when non-empty.
+    pub api_key: String,
+    /// Max texts per embeddings request (batched by the background worker).
+    pub batch_size: u64,
+    /// Per-request timeout in seconds.
+    pub timeout_secs: u64,
+    /// TLS verification for the endpoint: `"ca"` (verify against `tls_ca`),
+    /// `"system"` (public CAs — needs webpki roots), or `"insecure"` (skip;
+    /// dev only). Public-CA verification is not built in yet, so an HTTPS
+    /// endpoint needs `"ca"` + `tls_ca`, or `"insecure"`.
+    pub tls_verify: String,
+    /// CA certificate file (PEM) when `tls_verify = "ca"`.
+    pub tls_ca: String,
+}
+
+impl Default for InferenceConfig {
+    fn default() -> Self {
+        InferenceConfig {
+            enabled: false,
+            url: String::new(),
+            model: String::new(),
+            dim: 0,
+            api_key: String::new(),
+            batch_size: 32,
+            timeout_secs: 30,
+            tls_verify: "ca".to_string(),
+            tls_ca: String::new(),
+        }
+    }
 }
 
 /// Witness mode (`[witness]`): this node periodically PULLS a full copy of

@@ -4,6 +4,7 @@
 //! SQL statements and get back a [`QueryOutput`].
 
 pub mod catalog;
+pub mod embed;
 mod error;
 mod eval;
 mod exec;
@@ -14,6 +15,7 @@ mod session;
 mod ts_query;
 pub mod vector;
 
+pub use embed::{Embedder, HashEmbedder};
 pub use error::EngineError;
 pub use exec::{
     filter_rows, filter_search_query, matches_filter, run, statement_is_read_only, Cluster,
@@ -1507,7 +1509,7 @@ mod tests {
                 .unwrap();
             db.execute("INSERT INTO docs (id, cat, embedding) VALUES (4, 'b', [0.9, 0.1, 0.0])")
                 .unwrap();
-            db.create_vector_index("docs_emb", "docs", "embedding", "cosine", None, false)
+            db.create_vector_index("docs_emb", "docs", "embedding", "cosine", None, false, false)
                 .unwrap();
 
             // Nearest to [1,0,0]: id 1 (exact), then id 4 (close direction).
@@ -2354,6 +2356,55 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(sorted_ids(rs), vec![1]);
+    }
+
+    /// Managed (`EMBED`) vector index: skaidb embeds the text column at ingest
+    /// (existing rows at create, new rows out-of-band drained at commit) and
+    /// auto-embeds a string `NEAREST` query. Uses the deterministic
+    /// `HashEmbedder` (shared tokens → similar vectors), so the token-overlap
+    /// nearest doc ranks first.
+    #[test]
+    fn managed_embed_index_embeds_and_auto_embeds_query() {
+        use std::sync::Arc;
+        let mut db = Database::open(tempdir()).unwrap();
+        db.set_embedder(Arc::new(crate::embed::HashEmbedder::new(16)));
+        db.execute("CREATE TABLE docs (PRIMARY KEY (id))").unwrap();
+        db.execute(
+            "INSERT INTO docs (id, body) VALUES \
+             (1, 'quick brown fox'), (2, 'slow green turtle'), (3, 'quick fast rabbit')",
+        )
+        .unwrap();
+        // Managed index: embeds the `body` TEXT column; existing rows embedded
+        // at create.
+        db.execute("CREATE VECTOR INDEX docs_sem ON docs (body) EMBED DIM 16")
+            .unwrap();
+
+        // A string NEAREST auto-embeds the query; id1 (shares 'quick'+'fox')
+        // is closest.
+        let rs = rows(
+            db.execute("SELECT id FROM docs NEAREST (body, 'quick fox', 3)")
+                .unwrap(),
+        );
+        assert_eq!(ids(rs)[0], 1);
+
+        // A row inserted AFTER the index is embedded (drained at commit) and
+        // searchable; id4 and id1 both share 'quick'+'fox', so both top.
+        db.execute("INSERT INTO docs (id, body) VALUES (4, 'quick fox jumps')")
+            .unwrap();
+        let rs = rows(
+            db.execute("SELECT id FROM docs NEAREST (body, 'quick fox', 4)")
+                .unwrap(),
+        );
+        let top2: Vec<i64> = ids(rs).into_iter().take(2).collect();
+        assert!(top2.contains(&1) && top2.contains(&4), "id1 & id4 top: {top2:?}");
+
+        // EMBED needs a configured embedder; a fresh db (none set) errors.
+        let mut plain = Database::open(tempdir()).unwrap();
+        plain.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        let err = plain
+            .execute("CREATE VECTOR INDEX t_sem ON t (body) EMBED DIM 16")
+            .unwrap_err();
+        assert!(err.to_string().contains("inference"), "{err}");
     }
 
     /// Failure injection: a torn search-index directory (truncated

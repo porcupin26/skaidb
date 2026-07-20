@@ -849,14 +849,18 @@ impl Parser {
             self.expect(&Token::LParen)?;
             let path = self.parse_path()?;
             self.expect(&Token::RParen)?;
-            // `DIM <n>` (required) and `USING <metric>` (optional), either order.
+            // `DIM <n>` (required), `USING <metric>` and `EMBED` (optional),
+            // any order.
             let mut dim = None;
             let mut metric = None;
+            let mut embed = false;
             loop {
                 if self.eat_keyword(Keyword::Dim) {
                     dim = Some(self.expect_u64()? as usize);
                 } else if self.eat_keyword(Keyword::Using) {
                     metric = Some(self.expect_ident()?);
+                } else if self.eat_keyword(Keyword::Embed) {
+                    embed = true;
                 } else {
                     break;
                 }
@@ -870,6 +874,7 @@ impl Parser {
                 path,
                 dim,
                 metric: metric.unwrap_or_else(|| "cosine".into()),
+                embed,
             }))
         } else if self.peek_ident_ci("search") {
             // `SEARCH` is contextual so `SEARCH('...')` stays a valid

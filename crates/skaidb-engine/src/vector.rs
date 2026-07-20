@@ -124,6 +124,10 @@ impl Hnsw {
     pub fn dim(&self) -> usize {
         self.dim
     }
+    /// Whether `key` currently has a live vector in the graph.
+    pub fn contains(&self, key: &[u8]) -> bool {
+        self.by_key.contains_key(key)
+    }
 
     /// Insert or replace the vector for `key`. A replace soft-deletes the old
     /// node and inserts a fresh one (HNSW can't cheaply move a node).

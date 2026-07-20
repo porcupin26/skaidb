@@ -181,6 +181,15 @@ pub struct Database {
     /// instead of draining inline after each statement, so DDL acks at
     /// schema-apply (single-node/Session keeps run-to-completion DDL).
     defer_backfills: bool,
+    /// Managed (`EMBED`) vector indexes → row keys awaiting embedding. A write
+    /// to a managed index enqueues here instead of embedding inline (the row's
+    /// text is the source of truth); a drain reads the text, calls the external
+    /// embedder OFF the write lock, inserts the vector, and advances the
+    /// watermark — so the model server being down delays searchability but
+    /// never blocks or fails a write. In-memory (rebuilt from rows past the
+    /// snapshot watermark on open), so a lost queue costs re-embedding, not
+    /// data.
+    pending_embeds: std::collections::HashMap<String, std::collections::BTreeSet<Vec<u8>>>,
     /// Search indexes whose startup catch-up was deferred (server mode),
     /// with the committed watermark to replay from (`None` = full rebuild;
     /// the index was already cleared at open).
@@ -207,6 +216,10 @@ pub struct Database {
     /// commit) instead of serializing whole fsyncs under the lock. Set and
     /// drained only by [`Database::execute_session_statement_deferred`].
     deferred_syncs: Option<Vec<(Arc<WalSync>, WalCommit)>>,
+    /// Text-embedding provider for managed vector indexes (`… EMBED`). `None`
+    /// unless `[inference]` is configured. Invoked only off the hot path (the
+    /// background embedding worker and query-time auto-embed).
+    embedder: Option<Arc<dyn crate::embed::Embedder>>,
 }
 
 /// A search index plus its NRT refresh state: writes apply immediately but
@@ -622,9 +635,11 @@ impl Database {
             building_vectors: std::collections::HashSet::new(),
             pending_vector_backfills: Vec::new(),
             pending_search_catchups: pending_search,
+            pending_embeds: std::collections::HashMap::new(),
             defer_backfills: false,
             field_registry: std::sync::Mutex::new(HashMap::new()),
             deferred_syncs: None,
+            embedder: None,
         };
         // Re-arm the storage truncation gates, then replay any deferred
         // maintenance the crash interrupted (WAL replay above re-populated
@@ -676,6 +691,7 @@ impl Database {
     /// rows (convenient for a single node, but in a cluster a shard may be empty,
     /// so the broadcast DDL always supplies an explicit dimension).
     /// `metric` is `cosine`/`l2`/`dot`.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_vector_index(
         &mut self,
         name: &str,
@@ -683,10 +699,34 @@ impl Database {
         path: &str,
         metric: &str,
         dim: Option<usize>,
+        embed: bool,
         if_not_exists: bool,
     ) -> Result<QueryOutput> {
         if !self.catalog.tables.contains_key(table) {
             return Err(EngineError::TableNotFound(table.to_string()));
+        }
+        // A managed (EMBED) index needs an inference provider and an explicit
+        // DIM matching it — fail at create, not silently at first write.
+        if embed {
+            let d = dim.ok_or_else(|| {
+                EngineError::Constraint("CREATE VECTOR INDEX … EMBED requires DIM <n>".into())
+            })?;
+            match self.embedder.as_ref() {
+                None => {
+                    return Err(EngineError::Unsupported(
+                        "CREATE VECTOR INDEX … EMBED needs a configured [inference] provider"
+                            .into(),
+                    ))
+                }
+                Some(e) if e.dim() != d => {
+                    return Err(EngineError::Constraint(format!(
+                        "index DIM {d} does not match the inference model's dimension {} \
+                         (inference.dim)",
+                        e.dim()
+                    )))
+                }
+                Some(_) => {}
+            }
         }
         let hlc = self.ddl_stamp();
         let key = format!("v:{name}");
@@ -706,6 +746,7 @@ impl Database {
             let differs = existing.table != table
                 || existing.path != path
                 || !existing.metric.eq_ignore_ascii_case(metric)
+                || existing.embed != embed
                 || dim.is_some_and(|d| d != existing.dim);
             if !differs {
                 self.record_schema(key, hlc, false);
@@ -742,12 +783,25 @@ impl Database {
                 metric: metric.to_ascii_lowercase(),
                 dim: d,
                 ef_search: preserved_ef,
+                embed,
             };
             self.vector_indexes.insert(name.to_string(), new_hnsw(&def));
             self.vector_watermarks.insert(name.to_string(), Hlc::MIN);
             self.catalog.vector_indexes.insert(name.to_string(), def);
-            self.building_vectors.insert(name.to_string());
-            self.pending_vector_backfills.push(name.to_string());
+            if embed {
+                // Managed: queue existing rows for out-of-band embedding (not
+                // the vector-array backfill). Searches return NRT partial
+                // results while it catches up, so no `building` gate. A
+                // single-node Session drains inline now; a cluster node leaves
+                // it for the background embed worker.
+                self.enqueue_unembedded(name);
+                if !self.defer_backfills {
+                    self.run_embed_drain();
+                }
+            } else {
+                self.building_vectors.insert(name.to_string());
+                self.pending_vector_backfills.push(name.to_string());
+            }
             self.record_schema(key, hlc, false);
             self.save_catalog()?;
             return Ok(QueryOutput::Ddl);
@@ -784,6 +838,7 @@ impl Database {
                     metric: metric.to_ascii_lowercase(),
                     dim: d,
                     ef_search: None,
+                    embed,
                 };
                 hnsw = Some(new_hnsw(&def));
                 pending_def = Some(def);
@@ -805,6 +860,7 @@ impl Database {
             metric: metric.to_ascii_lowercase(),
             dim,
             ef_search: None,
+            embed,
         });
         let mut hnsw = hnsw.unwrap_or_else(|| new_hnsw(&def));
         if let Err(e) = save_vector_snapshot(&vector_snapshot_path(&self.dir, name), &hnsw, watermark)
@@ -1102,6 +1158,27 @@ impl Database {
     /// Approximate `k` nearest rows to `query` under the named vector index,
     /// optionally restricted to rows matching `filter` (filtered ANN). Returns
     /// `(key, doc, distance)` nearest-first.
+    /// Embed a query string against the managed (`EMBED`) index on
+    /// `(table, path)`. Errors if the index isn't managed or no embedder is set.
+    pub fn embed_query(&self, table: &str, path: &str, text: &str) -> Result<Vec<f32>> {
+        let name = self
+            .vector_index_for(table, path)
+            .ok_or_else(|| EngineError::Unsupported(format!("no vector index on {table} ({path})")))?;
+        if !self.catalog.vector_indexes.get(&name).is_some_and(|d| d.embed) {
+            return Err(EngineError::Type(format!(
+                "NEAREST on '{path}' takes a query vector; a string query needs a managed EMBED index"
+            )));
+        }
+        let embedder = self
+            .embedder
+            .as_ref()
+            .ok_or_else(|| EngineError::Unsupported("inference is not configured".into()))?;
+        embedder
+            .embed(&[text.to_string()])?
+            .pop()
+            .ok_or_else(|| EngineError::Type("embedder returned no vector".into()))
+    }
+
     pub fn vector_search(
         &self,
         index: &str,
@@ -1207,6 +1284,18 @@ impl Database {
             .map(|(name, _)| name.clone())
     }
 
+    /// Install the text-embedding provider for managed vector indexes. Set at
+    /// startup from `[inference]`; `None` leaves managed-index create/query as
+    /// a clear "inference is not configured" error.
+    pub fn set_embedder(&mut self, embedder: Arc<dyn crate::embed::Embedder>) {
+        self.embedder = Some(embedder);
+    }
+
+    /// The configured embedder, if any.
+    pub fn embedder(&self) -> Option<Arc<dyn crate::embed::Embedder>> {
+        self.embedder.clone()
+    }
+
     fn vector_indexes_on(&self, table: &str) -> Vec<(String, String)> {
         self.catalog
             .vector_indexes
@@ -1220,6 +1309,28 @@ impl Database {
     /// remove the entry when the doc has no vector at `path`. `hlc` advances
     /// the index's replay watermark.
     fn vector_index_put(&mut self, name: &str, path: &str, doc: &Document, key: &[u8], hlc: Hlc) {
+        // Managed (EMBED) index: enqueue the key for out-of-band embedding when
+        // the source text is present; drop it when the text went away. The
+        // vector watermark is NOT advanced here — the embed drain advances it
+        // once the vector actually lands, so a crash before embedding leaves
+        // the row "past the watermark" and it is re-enqueued on open.
+        if self.catalog.vector_indexes.get(name).is_some_and(|d| d.embed) {
+            let has_text = matches!(doc.get_path(path), Some(Value::String(s)) if !s.is_empty());
+            if has_text {
+                self.pending_embeds
+                    .entry(name.to_string())
+                    .or_default()
+                    .insert(key.to_vec());
+            } else {
+                if let Some(hnsw) = self.vector_indexes.get_mut(name) {
+                    hnsw.remove(key);
+                }
+                if let Some(q) = self.pending_embeds.get_mut(name) {
+                    q.remove(key);
+                }
+            }
+            return;
+        }
         let dim = self.vector_indexes.get(name).map(|h| h.dim());
         if let (Some(dim), Some(hnsw)) = (dim, self.vector_indexes.get_mut(name)) {
             match doc_vector(doc, path, dim) {
@@ -1234,6 +1345,10 @@ impl Database {
         if let Some(hnsw) = self.vector_indexes.get_mut(name) {
             hnsw.remove(key);
             self.advance_vector_watermark(name, hlc);
+        }
+        // A managed index also drops the key from its embed queue.
+        if let Some(q) = self.pending_embeds.get_mut(name) {
+            q.remove(key);
         }
     }
 
@@ -1255,6 +1370,177 @@ impl Database {
     fn maintain_vectors_del(&mut self, table: &str, key: &[u8], hlc: Hlc) {
         for (name, _) in self.vector_indexes_on(table) {
             self.vector_index_del(&name, key, hlc);
+        }
+    }
+
+    // ---- managed (EMBED) vector index: out-of-band embedding ----
+
+    /// Queue every row of a managed index whose text is present but not yet in
+    /// the HNSW. Run at create (initial backfill) and on open (crash recovery —
+    /// the snapshot restores embedded vectors; this re-queues the rest). Scans
+    /// keys only, so it is cheap; the actual embedding is deferred to the drain.
+    pub fn enqueue_unembedded(&mut self, name: &str) {
+        let Some(def) = self.catalog.vector_indexes.get(name).cloned() else {
+            return;
+        };
+        if !def.embed {
+            return;
+        }
+        let Some(engine) = self.tables.get(&def.table) else {
+            return;
+        };
+        let mut with_text: Vec<Vec<u8>> = Vec::new();
+        let mut cursor: Option<Vec<u8>> = None;
+        while let Ok(rows) = engine.scan_versioned_page(cursor.as_deref(), 4096) {
+            let done = rows.len() < 4096;
+            cursor = rows.last().map(|(k, ..)| k.clone());
+            for (key, _hlc, bytes) in rows {
+                let Some(bytes) = bytes else { continue };
+                if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
+                    if matches!(doc.get_path(&def.path), Some(Value::String(s)) if !s.is_empty()) {
+                        with_text.push(key);
+                    }
+                }
+            }
+            if done {
+                break;
+            }
+        }
+        // Keep only keys not already embedded (immutable borrow before the
+        // mutable queue insert).
+        let unembedded: Vec<Vec<u8>> = {
+            let hnsw = self.vector_indexes.get(name);
+            with_text
+                .into_iter()
+                .filter(|k| !hnsw.is_some_and(|h| h.contains(k)))
+                .collect()
+        };
+        if !unembedded.is_empty() {
+            self.pending_embeds
+                .entry(name.to_string())
+                .or_default()
+                .extend(unembedded);
+        }
+    }
+
+    /// Read the current text for up to `limit` queued keys of a managed index.
+    /// Returns `(keys, texts)` in matching order; keys whose row/text vanished
+    /// are dropped from the queue and omitted.
+    pub fn peek_embed_batch(&mut self, name: &str, limit: usize) -> (Vec<Vec<u8>>, Vec<String>) {
+        let Some(def) = self.catalog.vector_indexes.get(name).cloned() else {
+            return (Vec::new(), Vec::new());
+        };
+        let candidates: Vec<Vec<u8>> = self
+            .pending_embeds
+            .get(name)
+            .map(|q| q.iter().take(limit).cloned().collect())
+            .unwrap_or_default();
+        let mut gone: Vec<Vec<u8>> = Vec::new();
+        let (mut keys, mut texts) = (Vec::new(), Vec::new());
+        if let Some(engine) = self.tables.get(&def.table) {
+            for key in candidates {
+                let text = engine.get(&key).ok().flatten().and_then(|bytes| {
+                    match Value::decode(&bytes) {
+                        Ok(Value::Document(doc)) => match doc.get_path(&def.path) {
+                            Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                });
+                match text {
+                    Some(t) => {
+                        keys.push(key);
+                        texts.push(t);
+                    }
+                    None => gone.push(key), // row deleted / text removed
+                }
+            }
+        }
+        if let Some(q) = self.pending_embeds.get_mut(name) {
+            for k in &gone {
+                q.remove(k);
+            }
+        }
+        (keys, texts)
+    }
+
+    /// Insert freshly-embedded vectors into the managed index's HNSW, dropping
+    /// their keys from the queue. Dimension is validated by the caller.
+    pub fn apply_embeddings(&mut self, name: &str, keys: &[Vec<u8>], vectors: Vec<Vec<f32>>) {
+        if let Some(hnsw) = self.vector_indexes.get_mut(name) {
+            for (key, vector) in keys.iter().zip(vectors) {
+                hnsw.insert(key.clone(), vector);
+            }
+        }
+        if let Some(q) = self.pending_embeds.get_mut(name) {
+            for k in keys {
+                q.remove(k);
+            }
+        }
+    }
+
+    /// True if any managed index has rows awaiting embedding.
+    pub fn has_pending_embeds(&self) -> bool {
+        self.pending_embeds.values().any(|q| !q.is_empty())
+    }
+
+    /// Drain the embed queue for every managed index: batch queued rows, call
+    /// the external embedder OFF nothing that blocks a write, insert the
+    /// vectors, and snapshot. Errors (endpoint down) are swallowed and the keys
+    /// stay queued for the next drain — a write is never failed by inference.
+    /// Inline for a single-node Session (drained at commit); a cluster node's
+    /// background worker calls it on its tick.
+    pub fn run_embed_drain(&mut self) {
+        let Some(embedder) = self.embedder.clone() else {
+            return;
+        };
+        // Texts per embeddings request. A generous default; the endpoint's own
+        // batch limit is the real ceiling, and the drain loops until caught up.
+        const EMBED_BATCH: usize = 32;
+        let batch = EMBED_BATCH;
+        let names: Vec<String> = self
+            .pending_embeds
+            .iter()
+            .filter(|(_, q)| !q.is_empty())
+            .map(|(n, _)| n.clone())
+            .collect();
+        for name in names {
+            loop {
+                let (keys, texts) = self.peek_embed_batch(&name, batch);
+                if keys.is_empty() {
+                    break;
+                }
+                match embedder.embed(&texts) {
+                    Ok(vectors) => {
+                        if crate::embed::check_dim(&vectors, embedder.dim()).is_err() {
+                            skaidb_types::slog!(
+                                "skaidb: embedder dimension mismatch for '{name}' — pausing embed"
+                            );
+                            break;
+                        }
+                        self.apply_embeddings(&name, &keys, vectors);
+                    }
+                    Err(e) => {
+                        skaidb_types::slog!(
+                            "skaidb: embedding failed for '{name}' ({e}); rows stay queued, will retry"
+                        );
+                        break; // leave keys queued; do not fail any write
+                    }
+                }
+            }
+            // Persist the freshly embedded vectors.
+            let path = vector_snapshot_path(&self.dir, &name);
+            let watermark = self.vector_watermarks.get(&name).copied().unwrap_or(Hlc::MIN);
+            if let Some(hnsw) = self.vector_indexes.get_mut(&name) {
+                if hnsw.is_dirty() {
+                    if let Err(e) = save_vector_snapshot(&path, hnsw, watermark) {
+                        skaidb_types::slog!("skaidb: vector snapshot save failed for {name}: {e}");
+                    } else {
+                        hnsw.mark_clean();
+                    }
+                }
+            }
         }
     }
 
@@ -2421,6 +2707,12 @@ impl Database {
                 self.run_vector_backfill(&name)?;
             }
         }
+        // Single-node: embed any rows this statement queued to managed indexes,
+        // inline at commit (a Session has no background worker). Never fails the
+        // statement — a down embedder just leaves rows queued.
+        if !self.defer_backfills && self.has_pending_embeds() {
+            self.run_embed_drain();
+        }
         Ok(out)
     }
 
@@ -2465,6 +2757,7 @@ impl Database {
                     &ci.path,
                     &ci.metric,
                     Some(ci.dim),
+                    ci.embed,
                     ci.if_not_exists,
                 )
             }
@@ -7513,6 +7806,14 @@ pub trait Cluster {
             "vector search is not available on this backend".into(),
         ))
     }
+    /// Embed a query string for a **managed** (`EMBED`) vector index on
+    /// `(table, path)` — a string `NEAREST` query is auto-embedded. Errors if
+    /// the index isn't managed or no inference provider is configured.
+    fn embed_query(&self, _table: &str, _path: &str, _text: &str) -> Result<Vec<f32>> {
+        Err(EngineError::Unsupported(
+            "a string NEAREST query needs a managed EMBED index with [inference] configured".into(),
+        ))
+    }
     /// Full-text search over the search index covering `query`'s fields on
     /// `table`, as `(key, doc, score)`. `k = Some(n)` is the ranked path (the
     /// `n` best BM25 scores, best first); `k = None` returns every matching
@@ -7865,8 +8166,15 @@ fn run_const_select(sel: &Select) -> Result<ResultSet> {
 /// hit's distance as a `_distance` field, and project as usual.
 /// Evaluate a query-vector expression (array literal or bound parameter) to
 /// `Vec<f32>` — shared by the `NEAREST` and hybrid (`RANK BY RRF`) paths.
-fn eval_query_vector(expr: &Expr, row: &Document) -> Result<Vec<f32>> {
-    match eval(expr, row)? {
+fn resolve_query_vector(
+    cluster: &dyn Cluster,
+    table: &str,
+    path: &str,
+    expr: &Expr,
+) -> Result<Vec<f32>> {
+    match eval(expr, &Document::new())? {
+        // A string query on a managed (EMBED) index is auto-embedded.
+        Value::String(s) => cluster.embed_query(table, path, &s),
         Value::Array(items) => {
             let mut v = Vec::with_capacity(items.len());
             for item in items {
@@ -7883,7 +8191,7 @@ fn eval_query_vector(expr: &Expr, row: &Document) -> Result<Vec<f32>> {
             Ok(v)
         }
         _ => Err(EngineError::Type(
-            "query vector must be a numeric array".into(),
+            "NEAREST query must be a numeric array, or a string for a managed EMBED index".into(),
         )),
     }
 }
@@ -7935,7 +8243,7 @@ fn run_hybrid_select(sel: &Select, cluster: &mut dyn Cluster) -> Result<ResultSe
 
     // Shared vector-leg query + candidate depth (both legs fetch `k`).
     let empty = Document::new();
-    let query_vec = eval_query_vector(&nearest.query, &empty)?;
+    let query_vec = resolve_query_vector(&*cluster, &sel.from, &nearest.path, &nearest.query)?;
     let candidate_k = match eval(&nearest.k, &empty)? {
         Value::Int(k) if k > 0 => k as usize,
         _ => {
@@ -7999,7 +8307,7 @@ fn run_nearest_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> 
         ));
     }
     let empty = Document::new();
-    let query = eval_query_vector(&nearest.query, &empty)?;
+    let query = resolve_query_vector(cluster, &sel.from, &nearest.path, &nearest.query)?;
     let k = match eval(&nearest.k, &empty)? {
         Value::Int(k) if k > 0 => k as usize,
         _ => {
@@ -9627,6 +9935,10 @@ impl Cluster for LocalCluster<'_> {
         self.db.vector_search(&index, query, k, filter)
     }
 
+    fn embed_query(&self, table: &str, path: &str, text: &str) -> Result<Vec<f32>> {
+        self.db.embed_query(table, path, text)
+    }
+
     fn search(
         &mut self,
         table: &str,
@@ -9803,6 +10115,10 @@ impl Cluster for LocalRead<'_> {
             EngineError::Unsupported(format!("no vector index on {table} ({path})"))
         })?;
         self.db.vector_search(&index, query, k, filter)
+    }
+
+    fn embed_query(&self, table: &str, path: &str, text: &str) -> Result<Vec<f32>> {
+        self.db.embed_query(table, path, text)
     }
 
     fn search(
