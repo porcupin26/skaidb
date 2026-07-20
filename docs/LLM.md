@@ -702,7 +702,13 @@ takes `Client::connect_many_tls(...)`. **Kerberos (GSSAPI) client auth:**
 `kerberos`-feature client build (glibc; the musl `skaidbsh` errors that GSSAPI
 is unavailable) and an external user (`CREATE USER "user@REALM" GSSAPI`) on a
 server with `auth.gssapi_enabled`. Wrap it in TLS for confidentiality —
-GSSAPI authenticates, it doesn't encrypt the SQL stream. **REST port when TLS is on:** with
+GSSAPI authenticates, it doesn't encrypt the SQL stream. **REST/UI SPNEGO:**
+when `gssapi_enabled`, the REST endpoints also accept `Authorization:
+Negotiate <base64 GSS token>` (RFC 4559) and advertise it in the 401
+`WWW-Authenticate` (alongside Basic), so a Kerberos browser or
+`curl --negotiate` gets single-sign-on to the external user's role;
+single-leg only (Kerberos finishes in one token — stateless REST doesn't
+carry a multi-round negotiation). **REST port when TLS is on:** with
 `client_tls != off`, HTTPS REST moves to `server.rest_tls_port` (default
 **7443**) and `rest_port` (7080) becomes a plaintext HTTP→HTTPS **308 redirect**
 to it — so point REST/UI/monitoring clients at `https://…:7443` (`skaidbsh`

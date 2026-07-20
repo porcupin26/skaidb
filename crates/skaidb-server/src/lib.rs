@@ -2015,6 +2015,77 @@ pub(crate) mod tests {
         }
     }
 
+    /// REST SPNEGO (RFC 4559): a `Negotiate` token authenticates a browser/REST
+    /// client to its external-user role over HTTP. CI-skipped; run manually
+    /// with the bench KDC (same env as `gssapi_end_to_end_against_kdc`).
+    #[cfg(feature = "kerberos")]
+    #[test]
+    #[ignore = "requires a live KDC + service keytab + kinit ticket (see doc comment)"]
+    fn rest_spnego_end_to_end_against_kdc() {
+        use crate::shared::execute;
+        use skaidb_gssapi::ClientHandshake;
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let keytab = std::env::var("KRB5_KTNAME").expect("set KRB5_KTNAME");
+        let spn = std::env::var("SKAIDB_TEST_SPN").expect("set SKAIDB_TEST_SPN");
+        skaidb_gssapi::set_keytab(&keytab);
+
+        let mut cfg = Config::default();
+        cfg.auth.gssapi_enabled = true;
+        cfg.auth.gssapi_keytab = keytab;
+        let ctx: Shared = Arc::new(Context {
+            backend: Backend::Local(Box::new(RwLock::new(Database::open(temp_dir()).unwrap()))),
+            metrics: Metrics::new(),
+            audit: RwLock::new(quiet_audit()),
+            // Required so the REST auth path actually runs (not anonymous).
+            authn: AuthState::required(),
+            superuser_role: "superuser".into(),
+            admin_lock: Mutex::new(()),
+            start: Instant::now(),
+            slow_log: crate::slowlog::SlowLog::new(),
+            config: RwLock::new(cfg),
+            config_path: None,
+            drivers_table_ensured: std::sync::atomic::AtomicBool::new(false),
+        });
+        assert_eq!(
+            execute(&ctx, r#"CREATE USER "alice@SKAIDB.TEST" GSSAPI"#),
+            Response::Ddl
+        );
+        assert_eq!(
+            execute(&ctx, r#"GRANT SELECT ON * TO "alice@SKAIDB.TEST""#),
+            Response::Ddl
+        );
+
+        let addr = "127.0.0.1:0".to_string();
+        let (addr, _h) = rest::spawn(&addr, ctx, rest::RestRole::Data).unwrap();
+
+        // A SPNEGO token targeting the skaidb service principal (we control the
+        // client, so we can target our SPN directly instead of curl's HTTP/<host>).
+        let (_client, token) = ClientHandshake::new(&spn, None).expect("client init (kinit?)");
+        let b64 = crate::rest::base64_encode(&token);
+
+        let body = r#"{"sql":"SELECT 1"}"#;
+        let req = format!(
+            "POST /query HTTP/1.1\r\nHost: skaidb\r\nAuthorization: Negotiate {b64}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.write_all(req.as_bytes()).unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        let status = resp.lines().next().unwrap_or("");
+        // 200 = authenticated + query ran; the key assertion is that SPNEGO did
+        // NOT fall through to a 401.
+        assert!(
+            status.contains(" 200 "),
+            "expected 200 (SPNEGO authenticated), got: {status}\n{}",
+            resp.lines().take(6).collect::<Vec<_>>().join("\n")
+        );
+    }
+
     /// Client TLS on the binary port: a `required`-TLS server refuses a
     /// plaintext driver, accepts a CA-verifying TLS driver (SCRAM still
     /// enforced inside TLS), and rejects a wrong password over TLS.

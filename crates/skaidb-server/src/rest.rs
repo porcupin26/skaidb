@@ -192,9 +192,9 @@ fn handle_connection(
                     return write_response(&mut stream, 404, &json!({"error": "not found"}));
                 }
                 let role = if ctx.authn.required {
-                    match basic_auth_role(&ctx, req.authorization.as_deref()) {
+                    match auth_role(&ctx, req.authorization.as_deref()) {
                         Some(role) => role,
-                        None => return write_unauthorized(&mut stream),
+                        None => return write_unauthorized(&mut stream, &ctx),
                     }
                 } else {
                     ctx.superuser_role.clone()
@@ -208,9 +208,9 @@ fn handle_connection(
                     return write_response(&mut stream, 404, &json!({"error": "not found"}));
                 }
                 let role = if ctx.authn.required {
-                    match basic_auth_role(&ctx, req.authorization.as_deref()) {
+                    match auth_role(&ctx, req.authorization.as_deref()) {
                         Some(role) => role,
-                        None => return write_unauthorized(&mut stream),
+                        None => return write_unauthorized(&mut stream, &ctx),
                     }
                 } else {
                     ctx.superuser_role.clone()
@@ -225,9 +225,9 @@ fn handle_connection(
                 if !enabled {
                     return write_response(&mut stream, 404, &json!({"error": "not found"}));
                 }
-                if ctx.authn.required && basic_auth_role(&ctx, req.authorization.as_deref()).is_none()
+                if ctx.authn.required && auth_role(&ctx, req.authorization.as_deref()).is_none()
                 {
-                    return write_unauthorized(&mut stream);
+                    return write_unauthorized(&mut stream, &ctx);
                 }
                 let (status, body) = crate::ui::hosts_json(&ctx);
                 return write_json_body(&mut stream, status, &body);
@@ -240,9 +240,9 @@ fn handle_connection(
                 if !enabled {
                     return write_response(&mut stream, 404, &json!({"error": "not found"}));
                 }
-                if ctx.authn.required && basic_auth_role(&ctx, req.authorization.as_deref()).is_none()
+                if ctx.authn.required && auth_role(&ctx, req.authorization.as_deref()).is_none()
                 {
-                    return write_unauthorized(&mut stream);
+                    return write_unauthorized(&mut stream, &ctx);
                 }
                 let (status, body) = crate::ui::drivers_json(&ctx);
                 return write_json_body(&mut stream, status, &body);
@@ -252,9 +252,9 @@ fn handle_connection(
                 if !enabled {
                     return write_response(&mut stream, 404, &json!({"error": "not found"}));
                 }
-                if ctx.authn.required && basic_auth_role(&ctx, req.authorization.as_deref()).is_none()
+                if ctx.authn.required && auth_role(&ctx, req.authorization.as_deref()).is_none()
                 {
-                    return write_unauthorized(&mut stream);
+                    return write_unauthorized(&mut stream, &ctx);
                 }
                 let (status, body) = crate::ui::witnesses_json(&ctx);
                 return write_json_body(&mut stream, status, &body);
@@ -276,9 +276,9 @@ fn handle_connection(
             return write_response(&mut stream, 404, &json!({"error": "unknown admin route"}));
         };
         let role = if ctx.authn.required {
-            match basic_auth_role(&ctx, req.authorization.as_deref()) {
+            match auth_role(&ctx, req.authorization.as_deref()) {
                 Some(role) => role,
-                None => return write_unauthorized(&mut stream),
+                None => return write_unauthorized(&mut stream, &ctx),
             }
         } else {
             ctx.superuser_role.clone()
@@ -292,9 +292,9 @@ fn handle_connection(
     let bare_path = req.path.split('?').next().unwrap_or(&req.path).to_string();
     if bare_path.starts_with("/api/v1/") && bare_path != "/api/v1/write" {
         let role = if ctx.authn.required {
-            match basic_auth_role(&ctx, req.authorization.as_deref()) {
+            match auth_role(&ctx, req.authorization.as_deref()) {
                 Some(role) => role,
-                None => return write_unauthorized(&mut stream),
+                None => return write_unauthorized(&mut stream, &ctx),
             }
         } else {
             ctx.superuser_role.clone()
@@ -350,9 +350,9 @@ fn handle_connection(
     // Prometheus remote_write: snappy-compressed protobuf WriteRequest.
     if req.method == "POST" && req.path == "/api/v1/write" {
         let role = if ctx.authn.required {
-            match basic_auth_role(&ctx, req.authorization.as_deref()) {
+            match auth_role(&ctx, req.authorization.as_deref()) {
                 Some(role) => role,
-                None => return write_unauthorized(&mut stream),
+                None => return write_unauthorized(&mut stream, &ctx),
             }
         } else {
             ctx.superuser_role.clone()
@@ -370,9 +370,9 @@ fn handle_connection(
     // _bulk, _mapping (+ /_bulk). Authenticated like /query.
     if crate::es::path_is_es(&req.path) {
         let role = if ctx.authn.required {
-            match basic_auth_role(&ctx, req.authorization.as_deref()) {
+            match auth_role(&ctx, req.authorization.as_deref()) {
                 Some(role) => role,
-                None => return write_unauthorized(&mut stream),
+                None => return write_unauthorized(&mut stream, &ctx),
             }
         } else {
             ctx.superuser_role.clone()
@@ -393,9 +393,9 @@ fn handle_connection(
     // (needs `Insert` on the target table/database).
     if req.method == "POST" && req.path.starts_with("/insert") {
         let role = if ctx.authn.required {
-            match basic_auth_role(&ctx, req.authorization.as_deref()) {
+            match auth_role(&ctx, req.authorization.as_deref()) {
                 Some(role) => role,
-                None => return write_unauthorized(&mut stream),
+                None => return write_unauthorized(&mut stream, &ctx),
             }
         } else {
             ctx.superuser_role.clone()
@@ -417,10 +417,10 @@ fn handle_connection(
 
     // Resolve the role: HTTP Basic auth when required, else anonymous superuser.
     let role = if ctx.authn.required {
-        match basic_auth_role(&ctx, req.authorization.as_deref()) {
+        match auth_role(&ctx, req.authorization.as_deref()) {
             Some(role) => role,
             None => {
-                return write_unauthorized(&mut stream);
+                return write_unauthorized(&mut stream, &ctx);
             }
         }
     } else {
@@ -615,6 +615,59 @@ fn read_request<R: io::Read>(stream: &mut R) -> io::Result<Option<HttpRequest>> 
     }))
 }
 
+/// Resolve a role from an `Authorization` header: SPNEGO (`Negotiate`, for
+/// Kerberos browser/REST SSO) first, then HTTP `Basic`. `None` if neither
+/// authenticates.
+fn auth_role(ctx: &Shared, authorization: Option<&str>) -> Option<String> {
+    if let Some(h) = authorization {
+        if h.len() >= 10 && h[..10].eq_ignore_ascii_case("Negotiate ") {
+            return negotiate_role(ctx, h);
+        }
+    }
+    basic_auth_role(ctx, authorization)
+}
+
+/// Whether this server advertises/accepts SPNEGO: a `kerberos` build with
+/// `auth.gssapi_enabled`.
+fn gssapi_offered(ctx: &Shared) -> bool {
+    cfg!(feature = "kerberos")
+        && ctx
+            .config
+            .read()
+            .map(|c| c.auth.gssapi_enabled)
+            .unwrap_or(false)
+}
+
+/// Resolve a role from an `Authorization: Negotiate <base64 GSS token>` header
+/// (RFC 4559 SPNEGO). Single-leg: Kerberos normally establishes the context in
+/// one token, so a mechanism that asks for another round (NTLM-style) is
+/// rejected rather than carried across stateless REST requests. The
+/// authenticated principal maps to an external user's role (phase-2 seam).
+#[cfg(feature = "kerberos")]
+fn negotiate_role(ctx: &Shared, header: &str) -> Option<String> {
+    if !gssapi_offered(ctx) {
+        return None;
+    }
+    let b64 = header.get(10..)?.trim();
+    let token = base64_decode(b64)?;
+    let spn = {
+        let c = ctx.config.read().ok()?;
+        (!c.auth.gssapi_service_principal.is_empty())
+            .then(|| c.auth.gssapi_service_principal.clone())
+    };
+    let handshake = skaidb_gssapi::ServerHandshake::new(spn.as_deref()).ok()?;
+    match handshake.step(&token).ok()? {
+        skaidb_gssapi::ServerStep::Done { principal, .. } => ctx.lookup_external_role(&principal),
+        // Multi-leg negotiation isn't supported over stateless REST.
+        skaidb_gssapi::ServerStep::Continue { .. } => None,
+    }
+}
+
+#[cfg(not(feature = "kerberos"))]
+fn negotiate_role(_ctx: &Shared, _header: &str) -> Option<String> {
+    None
+}
+
 /// Resolve a role from an `Authorization: Basic ...` header, or `None`.
 fn basic_auth_role(ctx: &Shared, authorization: Option<&str>) -> Option<String> {
     let header = authorization?;
@@ -627,15 +680,43 @@ fn basic_auth_role(ctx: &Shared, authorization: Option<&str>) -> Option<String> 
     crate::authn::AuthState::verify_password(ctx.lookup_account(user).as_ref(), pass)
 }
 
-fn write_unauthorized<W: io::Write>(stream: &mut W) -> io::Result<()> {
+fn write_unauthorized<W: io::Write>(stream: &mut W, ctx: &Shared) -> io::Result<()> {
     let body = json!({"error": "authentication required"}).to_string();
+    // Offer SPNEGO first (browsers/`curl --negotiate` pick it) when Kerberos is
+    // on, then Basic so password clients still work — a client that can't do
+    // Negotiate falls through to it.
+    let challenge = if gssapi_offered(ctx) {
+        "WWW-Authenticate: Negotiate\r\nWWW-Authenticate: Basic realm=\"skaidb\"\r\n"
+    } else {
+        "WWW-Authenticate: Basic realm=\"skaidb\"\r\n"
+    };
     let head = format!(
-        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"skaidb\"\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 401 Unauthorized\r\n{challenge}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes())?;
     stream.write_all(body.as_bytes())?;
     stream.flush()
+}
+
+/// Encode bytes as standard base64 (with `=` padding).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(A[(n >> 18 & 63) as usize] as char);
+        out.push(A[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { A[(n >> 6 & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { A[(n & 63) as usize] as char } else { '=' });
+    }
+    out
 }
 
 /// Decode standard base64 (no whitespace) into bytes.
@@ -1061,6 +1142,28 @@ mod tests {
         let msg = body["error"].as_str().unwrap();
         assert!(msg.contains("response limit"), "{msg}");
         assert!(msg.contains("LIMIT"), "{msg}");
+    }
+
+    /// base64 encode/decode round-trip (the SPNEGO `Negotiate` token codec and
+    /// HTTP Basic share these); padding and every 3-byte alignment.
+    #[test]
+    fn base64_roundtrip() {
+        for case in [
+            &b""[..],
+            b"f",
+            b"fo",
+            b"foo",
+            b"foob",
+            b"fooba",
+            b"foobar",
+            &[0u8, 255, 128, 1, 2, 3, 254],
+        ] {
+            let enc = base64_encode(case);
+            assert_eq!(base64_decode(&enc).as_deref(), Some(case), "roundtrip {enc}");
+        }
+        // Known vector.
+        assert_eq!(base64_encode(b"Man"), "TWFu");
+        assert_eq!(base64_encode(b"M"), "TQ==");
     }
 
     /// The size estimate covers every value shape and scales with payload.
