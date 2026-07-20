@@ -876,6 +876,24 @@ impl Parser {
                 metric: metric.unwrap_or_else(|| "cosine".into()),
                 embed,
             }))
+        } else if self.peek_ident_ci("geo") {
+            // `GEO` is contextual (there is no GEO keyword — `geo_distance` /
+            // `geo_bbox` are ordinary function idents).
+            self.advance();
+            self.expect_keyword(Keyword::Index)?;
+            let if_not_exists = self.parse_if_not_exists()?;
+            let name = self.expect_ident()?;
+            self.expect_keyword(Keyword::On)?;
+            let table = self.parse_table_name()?;
+            self.expect(&Token::LParen)?;
+            let path = self.parse_path()?;
+            self.expect(&Token::RParen)?;
+            Ok(Statement::CreateGeoIndex(CreateGeoIndex {
+                name,
+                if_not_exists,
+                table,
+                path,
+            }))
         } else if self.peek_ident_ci("search") {
             // `SEARCH` is contextual so `SEARCH('...')` stays a valid
             // function call in expressions.
@@ -973,6 +991,12 @@ impl Parser {
             let if_exists = self.parse_if_exists()?;
             let name = self.expect_ident()?;
             Ok(Statement::DropVectorIndex { name, if_exists })
+        } else if self.peek_ident_ci("geo") {
+            self.advance();
+            self.expect_keyword(Keyword::Index)?;
+            let if_exists = self.parse_if_exists()?;
+            let name = self.expect_ident()?;
+            Ok(Statement::DropGeoIndex { name, if_exists })
         } else if self.peek_ident_ci("search") {
             self.advance();
             self.expect_keyword(Keyword::Index)?;
@@ -2578,5 +2602,31 @@ mod tests {
             "SELECT id FROM docs NEAREST (emb, [1.0], 5) WHERE MATCH(body,'x') RANK BY RRF (0)"
         )
         .is_err());
+    }
+
+    #[test]
+    fn parse_create_and_drop_geo_index() {
+        match parse("CREATE GEO INDEX places_geo ON places (loc)").unwrap() {
+            Statement::CreateGeoIndex(c) => {
+                assert_eq!(c.name, "places_geo");
+                assert_eq!(c.table, "places");
+                assert_eq!(c.path, "loc");
+                assert!(!c.if_not_exists);
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse("CREATE GEO INDEX IF NOT EXISTS g ON t (point)").unwrap() {
+            Statement::CreateGeoIndex(c) => assert!(c.if_not_exists),
+            other => panic!("{other:?}"),
+        }
+        match parse("DROP GEO INDEX IF EXISTS places_geo").unwrap() {
+            Statement::DropGeoIndex { name, if_exists } => {
+                assert_eq!(name, "places_geo");
+                assert!(if_exists);
+            }
+            other => panic!("{other:?}"),
+        }
+        // `geo` stays a usable identifier / function name elsewhere.
+        assert!(parse("SELECT geo_distance(loc, 1.0, 2.0) FROM t").is_ok());
     }
 }

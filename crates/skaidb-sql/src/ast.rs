@@ -21,6 +21,11 @@ pub enum Statement {
     DropIndex { name: String, if_exists: bool },
     CreateVectorIndex(CreateVectorIndex),
     DropVectorIndex { name: String, if_exists: bool },
+    /// `CREATE GEO INDEX` — a Morton/Z-order index over a `{lat, lon}` point
+    /// column that transparently accelerates `geo_distance` / `geo_bbox`.
+    CreateGeoIndex(CreateGeoIndex),
+    /// `DROP GEO INDEX [IF EXISTS] name`.
+    DropGeoIndex { name: String, if_exists: bool },
     /// `CREATE SEARCH INDEX` — a full-text index over one or more text
     /// columns, queried with `MATCH()`/`SEARCH()` predicates.
     CreateSearchIndex(CreateSearchIndex),
@@ -225,6 +230,7 @@ impl Statement {
             Statement::DropTable { name, .. } => f(name),
             Statement::CreateIndex(c) => f(&mut c.table),
             Statement::CreateVectorIndex(c) => f(&mut c.table),
+            Statement::CreateGeoIndex(c) => f(&mut c.table),
             Statement::CreateSearchIndex(c) => f(&mut c.table),
             Statement::AlterTable(a) => {
                 f(&mut a.name);
@@ -251,6 +257,8 @@ impl Statement {
             Statement::DropIndex { name, .. } => f(name),
             Statement::CreateVectorIndex(c) => f(&mut c.name),
             Statement::DropVectorIndex { name, .. } => f(name),
+            Statement::CreateGeoIndex(c) => f(&mut c.name),
+            Statement::DropGeoIndex { name, .. } => f(name),
             Statement::CreateSearchIndex(c) => f(&mut c.name),
             Statement::DropSearchIndex { name, .. } => f(name),
             Statement::RebuildSearchIndex { name } => f(name),
@@ -393,6 +401,16 @@ pub struct CreateVectorIndex {
     /// pre-computed vector array from the row). A string `NEAREST` query on such
     /// an index is auto-embedded too.
     pub embed: bool,
+}
+
+/// `CREATE GEO INDEX [IF NOT EXISTS] name ON table (path)`. A Morton/Z-order
+/// spatial index over the `{lat, lon}` point at `path`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateGeoIndex {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub table: String,
+    pub path: String,
 }
 
 /// `CREATE SEARCH INDEX [IF NOT EXISTS] name ON table (path1 [, path2, ...])

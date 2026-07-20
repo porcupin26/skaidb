@@ -37,6 +37,9 @@ DROP   INDEX [IF EXISTS] <name>
 CREATE VECTOR INDEX [IF NOT EXISTS] <name> ON <table> (<path>) DIM <n> [USING <metric>]
 DROP   VECTOR INDEX [IF EXISTS] <name>
 ALTER  VECTOR INDEX <name> SET (ef = <n>)   -- live recall/latency tuning
+CREATE GEO INDEX [IF NOT EXISTS] <name> ON <table> (<point-path>)
+       -- Morton/Z-order index: geo_distance / geo_bbox prune to a neighborhood
+DROP   GEO INDEX [IF EXISTS] <name>
 CREATE SEARCH INDEX [IF NOT EXISTS] <name> ON <table> (<path> [, <path> ...])
        [WITH (<option> = <literal> [, <option> = <literal> ...])]
        -- options are global (analyzer, refresh_ms) or per-column (<path>.<option>)
@@ -166,6 +169,14 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   `USING <metric>` is `cosine` (default), `l2`, or `dot`. It broadcasts across
   the cluster so every node indexes its shard. Query it with the `NEAREST`
   clause (see *Vector search* below and [VECTOR.md](VECTOR.md)).
+- `CREATE GEO INDEX` builds a **Morton (Z-order) spatial index** over the
+  `{lat, lon}` point column at `<point-path>`, so `geo_distance` / `geo_bbox`
+  predicates in a `WHERE` scan a small set of code ranges instead of the whole
+  table — no query change, the index is used transparently when present. It
+  broadcasts across the cluster (each node indexes its shard), maintains itself
+  on write, backfills existing rows in the background, and persists on disk (no
+  rebuild on restart). There is nothing to configure; a row whose column is not
+  a readable point is simply not indexed. See [GEO.md](GEO.md).
 - `CREATE SEARCH INDEX` builds a **full-text (BM25) index** over the listed
   document paths. Global options: `analyzer` (`'standard'` default,
   `'folding'`, `'whitespace'`, `'keyword'`, `'ngram(min,max)'`,
@@ -497,9 +508,9 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   filter) rather than erroring. Use them anywhere:
   `WHERE geo_distance(loc, 40.71, -74.0) <= 5000`,
   `ORDER BY geo_distance(loc, 40.71, -74.0) LIMIT 10` (nearest-first), or
-  `WHERE geo_bbox(loc, 40.4, -74.3, 40.9, -73.7)`. These evaluate over a scan
-  (bounded by the scan budget) — there is no geo index yet, so scope with a
-  `geo_bbox`/other filter on large tables.
+  `WHERE geo_bbox(loc, 40.4, -74.3, 40.9, -73.7)`. A **`CREATE GEO INDEX`**
+  (below) makes these predicates prune to a neighborhood instead of scanning the
+  whole table; without one they still work over a (scan-budget-bounded) scan.
 - **Bind parameters:** `?` marks a positional parameter in any expression
   position of a **prepared** `SELECT`/`INSERT`/`UPDATE`/`DELETE` (e.g.
   `INSERT INTO t (id, v) VALUES (?, ?)`), and additionally in `LIMIT ?` /

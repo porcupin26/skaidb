@@ -1009,6 +1009,36 @@ impl Node {
                     }
                 }
             }
+            // Geo backfills: same paged drain. Entries persist in the on-disk
+            // index engine (nothing rebuilds on open), so this is only the
+            // initial fill of rows that predated the index.
+            let pending = match node.local.write() {
+                Ok(mut db) => db.take_pending_geo_backfills(),
+                Err(_) => return,
+            };
+            for name in pending {
+                let mut cursor = None;
+                loop {
+                    let step = match node.local.write() {
+                        Ok(mut db) => db.backfill_geo_page(&name, cursor.take(), 2048),
+                        Err(_) => return,
+                    };
+                    match step {
+                        Ok(Some(next)) => {
+                            cursor = Some(next);
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Ok(None) => {
+                            skaidb_types::slog!("skaidb: background geo backfill complete: {name}");
+                            break;
+                        }
+                        Err(e) => {
+                            skaidb_types::slog!("skaidb: geo backfill failed on {name}: {e}");
+                            break;
+                        }
+                    }
+                }
+            }
             // Managed-embedding drain: embed rows queued by writes to `… EMBED`
             // indexes. The HTTP call to the model server happens OUTSIDE the
             // engine lock — gather text under a brief lock, embed, re-acquire
@@ -8074,6 +8104,8 @@ fn is_ddl(stmt: &Statement) -> bool {
             | Statement::DropIndex { .. }
             | Statement::CreateVectorIndex(_)
             | Statement::DropVectorIndex { .. }
+            | Statement::CreateGeoIndex(_)
+            | Statement::DropGeoIndex { .. }
             | Statement::CreateSearchIndex(_)
             | Statement::DropSearchIndex { .. }
             | Statement::RebuildSearchIndex { .. }
@@ -8129,6 +8161,37 @@ impl Coordinator {
             .read()
             .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
             .plan_global_probe(table, filter))
+    }
+
+    /// Distributed geo-index candidate gather: for each Morton-code range the
+    /// predicate expands to, scatter an `IndexScan` to every member (reusing the
+    /// secondary-index candidate machinery — a geo scan is just a multi-range
+    /// index scan), union the row keys, re-read each at quorum, then apply the
+    /// exact geo filter on the coordinator. `Ok(None)` when no geo index serves
+    /// the predicate (the caller falls through to the other access paths).
+    fn geo_lookup(
+        &self,
+        table: &str,
+        filter: &Option<Expr>,
+        project: Option<&HashSet<String>>,
+    ) -> EngineResult<ProbeRows> {
+        let plan = self
+            .node
+            .local
+            .read()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .plan_geo_scan(table, filter);
+        let Some((index, ranges)) = plan else {
+            return Ok(None);
+        };
+        let mut keys: BTreeMap<Vec<u8>, ()> = BTreeMap::new();
+        for (start, end) in ranges {
+            for (k, _) in self.node.index_candidate_keys(table, &index, Some(start), end)? {
+                keys.insert(k, ());
+            }
+        }
+        let rows = self.node.resolve_candidates(table, keys, self.oc, project)?;
+        Ok(Some(filter_rows(filter, rows)?))
     }
 }
 
@@ -8544,6 +8607,12 @@ impl Cluster for Coordinator {
             let rows = self.node.resolve_candidates(table, set, self.oc, None)?;
             return filter_rows(filter, rows);
         }
+        // Geo predicate served by a geo index: gather Morton-range candidates
+        // from every shard (a geo scan is a multi-range index scan), re-read at
+        // quorum, exact-filter here.
+        if let Some(rows) = self.geo_lookup(table, filter, None)? {
+            return Ok(rows);
+        }
         // Indexed non-PK predicate: push the index scan to every node to gather
         // candidate keys, then re-read each at quorum — far less data than
         // shipping every node's whole shard.
@@ -8623,6 +8692,9 @@ impl Cluster for Coordinator {
             let rows = self.node.resolve_candidates(table, set, self.oc, Some(project))?;
             return filter_rows(filter, rows);
         }
+        if let Some(rows) = self.geo_lookup(table, filter, Some(project))? {
+            return Ok(rows);
+        }
         if let Some((index, start, end)) = self.plan_index_scan(table, filter)? {
             let rows = self.node.index_lookup(table, &index, start, end, self.oc)?;
             return filter_rows(filter, rows);
@@ -8669,6 +8741,11 @@ impl Cluster for Coordinator {
         // key than the on-disk key order — both keep the default full gather.
         if let (None, None, Some(lim)) = (filter, order, fetch_limit) {
             let rows = self.node.cluster_scan_limited(table, self.oc, lim)?;
+            return Ok((rows, false));
+        }
+        // Geo predicate served by a geo index: gather Morton-range candidates
+        // (unordered — the executor re-sorts by distance and applies LIMIT).
+        if let Some(rows) = self.geo_lookup(table, filter, None)? {
             return Ok((rows, false));
         }
         // Filtered + limited, no order: a selective filter takes the index
@@ -9697,6 +9774,71 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(rs.rows, vec![vec![Value::Int(3)], vec![Value::Int(5)]]);
+    }
+
+    #[test]
+    fn distributed_geo_index_query() {
+        // A geo index accelerates geo_distance/geo_bbox cluster-wide: each shard
+        // scans the Morton-code ranges the bbox expands to (the secondary-index
+        // scatter reused for multiple ranges), the coordinator re-reads at quorum
+        // and applies the exact predicate. Creating the index BEFORE the inserts
+        // keeps every write live-maintained (no async backfill to wait on).
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let na = Node::new(
+            Database::open(temp_dir("geoa")).unwrap(),
+            cfg("a", &a, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("geob")).unwrap(),
+            cfg("b", &b, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nc = Node::new(
+            Database::open(temp_dir("geoc")).unwrap(),
+            cfg("c", &c, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        nc.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE places (PRIMARY KEY (id))").unwrap();
+        na.execute("CREATE GEO INDEX places_geo ON places (loc)").unwrap();
+        na.execute(
+            "INSERT INTO places (id, loc) VALUES \
+             (1, {lat: 0.0, lon: 0.0}), (2, {lat: 0.1, lon: 0.1}), \
+             (3, {lat: 40.0, lon: 40.0}), (4, {lat: -35.0, lon: 150.0})",
+        )
+        .unwrap();
+
+        // Radius query coordinated by a *different* node.
+        let rs = rows(
+            nb.execute(
+                "SELECT id FROM places WHERE geo_distance(loc, 0.0, 0.0) <= 50000 ORDER BY id",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+
+        // Bounding box coordinated by a third node.
+        let rs = rows(
+            nc.execute(
+                "SELECT id FROM places WHERE geo_bbox(loc, 30.0, 30.0, 50.0, 50.0) ORDER BY id",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(3)]]);
+
+        // Move a point out of range (PK update); the geo query reflects it
+        // cluster-wide (old Morton entry cleared, candidates re-read at quorum).
+        nb.execute("UPDATE places SET loc = {lat: 80.0, lon: 80.0} WHERE id = 2")
+            .unwrap();
+        let rs = rows(
+            na.execute(
+                "SELECT id FROM places WHERE geo_distance(loc, 0.0, 0.0) <= 50000 ORDER BY id",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(1)]]);
     }
 
     #[test]

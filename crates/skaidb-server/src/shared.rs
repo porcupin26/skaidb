@@ -1306,6 +1306,7 @@ fn required_privilege(
         Statement::CreateRollup(cr) => (Privilege::Create, Object::Table(cr.table.clone())),
         Statement::CreateIndex(ci) => (Privilege::Create, Object::Table(ci.table.clone())),
         Statement::CreateVectorIndex(ci) => (Privilege::Create, Object::Table(ci.table.clone())),
+        Statement::CreateGeoIndex(ci) => (Privilege::Create, Object::Table(ci.table.clone())),
         Statement::CreateSearchIndex(ci) => (Privilege::Create, Object::Table(ci.table.clone())),
         Statement::DropTable { name, .. } => (Privilege::Drop, Object::Table(name.clone())),
         // Index lifecycle (drop/rebuild/alter) is governed by the same
@@ -1317,6 +1318,7 @@ fn required_privilege(
         // IF EXISTS), and index existence is already free via SHOW INDEXES.
         Statement::DropIndex { name, .. }
         | Statement::DropVectorIndex { name, .. }
+        | Statement::DropGeoIndex { name, .. }
         | Statement::DropSearchIndex { name, .. }
         | Statement::RebuildSearchIndex { name }
         | Statement::AlterSearchIndex { name, .. }

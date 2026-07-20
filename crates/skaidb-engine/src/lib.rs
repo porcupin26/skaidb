@@ -5,6 +5,7 @@
 
 pub mod catalog;
 pub mod embed;
+pub mod geo;
 mod error;
 mod eval;
 mod exec;
@@ -2356,6 +2357,111 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(sorted_ids(rs), vec![1]);
+    }
+
+    /// Geo index: `CREATE GEO INDEX` accelerates `geo_distance` / `geo_bbox`
+    /// transparently — same results as the scan, with the index engaged (proven
+    /// via EXPLAIN), across backfill of pre-existing rows, live inserts, an
+    /// UPDATE that moves a point out of range, and a DELETE.
+    #[test]
+    fn geo_index_prunes_and_stays_consistent() {
+        let dir = tempdir();
+        let mut db = Database::open(&dir).unwrap();
+        db.execute("CREATE TABLE places (PRIMARY KEY (id))").unwrap();
+        // Rows inserted BEFORE the index exists — the backfill must pick them up.
+        // A spread of points; only those near (0,0) are "in range" below.
+        db.execute(
+            "INSERT INTO places (id, loc) VALUES \
+             (1, {lat: 0.0, lon: 0.0}), (2, {lat: 0.1, lon: 0.1}), \
+             (3, {lat: 40.0, lon: 40.0}), (4, {lat: -35.0, lon: 150.0}), \
+             (5, 'not-a-point')",
+        )
+        .unwrap();
+        db.execute("CREATE GEO INDEX places_geo ON places (loc)").unwrap();
+
+        // EXPLAIN proves the geo index is chosen for a geo_distance predicate.
+        let ex = rows(
+            db.execute(
+                "EXPLAIN SELECT id FROM places WHERE geo_distance(loc, 0.0, 0.0) <= 50000",
+            )
+            .unwrap(),
+        );
+        let access: String = ex
+            .rows
+            .iter()
+            .find(|r| r[0] == Value::String("access".into()))
+            .map(|r| match &r[1] {
+                Value::String(s) => s.clone(),
+                o => format!("{o:?}"),
+            })
+            .unwrap_or_default();
+        assert!(access.contains("geo index scan"), "explain access = {access}");
+
+        // Radius query: only (0,0) and (0.1,0.1) are within 50 km of (0,0).
+        let rs = rows(
+            db.execute("SELECT id FROM places WHERE geo_distance(loc, 0.0, 0.0) <= 50000")
+                .unwrap(),
+        );
+        assert_eq!(sorted_ids(rs), vec![1, 2]);
+
+        // Bounding box over the same neighborhood — same two rows.
+        let rs = rows(
+            db.execute("SELECT id FROM places WHERE geo_bbox(loc, -0.5, -0.5, 0.5, 0.5)")
+                .unwrap(),
+        );
+        assert_eq!(sorted_ids(rs), vec![1, 2]);
+
+        // A row inserted AFTER the index is maintained live.
+        db.execute("INSERT INTO places (id, loc) VALUES (6, {lat: 0.2, lon: -0.2})")
+            .unwrap();
+        let rs = rows(
+            db.execute("SELECT id FROM places WHERE geo_distance(loc, 0.0, 0.0) <= 50000")
+                .unwrap(),
+        );
+        assert_eq!(sorted_ids(rs), vec![1, 2, 6]);
+
+        // UPDATE moves row 2 far away — the old Morton entry must be cleared so
+        // it no longer answers the near query (and answers a far one).
+        db.execute("UPDATE places SET loc = {lat: 80.0, lon: 80.0} WHERE id = 2")
+            .unwrap();
+        let rs = rows(
+            db.execute("SELECT id FROM places WHERE geo_distance(loc, 0.0, 0.0) <= 50000")
+                .unwrap(),
+        );
+        assert_eq!(sorted_ids(rs), vec![1, 6]);
+        let rs = rows(
+            db.execute("SELECT id FROM places WHERE geo_distance(loc, 80.0, 80.0) <= 50000")
+                .unwrap(),
+        );
+        assert_eq!(sorted_ids(rs), vec![2]);
+
+        // DELETE removes row 1 from the index.
+        db.execute("DELETE FROM places WHERE id = 1").unwrap();
+        let rs = rows(
+            db.execute("SELECT id FROM places WHERE geo_distance(loc, 0.0, 0.0) <= 50000")
+                .unwrap(),
+        );
+        assert_eq!(sorted_ids(rs), vec![6]);
+
+        // ORDER BY geo_distance still works through the index (re-sorted by the
+        // executor since Z-order is not distance order).
+        let rs = rows(
+            db.execute(
+                "SELECT id FROM places WHERE geo_distance(loc, 0.0, 0.0) <= 20000000 \
+                 ORDER BY geo_distance(loc, 0.0, 0.0) LIMIT 1",
+            )
+            .unwrap(),
+        );
+        assert_eq!(ids(rs)[0], 6);
+
+        // Survives reopen: entries are durable (no rebuild), still consistent.
+        drop(db);
+        let mut db = Database::open(&dir).unwrap();
+        let rs = rows(
+            db.execute("SELECT id FROM places WHERE geo_distance(loc, 0.0, 0.0) <= 50000")
+                .unwrap(),
+        );
+        assert_eq!(sorted_ids(rs), vec![6]);
     }
 
     /// Managed (`EMBED`) vector index: skaidb embeds the text column at ingest

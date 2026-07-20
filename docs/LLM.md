@@ -118,8 +118,13 @@ Key facts an agent must know:
   `geo_bbox(point, min_lat, min_lon, max_lat, max_lon)` → bool (min_lon>max_lon
   crosses the antimeridian). `point` is a `{lat,lon}` object or `[lat,lon]`
   array; non-point/NULL → NULL. Use in `WHERE geo_distance(loc,..) <= <metres>`
-  and `ORDER BY geo_distance(loc,..) LIMIT k` (nearest-first). Evaluates over a
-  scan (no geo index yet — filter to scope large tables).
+  and `ORDER BY geo_distance(loc,..) LIMIT k` (nearest-first). `CREATE GEO INDEX
+  <name> ON <t>(<point-col>)` makes both predicates prune via a Morton/Z-order
+  index (transparent — no query change; a single non-wrapping `geo_bbox` box or
+  a `geo_distance <= r` radius routes to code-range scans, exact-filtered on
+  re-read); without one they scan. Broadcast DDL, self-maintaining, on-disk
+  (no rebuild on restart), cluster-wide via the secondary-index scatter. A
+  wrapping/degenerate box falls back to a scan. See [GEO.md](GEO.md).
 - **`SELECT <expr>` without FROM**: constant projection, one row
   (`SELECT 1` = liveness probe; needs no privilege). `*` and other
   clauses still require a table; a FROM-less leg works inside UNION.

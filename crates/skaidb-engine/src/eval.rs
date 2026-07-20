@@ -364,8 +364,10 @@ fn as_f64(v: &Value) -> Option<f64> {
 }
 
 /// Read a geo point as `(lat, lon)` from a `{lat, lon}` object (`lng` also
-/// accepted) or a `[lat, lon]` array. `None` for any other shape.
-fn read_point(v: &Value) -> Option<(f64, f64)> {
+/// accepted) or a `[lat, lon]` array. `None` for any other shape. `pub(crate)`
+/// so the geo index maintenance/planner reads points the same way the
+/// `geo_distance` / `geo_bbox` predicates do.
+pub(crate) fn read_point(v: &Value) -> Option<(f64, f64)> {
     match v {
         Value::Document(d) => {
             let lat = as_f64(d.get("lat")?)?;

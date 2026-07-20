@@ -79,6 +79,23 @@ pub struct VectorIndexDef {
     pub embed: bool,
 }
 
+/// A geospatial index declaration (`CREATE GEO INDEX ... ON t(point_col)`).
+/// The index stores one entry per row keyed by the point's Morton (Z-order)
+/// code, so `geo_distance` / `geo_bbox` predicates over `path` scan a small set
+/// of code ranges instead of the whole shard. `path` is a `{lat, lon}` (or
+/// `[lat, lon]`) column, read schema-lessly at write time. Entries live in an
+/// ordinary on-disk index engine (durable, distributed via the same
+/// `IndexScan` scatter as secondary indexes), so nothing is rebuilt on open.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GeoIndexDef {
+    pub table: String,
+    pub path: String,
+    /// This node's backfill is still running: the planner must not use the
+    /// index yet (its entries are incomplete). LOCAL state, like `IndexDef`.
+    #[serde(default)]
+    pub building: bool,
+}
+
 /// A full-text search index declaration (`CREATE SEARCH INDEX ... ON t(paths)
 /// WITH (...)`), backing `MATCH()`/`SEARCH()` predicates over the text at
 /// `paths`.
@@ -293,6 +310,11 @@ pub struct Catalog {
     /// `default` so older catalogs load.
     #[serde(default)]
     pub search_indexes: BTreeMap<String, SearchIndexDef>,
+    /// Geospatial (Morton/Z-order) indexes over point columns. Entries live in
+    /// an on-disk index engine like a secondary index. `default` so older
+    /// catalogs load.
+    #[serde(default)]
+    pub geo_indexes: BTreeMap<String, GeoIndexDef>,
     /// Named databases other than the implicit `default`. A database is a
     /// namespace prefix on table/index names; this set lets an empty database
     /// (created but holding no tables yet) persist. `default` so older catalogs
@@ -307,7 +329,7 @@ pub struct Catalog {
     pub auth_roles: BTreeMap<String, AuthRoleDef>,
     /// Per-object DDL version stamps for last-writer-wins schema replication,
     /// keyed by a kind-prefixed name: `d:<db>`, `t:<table>`, `i:<index>`,
-    /// `v:<vector index>`, `s:<search index>`. A `dropped` stamp is a
+    /// `v:<vector index>`, `s:<search index>`, `g:<geo index>`. A `dropped` stamp is a
     /// tombstone. `default` so older
     /// catalogs load with no versions and converge on the next DDL/repair.
     #[serde(default)]

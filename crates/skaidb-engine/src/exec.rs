@@ -43,6 +43,13 @@ pub type VersionedTombstoneRow = (Vec<u8>, Vec<u8>, Hlc, bool);
 /// end_key)` (byte bounds, `None` = unbounded).
 pub type IndexScanRange = (String, Option<Vec<u8>>, Option<Vec<u8>>);
 
+/// A geo-index scan plan: `(index_name, ranges)` where each range is a byte
+/// `(start_inclusive, end_exclusive)` over the index's Morton-code entries
+/// (`end = None` when the range runs to the maximum code). The union of ranges
+/// is a superset of the query's matching points — the caller re-reads each
+/// candidate and applies the exact `geo_distance` / `geo_bbox` predicate.
+pub type GeoScanPlan = (String, Vec<(Vec<u8>, Option<Vec<u8>>)>);
+
 /// `(key, document)` rows — the engine's standard row-gather result.
 type KeyedRows = Vec<(Vec<u8>, Document)>;
 /// `DESCRIBE`'s catalog half: the primary-key columns (in key order) and, per
@@ -109,6 +116,7 @@ enum IndexClass {
     Secondary,
     Vector,
     Search,
+    Geo,
 }
 /// Per-key version chain: `(hlc, Some(bytes) | None-tombstone)`, used by the
 /// deferred-maintenance crash replay.
@@ -177,6 +185,10 @@ pub struct Database {
     /// `pending_backfills` (inline for a Session, background on a cluster
     /// node).
     pending_vector_backfills: Vec<String>,
+    /// Geo indexes created/imported here whose backfill hasn't been driven.
+    /// Same drain contract as `pending_backfills` (geo entries persist in the
+    /// index engine, so this is only about the initial fill of existing rows).
+    pending_geo_backfills: Vec<String>,
     /// Cluster mode: leave pending backfills for the background worker
     /// instead of draining inline after each statement, so DDL acks at
     /// schema-apply (single-node/Session keeps run-to-completion DDL).
@@ -443,6 +455,18 @@ impl Database {
             let engine = StorageEngine::open_with_options(index_dir(&dir, name), opts.clone())?;
             indexes.insert(name.clone(), engine);
         }
+        // Geo indexes share the on-disk index-engine machinery (durable
+        // entries, distributed via the same `IndexScan` scatter), so reopen
+        // each into the same `indexes` map. Entries persist — nothing rebuilds
+        // — but an index whose backfill was interrupted resumes below.
+        let mut pending_geo_backfills = Vec::new();
+        for (name, def) in &catalog.geo_indexes {
+            let engine = StorageEngine::open_with_options(index_dir(&dir, name), opts.clone())?;
+            indexes.insert(name.clone(), engine);
+            if def.building {
+                pending_geo_backfills.push(name.clone());
+            }
+        }
 
         let mut timeseries = HashMap::new();
         for (name, def) in &catalog.timeseries {
@@ -634,6 +658,7 @@ impl Database {
             pending_backfills: Vec::new(),
             building_vectors: std::collections::HashSet::new(),
             pending_vector_backfills: Vec::new(),
+            pending_geo_backfills,
             pending_search_catchups: pending_search,
             pending_embeds: std::collections::HashMap::new(),
             defer_backfills: false,
@@ -1373,6 +1398,42 @@ impl Database {
         }
     }
 
+    /// The `(name, path)` of every geo index on `table`.
+    fn geo_indexes_on(&self, table: &str) -> Vec<(String, String)> {
+        self.catalog
+            .geo_indexes
+            .iter()
+            .filter(|(_, g)| g.table == table)
+            .map(|(name, g)| (name.clone(), g.path.clone()))
+            .collect()
+    }
+
+    /// Add the geo index entry for a written row's point (all geo indexes on
+    /// `table`). A row whose column is not a readable point gets no entry.
+    fn maintain_geo_put(&mut self, table: &str, doc: &Document, key: &[u8]) -> Result<()> {
+        for (name, path) in self.geo_indexes_on(table) {
+            if let Some(entry) = geo_entry_key(doc, &path, key) {
+                if let Some(engine) = self.indexes.get_mut(&name) {
+                    engine.put(&entry, key.to_vec())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove the geo index entry for a row's point (used on delete, and on the
+    /// previous version before an overwrite whose point moved).
+    fn maintain_geo_del(&mut self, table: &str, doc: &Document, key: &[u8]) -> Result<()> {
+        for (name, path) in self.geo_indexes_on(table) {
+            if let Some(entry) = geo_entry_key(doc, &path, key) {
+                if let Some(engine) = self.indexes.get_mut(&name) {
+                    engine.delete(&entry)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     // ---- managed (EMBED) vector index: out-of-band embedding ----
 
     /// Queue every row of a managed index whose text is present but not yet in
@@ -2007,6 +2068,20 @@ impl Database {
                             );
                         }
                     }
+                } else if let Some((idx, ranges)) =
+                    self.plan_geo_scan(&sel.from, &sel.filter)
+                {
+                    push(
+                        "access",
+                        format!(
+                            "geo index scan via '{idx}' ({} Morton-code range(s))",
+                            ranges.len()
+                        ),
+                    );
+                    push(
+                        "residual_filter",
+                        "exact geo_distance/geo_bbox re-checked on candidates".into(),
+                    );
                 } else {
                     let pk = self.table_primary_key(&sel.from)?;
                     if pk_point_key(&pk, &sel.filter).is_some() {
@@ -2559,7 +2634,8 @@ impl Database {
             .get(&internal)
             .map(|d| &d.table)
             .or_else(|| self.catalog.vector_indexes.get(&internal).map(|d| &d.table))
-            .or_else(|| self.catalog.search_indexes.get(&internal).map(|d| &d.table))?;
+            .or_else(|| self.catalog.search_indexes.get(&internal).map(|d| &d.table))
+            .or_else(|| self.catalog.geo_indexes.get(&internal).map(|d| &d.table))?;
         Some(crate::namespace::display_name(table, current_db))
     }
 
@@ -2750,6 +2826,11 @@ impl Database {
                 self.run_vector_backfill(&name)?;
             }
         }
+        if !self.defer_backfills && !self.pending_geo_backfills.is_empty() {
+            for name in self.take_pending_geo_backfills() {
+                self.run_geo_backfill(&name)?;
+            }
+        }
         // Single-node: embed any rows this statement queued to managed indexes,
         // inline at commit (a Session has no background worker). Never fails the
         // statement — a down embedder just leaves rows queued.
@@ -2807,6 +2888,10 @@ impl Database {
             Statement::DropVectorIndex { name, if_exists } => {
                 self.drop_vector_index(&name, if_exists)
             }
+            Statement::CreateGeoIndex(ci) => {
+                self.create_geo_index(&ci.name, &ci.table, &ci.path, ci.if_not_exists)
+            }
+            Statement::DropGeoIndex { name, if_exists } => self.drop_geo_index(&name, if_exists),
             Statement::CreateSearchIndex(ci) => self.create_search_index(&ci),
             Statement::DropSearchIndex { name, if_exists } => {
                 self.drop_search_index(&name, if_exists)
@@ -3261,6 +3346,18 @@ impl Database {
                 Value::String(self.index_local_health(name, IndexClass::Search).into()),
             ]);
         }
+        for (name, g) in &self.catalog.geo_indexes {
+            if !namespace::belongs_to(name, current_db) {
+                continue;
+            }
+            rows.push(vec![
+                Value::String(namespace::split(name).1.to_string()),
+                Value::String(namespace::split(&g.table).1.to_string()),
+                Value::String("geo".into()),
+                Value::String(g.path.clone()),
+                Value::String(self.index_local_health(name, IndexClass::Geo).into()),
+            ]);
+        }
         rows.sort_by(|a, b| match (&a[0], &b[0]) {
             (Value::String(x), Value::String(y)) => x.cmp(y),
             _ => std::cmp::Ordering::Equal,
@@ -3307,6 +3404,15 @@ impl Database {
                 Some(live) if live.building => "building",
                 Some(_) => "ok",
                 None => "missing",
+            },
+            // Geo entries persist in the on-disk index engine (like a secondary
+            // index): `building` while its initial backfill runs, else `ok` if
+            // the engine is live, `missing` if the catalog lists it but no
+            // engine is open.
+            IndexClass::Geo => match self.catalog.geo_indexes.get(name) {
+                Some(d) if d.building => "building",
+                _ if self.indexes.contains_key(name) => "ok",
+                _ => "missing",
             },
         }
     }
@@ -3853,6 +3959,24 @@ impl Database {
             self.vector_indexes.remove(&vname);
             self.record_schema(format!("v:{vname}"), hlc, true);
         }
+        // Geo indexes cascade too (same orphan-on-join hazard as above).
+        let dropped_geo: Vec<String> = self
+            .catalog
+            .geo_indexes
+            .iter()
+            .filter(|(_, gdef)| gdef.table == name)
+            .map(|(n, _)| n.clone())
+            .collect();
+        for gname in dropped_geo {
+            self.catalog.geo_indexes.remove(&gname);
+            self.indexes.remove(&gname);
+            self.pending_geo_backfills.retain(|n| n != &gname);
+            self.record_schema(format!("g:{gname}"), hlc, true);
+            let gdir = index_dir(&self.dir, &gname);
+            if gdir.exists() {
+                std::fs::remove_dir_all(gdir)?;
+            }
+        }
         self.record_schema(key, hlc, true);
         self.save_catalog()?;
         let dir = table_dir(&self.dir, name);
@@ -4041,6 +4165,143 @@ impl Database {
     /// this; a Session drains it inline right after the DDL.
     pub fn take_pending_backfills(&mut self) -> Vec<String> {
         std::mem::take(&mut self.pending_backfills)
+    }
+
+    /// `CREATE GEO INDEX [IF NOT EXISTS] name ON table (path)`: a Morton/Z-order
+    /// spatial index over a `{lat, lon}` point column, stored in an ordinary
+    /// on-disk index engine. DDL acks with the index marked `building`; the
+    /// backfill of existing rows runs afterward (inline for a Session, paged in
+    /// the background on a cluster node), and writes maintain it meanwhile.
+    fn create_geo_index(
+        &mut self,
+        name: &str,
+        table: &str,
+        path: &str,
+        if_not_exists: bool,
+    ) -> Result<QueryOutput> {
+        if !self.catalog.tables.contains_key(table) {
+            return Err(EngineError::TableNotFound(table.to_string()));
+        }
+        let hlc = self.ddl_stamp();
+        let key = format!("g:{name}");
+        if !self.schema_advances(&key, hlc) {
+            return Ok(QueryOutput::Ddl);
+        }
+        if let Some(existing) = self.catalog.geo_indexes.get(name) {
+            if !if_not_exists {
+                return Err(EngineError::IndexExists(name.to_string()));
+            }
+            // Schema sync replays peer defs as IF NOT EXISTS with the peer's
+            // HLC; a differing def is newer — replace and rebuild.
+            if existing.table == table && existing.path == path {
+                self.record_schema(key, hlc, false);
+                self.save_catalog()?;
+                return Ok(QueryOutput::Ddl);
+            }
+            self.catalog.geo_indexes.remove(name);
+            self.indexes.remove(name);
+            self.pending_geo_backfills.retain(|n| n != name);
+            let _ = std::fs::remove_dir_all(index_dir(&self.dir, name));
+        }
+        if self.catalog.tables.get(table).is_some_and(|t| t.memory) {
+            return Err(EngineError::Unsupported(
+                "geo indexes on memory tables are not supported".into(),
+            ));
+        }
+        let engine =
+            StorageEngine::open_with_options(index_dir(&self.dir, name), self.storage_opts.clone())?;
+        self.indexes.insert(name.to_string(), engine);
+        self.catalog.geo_indexes.insert(
+            name.to_string(),
+            crate::catalog::GeoIndexDef {
+                table: table.to_string(),
+                path: path.to_string(),
+                building: true,
+            },
+        );
+        self.record_schema(key, hlc, false);
+        self.save_catalog()?;
+        self.pending_geo_backfills.push(name.to_string());
+        Ok(QueryOutput::Ddl)
+    }
+
+    /// `DROP GEO INDEX [IF EXISTS] name`.
+    fn drop_geo_index(&mut self, name: &str, if_exists: bool) -> Result<QueryOutput> {
+        let hlc = self.ddl_stamp();
+        let key = format!("g:{name}");
+        if !self.schema_advances(&key, hlc) {
+            return Ok(QueryOutput::Ddl);
+        }
+        if self.catalog.geo_indexes.remove(name).is_none() && !if_exists {
+            return Err(EngineError::IndexNotFound(name.to_string()));
+        }
+        self.indexes.remove(name);
+        self.pending_geo_backfills.retain(|n| n != name);
+        let idir = index_dir(&self.dir, name);
+        if idir.exists() {
+            std::fs::remove_dir_all(idir)?;
+        }
+        self.record_schema(key, hlc, true);
+        self.save_catalog()?;
+        Ok(QueryOutput::Ddl)
+    }
+
+    /// One page of a geo-index backfill: encode each row's point into the index
+    /// engine keyed by its Morton code. Page-sized like [`Database::backfill_index_page`].
+    pub fn backfill_geo_page(
+        &mut self,
+        name: &str,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(def) = self.catalog.geo_indexes.get(name).cloned() else {
+            return Ok(None); // dropped mid-backfill
+        };
+        if !def.building {
+            return Ok(None);
+        }
+        let rows = {
+            let Some(engine) = self.tables.get(&def.table) else {
+                return Ok(None);
+            };
+            engine.scan_versioned_page(cursor.as_deref(), limit)?
+        };
+        let done = rows.len() < limit;
+        let next = rows.last().map(|(k, _, _)| k.clone());
+        if let Some(index_engine) = self.indexes.get_mut(name) {
+            for (row_key, _hlc, bytes) in rows {
+                let Some(bytes) = bytes else { continue }; // tombstone
+                if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
+                    if let Some(entry) = geo_entry_key(&doc, &def.path, &row_key) {
+                        index_engine.put(&entry, row_key.clone())?;
+                    }
+                }
+            }
+        }
+        if done {
+            if let Some(def) = self.catalog.geo_indexes.get_mut(name) {
+                def.building = false;
+            }
+            self.save_catalog()?;
+            return Ok(None);
+        }
+        Ok(next)
+    }
+
+    /// Run a geo backfill to completion, inline (Session / single-node path).
+    pub fn run_geo_backfill(&mut self, name: &str) -> Result<()> {
+        let mut cursor = None;
+        loop {
+            match self.backfill_geo_page(name, cursor, 4096)? {
+                Some(next) => cursor = Some(next),
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// Geo backfills this node still owes; drained like [`Database::take_pending_backfills`].
+    pub fn take_pending_geo_backfills(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_geo_backfills)
     }
 
     /// Cluster mode: DDL acks at schema-apply and index backfills run in the
@@ -4964,6 +5225,14 @@ impl Database {
             // when the caller asked for no particular order.
             return Ok((rows, order.is_none()));
         }
+        // Geo predicate served by a geo index: walk the Morton-code ranges the
+        // bbox/radius expands to instead of the whole shard, re-reading each
+        // candidate and applying the exact geo filter. Unordered (Z-order is
+        // not distance order), so an ORDER BY/LIMIT is re-sorted by the caller.
+        if let Some((index, ranges)) = self.plan_geo_scan(table, filter) {
+            let rows = self.geo_gather_local(&index, table, &ranges, filter, project)?;
+            return Ok((rows, false));
+        }
         // Primary-key prefix range: a leftmost run of PK columns pinned by
         // equality (plus one optional trailing range on the next PK column)
         // bounds the scan to that key range of the table itself — the table
@@ -5405,6 +5674,7 @@ impl Database {
         self.catalog.indexes.values().any(|i| i.table == table)
             || self.catalog.vector_indexes.values().any(|v| v.table == table)
             || self.catalog.search_indexes.values().any(|s| s.table == table)
+            || self.catalog.geo_indexes.values().any(|g| g.table == table)
     }
 
     fn indexes_on(&self, table: &str) -> Vec<(String, Vec<String>)> {
@@ -5488,7 +5758,12 @@ impl Database {
     /// which lost rows when the put half's quorum failed (2026-07-13).
     /// No-op (no read) on tables without secondary indexes.
     fn index_del_previous(&mut self, table: &str, key: &[u8]) -> Result<()> {
-        if self.catalog.indexes.values().all(|i| i.table != table) {
+        let has_secondary = self.catalog.indexes.values().any(|i| i.table == table);
+        // A geo index's entry key embeds the point, so an overwrite that moved
+        // the point leaves a stale entry unless the old one is removed here —
+        // the same read-before-write the secondary indexes need.
+        let has_geo = self.catalog.geo_indexes.values().any(|g| g.table == table);
+        if !has_secondary && !has_geo {
             return Ok(());
         }
         let existing = match self.tables.get(table) {
@@ -5497,8 +5772,13 @@ impl Database {
         };
         if let Some(bytes) = existing {
             if let Ok(Value::Document(old)) = Value::decode(&bytes) {
-                for (name, path) in self.indexes_on(table) {
-                    self.index_del(&name, &path, &old, key)?;
+                if has_secondary {
+                    for (name, path) in self.indexes_on(table) {
+                        self.index_del(&name, &path, &old, key)?;
+                    }
+                }
+                if has_geo {
+                    self.maintain_geo_del(table, &old, key)?;
                 }
             }
         }
@@ -5616,6 +5896,68 @@ impl Database {
             .into_iter()
             .map(|(_entry_key, row_key)| row_key)
             .collect())
+    }
+
+    /// Plan a geo-index scan for `filter`: the serving index and the byte
+    /// ranges over its Morton codes, or `None` when no geo index covers the
+    /// predicate (the query then scans). The encoding is catalog-deterministic,
+    /// so every node's local index scans the same ranges — the coordinator
+    /// reuses this plan for its distributed `IndexScan` scatter.
+    pub fn plan_geo_scan(&self, table: &str, filter: &Option<Expr>) -> Option<GeoScanPlan> {
+        let (col, bbox) = geo_predicate(filter)?;
+        for (name, def) in &self.catalog.geo_indexes {
+            if def.table != table || def.building || def.path != col {
+                continue;
+            }
+            let ranges = crate::geo::cover_ranges(&bbox, crate::geo::DEFAULT_MAX_RANGES)
+                .into_iter()
+                .map(|(lo, hi)| crate::geo::range_bytes(lo, hi))
+                .collect();
+            return Some((name.clone(), ranges));
+        }
+        None
+    }
+
+    /// Gather rows from a local geo index: walk each Morton-code range, re-read
+    /// each candidate row, and keep those passing the exact `filter` (the range
+    /// cover is a superset — the residual filter is the authoritative geo
+    /// predicate). Row keys are de-duplicated defensively across ranges.
+    fn geo_gather_local(
+        &self,
+        index: &str,
+        table: &str,
+        ranges: &[(Vec<u8>, Option<Vec<u8>>)],
+        filter: &Option<Expr>,
+        project: Option<&HashSet<String>>,
+    ) -> Result<Vec<(Vec<u8>, Document)>> {
+        let index_engine = self
+            .indexes
+            .get(index)
+            .ok_or_else(|| EngineError::IndexNotFound(index.to_string()))?;
+        let table_engine = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+        let mut seen: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        for (start, end) in ranges {
+            for item in index_engine.scan_range_iter(Some(start), end.as_deref()) {
+                let (_entry_key, row_key) = item?;
+                crate::scan_meter::tick(1)?;
+                if !seen.insert(row_key.clone()) {
+                    continue; // a row appears once per code, but guard anyway
+                }
+                let Some(bytes) = table_engine.get(&row_key)? else {
+                    continue; // index entry for a since-deleted row
+                };
+                let doc = Self::decode_row(&bytes, project)?;
+                if matches_filter(filter, &doc)? {
+                    crate::scan_meter::tick_bytes(bytes.len())?;
+                    out.push((row_key, doc));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Whether `table` exists locally.
@@ -5753,6 +6095,15 @@ impl Database {
                 ver(&format!("s:{name}")),
             ));
         }
+        for (name, g) in &self.catalog.geo_indexes {
+            let (db, bare) = namespace::split(name);
+            let table = namespace::split(&g.table).1;
+            out.push((
+                db.to_string(),
+                format!("CREATE GEO INDEX IF NOT EXISTS {bare} ON {table} ({})", g.path),
+                ver(&format!("g:{name}")),
+            ));
+        }
         for (name, def) in &self.catalog.users {
             let ddl = match def.auth_kind {
                 UserAuthKind::Scram => format!("CREATE USER {name} VERIFIER '{}'", def.credential),
@@ -5791,6 +6142,10 @@ impl Database {
                 "v" => {
                     let (db, bare) = namespace::split(name);
                     (db.to_string(), format!("DROP VECTOR INDEX IF EXISTS {bare}"))
+                }
+                "g" => {
+                    let (db, bare) = namespace::split(name);
+                    (db.to_string(), format!("DROP GEO INDEX IF EXISTS {bare}"))
                 }
                 "s" => {
                     let (db, bare) = namespace::split(name);
@@ -5890,6 +6245,14 @@ impl Database {
                     s.paths.join(", "),
                     s.with_clause()
                 ),
+            ));
+        }
+        for (name, g) in &self.catalog.geo_indexes {
+            let (db, bare) = namespace::split(name);
+            let table = namespace::split(&g.table).1;
+            out.push((
+                db.to_string(),
+                format!("CREATE GEO INDEX IF NOT EXISTS {bare} ON {table} ({})", g.path),
             ));
         }
         out
@@ -6190,6 +6553,15 @@ impl Database {
                 Value::String(self.index_local_health(name, IndexClass::Search).into()),
             ]);
         }
+        for (name, g) in &self.catalog.geo_indexes {
+            rows.push(vec![
+                Value::String(name.clone()),
+                Value::String(g.table.clone()),
+                Value::String("geo".into()),
+                Value::String(g.path.clone()),
+                Value::String(self.index_local_health(name, IndexClass::Geo).into()),
+            ]);
+        }
         rows.sort_by(|a, b| match (&a[0], &b[0]) {
             (Value::String(x), Value::String(y)) => x.cmp(y),
             _ => std::cmp::Ordering::Equal,
@@ -6256,6 +6628,15 @@ impl Database {
             for p in &s.paths {
                 idx_of.entry(column_of(p)).or_default().push(label.clone());
             }
+        }
+        for (name, g) in &self.catalog.geo_indexes {
+            if g.table != table {
+                continue;
+            }
+            idx_of
+                .entry(column_of(&g.path))
+                .or_default()
+                .push(format!("{} (geo)", namespace::split(name).1));
         }
         Ok((pk, idx_of))
     }
@@ -7282,6 +7663,7 @@ impl Database {
             for (name, path) in self.indexes_on(&m.table) {
                 self.index_del(&name, &path, old, &m.key)?;
             }
+            self.maintain_geo_del(&m.table, old, &m.key)?;
         }
         match &m.new_doc {
             Some(new) => {
@@ -7289,6 +7671,7 @@ impl Database {
                     self.index_put(&name, &path, new, &m.key)?;
                 }
                 self.maintain_vectors_put(&m.table, new, &m.key, m.hlc);
+                self.maintain_geo_put(&m.table, new, &m.key)?;
                 self.search_put_unrefreshed(&m.table, new, &m.key, m.hlc)?;
             }
             None => {
@@ -7522,6 +7905,7 @@ impl Database {
                 self.index_put(&name, &path, &doc, key)?;
             }
             self.maintain_vectors_put(table, &doc, key, hlc);
+            self.maintain_geo_put(table, &doc, key)?;
             self.maintain_search_put(table, &doc, key, hlc)?;
         }
         Ok(())
@@ -7551,6 +7935,7 @@ impl Database {
                 for (name, path) in self.indexes_on(table) {
                     self.index_del(&name, &path, &doc, key)?;
                 }
+                self.maintain_geo_del(table, &doc, key)?;
             }
         }
         self.maintain_vectors_del(table, key, hlc);
@@ -7609,6 +7994,7 @@ impl Database {
                 self.index_put(&name, &path, &doc, key)?;
             }
             self.maintain_vectors_put(table, &doc, key, hlc);
+            self.maintain_geo_put(table, &doc, key)?;
             self.search_put_unrefreshed(table, &doc, key, hlc)?;
         }
         Ok((commit, handle))
@@ -7648,6 +8034,7 @@ impl Database {
                 for (name, path) in self.indexes_on(table) {
                     self.index_del(&name, &path, &doc, key)?;
                 }
+                self.maintain_geo_del(table, &doc, key)?;
             }
         }
         self.maintain_vectors_del(table, key, hlc);
@@ -8370,6 +8757,88 @@ fn run_nearest_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> 
     let mut rs = project(sel, docs, &HashSet::new(), true)?;
     apply_offset_limit(&mut rs.rows, sel.offset, sel.limit);
     Ok(rs)
+}
+
+/// A geo predicate a geo index can serve — a `geo_distance(col, lat, lon) <= r`
+/// (or flipped) comparison, or a bare `geo_bbox(col, …)` — pulled out of the
+/// filter's top-level AND chain as `(column, bounding box)`. `None` when no such
+/// conjunct exists or its arguments are not constants (the query then scans).
+/// An antimeridian-crossing or degenerate box also returns `None` — v1 serves a
+/// single non-wrapping rectangle and falls back to a scan otherwise.
+fn geo_predicate(filter: &Option<Expr>) -> Option<(String, crate::geo::BBox)> {
+    find_geo_conjunct(filter.as_ref()?)
+}
+
+fn find_geo_conjunct(expr: &Expr) -> Option<(String, crate::geo::BBox)> {
+    match expr {
+        Expr::Binary { op: BinaryOp::And, left, right } => {
+            find_geo_conjunct(left).or_else(|| find_geo_conjunct(right))
+        }
+        // geo_distance(col, lat, lon) <= r   /   < r
+        Expr::Binary { op: BinaryOp::LtEq | BinaryOp::Lt, left, right } => {
+            geo_distance_bbox(left, right)
+        }
+        // r >= geo_distance(col, lat, lon)   /   r > …
+        Expr::Binary { op: BinaryOp::GtEq | BinaryOp::Gt, left, right } => {
+            geo_distance_bbox(right, left)
+        }
+        Expr::Func { name, args } if name == "geo_bbox" => geo_bbox_predicate(args),
+        _ => None,
+    }
+}
+
+/// `geo_distance(col, lat, lon)` on `func_side`, radius on `radius_side`.
+fn geo_distance_bbox(func_side: &Expr, radius_side: &Expr) -> Option<(String, crate::geo::BBox)> {
+    let Expr::Func { name, args } = func_side else {
+        return None;
+    };
+    if name != "geo_distance" || args.len() != 3 {
+        return None;
+    }
+    let col = geo_column(&args[0])?;
+    let lat = const_f64(&args[1])?;
+    let lon = const_f64(&args[2])?;
+    let radius = const_f64(radius_side)?;
+    if !(radius.is_finite() && radius >= 0.0) {
+        return None;
+    }
+    Some((col, crate::geo::BBox::around(lat, lon, radius)))
+}
+
+/// `geo_bbox(col, min_lat, min_lon, max_lat, max_lon)` → `(col, box)`.
+fn geo_bbox_predicate(args: &[Expr]) -> Option<(String, crate::geo::BBox)> {
+    if args.len() != 5 {
+        return None;
+    }
+    let col = geo_column(&args[0])?;
+    let min_lat = const_f64(&args[1])?;
+    let min_lon = const_f64(&args[2])?;
+    let max_lat = const_f64(&args[3])?;
+    let max_lon = const_f64(&args[4])?;
+    // A wrapping (min_lon > max_lon) or degenerate box is left to the scan path.
+    if min_lat > max_lat || min_lon > max_lon {
+        return None;
+    }
+    Some((col, crate::geo::BBox { min_lat, min_lon, max_lat, max_lon }))
+}
+
+/// The column path of a geo function's point argument (`Expr::Column`).
+fn geo_column(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Column(c) => Some(c.clone()),
+        _ => None,
+    }
+}
+
+/// Evaluate a constant coordinate/radius argument (literal, unary minus, or any
+/// row-independent expression) to `f64`. Row-dependent or unbound → `None`.
+fn const_f64(expr: &Expr) -> Option<f64> {
+    match crate::eval::eval(expr, &Document::new()).ok()? {
+        Value::Int(i) => Some(i as f64),
+        Value::Float(f) => Some(f),
+        Value::Decimal(d) => d.to_string().parse().ok(),
+        _ => None,
+    }
 }
 
 /// The `MATCH()`-family predicate functions (names arrive lowercased).
@@ -9906,6 +10375,7 @@ impl<'a> LocalCluster<'a> {
             }
         }
         self.db.maintain_vectors_put(table, doc, key, hlc);
+        self.db.maintain_geo_put(table, doc, key)?;
         self.db.search_put_unrefreshed(table, doc, key, hlc)?;
         Ok(true)
     }
@@ -10053,6 +10523,7 @@ impl Cluster for LocalCluster<'_> {
                 self.pending.insert(format!("i:{name}"), sync);
             }
         }
+        self.db.maintain_geo_del(table, doc, key)?;
         self.db.maintain_vectors_del(table, key, hlc);
         self.db.maintain_search_del(table, key, hlc)?;
         Ok(())
@@ -10830,6 +11301,18 @@ pub fn index_entry_key(values: &[Value], row_key: &[u8]) -> Vec<u8> {
     let mut elems = values.to_vec();
     elems.push(Value::Bytes(row_key.to_vec()));
     Value::Array(elems).encode_key()
+}
+
+/// The geo index entry key for `doc`'s point at `path`: the 8-byte big-endian
+/// Morton code of the point, followed by the row key (so entries sort by
+/// Z-order and every row is a distinct entry). `None` when the field is not a
+/// readable `{lat, lon}` point — schema-less policy: absent/bad → no entry,
+/// exactly as the row would never satisfy a geo predicate.
+fn geo_entry_key(doc: &Document, path: &str, row_key: &[u8]) -> Option<Vec<u8>> {
+    let (lat, lon) = crate::eval::read_point(doc.get_path(path)?)?;
+    let mut key = crate::geo::morton_key(lat, lon).to_vec();
+    key.extend_from_slice(row_key);
+    Some(key)
 }
 
 /// The shared byte prefix of every index entry whose leading values are
