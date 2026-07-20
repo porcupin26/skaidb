@@ -491,51 +491,56 @@ impl<'a> P<'a> {
     /// label), so `{__name__=~"skaidb.*"}` and `{name=~"skaidb.*"}` both
     /// work.
     fn matcher_block(&mut self, matchers: &mut Vec<Matcher>) -> Result<(), String> {
-        if self.eat(b'{') && !self.eat(b'}') {
-            {
-                loop {
-                    let mut label = self.ident().ok_or("expected label name")?;
-                    if label == "__name__" {
-                        label = "name".into();
-                    }
-                    self.ws();
-                    enum Op {
-                        Eq,
-                        Ne,
-                        Re,
-                        NotRe,
-                    }
-                    let op = if self.eat(b'=') {
-                        if self.eat(b'~') {
-                            Op::Re
-                        } else {
-                            Op::Eq
-                        }
-                    } else if self.eat(b'!') {
-                        if self.eat(b'~') {
-                            Op::NotRe
-                        } else {
-                            self.expect(b'=')?;
-                            Op::Ne
-                        }
-                    } else {
-                        return Err("expected '=', '!=', '=~' or '!~'".into());
-                    };
-                    let value = self.string()?;
-                    matchers.push(match op {
-                        Op::Eq => Matcher::Eq(label, value),
-                        Op::Ne => Matcher::Ne(label, value),
-                        Op::Re => Matcher::re(label, &value).map_err(|e| e.to_string())?,
-                        Op::NotRe => Matcher::not_re(label, &value).map_err(|e| e.to_string())?,
-                    });
-                    if !self.eat(b',') {
-                        break;
-                    }
+        if !self.eat(b'{') {
+            return Ok(());
+        }
+        loop {
+            // Trailing commas are legal PromQL (`{a="b",}`) — Grafana's
+            // Metrics Drilldown emits `{__ignore_usage__="", }` when its
+            // filters variable interpolates empty, so this closes-after-comma
+            // check is load-bearing, not pedantry.
+            if self.eat(b'}') {
+                return Ok(());
+            }
+            let mut label = self.ident().ok_or("expected label name")?;
+            if label == "__name__" {
+                label = "name".into();
+            }
+            self.ws();
+            enum Op {
+                Eq,
+                Ne,
+                Re,
+                NotRe,
+            }
+            let op = if self.eat(b'=') {
+                if self.eat(b'~') {
+                    Op::Re
+                } else {
+                    Op::Eq
                 }
+            } else if self.eat(b'!') {
+                if self.eat(b'~') {
+                    Op::NotRe
+                } else {
+                    self.expect(b'=')?;
+                    Op::Ne
+                }
+            } else {
+                return Err("expected '=', '!=', '=~' or '!~'".into());
+            };
+            let value = self.string()?;
+            matchers.push(match op {
+                Op::Eq => Matcher::Eq(label, value),
+                Op::Ne => Matcher::Ne(label, value),
+                Op::Re => Matcher::re(label, &value).map_err(|e| e.to_string())?,
+                Op::NotRe => Matcher::not_re(label, &value).map_err(|e| e.to_string())?,
+            });
+            if !self.eat(b',') {
                 self.expect(b'}')?;
+                return Ok(());
             }
         }
-        Ok(())
     }
 
     /// The optional `[range]` / `offset` tail after a selector's matchers.
@@ -1277,6 +1282,44 @@ mod tests {
         assert_eq!(run("avg_over_time(m[10s])", &one)[0].1, 7.0);
         // The drilldown's exact tile shape parses and evaluates.
         assert_eq!(run("avg(avg_over_time(m[10s]))", &one)[0].1, 7.0);
+    }
+
+    /// Grafana's Metrics Drilldown emits `{__ignore_usage__="", }` — a
+    /// no-op empty-value matcher AND a trailing comma (its filters variable
+    /// interpolated empty). Both must parse; the empty-value Eq matches
+    /// series lacking the label.
+    #[test]
+    fn matcher_block_accepts_drilldown_shapes() {
+        // The exact tile expression that failed with "expected label name".
+        let mut e = P::new(r#"avg(avg_over_time(aqi{__ignore_usage__="", }[4m]))"#)
+            .parse()
+            .unwrap();
+        let mut specs = Vec::new();
+        assign_slots(&mut e, &mut specs);
+        assert_eq!(specs.len(), 1);
+        assert!(specs[0].0.iter().any(
+            |m| matches!(m, Matcher::Eq(k, v) if k == "__ignore_usage__" && v.is_empty())
+        ));
+        let fetched = vec![Fetched {
+            series: vec![(
+                vec![("name".to_string(), "aqi".to_string())],
+                vec![Sample { ts: 9_000, value: 14.0 }],
+            )],
+        }];
+        let vals = eval_steps(&e, &fetched, &[10_000]).unwrap();
+        let StepVal::Vector(v) = &vals[0] else { panic!() };
+        assert_eq!(v[0].1, 14.0);
+        // Trailing-comma / whitespace variants all parse.
+        for q in [
+            r#"m{a="b",}"#,
+            r#"m{ a="b" , c!="d" , }"#,
+            "m{ }",
+            "m{}",
+        ] {
+            P::new(q).parse().unwrap_or_else(|e| panic!("{q}: {e}"));
+        }
+        // A lone comma is still malformed, like Prometheus.
+        assert!(P::new("m{,}").parse().is_err());
     }
 
     /// Number-only expressions (Grafana's `1+1` datasource health check)

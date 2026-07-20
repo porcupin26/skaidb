@@ -338,6 +338,7 @@ fn handle_connection(
                 params.insert(k, v);
             }
         }
+        let started = std::time::Instant::now();
         let (status, payload) = match prom_path.as_str() {
             "/api/v1/query" => crate::promql::query(&ctx, &prom_scope, &params),
             "/api/v1/query_range" => crate::promql::query_range(&ctx, &prom_scope, &params),
@@ -360,6 +361,20 @@ fn handle_connection(
                 }
             }
         };
+        // PromQL evaluations flow through the same audit query/error logs as
+        // SQL, so a failing dashboard query is visible server-side (this
+        // debugging surface did not exist while chasing the Grafana
+        // drilldown 4xx chain — every failure was client-side-only).
+        if matches!(prom_path.as_str(), "/api/v1/query" | "/api/v1/query_range") {
+            let expr = params.get("query").map(String::as_str).unwrap_or("");
+            let err = (status != 200)
+                .then(|| payload["error"].as_str().unwrap_or("error").to_string());
+            ctx.audit().record(
+                &format!("promql {} {expr}", prom_path.trim_start_matches("/api/v1/")),
+                started.elapsed().as_millis() as u64,
+                err.as_deref(),
+            );
+        }
         return write_response(&mut stream, status, &payload);
     }
 
