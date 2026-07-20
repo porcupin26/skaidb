@@ -162,6 +162,16 @@ enum RangeFn {
     Rate,
     Increase,
     Delta,
+    /// The `<agg>_over_time` window aggregations. Grafana's Metrics
+    /// Drilldown tiles wrap gauges in `avg_over_time`, so these are load-
+    /// bearing for stock dashboards, not a completeness nicety.
+    AvgOverTime,
+    MinOverTime,
+    MaxOverTime,
+    SumOverTime,
+    CountOverTime,
+    /// Keeps the metric name (returns a raw sample), Prometheus-style.
+    LastOverTime,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -451,6 +461,12 @@ impl<'a> P<'a> {
             "rate" => Some(RangeFn::Rate),
             "increase" => Some(RangeFn::Increase),
             "delta" => Some(RangeFn::Delta),
+            "avg_over_time" => Some(RangeFn::AvgOverTime),
+            "min_over_time" => Some(RangeFn::MinOverTime),
+            "max_over_time" => Some(RangeFn::MaxOverTime),
+            "sum_over_time" => Some(RangeFn::SumOverTime),
+            "count_over_time" => Some(RangeFn::CountOverTime),
+            "last_over_time" => Some(RangeFn::LastOverTime),
             _ => None,
         };
         if let Some(func) = func {
@@ -690,7 +706,10 @@ fn eval_steps(expr: &PExpr, fetched: &[Fetched], steps: &[i64]) -> Result<Vec<St
                 ..
             } = arg.as_ref()
             else {
-                return Err("rate()/increase()/delta() need a range selector like m[5m]".into());
+                return Err(
+                    "rate()/increase()/delta()/*_over_time() need a range selector like m[5m]"
+                        .into(),
+                );
             };
             let window = *window;
             let data = &fetched[*slot];
@@ -702,33 +721,66 @@ fn eval_steps(expr: &PExpr, fetched: &[Fetched], steps: &[i64]) -> Result<Vec<St
                         let lo = samples.partition_point(|s| s.ts < t - window);
                         let hi = samples.partition_point(|s| s.ts <= t);
                         let win = &samples[lo..hi];
-                        if win.len() < 2 {
-                            continue;
-                        }
-                        let change = match func {
-                            RangeFn::Delta => win[win.len() - 1].value - win[0].value,
-                            _ => {
-                                // Counter-reset-aware increase.
-                                let mut inc = 0.0;
-                                let mut prev = win[0].value;
-                                for s in &win[1..] {
-                                    inc += if s.value >= prev {
-                                        s.value - prev
-                                    } else {
-                                        s.value
-                                    };
-                                    prev = s.value;
+                        let value = match func {
+                            // Change-over-window family: needs two samples.
+                            RangeFn::Rate | RangeFn::Increase | RangeFn::Delta => {
+                                if win.len() < 2 {
+                                    continue;
                                 }
-                                inc
+                                let change = match func {
+                                    RangeFn::Delta => win[win.len() - 1].value - win[0].value,
+                                    _ => {
+                                        // Counter-reset-aware increase.
+                                        let mut inc = 0.0;
+                                        let mut prev = win[0].value;
+                                        for s in &win[1..] {
+                                            inc += if s.value >= prev {
+                                                s.value - prev
+                                            } else {
+                                                s.value
+                                            };
+                                            prev = s.value;
+                                        }
+                                        inc
+                                    }
+                                };
+                                if *func == RangeFn::Rate {
+                                    change / (window as f64 / 1000.0)
+                                } else {
+                                    change
+                                }
+                            }
+                            // Window aggregations: any sample counts.
+                            _ => {
+                                if win.is_empty() {
+                                    continue;
+                                }
+                                match func {
+                                    RangeFn::AvgOverTime => {
+                                        win.iter().map(|s| s.value).sum::<f64>()
+                                            / win.len() as f64
+                                    }
+                                    RangeFn::MinOverTime => win
+                                        .iter()
+                                        .map(|s| s.value)
+                                        .fold(f64::INFINITY, f64::min),
+                                    RangeFn::MaxOverTime => win
+                                        .iter()
+                                        .map(|s| s.value)
+                                        .fold(f64::NEG_INFINITY, f64::max),
+                                    RangeFn::SumOverTime => {
+                                        win.iter().map(|s| s.value).sum()
+                                    }
+                                    RangeFn::CountOverTime => win.len() as f64,
+                                    RangeFn::LastOverTime => win[win.len() - 1].value,
+                                    _ => unreachable!("change family handled above"),
+                                }
                             }
                         };
-                        let value = if *func == RangeFn::Rate {
-                            change / (window as f64 / 1000.0)
-                        } else {
-                            change
-                        };
-                        // rate() drops the metric name, PromQL-style.
-                        v.push((clean_labels(labels, false), value));
+                        // Range functions drop the metric name, PromQL-style —
+                        // except last_over_time, which returns a raw sample.
+                        let keep_name = *func == RangeFn::LastOverTime;
+                        v.push((clean_labels(labels, keep_name), value));
                     }
                     StepVal::Vector(v)
                 })
@@ -1188,6 +1240,44 @@ fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `*_over_time` window aggregations — Grafana's Metrics Drilldown
+    /// tiles wrap gauges in `avg_over_time`, so an unsupported family showed
+    /// every tile as "No data".
+    #[test]
+    fn over_time_functions_evaluate() {
+        let series = |values: &[(i64, f64)]| Fetched {
+            series: vec![(
+                vec![("name".to_string(), "m".to_string())],
+                values.iter().map(|&(ts, value)| Sample { ts, value }).collect(),
+            )],
+        };
+        let run = |q: &str, fetched: &Fetched| -> Vec<(Labels, f64)> {
+            let mut e = P::new(q).parse().unwrap();
+            let mut specs = Vec::new();
+            assign_slots(&mut e, &mut specs);
+            let f = vec![Fetched { series: fetched.series.clone() }];
+            let vals = eval_steps(&e, &f, &[10_000]).unwrap();
+            let StepVal::Vector(v) = &vals[0] else { panic!("expected vector") };
+            v.clone()
+        };
+        let data = series(&[(1_000, 2.0), (5_000, 6.0), (9_000, 4.0)]);
+        assert_eq!(run("avg_over_time(m[10s])", &data)[0].1, 4.0);
+        assert_eq!(run("min_over_time(m[10s])", &data)[0].1, 2.0);
+        assert_eq!(run("max_over_time(m[10s])", &data)[0].1, 6.0);
+        assert_eq!(run("sum_over_time(m[10s])", &data)[0].1, 12.0);
+        assert_eq!(run("count_over_time(m[10s])", &data)[0].1, 3.0);
+        let last = run("last_over_time(m[10s])", &data);
+        assert_eq!(last[0].1, 4.0);
+        // last_over_time keeps the metric name; the aggregations drop it.
+        assert_eq!(last[0].0, vec![("__name__".to_string(), "m".to_string())]);
+        assert!(run("avg_over_time(m[10s])", &data)[0].0.is_empty());
+        // A single sample is enough (unlike rate's two-sample floor).
+        let one = series(&[(9_000, 7.0)]);
+        assert_eq!(run("avg_over_time(m[10s])", &one)[0].1, 7.0);
+        // The drilldown's exact tile shape parses and evaluates.
+        assert_eq!(run("avg(avg_over_time(m[10s]))", &one)[0].1, 7.0);
+    }
 
     /// Number-only expressions (Grafana's `1+1` datasource health check)
     /// evaluate to scalars with nothing fetched.

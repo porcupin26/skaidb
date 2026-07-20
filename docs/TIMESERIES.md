@@ -82,8 +82,9 @@ stored as its own compressed stream. Full grammar and semantics:
 - **Prometheus query API / Grafana** (v0.28.0): point Grafana's built-in
   Prometheus datasource at skaidb's REST listener. `/api/v1/query` and
   `/api/v1/query_range` evaluate a PromQL subset — instant selectors with
-  `=`/`!=` matchers, `rate`/`increase`/`delta` over range selectors
-  (counter-reset-aware, matching the SQL aggregates), and
+  `=`/`!=` matchers, `rate`/`increase`/`delta` and
+  `avg/min/max/sum/count/last_over_time` over range selectors
+  (counter-reset-aware where applicable, matching the SQL aggregates), and
   `sum/avg/min/max/count [by|without (...)]` — plus **regex matchers**
   (`=~`/`!~`, anchored like Prometheus), **`offset`**, **vector
   arithmetic** (`+ - * /`; scalar∘vector and one-to-one vector∘vector on

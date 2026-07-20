@@ -73,10 +73,12 @@ SELECT rate(value) FROM metrics WHERE name = 'http_requests_total' AND job = 'ap
 ### Supported PromQL (v1 subset)
 
 Instant selectors with `=`/`!=`/`=~`/`!~` label matchers (regex forms
-anchored, Prometheus-style), `offset`, `rate` / `increase` / `delta`
-over range selectors (`[5m]`), `sum/avg/min/max/count
-[by|without (...)]`, vector arithmetic (`+ - * /`, one-to-one matching),
-and `histogram_quantile`. Typical dashboard panels —
+anchored, Prometheus-style), `offset`, `rate` / `increase` / `delta` and
+`avg/min/max/sum/count/last_over_time` over range selectors (`[5m]` —
+the `*_over_time` family is what Grafana's Metrics Drilldown tiles use),
+`sum/avg/min/max/count [by|without (...)]`, vector arithmetic
+(`+ - * /`, one-to-one matching), number-only expressions (the `1+1`
+datasource health check), and `histogram_quantile`. Typical dashboard panels —
 `sum by (job) (rate(http_requests_total[5m]))`,
 `histogram_quantile(0.9, sum by (le) (rate(req_bucket[5m])))` — work
 as-is.

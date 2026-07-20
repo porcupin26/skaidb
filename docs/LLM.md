@@ -531,6 +531,8 @@ WHERE ts >= now() - 6h GROUP BY t;
   point a Grafana datasource base URL at the prefix; permission =
   Select on the scoped table. PromQL subset: selectors with `= != =~ !~` (regex anchored),
   bare `{name=~"..."}` selectors, `offset`, `rate/increase/delta[5m]`,
+  `avg/min/max/sum/count/last_over_time[5m]` (Grafana drilldown tiles),
+  number-only exprs (`1+1` health check),
   `sum/avg/min/max/count [by|without]`, vector arithmetic `+ - * /`,
   `histogram_quantile`. Not supported: subqueries, `group_left/right`, `topk`.
 - **Self-scrape**: `config set observability.self_scrape true` (live) makes
