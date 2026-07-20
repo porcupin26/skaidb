@@ -401,6 +401,10 @@ pub struct CreateVectorIndex {
     /// pre-computed vector array from the row). A string `NEAREST` query on such
     /// an index is auto-embedded too.
     pub embed: bool,
+    /// `QUANTIZED` — the in-RAM graph stores int8 scalar-quantized vectors
+    /// (4× less RAM); searches over-fetch and rescore the top-k against the
+    /// exact vectors re-read from the rows. Incompatible with `EMBED`.
+    pub quantized: bool,
 }
 
 /// `CREATE GEO INDEX [IF NOT EXISTS] name ON table (path)`. A Morton/Z-order

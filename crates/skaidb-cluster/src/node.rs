@@ -7454,20 +7454,31 @@ impl Node {
         k: usize,
         filter: &Option<Expr>,
     ) -> EngineResult<Vec<(Vec<u8>, Document, f32)>> {
-        let table = {
+        let (table, rescore) = {
             let db = self
                 .local
                 .read()
                 .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?;
-            db.vector_index_table(index)
-                .ok_or_else(|| EngineError::IndexNotFound(index.to_string()))?
+            (
+                db.vector_index_table(index)
+                    .ok_or_else(|| EngineError::IndexNotFound(index.to_string()))?,
+                db.vector_index_rescore(index),
+            )
+        };
+        // A quantized graph returns approximate distances: widen the fetch
+        // and the survivor set, then rescore exactly below.
+        let oversample = if rescore.as_ref().is_some_and(|r| r.3) {
+            skaidb_engine::QUANT_RESCORE_OVERSAMPLE
+        } else {
+            1
         };
         // Over-fetch per shard so the merge (and any filtering) still yields k.
         let fetch = if filter.is_some() {
             k.saturating_mul(4).max(k + 16)
         } else {
             k.max(1)
-        };
+        }
+        .saturating_mul(oversample);
 
         // Best (smallest) distance seen per key across all shards.
         let mut best: HashMap<Vec<u8>, f32> = HashMap::new();
@@ -7506,7 +7517,9 @@ impl Node {
             }
         }
 
-        // Rank globally by distance, then re-read + filter until we have k.
+        // Rank globally by distance, then re-read + filter until we have
+        // enough survivors (`k`, oversampled for a quantized graph).
+        let want = k.saturating_mul(oversample);
         let mut ranked: Vec<(Vec<u8>, f32)> = best.into_iter().collect();
         ranked.sort_by(|a, b| a.1.total_cmp(&b.1));
         let mut out = Vec::new();
@@ -7514,10 +7527,25 @@ impl Node {
             let rows = filter_rows(filter, self.point_get(table.as_str(), &key, None)?)?;
             if let Some((_, doc)) = rows.into_iter().next() {
                 out.push((key, doc, dist));
-                if out.len() >= k {
+                if out.len() >= want {
                     break;
                 }
             }
+        }
+        if let Some((path, dim, metric, true)) = rescore {
+            // Mandatory exact rescore for quantized graphs: the re-read row
+            // holds the exact f32 vector — replace each survivor's
+            // approximate per-shard distance with the true metric distance,
+            // keep the best `k`.
+            for (_, doc, dist) in &mut out {
+                if let Some(v) = skaidb_engine::doc_vector(doc, &path, dim) {
+                    if let Some(d) = skaidb_engine::vector_exact_distance(&metric, query, &v) {
+                        *dist = d;
+                    }
+                }
+            }
+            out.sort_by(|a, b| a.2.total_cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+            out.truncate(k);
         }
         Ok(out)
     }
@@ -10110,6 +10138,88 @@ mod tests {
             .execute("SELECT id FROM docs NEAREST (embedding, [1.0, 0.0, 0.0], 2) ORDER BY id")
             .unwrap_err();
         assert!(err.to_string().contains("ORDER BY"), "got: {err}");
+    }
+
+    /// A QUANTIZED vector index cluster-wide: the DDL broadcast carries the
+    /// option, the coordinator merges approximate per-shard hits, and the
+    /// returned `_distance` is the EXACT metric distance rescored from the
+    /// re-read rows.
+    #[test]
+    fn distributed_quantized_vector_search() {
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let na = Node::new(
+            Database::open(temp_dir("qva")).unwrap(),
+            cfg("a", &a, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("qvb")).unwrap(),
+            cfg("b", &b, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        let nc = Node::new(
+            Database::open(temp_dir("qvc")).unwrap(),
+            cfg("c", &c, &members, Consistency::Quorum, Consistency::Quorum),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        nc.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE docs (PRIMARY KEY (id))").unwrap();
+        na.execute(
+            "CREATE VECTOR INDEX docs_emb ON docs (embedding) DIM 3 USING cosine QUANTIZED",
+        )
+        .unwrap();
+        na.execute(
+            "INSERT INTO docs (id, embedding) VALUES \
+             (1,[1.0,0.0,0.0]),(2,[0.0,1.0,0.0]),(3,[0.0,0.0,1.0]),(4,[0.9,0.1,0.0])",
+        )
+        .unwrap();
+        // The broadcast def carries QUANTIZED to every member.
+        for node in [&na, &nb, &nc] {
+            assert!(
+                node.local
+                    .read()
+                    .unwrap()
+                    .vector_index_rescore("docs_emb")
+                    .expect("def exists")
+                    .3,
+                "peer lost the QUANTIZED option"
+            );
+        }
+        for node in [&na, &nb, &nc] {
+            for attempt in 0.. {
+                match node
+                    .local
+                    .read()
+                    .unwrap()
+                    .vector_search_local("docs_emb", &[1.0, 0.0, 0.0], 1)
+                {
+                    Ok(_) => break,
+                    Err(_) if attempt < 100 => thread::sleep(Duration::from_millis(50)),
+                    Err(e) => panic!("vector index never became ready: {e}"),
+                }
+            }
+        }
+
+        let rs = rows(
+            nb.execute("SELECT id, _distance FROM docs NEAREST (embedding, [1.0, 0.0, 0.0], 2)")
+                .unwrap(),
+        );
+        assert_eq!(rs.rows[0][0], Value::Int(1));
+        assert_eq!(rs.rows[1][0], Value::Int(4));
+        // Rescored: the coordinator replaced the approximate per-shard
+        // distances with exact ones computed from the re-read rows.
+        let exact = |v: &[f32]| {
+            f64::from(
+                skaidb_engine::vector_exact_distance("cosine", &[1.0, 0.0, 0.0], v).unwrap(),
+            )
+        };
+        let d = |r: usize| match rs.rows[r][1] {
+            Value::Float(f) => f,
+            ref o => panic!("expected float distance, got {o:?}"),
+        };
+        assert!((d(0) - exact(&[1.0, 0.0, 0.0])).abs() < 1e-6, "{}", d(0));
+        assert!((d(1) - exact(&[0.9, 0.1, 0.0])).abs() < 1e-6, "{}", d(1));
     }
 
     /// rf=1 NodeConfig: every key lives on exactly one node, so a full-text

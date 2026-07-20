@@ -19,10 +19,11 @@ pub mod vector;
 pub use embed::{Embedder, HashEmbedder, OverlapReranker, Reranker};
 pub use error::EngineError;
 pub use exec::{
-    filter_rows, filter_search_query, matches_filter, run, statement_is_read_only, Cluster,
+    doc_vector, filter_rows, filter_search_query, matches_filter, run, statement_is_read_only,
+    vector_exact_distance, Cluster,
     Database, DbStats, IndexScanRange, Inventory, InventoryIndex, InventorySearch,
     InventoryTable, InventoryTimeseries, InventoryVector, pk_point_key, pk_point_keys, TableStats,
-    TsRollupInfo,
+    TsRollupInfo, QUANT_RESCORE_OVERSAMPLE,
     DecodedMaint, MaintTask,
     gidx_table, global_entry_delta, index_entry_key,
     gidx_entry_key, gidx_entry_row_key, gidx_placement_prefix, gidx_probe_bounds, is_gidx_table,
@@ -1510,8 +1511,10 @@ mod tests {
                 .unwrap();
             db.execute("INSERT INTO docs (id, cat, embedding) VALUES (4, 'b', [0.9, 0.1, 0.0])")
                 .unwrap();
-            db.create_vector_index("docs_emb", "docs", "embedding", "cosine", None, false, false)
-                .unwrap();
+            db.create_vector_index(
+                "docs_emb", "docs", "embedding", "cosine", None, false, false, false,
+            )
+            .unwrap();
 
             // Nearest to [1,0,0]: id 1 (exact), then id 4 (close direction).
             let ids: Vec<i64> = db
@@ -1551,6 +1554,63 @@ mod tests {
         let db = Database::open(&dir).unwrap();
         let top = db.vector_search("docs_emb", &[0.0, 0.0, 1.0], 1, &None).unwrap();
         assert_eq!(doc_id(&top[0].1), 3);
+    }
+
+    /// A `QUANTIZED` vector index answers `NEAREST` with **exact** rescored
+    /// distances (the int8 graph only picks candidates), survives a reopen
+    /// through the `SKHNSW02` snapshot, and refuses to combine with `EMBED`.
+    #[test]
+    fn quantized_vector_index_rescores_exactly() {
+        let dir = tempdir();
+        {
+            let mut db = Database::open(&dir).unwrap();
+            db.execute("CREATE TABLE docs (PRIMARY KEY (id))").unwrap();
+            db.execute(
+                "INSERT INTO docs (id, embedding) VALUES \
+                 (1, [1.0, 0.0, 0.0]), (2, [0.0, 1.0, 0.0]), \
+                 (3, [0.0, 0.0, 1.0]), (4, [0.9, 0.1, 0.0])",
+            )
+            .unwrap();
+            db.execute(
+                "CREATE VECTOR INDEX docs_emb ON docs (embedding) DIM 3 USING cosine QUANTIZED",
+            )
+            .unwrap();
+            assert!(db.vector_index_rescore("docs_emb").expect("def exists").3);
+
+            let rs = rows(
+                db.execute("SELECT id, _distance FROM docs NEAREST (embedding, [1.0, 0.0, 0.0], 2)")
+                    .unwrap(),
+            );
+            assert_eq!(rs.rows[0][0], Value::Int(1));
+            assert_eq!(rs.rows[1][0], Value::Int(4));
+            // The reported distance is the EXACT cosine distance of the raw
+            // row vector, not the quantized-graph approximation.
+            let exact = |v: [f32; 3]| {
+                f64::from(crate::vector_exact_distance("cosine", &[1.0, 0.0, 0.0], &v).unwrap())
+            };
+            let d = |r: usize| match rs.rows[r][1] {
+                Value::Float(f) => f,
+                ref o => panic!("expected float distance, got {o:?}"),
+            };
+            assert!((d(0) - exact([1.0, 0.0, 0.0])).abs() < 1e-6, "{}", d(0));
+            assert!((d(1) - exact([0.9, 0.1, 0.0])).abs() < 1e-6, "{}", d(1));
+        }
+        // Reopen: the quantized snapshot loads (or replays) and still serves.
+        let db = Database::open(&dir).unwrap();
+        let top = db.vector_search("docs_emb", &[0.0, 0.0, 1.0], 1, &None).unwrap();
+        assert_eq!(doc_id(&top[0].1), 3);
+        assert!(db.vector_index_rescore("docs_emb").expect("def exists").3);
+
+        // QUANTIZED + EMBED is rejected (no exact vector in the row to
+        // rescore against).
+        let mut db = db;
+        let err = db
+            .execute(
+                "CREATE VECTOR INDEX docs_q ON docs (body) DIM 8 QUANTIZED EMBED",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("EMBED"), "{err}");
     }
 
     #[test]

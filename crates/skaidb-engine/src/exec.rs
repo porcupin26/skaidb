@@ -727,6 +727,7 @@ impl Database {
     /// so the broadcast DDL always supplies an explicit dimension).
     /// `metric` is `cosine`/`l2`/`dot`.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn create_vector_index(
         &mut self,
         name: &str,
@@ -735,10 +736,21 @@ impl Database {
         metric: &str,
         dim: Option<usize>,
         embed: bool,
+        quantized: bool,
         if_not_exists: bool,
     ) -> Result<QueryOutput> {
         if !self.catalog.tables.contains_key(table) {
             return Err(EngineError::TableNotFound(table.to_string()));
+        }
+        // Rescoring reads the exact vector back from the row; an EMBED index
+        // stores only the text there, so the two options cannot combine.
+        if quantized && embed {
+            return Err(EngineError::Unsupported(
+                "QUANTIZED requires the vector stored in the row and cannot combine with \
+                 EMBED (the row holds only the text — there is no exact vector to rescore \
+                 against)"
+                    .into(),
+            ));
         }
         // A managed (EMBED) index needs an inference provider and an explicit
         // DIM matching it — fail at create, not silently at first write.
@@ -782,6 +794,7 @@ impl Database {
                 || existing.path != path
                 || !existing.metric.eq_ignore_ascii_case(metric)
                 || existing.embed != embed
+                || existing.quantized != quantized
                 || dim.is_some_and(|d| d != existing.dim);
             if !differs {
                 self.record_schema(key, hlc, false);
@@ -819,6 +832,7 @@ impl Database {
                 dim: d,
                 ef_search: preserved_ef,
                 embed,
+                quantized,
             };
             self.vector_indexes.insert(name.to_string(), new_hnsw(&def));
             self.vector_watermarks.insert(name.to_string(), Hlc::MIN);
@@ -874,6 +888,7 @@ impl Database {
                     dim: d,
                     ef_search: None,
                     embed,
+                    quantized,
                 };
                 hnsw = Some(new_hnsw(&def));
                 pending_def = Some(def);
@@ -896,6 +911,7 @@ impl Database {
             dim,
             ef_search: None,
             embed,
+            quantized,
         });
         let mut hnsw = hnsw.unwrap_or_else(|| new_hnsw(&def));
         if let Err(e) = save_vector_snapshot(&vector_snapshot_path(&self.dir, name), &hnsw, watermark)
@@ -1236,13 +1252,20 @@ impl Database {
             .get(&def.table)
             .ok_or_else(|| EngineError::TableNotFound(def.table.clone()))?;
 
+        // Quantized graph: over-fetch approximate candidates, then rescore
+        // the survivors against the exact row vectors below.
+        let fetch = if def.quantized {
+            k.saturating_mul(QUANT_RESCORE_OVERSAMPLE)
+        } else {
+            k
+        };
         // The HNSW only knows keys; resolve each candidate to its row to apply
         // the filter (filtered nearest-neighbor search). Decoded docs are kept
         // so each candidate is read and decoded once, and survivors are served
         // from the same map instead of a second storage read.
         let decoded: std::cell::RefCell<HashMap<Vec<u8>, Option<Document>>> =
             std::cell::RefCell::new(HashMap::new());
-        let hits = hnsw.search(query, k, |key| {
+        let hits = hnsw.search(query, fetch, |key| {
             let mut cache = decoded.borrow_mut();
             let doc = cache.entry(key.to_vec()).or_insert_with(|| {
                 match table_engine.get(key) {
@@ -1266,6 +1289,20 @@ impl Database {
             if let Some(Some(doc)) = cache.remove(&key) {
                 out.push((key, doc, dist));
             }
+        }
+        if def.quantized {
+            // Mandatory exact rescore: replace each candidate's approximate
+            // graph distance with the true metric distance to the row's
+            // stored f32 vector, then keep the best `k`. (A row whose vector
+            // field changed shape keeps its approximate distance.)
+            let metric = Metric::parse(&def.metric).unwrap_or(Metric::Cosine);
+            for (_, doc, dist) in &mut out {
+                if let Some(v) = doc_vector(doc, &def.path, def.dim) {
+                    *dist = crate::vector::exact_distance(metric, query, &v);
+                }
+            }
+            out.sort_by(|a, b| a.2.total_cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+            out.truncate(k);
         }
         Ok(out)
     }
@@ -1306,6 +1343,16 @@ impl Database {
             .vector_indexes
             .get(index)
             .map(|d| d.table.clone())
+    }
+
+    /// What a cluster coordinator needs to rescore a vector index's
+    /// candidates exactly: `(path, dim, metric, quantized)`. `None` if the
+    /// index does not exist locally.
+    pub fn vector_index_rescore(&self, index: &str) -> Option<(String, usize, String, bool)> {
+        self.catalog
+            .vector_indexes
+            .get(index)
+            .map(|d| (d.path.clone(), d.dim, d.metric.clone(), d.quantized))
     }
 
     /// The `(name, path)` of every vector index on `table`.
@@ -2946,6 +2993,7 @@ impl Database {
                     &ci.metric,
                     Some(ci.dim),
                     ci.embed,
+                    ci.quantized,
                     ci.if_not_exists,
                 )
             }
@@ -6140,8 +6188,16 @@ impl Database {
             out.push((
                 db.to_string(),
                 format!(
-                    "CREATE VECTOR INDEX IF NOT EXISTS {bare} ON {table} ({}) DIM {} USING {}",
-                    v.path, v.dim, v.metric
+                    "CREATE VECTOR INDEX IF NOT EXISTS {bare} ON {table} ({}) DIM {} USING {}{}{}",
+                    v.path,
+                    v.dim,
+                    v.metric,
+                    // Both options must survive the DDL-string regeneration
+                    // (schema repair replays these) — EMBED used to be
+                    // dropped here, silently demoting a managed index to a
+                    // plain one on a repaired peer.
+                    if v.quantized { " QUANTIZED" } else { "" },
+                    if v.embed { " EMBED" } else { "" },
                 ),
                 ver(&format!("v:{name}")),
             ));
@@ -6294,8 +6350,12 @@ impl Database {
             out.push((
                 db.to_string(),
                 format!(
-                    "CREATE VECTOR INDEX IF NOT EXISTS {bare} ON {table} ({}) DIM {} USING {}",
-                    v.path, v.dim, v.metric
+                    "CREATE VECTOR INDEX IF NOT EXISTS {bare} ON {table} ({}) DIM {} USING {}{}{}",
+                    v.path,
+                    v.dim,
+                    v.metric,
+                    if v.quantized { " QUANTIZED" } else { "" },
+                    if v.embed { " EMBED" } else { "" },
                 ),
             ));
         }
@@ -11603,7 +11663,7 @@ fn load_vector_snapshot(
     let watermark = Hlc::from_bytes(wm);
     let mut h = Hnsw::read_from(&mut r).ok()?;
     let fresh = new_hnsw(def);
-    if h.params() != fresh.params() {
+    if h.params() != fresh.params() || h.is_quantized() != fresh.is_quantized() {
         skaidb_types::slog!(
             "skaidb: vector snapshot {} ignored — construction params changed",
             path.display()
@@ -11653,11 +11713,32 @@ fn table_with_options(def: &TableDef) -> String {
 }
 
 fn new_hnsw(def: &VectorIndexDef) -> Hnsw {
-    let mut h = Hnsw::new(Metric::parse(&def.metric).unwrap_or(Metric::Cosine), def.dim);
+    let metric = Metric::parse(&def.metric).unwrap_or(Metric::Cosine);
+    let mut h = if def.quantized {
+        Hnsw::new_quantized(metric, def.dim)
+    } else {
+        Hnsw::new(metric, def.dim)
+    };
     if let Some(ef) = def.ef_search {
         h.set_ef_search(ef);
     }
     h
+}
+
+/// How far a quantized-graph search over-fetches before the exact rescore:
+/// `k × this` approximate candidates are re-scored against the exact row
+/// vectors, and the best `k` by exact distance are returned.
+pub const QUANT_RESCORE_OVERSAMPLE: usize = 4;
+
+/// Exact metric distance between two raw f32 vectors (`None` on an unknown
+/// metric or a dimension mismatch) — the rescoring primitive a cluster
+/// coordinator uses on candidates from a quantized graph. Cosine normalizes
+/// internally, so row-stored vectors need no preparation.
+pub fn vector_exact_distance(metric: &str, a: &[f32], b: &[f32]) -> Option<f32> {
+    if a.len() != b.len() {
+        return None;
+    }
+    Metric::parse(metric).map(|m| crate::vector::exact_distance(m, a, b))
 }
 
 /// Extract the float vector at `path` (an array of `int`/`float`), or `None`.
@@ -11677,7 +11758,9 @@ fn doc_vector_raw(doc: &Document, path: &str) -> Option<Vec<f32>> {
 }
 
 /// Like [`doc_vector_raw`] but only accepts vectors of the expected dimension.
-fn doc_vector(doc: &Document, path: &str, dim: usize) -> Option<Vec<f32>> {
+/// `pub` so a cluster coordinator can pull the exact vector out of a re-read
+/// row when rescoring quantized-graph candidates.
+pub fn doc_vector(doc: &Document, path: &str, dim: usize) -> Option<Vec<f32>> {
     doc_vector_raw(doc, path).filter(|v| v.len() == dim)
 }
 

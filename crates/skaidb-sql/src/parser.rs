@@ -849,11 +849,12 @@ impl Parser {
             self.expect(&Token::LParen)?;
             let path = self.parse_path()?;
             self.expect(&Token::RParen)?;
-            // `DIM <n>` (required), `USING <metric>` and `EMBED` (optional),
-            // any order.
+            // `DIM <n>` (required), `USING <metric>`, `EMBED`, and
+            // `QUANTIZED` (optional; contextual ident), any order.
             let mut dim = None;
             let mut metric = None;
             let mut embed = false;
+            let mut quantized = false;
             loop {
                 if self.eat_keyword(Keyword::Dim) {
                     dim = Some(self.expect_u64()? as usize);
@@ -861,6 +862,8 @@ impl Parser {
                     metric = Some(self.expect_ident()?);
                 } else if self.eat_keyword(Keyword::Embed) {
                     embed = true;
+                } else if self.eat_ident_ci("quantized") {
+                    quantized = true;
                 } else {
                     break;
                 }
@@ -875,6 +878,7 @@ impl Parser {
                 dim,
                 metric: metric.unwrap_or_else(|| "cosine".into()),
                 embed,
+                quantized,
             }))
         } else if self.peek_ident_ci("geo") {
             // `GEO` is contextual (there is no GEO keyword — `geo_distance` /
@@ -2737,6 +2741,30 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(parse("SELECT id FROM docs WHERE MATCH(body, 'x') LIMIT 5 AFTER ()").is_err());
+    }
+
+    #[test]
+    fn parse_create_vector_index_quantized() {
+        match parse(
+            "CREATE VECTOR INDEX docs_emb ON docs (embedding) DIM 768 USING cosine QUANTIZED",
+        )
+        .unwrap()
+        {
+            Statement::CreateVectorIndex(c) => {
+                assert_eq!((c.dim, c.metric.as_str()), (768, "cosine"));
+                assert!(c.quantized && !c.embed);
+            }
+            other => panic!("{other:?}"),
+        }
+        // Options are order-free; absent → false.
+        match parse("CREATE VECTOR INDEX v ON t (e) QUANTIZED DIM 8").unwrap() {
+            Statement::CreateVectorIndex(c) => assert!(c.quantized),
+            other => panic!("{other:?}"),
+        }
+        match parse("CREATE VECTOR INDEX v ON t (e) DIM 8").unwrap() {
+            Statement::CreateVectorIndex(c) => assert!(!c.quantized),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

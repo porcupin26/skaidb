@@ -241,7 +241,11 @@ CREATE INDEX [IF NOT EXISTS] i ON t (path [, path ...])   -- composite = leftmos
 --   background after DDL (probes route once it completes); local
 --   indexes remain the default. See docs/GLOBAL_INDEXES.md.
 DROP INDEX [IF EXISTS] i
-CREATE VECTOR INDEX [IF NOT EXISTS] v ON t (path) DIM n [USING cosine|l2|dot]
+CREATE VECTOR INDEX [IF NOT EXISTS] v ON t (path) DIM n [USING cosine|l2|dot] [QUANTIZED] [EMBED]
+-- QUANTIZED: int8 scalar-quantized in-RAM graph (4x less vector RAM);
+-- queries over-fetch 4x + RESCORE top-k against exact row vectors, so
+-- _distance stays exact. Build-time choice (rebuild to change); not with
+-- EMBED (no exact vector in the row). Snapshot magic SKHNSW02.
 DROP VECTOR INDEX [IF EXISTS] v
 ALTER VECTOR INDEX v SET (ef = n)           -- live recall/latency tuning (persisted);
 --   build-time knobs (m, ef_construction, dim, metric) need a rebuild
@@ -615,7 +619,8 @@ WHERE cat = 'news';
 ```
 
 HNSW (snapshot-persisted; reload + watermark replay on open), metrics
-`cosine` (default) / `l2` / `dot`; `_distance` injected;
+`cosine` (default) / `l2` / `dot`; `_distance` injected; `QUANTIZED` for
+int8 in-RAM vectors with exact rescore (see §5 DDL note);
 `ALTER VECTOR INDEX v SET (ef = n)` retunes search-time recall/latency
 live (persisted; build-time knobs need a rebuild);
 `WHERE` filters candidates (over-fetch + filter); `LIMIT/OFFSET` apply

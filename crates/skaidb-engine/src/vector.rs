@@ -52,9 +52,54 @@ impl Ord for Dist {
     }
 }
 
+/// A node's vector payload. A graph is **homogeneous**: every node (and every
+/// prepared query) uses the same representation, chosen at construction.
+#[derive(Debug, Clone)]
+enum Stored {
+    /// Exact f32 components.
+    Exact(Vec<f32>),
+    /// Symmetric per-vector int8 scalar quantization: `x_i ≈ scale · q_i`
+    /// (4× less RAM than f32). `norm` caches the reconstructed squared L2
+    /// norm (`scale² · Σq²`) so L2 distances stay O(dim) int multiplies.
+    Q8 { q: Vec<i8>, scale: f32, norm: f32 },
+}
+
+/// Quantize a (metric-prepared) vector to int8 with a per-vector scale.
+fn quantize_i8(v: &[f32]) -> Stored {
+    let max = v.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    let scale = if max > 0.0 && max.is_finite() { max / 127.0 } else { 1.0 };
+    let q: Vec<i8> = v
+        .iter()
+        .map(|x| (x / scale).round().clamp(-127.0, 127.0) as i8)
+        .collect();
+    let qsq: i64 = q.iter().map(|&x| i64::from(x) * i64::from(x)).sum();
+    Stored::Q8 {
+        q,
+        scale,
+        norm: scale * scale * qsq as f32,
+    }
+}
+
+/// Exact metric distance between two raw f32 vectors. Unlike the graph's
+/// internal distance, cosine normalizes **internally** — inputs need not be
+/// pre-normalized. This is the rescoring primitive for quantized graphs: the
+/// approximate graph distance of each candidate is replaced by this value,
+/// computed against the exact vector re-read from the row.
+pub fn exact_distance(metric: Metric, a: &[f32], b: &[f32]) -> f32 {
+    match metric {
+        Metric::L2 => a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum(),
+        Metric::Dot => -a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>(),
+        Metric::Cosine => {
+            let na = a.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+            let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+            1.0 - a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>() / (na * nb)
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Node {
-    vector: Vec<f32>,
+    vector: Stored,
     key: Vec<u8>,
     /// Neighbor internal ids per layer; `neighbors[l]` is this node's layer-`l` adjacency.
     neighbors: Vec<Vec<u32>>,
@@ -75,13 +120,29 @@ pub struct Hnsw {
     by_key: HashMap<Vec<u8>, u32>,
     entry: Option<u32>,
     rng: u64,
+    /// int8 scalar-quantized graph (see [`Stored::Q8`]); chosen at
+    /// construction, homogeneous for the graph's lifetime.
+    quantized: bool,
     /// Mutated since the last snapshot save (never persisted itself).
     dirty: bool,
 }
 
 impl Hnsw {
     pub fn new(metric: Metric, dim: usize) -> Hnsw {
-        Hnsw::with_params(metric, dim, 16, 200, 64)
+        Hnsw::with_params(metric, dim, 16, 200, 64, false)
+    }
+
+    /// An int8 scalar-quantized graph (`CREATE VECTOR INDEX … QUANTIZED`):
+    /// vectors are quantized on insert and the graph searches over them —
+    /// distances are approximate, so callers over-fetch and **rescore** the
+    /// final top-k against exact vectors re-read from the table.
+    pub fn new_quantized(metric: Metric, dim: usize) -> Hnsw {
+        Hnsw::with_params(metric, dim, 16, 200, 64, true)
+    }
+
+    /// Whether this graph stores int8-quantized vectors.
+    pub fn is_quantized(&self) -> bool {
+        self.quantized
     }
 
     /// Retune the search-time candidate-list size (`ef`) live — a pure
@@ -98,6 +159,7 @@ impl Hnsw {
         m: usize,
         ef_construction: usize,
         ef_search: usize,
+        quantized: bool,
     ) -> Hnsw {
         Hnsw {
             metric,
@@ -111,6 +173,7 @@ impl Hnsw {
             by_key: HashMap::new(),
             entry: None,
             rng: 0x2545_f491_4f6c_dd1d,
+            quantized,
             dirty: false,
         }
     }
@@ -247,8 +310,8 @@ impl Hnsw {
 
     // ---- internals ----
 
-    /// Normalize for cosine; pass through otherwise.
-    fn prepared(&self, mut v: Vec<f32>) -> Vec<f32> {
+    /// Normalize for cosine, then quantize when this is a quantized graph.
+    fn prepared(&self, mut v: Vec<f32>) -> Stored {
         if self.metric == Metric::Cosine {
             let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
             if norm > 0.0 {
@@ -257,14 +320,40 @@ impl Hnsw {
                 }
             }
         }
-        v
+        if self.quantized {
+            quantize_i8(&v)
+        } else {
+            Stored::Exact(v)
+        }
     }
 
-    fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
-        match self.metric {
-            Metric::L2 => a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum(),
-            Metric::Dot => -a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>(),
-            Metric::Cosine => 1.0 - a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>(),
+    fn distance(&self, a: &Stored, b: &Stored) -> f32 {
+        match (a, b) {
+            (Stored::Exact(a), Stored::Exact(b)) => match self.metric {
+                Metric::L2 => a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum(),
+                Metric::Dot => -a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>(),
+                Metric::Cosine => 1.0 - a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>(),
+            },
+            (
+                Stored::Q8 { q: qa, scale: sa, norm: na },
+                Stored::Q8 { q: qb, scale: sb, norm: nb },
+            ) => {
+                // `x·y ≈ sa·sb·Σ(qa·qb)`; i64 accumulation cannot overflow
+                // (127² per element).
+                let dot_q: i64 = qa
+                    .iter()
+                    .zip(qb)
+                    .map(|(&x, &y)| i64::from(x) * i64::from(y))
+                    .sum();
+                let dot = sa * sb * dot_q as f32;
+                match self.metric {
+                    Metric::L2 => na + nb - 2.0 * dot,
+                    Metric::Dot => -dot,
+                    Metric::Cosine => 1.0 - dot,
+                }
+            }
+            // Graphs are homogeneous by construction; a mixed pair is a bug.
+            _ => f32::INFINITY,
         }
     }
 
@@ -279,7 +368,7 @@ impl Hnsw {
         (-u.ln() * self.ml).floor() as usize
     }
 
-    fn search_layer(&self, query: &[f32], entry: u32, ef: usize, layer: usize) -> Vec<(Dist, u32)> {
+    fn search_layer(&self, query: &Stored, entry: u32, ef: usize, layer: usize) -> Vec<(Dist, u32)> {
         let mut visited: HashMap<u32, ()> = HashMap::new();
         // `candidates` is a min-heap (closest first) via Reverse; `result` is a
         // max-heap (farthest first) capped at `ef`.
@@ -380,13 +469,14 @@ impl Hnsw {
         self.dirty = false;
     }
 
-    /// Snapshot the whole graph to a byte stream: format `SKHNSW01`, all
-    /// parameters, every node (key, tombstone, adjacency, raw f32 vector) —
-    /// enough to resume exactly where construction left off, `rng` included
-    /// (levels of future inserts stay deterministic across a reload, so
-    /// replicas that build vs. load converge on identical graphs).
+    /// Snapshot the whole graph to a byte stream: format `SKHNSW01` (exact
+    /// f32 vectors) or `SKHNSW02` (int8-quantized: per node scale + norm +
+    /// i8 payload), all parameters, every node (key, tombstone, adjacency,
+    /// vector) — enough to resume exactly where construction left off, `rng`
+    /// included (levels of future inserts stay deterministic across a reload,
+    /// so replicas that build vs. load converge on identical graphs).
     pub fn write_to(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
-        w.write_all(b"SKHNSW01")?;
+        w.write_all(if self.quantized { b"SKHNSW02" } else { b"SKHNSW01" })?;
         w.write_all(&[match self.metric {
             Metric::Cosine => 0u8,
             Metric::L2 => 1,
@@ -416,9 +506,19 @@ impl Hnsw {
                     w.write_all(&nb.to_le_bytes())?;
                 }
             }
-            // Vector length is `dim` by construction; write raw f32 LE.
-            for &x in &n.vector {
-                w.write_all(&x.to_le_bytes())?;
+            // Vector length is `dim` by construction.
+            match &n.vector {
+                Stored::Exact(v) => {
+                    for &x in v {
+                        w.write_all(&x.to_le_bytes())?;
+                    }
+                }
+                Stored::Q8 { q, scale, norm } => {
+                    w.write_all(&scale.to_le_bytes())?;
+                    w.write_all(&norm.to_le_bytes())?;
+                    let raw: Vec<u8> = q.iter().map(|&x| x as u8).collect();
+                    w.write_all(&raw)?;
+                }
             }
         }
         Ok(())
@@ -441,9 +541,11 @@ impl Hnsw {
         }
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic)?;
-        if &magic != b"SKHNSW01" {
-            return Err(Error::new(ErrorKind::InvalidData, "bad HNSW snapshot magic"));
-        }
+        let quantized = match &magic {
+            b"SKHNSW01" => false,
+            b"SKHNSW02" => true,
+            _ => return Err(Error::new(ErrorKind::InvalidData, "bad HNSW snapshot magic")),
+        };
         let mut mb = [0u8; 1];
         r.read_exact(&mut mb)?;
         let metric = match mb[0] {
@@ -486,12 +588,28 @@ impl Hnsw {
                 }
                 neighbors.push(level);
             }
-            let mut raw = vec![0u8; dim * 4];
-            r.read_exact(&mut raw)?;
-            let vector: Vec<f32> = raw
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
+            let vector = if quantized {
+                let mut sb = [0u8; 4];
+                r.read_exact(&mut sb)?;
+                let scale = f32::from_le_bytes(sb);
+                r.read_exact(&mut sb)?;
+                let norm = f32::from_le_bytes(sb);
+                let mut raw = vec![0u8; dim];
+                r.read_exact(&mut raw)?;
+                Stored::Q8 {
+                    q: raw.into_iter().map(|b| b as i8).collect(),
+                    scale,
+                    norm,
+                }
+            } else {
+                let mut raw = vec![0u8; dim * 4];
+                r.read_exact(&mut raw)?;
+                Stored::Exact(
+                    raw.chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect(),
+                )
+            };
             if del[0] == 0 {
                 by_key.insert(key.clone(), id as u32);
             }
@@ -514,6 +632,7 @@ impl Hnsw {
             by_key,
             entry: (entry_raw != u32::MAX).then_some(entry_raw),
             rng,
+            quantized,
             dirty: false,
         })
     }
@@ -685,6 +804,97 @@ mod tests {
             let recall = hits as f64 / total as f64;
             assert!(recall > 0.90, "{metric:?} recall {recall:.3} too low");
         }
+    }
+
+    /// A quantized graph keeps high recall vs exact brute force — int8 with a
+    /// per-vector scale loses little on ranking (callers additionally rescore
+    /// the top-k exactly, which this test does NOT rely on).
+    #[test]
+    fn quantized_recall_vs_brute_force() {
+        for metric in [Metric::Cosine, Metric::L2, Metric::Dot] {
+            let dim = 16;
+            let data = vecs(2000, dim, 42);
+            let mut h = Hnsw::new_quantized(metric, dim);
+            assert!(h.is_quantized());
+            for (i, v) in data.iter().enumerate() {
+                h.insert((i as u32).to_le_bytes().to_vec(), v.clone());
+            }
+            let queries = vecs(50, dim, 7);
+            let k = 10;
+            let (mut hits, mut total) = (0usize, 0usize);
+            for q in &queries {
+                let truth: std::collections::HashSet<usize> =
+                    brute(metric, &data, q, k).into_iter().collect();
+                for (key, _) in h.search(q, k, |_| true) {
+                    let id = u32::from_le_bytes(key.try_into().unwrap()) as usize;
+                    if truth.contains(&id) {
+                        hits += 1;
+                    }
+                }
+                total += k;
+            }
+            let recall = hits as f64 / total as f64;
+            assert!(recall > 0.85, "{metric:?} quantized recall {recall:.3} too low");
+        }
+    }
+
+    /// Quantized snapshots round-trip through the `SKHNSW02` format and stay
+    /// deterministic twins, exactly like exact graphs; the two formats are
+    /// mutually rejected (a repr change falls back to a rebuild).
+    #[test]
+    fn quantized_snapshot_roundtrip() {
+        let dim = 24;
+        let mut a = Hnsw::new_quantized(Metric::Cosine, dim);
+        let data = vecs(800, dim, 11);
+        for (i, v) in data.iter().enumerate().take(600) {
+            a.insert(format!("k{i}").into_bytes(), v.clone());
+        }
+        let mut buf = Vec::new();
+        a.write_to(&mut buf).unwrap();
+        assert_eq!(&buf[..8], b"SKHNSW02");
+        let mut b = Hnsw::read_from(&mut buf.as_slice()).unwrap();
+        assert!(b.is_quantized());
+        assert_eq!(a.len(), b.len());
+        for (i, v) in data.iter().enumerate().skip(600) {
+            a.insert(format!("k{i}").into_bytes(), v.clone());
+            b.insert(format!("k{i}").into_bytes(), v.clone());
+        }
+        for i in (0..800).step_by(97) {
+            assert_eq!(
+                a.search(&data[i], 5, |_| true),
+                b.search(&data[i], 5, |_| true),
+                "diverged at probe {i}"
+            );
+        }
+        // An exact graph still writes/reads the 01 format.
+        let mut e = Hnsw::new(Metric::Cosine, dim);
+        e.insert(b"x".to_vec(), data[0].clone());
+        let mut ebuf = Vec::new();
+        e.write_to(&mut ebuf).unwrap();
+        assert_eq!(&ebuf[..8], b"SKHNSW01");
+        assert!(!Hnsw::read_from(&mut ebuf.as_slice()).unwrap().is_quantized());
+    }
+
+    /// The quantized snapshot is ~4× smaller on the vector payload.
+    #[test]
+    fn quantized_snapshot_is_smaller() {
+        let dim = 128;
+        let data = vecs(500, dim, 3);
+        let (mut q, mut e) = (Hnsw::new_quantized(Metric::L2, dim), Hnsw::new(Metric::L2, dim));
+        for (i, v) in data.iter().enumerate() {
+            q.insert((i as u32).to_le_bytes().to_vec(), v.clone());
+            e.insert((i as u32).to_le_bytes().to_vec(), v.clone());
+        }
+        let (mut qb, mut eb) = (Vec::new(), Vec::new());
+        q.write_to(&mut qb).unwrap();
+        e.write_to(&mut eb).unwrap();
+        // Vector payload: 128 B vs 512 B per node (plus shared graph bytes).
+        assert!(
+            (qb.len() as f64) < (eb.len() as f64) * 0.45,
+            "quantized {} vs exact {}",
+            qb.len(),
+            eb.len()
+        );
     }
 
     #[test]

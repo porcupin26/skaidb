@@ -39,6 +39,32 @@ index answer **"vector index is rebuilding — retry shortly"** rather than
 silently serving a partial graph. On a single-node/embedded database the
 backfill completes before the DDL returns.
 
+## Quantization (`QUANTIZED`)
+
+```sql
+CREATE VECTOR INDEX docs_emb ON docs (embedding) DIM 768 USING cosine QUANTIZED
+```
+
+`QUANTIZED` cuts the graph's RAM: instead of exact f32 components, each in-RAM
+vector is stored **int8 scalar-quantized** (a per-vector scale, `x_i ≈
+scale·q_i`) — **4× less vector memory and snapshot payload** (measured: a
+2000×64 index's snapshot shrank 824 → 456 KB; at 768 dims the vector payload
+dominates the graph, so the whole-index saving approaches 4×). The graph
+searches over the quantized vectors, then every query **rescores**: it
+over-fetches 4× the requested `k`, re-reads the candidates' exact f32 vectors
+from their rows, recomputes the true metric distance, and returns the best
+`k` — so `_distance` (and the ES `_score` derived from it) is always the
+**exact** distance, and ranking quality is largely recovered even where the
+quantized graph ordering is slightly off. The cluster path rescores at the
+coordinator on the rows it already re-reads at read consistency.
+
+Constraints: a build-time choice — `DROP` + re-`CREATE` to change (the
+snapshot format differs: `SKHNSW02` vs `SKHNSW01`; a mismatched snapshot
+falls back to a rebuild). Not combinable with `EMBED` — a managed index
+stores only the text in the row, so there is no exact vector to rescore
+against. Use it when vector RAM is the constraint; skip it for small indexes
+where the 4× oversampled candidate re-read isn't worth the memory saved.
+
 ## Managed embeddings (`EMBED`, semantic_text)
 
 A **managed** vector index embeds a TEXT column for you — the ES `semantic_text`
@@ -247,7 +273,7 @@ search engines use. Where vector search sits across the systems compared in
 
 | Capability | PostgreSQL | MongoDB | Elasticsearch | Qdrant | Milvus | Weaviate | skaidb |
 |---|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
-| Vector ANN (kNN) | ⚠️ `pgvector` | ⚠️ Atlas | ✅ `dense_vector` | ✅ | ✅ | ✅ | ✅ (HNSW, embedded) |
+| Vector ANN (kNN) | ⚠️ `pgvector` | ⚠️ Atlas | ✅ `dense_vector` | ✅ | ✅ | ✅ | ✅ (HNSW + int8 quantization, embedded) |
 | Filtered ANN (`WHERE` + vector) | ✅ | ✅ | ✅ | ✅ (core) | ✅ | ✅ | ✅ |
 | ANN index types | HNSW/IVFFlat | HNSW | HNSW | HNSW (+quantization) | HNSW/IVF/PQ/DiskANN/GPU | HNSW | HNSW |
 | Distributed vector search | single-primary | sharded | sharded | sharded | sharded | sharded | ✅ (sharded scatter-gather) |
@@ -264,8 +290,10 @@ in-memory; see limitations).
 ## Limitations
 
 - **In-memory** — the whole graph (vectors included) lives in RAM
-  (~1 GB resident for 182k×768). The RAM-lean evolution is quantized vectors
-  in RAM with exact vectors re-read from the table.
+  (~1 GB resident for 182k×768 at exact f32). `QUANTIZED` (above) cuts the
+  vector payload 4× by keeping int8 vectors in RAM and rescoring the top-k
+  against the exact vectors re-read from the table; the graph adjacency
+  itself still lives in RAM, and mmap-ing the snapshot remains future work.
 - **Snapshots** — each HNSW persists to `<data>/vector/<name>.hnsw` (written
   on build and graceful shutdown). A restart loads the snapshot and replays
   only rows stamped after its watermark — seconds, where the from-scratch

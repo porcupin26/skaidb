@@ -34,7 +34,7 @@ CREATE INDEX [IF NOT EXISTS] <name> ON <table> (<path>[[]] [, <path>[[]] ...]) [
        -- WITH (global = true): value-sharded index — equality probes route to the value's
        -- replica set instead of scattering; ranges keep the scatter path (GLOBAL_INDEXES.md)
 DROP   INDEX [IF EXISTS] <name>
-CREATE VECTOR INDEX [IF NOT EXISTS] <name> ON <table> (<path>) DIM <n> [USING <metric>]
+CREATE VECTOR INDEX [IF NOT EXISTS] <name> ON <table> (<path>) DIM <n> [USING <metric>] [QUANTIZED] [EMBED]
 DROP   VECTOR INDEX [IF EXISTS] <name>
 ALTER  VECTOR INDEX <name> SET (ef = <n>)   -- live recall/latency tuning
 CREATE GEO INDEX [IF NOT EXISTS] <name> ON <table> (<point-path>)
@@ -169,9 +169,13 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   on the array column) fall back to a scan.
 - `CREATE VECTOR INDEX` builds an HNSW index for nearest-neighbor search over the
   float array at `<path>`. `DIM <n>` (the vector dimension) is **required**;
-  `USING <metric>` is `cosine` (default), `l2`, or `dot`. It broadcasts across
-  the cluster so every node indexes its shard. Query it with the `NEAREST`
-  clause (see *Vector search* below and [VECTOR.md](VECTOR.md)).
+  `USING <metric>` is `cosine` (default), `l2`, or `dot`. `QUANTIZED` stores
+  int8 scalar-quantized vectors in the in-RAM graph (4× less vector RAM);
+  queries over-fetch and rescore the top-k against the exact row vectors, so
+  returned distances stay exact (build-time choice — rebuild to change; not
+  combinable with `EMBED`). It broadcasts across the cluster so every node
+  indexes its shard. Query it with the `NEAREST` clause (see *Vector search*
+  below and [VECTOR.md](VECTOR.md)).
 - `CREATE GEO INDEX` builds a **Morton (Z-order) spatial index** over the
   `{lat, lon}` point column at `<point-path>`, so `geo_distance` / `geo_bbox`
   predicates in a `WHERE` scan a small set of code ranges instead of the whole

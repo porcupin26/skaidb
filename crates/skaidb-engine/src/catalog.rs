@@ -77,6 +77,13 @@ pub struct VectorIndexDef {
     /// (false) keeps pre-existing catalogs — plain vector indexes — compatible.
     #[serde(default)]
     pub embed: bool,
+    /// `QUANTIZED` — the in-RAM graph stores int8 scalar-quantized vectors
+    /// (4× less RAM); queries over-fetch and rescore the top-k against the
+    /// exact vectors re-read from the rows. Build-time choice (rebuild to
+    /// change); incompatible with `embed` (an EMBED row has no exact vector
+    /// to rescore against). `#[serde(default)]` keeps old catalogs loading.
+    #[serde(default)]
+    pub quantized: bool,
 }
 
 /// A geospatial index declaration (`CREATE GEO INDEX ... ON t(point_col)`).
