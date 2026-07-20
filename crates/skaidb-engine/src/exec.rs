@@ -1485,6 +1485,49 @@ impl Database {
         self.pending_embeds.values().any(|q| !q.is_empty())
     }
 
+    /// Names of managed indexes with rows awaiting embedding — the work list
+    /// for a cluster node's background embed drain.
+    pub fn pending_embed_indexes(&self) -> Vec<String> {
+        self.pending_embeds
+            .iter()
+            .filter(|(_, q)| !q.is_empty())
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    /// Persist a managed index's HNSW if it has unsaved changes (the background
+    /// worker calls this after applying a batch — it embeds off the lock, so it
+    /// can't use the combined `run_embed_drain`).
+    pub fn save_vector_snapshot_if_dirty(&mut self, name: &str) {
+        let path = vector_snapshot_path(&self.dir, name);
+        let watermark = self.vector_watermarks.get(name).copied().unwrap_or(Hlc::MIN);
+        if let Some(hnsw) = self.vector_indexes.get_mut(name) {
+            if hnsw.is_dirty() {
+                if let Err(e) = save_vector_snapshot(&path, hnsw, watermark) {
+                    skaidb_types::slog!("skaidb: vector snapshot save failed for {name}: {e}");
+                } else {
+                    hnsw.mark_clean();
+                }
+            }
+        }
+    }
+
+    /// Queue every managed index's un-embedded rows — run once after the
+    /// embedder is installed at startup, so a crash-window delta (rows not in
+    /// the loaded snapshot) is re-embedded. A clean restart queues nothing.
+    pub fn enqueue_all_managed_unembedded(&mut self) {
+        let managed: Vec<String> = self
+            .catalog
+            .vector_indexes
+            .iter()
+            .filter(|(_, d)| d.embed)
+            .map(|(n, _)| n.clone())
+            .collect();
+        for name in managed {
+            self.enqueue_unembedded(&name);
+        }
+    }
+
     /// Drain the embed queue for every managed index: batch queued rows, call
     /// the external embedder OFF nothing that blocks a write, insert the
     /// vectors, and snapshot. Errors (endpoint down) are swallowed and the keys

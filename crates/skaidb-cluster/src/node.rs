@@ -1009,6 +1009,45 @@ impl Node {
                     }
                 }
             }
+            // Managed-embedding drain: embed rows queued by writes to `… EMBED`
+            // indexes. The HTTP call to the model server happens OUTSIDE the
+            // engine lock — gather text under a brief lock, embed, re-acquire
+            // to insert — so a slow/down endpoint never stalls writes. Rows
+            // stay queued on failure and retry next tick.
+            let (embedder, pending) = match node.local.read() {
+                Ok(db) => (db.embedder(), db.pending_embed_indexes()),
+                Err(_) => return,
+            };
+            if let Some(embedder) = embedder {
+                for name in pending {
+                    loop {
+                        let (keys, texts) = match node.local.write() {
+                            Ok(mut db) => db.peek_embed_batch(&name, 32),
+                            Err(_) => return,
+                        };
+                        if keys.is_empty() {
+                            break;
+                        }
+                        match embedder.embed(&texts) {
+                            Ok(vectors) => {
+                                if let Ok(mut db) = node.local.write() {
+                                    db.apply_embeddings(&name, &keys, vectors);
+                                }
+                                thread::sleep(Duration::from_millis(2));
+                            }
+                            Err(e) => {
+                                skaidb_types::slog!(
+                                    "skaidb: embedding failed on {name} ({e}); rows stay queued"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    if let Ok(mut db) = node.local.write() {
+                        db.save_vector_snapshot_if_dirty(&name);
+                    }
+                }
+            }
             loop {
                 let jobs = match node.local.write() {
                     Ok(mut db) => db.background_flush_jobs(),
@@ -8307,6 +8346,16 @@ impl Cluster for Coordinator {
         self.node.vector_search(&index, query, k, filter)
     }
 
+    fn embed_query(&self, table: &str, path: &str, text: &str) -> EngineResult<Vec<f32>> {
+        // Managed-index query embedding is a pure local call (the embedder is
+        // installed on every node's engine); no scatter needed.
+        self.node
+            .local
+            .read()
+            .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
+            .embed_query(table, path, text)
+    }
+
     fn search(
         &mut self,
         table: &str,
@@ -10306,6 +10355,59 @@ mod tests {
             entries.iter().all(|(k, _, _, p)| !p || *k != orphan),
             "orphan tombstoned on its owner"
         );
+    }
+
+    /// Managed embeddings work cluster-wide: each node's background worker
+    /// embeds its shard's text out of band (never blocking writes), and a
+    /// string `NEAREST` auto-embeds the query at any coordinator.
+    #[test]
+    fn distributed_managed_embeddings() {
+        use std::sync::Arc;
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b), member("c", &c)];
+        let mk = |tag: &str, id: &str, addr: &str| {
+            let mut db = Database::open(temp_dir(tag)).unwrap();
+            db.set_embedder(Arc::new(skaidb_engine::HashEmbedder::new(16)));
+            Node::new(db, rf1(id, addr, &members))
+        };
+        let na = mk("mea", "a", &a);
+        let nb = mk("meb", "b", &b);
+        let nc = mk("mec", "c", &c);
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        nc.serve_internode().unwrap();
+
+        na.execute("CREATE TABLE docs (PRIMARY KEY (id))").unwrap();
+        na.execute("CREATE VECTOR INDEX docs_sem ON docs (body) EMBED DIM 16")
+            .unwrap();
+        na.execute(
+            "INSERT INTO docs (id, body) VALUES \
+             (1, 'quick brown fox'), (2, 'slow green turtle'), (3, 'quick fast rabbit')",
+        )
+        .unwrap();
+
+        // The background worker embeds each shard out of band — wait for every
+        // node to drain its queue before querying.
+        for node in [&na, &nb, &nc] {
+            for attempt in 0.. {
+                if !node.local.read().unwrap().has_pending_embeds() {
+                    break;
+                }
+                assert!(attempt < 200, "embed drain never caught up");
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        // A string NEAREST auto-embeds the query at any coordinator; id1
+        // (shares 'quick'+'fox') is closest.
+        for coord in [&na, &nb, &nc] {
+            let rs = rows(
+                coord
+                    .execute("SELECT id FROM docs NEAREST (body, 'quick fox', 3)")
+                    .unwrap(),
+            );
+            assert_eq!(rs.rows[0][0], Value::Int(1), "id1 nearest from every coord");
+        }
     }
 
     /// Hybrid retrieval (`RANK BY RRF`) works cluster-wide: both legs scatter

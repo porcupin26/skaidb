@@ -256,6 +256,10 @@ DELETE FROM t [WHERE expr]
 -- Query
 SELECT [DISTINCT] item [, ...] FROM t [[AS] a]
   [JOIN ...] [NEAREST (path, [vector], k)] [WHERE expr]
+--   NEAREST: kNN over a vector index. MANAGED index (CREATE VECTOR INDEX …
+--   ON t(text_col) EMBED DIM n) embeds the text column via [inference] at
+--   ingest (out of band, never blocks a write) and auto-embeds a STRING query:
+--   NEAREST(text_col, 'natural language', k). See docs/VECTOR.md.
   [RANK BY RRF [(c)]]
 --   RANK BY RRF: HYBRID search — fuse the NEAREST (vector) leg and the WHERE
 --   search-predicate (text) leg by Reciprocal Rank Fusion (ES `rrf` retriever).

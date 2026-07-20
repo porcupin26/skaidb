@@ -39,6 +39,31 @@ index answer **"vector index is rebuilding — retry shortly"** rather than
 silently serving a partial graph. On a single-node/embedded database the
 backfill completes before the DDL returns.
 
+## Managed embeddings (`EMBED`, semantic_text)
+
+A **managed** vector index embeds a TEXT column for you — the ES `semantic_text`
+workflow. Configure an embeddings endpoint in `[inference]`, then:
+
+```sql
+CREATE VECTOR INDEX docs_sem ON docs (body) EMBED DIM 768;
+SELECT id FROM docs NEAREST (body, 'natural language query', 10);  -- query auto-embedded
+```
+
+`EMBED` makes `path` a text column: on write skaidb embeds it via the provider
+(rather than reading a pre-computed vector array), and a **string** `NEAREST`
+query is auto-embedded. `DIM` must match the model; the index errors at create
+if `[inference]` is off or the dimension disagrees.
+
+**Never blocks a write.** Embedding is out of band: a write commits with the
+raw text (the source of truth) and a background worker embeds it — a batch of
+texts POSTed to the endpoint OFF the engine lock, the returned vectors inserted
+after. If the model server is down, rows stay queued and searchability lags, but
+no write is ever blocked or failed. Each node embeds its own shard; a crash-
+window delta (rows not yet in the HNSW snapshot) is re-queued on restart. Config
+(`[inference]`): `url` (OpenAI/TEI-compatible `{"model","input":[…]}` →
+`{"data":[{"embedding":[…]}]}`), `model`, `dim`, `api_key`, `batch_size`,
+`timeout_secs`, `tls_verify`/`tls_ca`.
+
 ## Searching (SQL)
 
 ```sql

@@ -9,6 +9,7 @@
 pub mod admin;
 pub mod audit;
 pub mod authn;
+mod embed_http;
 mod es;
 pub mod binary;
 mod drivers;
@@ -241,7 +242,20 @@ pub fn run(
         defer_search_startup: true,
         ..Default::default()
     };
-    let db = Database::open_with_options(&config.server.data_dir, storage_opts)?;
+    let mut db = Database::open_with_options(&config.server.data_dir, storage_opts)?;
+
+    // Managed-embeddings provider (`[inference]`): install the HTTP embedder so
+    // `CREATE VECTOR INDEX … EMBED` and string `NEAREST` queries work. Set
+    // before `build_backend` so it travels into the cluster node's local
+    // engine too. A bad URL/TLS config fails startup loud, not at first use.
+    if config.inference.enabled {
+        let embedder = embed_http::HttpEmbedder::from_config(&config.inference)
+            .map_err(|e| format!("[inference] config: {e}"))?;
+        db.set_embedder(std::sync::Arc::new(embedder));
+        // Re-queue any managed-index rows the last snapshot didn't capture (a
+        // clean restart queues nothing); the drain catches them up.
+        db.enqueue_all_managed_unembedded();
+    }
 
     // Restart accounting: bump the persistent start counter and, when the
     // cgroup's OOM-kill count moved since the previous start, say so — the

@@ -87,3 +87,19 @@ query_log_file = ""
 slow_query_log_file = ""
 error_log_file = ""
 login_log_file = ""
+
+# External embeddings endpoint for managed vector indexes
+# (`CREATE VECTOR INDEX … ON t(text_col) EMBED`): skaidb embeds the text column
+# at ingest (out of band, never blocking a write) and auto-embeds a string
+# NEAREST query. OpenAI/TEI-compatible: POST url {"model","input":[texts]} ->
+# {"data":[{"embedding":[...]}]}.
+[inference]
+enabled = false
+url = ""                     # e.g. "https://api.openai.com/v1/embeddings" or a local TEI URL
+model = ""                   # e.g. "text-embedding-3-small"
+dim = 0                      # must match the model's output dim and the index DIM
+api_key = ""                 # sent as "Authorization: Bearer <api_key>" when set
+batch_size = 32
+timeout_secs = 30
+tls_verify = "ca"            # "ca" (verify against tls_ca) | "system" | "insecure"
+tls_ca = ""                  # CA cert (PEM) when tls_verify = "ca"
