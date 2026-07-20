@@ -968,11 +968,10 @@ pub fn query(ctx: &Shared, scope: &Scope, params: &BTreeMap<String, String>) -> 
         Ok(e) => e,
         Err(e) => return err_json(&e),
     };
+    // Number-only expressions (Grafana's datasource health check probes
+    // `1+1`) fetch nothing and evaluate to a scalar.
     let mut specs = Vec::new();
     assign_slots(&mut expr, &mut specs);
-    if specs.is_empty() {
-        return err_json("number-only expressions are not supported");
-    }
     let fetched = match fetch_all(ctx, scope, &specs, t, t) {
         Ok(f) => f,
         Err(e) => return err_json(&e),
@@ -1034,11 +1033,10 @@ pub fn query_range(ctx: &Shared, scope: &Scope, params: &BTreeMap<String, String
         Ok(e) => e,
         Err(e) => return err_json(&e),
     };
+    // Number-only expressions fetch nothing; `render_matrix` turns the
+    // per-step scalars into one `{}`-labeled series, matching Prometheus.
     let mut specs = Vec::new();
     assign_slots(&mut expr, &mut specs);
-    if specs.is_empty() {
-        return err_json("number-only expressions are not supported");
-    }
     let steps: Vec<i64> = (0..).map(|i| start + i * step_ms).take_while(|t| *t <= end).collect();
     let fetched = match fetch_all(ctx, scope, &specs, start, end) {
         Ok(f) => f,
@@ -1190,6 +1188,19 @@ fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Number-only expressions (Grafana's `1+1` datasource health check)
+    /// evaluate to scalars with nothing fetched.
+    #[test]
+    fn number_only_expressions_evaluate() {
+        let mut e = P::new("1+1").parse().unwrap();
+        let mut specs = Vec::new();
+        assign_slots(&mut e, &mut specs);
+        assert!(specs.is_empty());
+        let vals = eval_steps(&e, &[], &[1000, 2000]).unwrap();
+        assert_eq!(vals.len(), 2);
+        assert!(matches!(vals[0], StepVal::Scalar(v) if v == 2.0));
+    }
 
     #[test]
     fn parses_selectors_and_functions() {
