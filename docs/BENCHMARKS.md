@@ -42,7 +42,7 @@ idle non-participant containers). Run-to-run spread on this host is
 | C1–C4 | 2026-07-17 | 0.94.3 | 17.10 | 7.0.37 / 8.0.26 | 11.4 | — |
 | C0 | 2026-07-16 | 0.94.x-dev¹ | 15.18 | 7.0.34 / — | 11.4 | 8.14.3 |
 | FTS vs ES | 2026-07-16 | 0.92.1 | — | — | — | 8.14.3 |
-| Global-index A/B | 2026-07-16 | 0.92.1 | — | — | — | — |
+| Global-index A/B | 2026-07-21 | 0.134.1 | — | — | — | — |
 | Sharded scatter | 2026-07-16 | 0.92.1 | — | — | — | — |
 | Version-impact A/B | 2026-07-21 | 0.130.0 vs 0.134.1 | — | — | — | — |
 
@@ -235,32 +235,52 @@ both versions.
 write/read/mixed paths (all deltas inside noise), a consistent small win
 on large-row reads, and a category change for TS counts at scale.
 
-## Global-index routed probe — phase-4 A/B (v0.92.1, 2026-07-16)
+## Global-index routed probe — phase-4 A/B (v0.134.1, 2026-07-21)
 
-RF=1 (genuinely sharded), 250k rows / 5,000 distinct indexed values, one
-LOCAL and one GLOBAL index on identical twin tables, 100 equality probes
-per round with the same seeded value sequence, interleaved so host noise
-hits both arms equally.
+3 members, RF=1 (genuinely 3-way sharded), 250k rows / 5,000 distinct
+indexed values, one LOCAL and one GLOBAL index on identical twin tables.
+Reads: 100 equality probes per round × 20 rounds (n=2,000 per arm), same
+seeded value sequence, arms interleaved per round so host noise hits
+both equally; EXPLAIN-verified access paths (`index scan` vs
+`global-index probe, routed to the value's replica set`). Writes: 500-row
+batches interleaved table-by-table, fresh keys, two independent passes.
 
-**Correctness: exact in both rounds** — identical row counts from the
-local-index scatter and the global-index routed probe at both
-topologies. (This bench caught two real backfill bugs before any number
-was trusted — batched drives and retry-or-abort readiness — both fixed
-in v0.91.1/.2; a third operational finding, backfills stalling below
-quorum during ring joins until the next repair pass re-drives them, is
-recorded in GLOBAL_INDEXES.md.)
+**Correctness: exact** — identical row counts from the local-index
+scatter and the global-index routed probe across all 2,000 probe pairs.
+(The original 2026-07-16 run of this bench caught two real backfill bugs
+before any number was trusted — batched drives and retry-or-abort
+readiness — both fixed in v0.91.1/.2; a third operational finding,
+backfills stalling below quorum during ring joins until the next repair
+pass re-drives them, is recorded in GLOBAL_INDEXES.md.)
 
-| Members | RF | local-index scatter (median / p95) | global-index routed probe (median / p95) |
-|--------:|---:|----------------------------------:|------------------------------------------:|
-| 2 | 1 | 11.5 / 28.2 ms | 11.3 / 32.3 ms |
-| 3 | 1 | 3.3 / 4.5 ms | 2.9 / 4.0 ms |
+**Reads** (equality probe returning ~50 rows):
 
-Parity at 2 members (scatter costs exactly one extra peer RPC there); the
-routed probe pulls ahead ~12% at 3 members — scatter fan-out cost grows
-with member count, the probe's does not. Expected to widen at 5+ members
-(untested; this fleet tops out at 3). The two rows' absolute latencies
-aren't comparable to each other (different host-contention conditions).
-At RF = full a global index buys nothing by design.
+| Arm | median | p95 | mean |
+|---|--:|--:|--:|
+| local-index scatter (3-way fan-out) | 3.1 ms | 5.0 ms | 3.3 ms |
+| global-index routed probe (1 replica set) | 2.6 ms | 4.4 ms | 2.9 ms |
+
+**Writes** (indexed table, 500-row batches; two passes):
+
+| Arm | batch median | batch p95 | throughput |
+|---|--:|--:|--:|
+| local index | 837–859 ms | 991–1017 ms | 574–588 rows/s |
+| global index | 994–1088 ms | 1262–1269 ms | 491–493 rows/s |
+
+The routed probe wins reads by ~16% median / ~12% p95 at 3 members —
+scatter fan-out cost grows with member count, the probe's does not
+(expected to widen at 5+ members; this fleet tops out at 3). The
+earlier v0.92.1 2-member run showed parity there (scatter costs exactly
+one extra peer RPC at 2 members), consistent with this model. The write
+side pays for the read win: each insert drives its index entry to the
+indexed value's replica set, costing ~20–27% batch latency / ~15%
+throughput on this workload. At RF = full a global index buys nothing
+by design — reads already resolve on any single node.
+
+**Adoption guidance**: global indexes are for genuinely sharded
+deployments (members > RF) with read-heavy selective-equality workloads.
+The prod skai cluster is RF=3 over 3 members (full copies), where a
+local index already answers without fan-out — no prod schema change.
 
 ## Sharded scatter partials — fleet verification (v0.92.1, 2026-07-16)
 
