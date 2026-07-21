@@ -1048,7 +1048,22 @@ const KNOWN_METRICS: &[(&str, MetricType, &str)] = &[
     (
         "skaidb_table_disk_bytes",
         MetricType::Gauge,
-        "On-disk bytes per table (opt-in per-table metric).",
+        "On-disk bytes per table, all table kinds (opt-in per-table metric).",
+    ),
+    (
+        "skaidb_ts_table_series",
+        MetricType::Gauge,
+        "Series per time-series table (opt-in per-table metric).",
+    ),
+    (
+        "skaidb_ts_table_samples_appended_total",
+        MetricType::Counter,
+        "Samples appended per time-series table (opt-in per-table metric).",
+    ),
+    (
+        "skaidb_ts_table_samples_rejected_total",
+        MetricType::Counter,
+        "Samples rejected (OOO/series-limit) per time-series table (opt-in per-table metric).",
     ),
     // ---- vector index ----
     (

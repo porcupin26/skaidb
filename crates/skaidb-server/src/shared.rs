@@ -666,6 +666,24 @@ pub fn collect_runtime_metrics(ctx: &Shared) {
             m.set(&format!("skaidb_table_tombstones{{{labels}}}"), t.tombstones);
             m.set(&format!("skaidb_table_disk_bytes{{{labels}}}"), t.disk_bytes);
         }
+        // TIME-SERIES tables join the per-table gauges: disk under the SAME
+        // metric (one per-table disk dashboard covers every table kind),
+        // series/sample counters under ts-specific names.
+        for t in &s.per_timeseries {
+            let table = escape_label(&t.name);
+            let db = escape_label(&t.database);
+            let labels = format!("db=\"{db}\",table=\"{table}\"");
+            m.set(&format!("skaidb_table_disk_bytes{{{labels}}}"), t.disk_bytes);
+            m.set(&format!("skaidb_ts_table_series{{{labels}}}"), t.series);
+            m.set(
+                &format!("skaidb_ts_table_samples_appended_total{{{labels}}}"),
+                t.samples_appended,
+            );
+            m.set(
+                &format!("skaidb_ts_table_samples_rejected_total{{{labels}}}"),
+                t.samples_rejected,
+            );
+        }
     }
 
     // Host system stats (this node only — Prometheus scrapes per node).

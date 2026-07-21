@@ -327,6 +327,21 @@ pub struct DbStats {
     pub bloom_negatives: u64,
     /// Per-table breakdown (only populated when per-table metrics are enabled).
     pub per_table: Vec<TableStats>,
+    /// Per-TIME-SERIES-table breakdown (same gate) — TS tables were
+    /// invisible to per-table consumers (/metrics gauges, SHOW STATUS),
+    /// reported from onet.
+    pub per_timeseries: Vec<TsTableStats>,
+}
+
+/// Per-time-series-table statistics for metrics.
+#[derive(Debug, Clone, Default)]
+pub struct TsTableStats {
+    pub database: String,
+    pub name: String,
+    pub series: u64,
+    pub samples_appended: u64,
+    pub samples_rejected: u64,
+    pub disk_bytes: u64,
 }
 
 /// Per-table live-key / tombstone / size breakdown.
@@ -7378,6 +7393,21 @@ impl Database {
             }
             agg
                 .per_table
+                .sort_by(|a, b| (&a.database, &a.name).cmp(&(&b.database, &b.name)));
+            for (name, store) in &self.timeseries {
+                let ts = store.stats();
+                let (db, bare) = namespace::split(name);
+                agg.per_timeseries.push(TsTableStats {
+                    database: db.to_string(),
+                    name: bare.to_string(),
+                    series: ts.series as u64,
+                    samples_appended: ts.samples_appended,
+                    samples_rejected: ts.samples_rejected,
+                    disk_bytes: ts.disk_bytes,
+                });
+            }
+            agg
+                .per_timeseries
                 .sort_by(|a, b| (&a.database, &a.name).cmp(&(&b.database, &b.name)));
         }
         agg

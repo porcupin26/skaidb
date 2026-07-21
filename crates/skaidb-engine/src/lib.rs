@@ -22,7 +22,7 @@ pub use exec::{
     doc_vector, filter_rows, filter_search_query, matches_filter, run, statement_is_read_only,
     vector_exact_distance, Cluster,
     Database, DbStats, IndexScanRange, SessionTxn, Inventory, InventoryIndex, InventorySearch,
-    InventoryTable, InventoryTimeseries, InventoryVector, pk_point_key, pk_point_keys, TableStats,
+    InventoryTable, InventoryTimeseries, InventoryVector, pk_point_key, pk_point_keys, TableStats, TsTableStats,
     TsRollupInfo, QUANT_RESCORE_OVERSAMPLE,
     DecodedMaint, MaintTask,
     gidx_table, global_entry_delta, index_entry_key,
@@ -1230,6 +1230,28 @@ mod tests {
         assert_eq!(rs.rows.len(), 5);
         assert_eq!(rs.rows[0][1], Value::Float(99.0));
         assert_eq!(rs.rows[4][1], Value::Float(95.0));
+    }
+
+    /// TS tables appear in the per-table stats breakdown (they were
+    /// invisible to /metrics per-table gauges and SHOW STATUS table.* —
+    /// reported from onet).
+    #[test]
+    fn timeseries_in_per_table_stats() {
+        let mut db = Database::open(tempdir()).unwrap();
+        db.execute("CREATE TIMESERIES TABLE m (SERIES KEY (host))").unwrap();
+        db.execute("INSERT INTO m (host, ts, value) VALUES ('a', 1000, 1), ('b', 1000, 2)")
+            .unwrap();
+        let s = db.stats(true);
+        let t = s
+            .per_timeseries
+            .iter()
+            .find(|t| t.name == "m")
+            .expect("ts table in per-table stats");
+        assert_eq!(t.database, "default");
+        assert_eq!(t.series, 2);
+        assert_eq!(t.samples_appended, 2);
+        // The gate applies to TS tables too.
+        assert!(db.stats(false).per_timeseries.is_empty());
     }
 
     #[test]

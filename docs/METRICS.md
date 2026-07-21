@@ -125,7 +125,10 @@ Enabled with `observability.per_table_metrics = true`. Each carries `db` and
 |--------|------|--------|---------|
 | `skaidb_table_live_keys` | gauge | `db`, `table` | Live keys (full merged scan; O(rows) at scrape). |
 | `skaidb_table_tombstones` | gauge | `db`, `table` | Tombstones awaiting compaction. |
-| `skaidb_table_disk_bytes` | gauge | `db`, `table` | On-disk bytes for the table. |
+| `skaidb_table_disk_bytes` | gauge | `db`, `table` | On-disk bytes for the table — every table kind, TIME-SERIES included. |
+| `skaidb_ts_table_series` | gauge | `db`, `table` | Series count per time-series table. |
+| `skaidb_ts_table_samples_appended_total` | counter | `db`, `table` | Samples appended per time-series table. |
+| `skaidb_ts_table_samples_rejected_total` | counter | `db`, `table` | Samples rejected (OOO / series limit) per time-series table. |
 
 ## Vector index
 
