@@ -134,19 +134,22 @@ jobs:
             nfpm_arch: arm64
             linker: aarch64-linux-gnu-gcc
             apt: gcc-aarch64-linux-gnu
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            packaging: musl
-            apt: musl-tools
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            packaging: macos
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            packaging: macos
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            packaging: windows
+          # DISABLED 2026-07-20 (release-time savings): only .deb targets
+          # build for now. Uncomment any entry to re-enable its format —
+          # the packaging steps below are all still wired up.
+          # - target: x86_64-unknown-linux-musl
+          #   os: ubuntu-latest
+          #   packaging: musl
+          #   apt: musl-tools
+          # - target: x86_64-apple-darwin
+          #   os: macos-latest
+          #   packaging: macos
+          # - target: aarch64-apple-darwin
+          #   os: macos-latest
+          #   packaging: macos
+          # - target: x86_64-pc-windows-msvc
+          #   os: windows-latest
+          #   packaging: windows
     steps:
       - uses: actions/checkout@v6
         with:
@@ -184,7 +187,7 @@ jobs:
         # only (skaidb-cli has no such feature).
         run: cargo build --release --target ${{ matrix.target }} -p skaidb-server -p skaidb-cli --features "${{ matrix.features }}"
 
-      # ---- packaging: Linux (tarball + .deb + .rpm) ----
+      # ---- packaging: Linux (.deb; tarball + .rpm disabled below) ----
       - name: Install nfpm
         if: matrix.packaging == 'linux'
         run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.41.3
@@ -200,9 +203,11 @@ jobs:
           mkdir -p dist staging
           cp "target/$TARGET/release/skaidb" "target/$TARGET/release/skaidbsh" staging/
           cp LICENSE README.md staging/
-          tar -C staging -czf "dist/skaidb-$VERSION-$TARGET.tar.gz" .
           "$(go env GOPATH)/bin/nfpm" package -f .github/nfpm.yaml -p deb -t dist/
-          "$(go env GOPATH)/bin/nfpm" package -f .github/nfpm.yaml -p rpm -t dist/
+          # DISABLED 2026-07-20 (release-time savings): deb only for now.
+          # Uncomment to re-enable the tarball / rpm formats.
+          # tar -C staging -czf "dist/skaidb-$VERSION-$TARGET.tar.gz" .
+          # "$(go env GOPATH)/bin/nfpm" package -f .github/nfpm.yaml -p rpm -t dist/
 
       # ---- packaging: musl (static tarball) ----
       - name: Package musl
