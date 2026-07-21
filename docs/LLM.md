@@ -623,6 +623,11 @@ WHERE ts >= now() - 6h GROUP BY t;
   to lean on) holds a flat, bounded footprint instead of stacking frozen
   memtables. A standalone witness has no background flusher, so the pull
   drains its own memtables by bytes applied, not page count.
+  TIME-SERIES tables mirror too (routed by SHOW TABLES' `kind` column):
+  samples pull via time-windowed TsQuery scattered over every member,
+  unioned + deduped into one any-aged merge; recreated locally as plain
+  TIMESERIES tables (source series key, NO retention — the backup keeps
+  what the primary ages out; rollups mirror as plain TS tables).
   The single-row
   `witness_gc_config` table holds `grace_period_secs` (default 7 days) —
   cluster-consistent because it is a table row, settable with a plain

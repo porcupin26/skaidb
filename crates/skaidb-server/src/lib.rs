@@ -1836,7 +1836,7 @@ pub(crate) mod tests {
         assert!(body.contains("alpha"), "got: {body}");
         assert!(body.contains("beta"), "got: {body}");
         assert!(
-            body.contains("\"columns\":[\"table\",\"primary_key\",\"replication\",\"nodes\",\"witness\",\"transition\"]"),
+            body.contains("\"columns\":[\"table\",\"primary_key\",\"replication\",\"nodes\",\"witness\",\"transition\",\"kind\"]"),
             "got: {body}"
         );
     }
@@ -3219,6 +3219,118 @@ pub(crate) mod tests {
         assert_eq!(*pulled, 0, "unchanged table skipped entirely");
         assert_eq!(*applied, 0);
         assert_eq!(*rows_now, 3, "skipped table still reports its size");
+    }
+
+    /// TIME-SERIES tables mirror too: `SHOW TABLES`' kind column routes them
+    /// to the `TsQuery` sample pull (`ScanPage` only knows row tables — a
+    /// mirrored database with a TS table used to fail EVERY cycle with
+    /// `table does not exist`, found live on the first onet witness), the
+    /// witness recreates them as TIMESERIES tables locally, and new samples
+    /// arrive on later cycles via the any-aged merge.
+    #[test]
+    fn witness_pull_mirrors_timeseries_tables() {
+        let internode_addr = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let a = l.local_addr().unwrap().to_string();
+            drop(l);
+            a
+        };
+        let cfg = NodeConfig {
+            id: NodeId::new(&internode_addr),
+            internode_addr: internode_addr.clone(),
+            members: vec![(NodeId::new(&internode_addr), internode_addr.clone())],
+            replication_factor: 1,
+            vnodes_per_node: 64,
+            read_consistency: ClusterConsistency::Quorum,
+            write_consistency: ClusterConsistency::Quorum,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
+            anti_entropy_interval_secs: 0,
+        };
+        let node = Node::new(Database::open(temp_dir()).unwrap(), cfg);
+        node.serve_internode().unwrap();
+        let primary: Shared = Arc::new(Context {
+            backend: Backend::Cluster(node),
+            metrics: Metrics::new(),
+            audit: RwLock::new(quiet_audit()),
+            authn: AuthState::disabled(),
+            superuser_role: "superuser".into(),
+            admin_lock: Mutex::new(()),
+            start: Instant::now(),
+            slow_log: crate::slowlog::SlowLog::new(),
+            config: RwLock::new(Config::default()),
+            config_path: None,
+            drivers_table_ensured: std::sync::atomic::AtomicBool::new(false),
+        });
+        let (sql_addr, _h) = binary::spawn("127.0.0.1:0", primary.clone()).unwrap();
+        crate::witnesses::ensure_tables(&primary).unwrap();
+        let exec_p = |sql: &str| match crate::shared::execute_as(&primary, "superuser", sql) {
+            Response::Error(e) => panic!("primary {sql}: {e}"),
+            other => other,
+        };
+        exec_p("CREATE DATABASE mirror");
+        exec_p("CREATE TIMESERIES TABLE mirror.metrics (SERIES KEY (host))");
+        exec_p(
+            "INSERT INTO mirror.metrics (host, ts, value) VALUES \
+             ('a', 1000, 1.0), ('a', 2000, 2.0), ('b', 1000, 5.0)",
+        );
+        // A row table beside it: the kinds must route independently.
+        exec_p("CREATE TABLE mirror.items (PRIMARY KEY (id))");
+        exec_p("INSERT INTO mirror.items (id, v) VALUES (1, 'x')");
+
+        let witness = temp_ctx();
+        let wcfg = skaidb_config::WitnessConfig {
+            enabled: true,
+            primary_sql_addrs: vec![sql_addr.to_string()],
+            primary_internode_addrs: vec![internode_addr.clone()],
+            user: "anonymous".into(),
+            password: String::new(),
+            databases: vec!["mirror".into()],
+            interval_secs: 3600,
+            full_sweep_interval_secs: 86_400,
+            duty_pct: 90,
+            witness_id: "w-ts".into(),
+            region: "unit".into(),
+            ..Default::default()
+        };
+        let s1 = crate::witness_pull::run_cycle(&witness, &wcfg, &witness_test_pool()).unwrap();
+        let stat = |s: &crate::witness_pull::CycleSummary, t: &str| {
+            s.tables
+                .iter()
+                .find(|(n, ..)| n == t)
+                .map(|&(_, p, a, _)| (p, a))
+                .unwrap_or_else(|| panic!("{t} missing from cycle: {:?}", s.tables))
+        };
+        assert_eq!(stat(&s1, "mirror.metrics"), (3, 3), "all samples arrive");
+        assert_eq!(stat(&s1, "mirror.items"), (1, 1), "row table unaffected");
+        let exec_w = |sql: &str| match crate::shared::execute_as(&witness, "superuser", sql) {
+            Response::Error(e) => panic!("witness {sql}: {e}"),
+            other => other,
+        };
+        let rows_of = |resp: Response| match resp {
+            Response::Rows { rows, .. } => rows,
+            other => panic!("expected rows, got {other:?}"),
+        };
+        // Recreated AS a time-series table (a row-table mirror would refuse
+        // the ts/value query shape), samples byte-correct.
+        let got = rows_of(exec_w(
+            "SELECT ts, value FROM mirror.metrics WHERE host = 'a' ORDER BY ts",
+        ));
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[1][1], Value::Float(2.0));
+
+        // New samples arrive on the next cycle (delta or overlap re-pull —
+        // either way the merge dedupes; the visible state is what matters).
+        exec_p("INSERT INTO mirror.metrics (host, ts, value) VALUES ('a', 3000, 3.0)");
+        crate::witness_pull::run_cycle(&witness, &wcfg, &witness_test_pool()).unwrap();
+        let got = rows_of(exec_w(
+            "SELECT ts, value FROM mirror.metrics WHERE host = 'a' ORDER BY ts",
+        ));
+        assert_eq!(got.len(), 3, "the new sample arrived");
+        assert_eq!(got[2][1], Value::Float(3.0));
+        // Re-pulls stay idempotent: total sample count is exact, no dupes.
+        let got = rows_of(exec_w("SELECT count(*) FROM mirror.metrics"));
+        assert_eq!(got[0][0], Value::Int(4));
     }
 
     /// The witness pulls over mutual TLS from a `cert`-mode primary: its pool

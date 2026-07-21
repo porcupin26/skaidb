@@ -599,6 +599,14 @@ the status-tab sync detail and holds tombstone GC back (up to
 `witness_gc_config.grace_period_secs`) until every live witness has
 pulled the deletes. Witness mirroring is per-table opt-out:
 `WITH (witness = false)` / `ALTER TABLE t SET (witness = false)`.
+Time-series tables mirror too: their samples move via time-windowed
+`TsQuery` pulls (scattered over every member — series placement shards
+them on RF < members primaries — unioned, deduped, merged any-aged), with
+the same watermark + full-sweep-backstop ladder as row tables. On the
+witness they are recreated as plain TIMESERIES tables with the source's
+series key but NO retention (a backup keeps what the primary ages out);
+rollups mirror as plain time-series tables (the rollup→source link is
+derived state).
 
 ## Operational notes & limitations
 

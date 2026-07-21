@@ -188,8 +188,18 @@ pub(crate) fn run_cycle(ctx: &Shared, cfg: &WitnessConfig, pool: &Pool) -> Resul
         let tables = list_tables(&mut sql, db)?;
         for pt in &tables {
             let table = &pt.table;
-            ensure_local_table(ctx, db, table, &pt.pk_cols)?;
+            ensure_local_table(ctx, db, table, &pt.pk_cols, pt.kind)?;
             let qualified = skaidb_engine::namespace::qualify(db, table);
+            // Time-series tables take the sample-pull path (see
+            // sync_ts_table): scatter over every member, union, one merge.
+            if pt.kind == TableKind::Timeseries {
+                let (pulled, applied) = sync_ts_table(ctx, cfg, pool, &qualified, now)
+                    .map_err(|e| format!("{qualified}: {e}"))?;
+                summary
+                    .tables
+                    .push((format!("{db}.{table}"), pulled, applied, 0));
+                continue;
+            }
             // Where a complete copy of this table can come from. A pinned
             // table lives whole on each pin (any one live pin serves the
             // pull); a table whose RF override is below the primary's
@@ -525,6 +535,126 @@ fn pull_table_delta(
     }
 }
 
+/// Sync one TIME-SERIES table: `TsQuery` each member for the samples since
+/// that member's watermark (minus the delta margin; first sync and the
+/// full-sweep backstop use t0 = 0), UNION the answers deduped by
+/// `(series, ts)`, and land them in ONE local `ts_merge` — a merge always
+/// writes a block, so per-member merges of a full-copy primary would write
+/// the same data once per member every cycle. Scattering over every member
+/// is required for correctness anyway: series placement shards TS tables
+/// across members on RF < members primaries and the witness can't see the
+/// cluster RF. The merge path accepts any-aged samples, so overlap and
+/// re-pulls are idempotent (duplicates fold at read/compaction). There is
+/// no `TableSeq` gate — an idle table answers an empty in-range query
+/// nearly as cheaply. A down member degrades its shard until it returns
+/// (logged); ALL members down fails the cycle. Returns
+/// `(samples_pulled, samples_applied)`.
+fn sync_ts_table(
+    ctx: &Shared,
+    cfg: &WitnessConfig,
+    pool: &Pool,
+    qualified: &str,
+    now: u64,
+) -> Result<(usize, usize), String> {
+    let Backend::Local(local) = &ctx.backend else {
+        return Err("witness pull requires a standalone backend".into());
+    };
+    let mut union: std::collections::BTreeMap<(Vec<(String, String)>, i64), f64> =
+        std::collections::BTreeMap::new();
+    let mut pulled = 0usize;
+    // Deferred per-member watermark saves: only recorded once the merge
+    // below lands, else a crash between "state saved" and "data applied"
+    // would skip these samples until the full-sweep backstop.
+    let mut saves: Vec<(String, String, u64, u64)> = Vec::new();
+    let mut reachable = 0usize;
+    let mut last_err = String::new();
+    for addr in &cfg.primary_internode_addrs {
+        let state_key = format!("{qualified}|{addr}");
+        let state = load_sync_state(ctx, &state_key);
+        let backstop_due = now.saturating_sub(state.last_full_ms)
+            >= cfg.full_sweep_interval_secs.saturating_mul(1000);
+        let full = state.watermark_ms == 0 || backstop_due;
+        let t0 = if full {
+            0
+        } else {
+            state.watermark_ms.saturating_sub(DELTA_MARGIN_MS) as i64
+        };
+        let query_started = std::time::Instant::now();
+        let series = match pool.call(
+            addr,
+            &Request::TsQuery {
+                table: qualified.to_string(),
+                matchers: Vec::new(),
+                t0,
+                t1: i64::MAX,
+            },
+        ) {
+            Ok(Response::TsSeries { series }) => series,
+            Ok(Response::Err(e)) => {
+                skaidb_types::slog!(
+                    "witness: {qualified} (timeseries) @{addr} unavailable this cycle: {e}"
+                );
+                last_err = e;
+                continue;
+            }
+            Ok(other) => {
+                last_err = format!("unexpected {other:?}");
+                skaidb_types::slog!("witness: {qualified} (timeseries) @{addr}: {last_err}");
+                continue;
+            }
+            Err(e) => {
+                skaidb_types::slog!(
+                    "witness: {qualified} (timeseries) @{addr} unavailable this cycle: {e}"
+                );
+                last_err = e.to_string();
+                continue;
+            }
+        };
+        reachable += 1;
+        let mut max_ts: u64 = state.watermark_ms;
+        for (labels, samples) in series {
+            for (ts, value) in samples {
+                if ts > 0 {
+                    max_ts = max_ts.max(ts as u64);
+                }
+                pulled += 1;
+                union.insert((labels.clone(), ts), value);
+            }
+        }
+        saves.push((
+            state_key,
+            addr.clone(),
+            max_ts,
+            if full { now } else { state.last_full_ms },
+        ));
+        // Duty pacing, same rule as the row pull: rest in proportion to
+        // the time this member just spent serving us.
+        let pct = f64::from(cfg.duty_pct.clamp(1, 90));
+        let rest = query_started.elapsed().mul_f64((100.0 - pct) / pct);
+        std::thread::sleep(rest.max(PULL_PAGE_PAUSE_FLOOR));
+    }
+    if reachable == 0 {
+        return Err(format!("no source reachable: {last_err}"));
+    }
+    let applied = if union.is_empty() {
+        0
+    } else {
+        let rows: Vec<_> = union
+            .into_iter()
+            .map(|((labels, ts), value)| (labels, ts, value))
+            .collect();
+        let db = local
+            .read()
+            .map_err(|_| "witness local lock poisoned".to_string())?;
+        db.ts_merge(qualified, &rows)
+            .map_err(|e| format!("ts merge {qualified}: {e}"))?
+    };
+    for (state_key, addr, max_ts, last_full) in saves {
+        save_sync_state(ctx, &state_key, &addr, 0, max_ts, last_full)?;
+    }
+    Ok((pulled, applied))
+}
+
 /// Ensure the witness's registration row exists on the primary. An
 /// existing row is UPDATEd in place (last_seen + region only) — an
 /// INSERT would overwrite the whole row and wipe the previous cycle's
@@ -610,9 +740,21 @@ fn mirror_names(ctx: &Shared, sql: &mut Client, cfg: &WitnessConfig) {
 }
 
 /// One mirrored table's schema + placement as the primary lists it.
+/// How a primary table's data moves: rows page over `ScanPage`/
+/// `ScanSincePage`; time-series samples move via `TsQuery` + local merge.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TableKind {
+    Row,
+    /// A `CREATE TIMESERIES` table — including rollups, which the witness
+    /// mirrors as PLAIN time-series tables (their samples are preserved;
+    /// the rollup→source link is derived state the backup doesn't need).
+    Timeseries,
+}
+
 struct PrimaryTable {
     table: String,
     pk_cols: Vec<String>,
+    kind: TableKind,
     /// Per-table RF override on the primary (None = cluster default).
     replication: Option<u32>,
     /// Pinned members (internode ids — which ARE their addresses). A pin
@@ -656,6 +798,14 @@ fn list_tables(sql: &mut Client, db: &str) -> Result<Vec<PrimaryTable>, String> 
                 (Some(Value::String(t)), Some(Value::String(pk))) => Some(PrimaryTable {
                     table: t.clone(),
                     pk_cols: pk.split(',').map(|c| c.trim().to_string()).collect(),
+                    // Absent column = pre-kind primary: every table it lists
+                    // is a row table as far as this witness can pull anyway.
+                    kind: match idx("kind").and_then(|i| r.get(i)) {
+                        Some(Value::String(k)) if k == "timeseries" || k == "rollup" => {
+                            TableKind::Timeseries
+                        }
+                        _ => TableKind::Row,
+                    },
                     replication: match r_i.and_then(|i| r.get(i)) {
                         Some(Value::Int(n)) => Some(*n as u32),
                         _ => None,
@@ -682,21 +832,36 @@ fn list_tables(sql: &mut Client, db: &str) -> Result<Vec<PrimaryTable>, String> 
 /// Create the database + table locally if missing (schema-less: the PK is
 /// the whole schema). Runs as the superuser through the session layer —
 /// exempt from read_only, and DDL this way keeps the catalog consistent.
+/// A time-series table's listed key is `(series key, ts)` — recreate it as
+/// a TIMESERIES table with that series key. No RETENTION on the mirror
+/// (a backup keeps everything the primary may have already aged out) and
+/// no OOO window (samples land via the any-aged merge path, not append).
 fn ensure_local_table(
     ctx: &Shared,
     db: &str,
     table: &str,
     pk_cols: &[String],
+    kind: TableKind,
 ) -> Result<(), String> {
     let role = ctx.superuser_role.clone();
     let mut current_db = skaidb_engine::DEFAULT_DATABASE.to_string();
-    for sql in [
-        format!("CREATE DATABASE IF NOT EXISTS {db}"),
-        format!(
+    let create = match kind {
+        TableKind::Row => format!(
             "CREATE TABLE IF NOT EXISTS {db}.{table} (PRIMARY KEY ({}))",
             pk_cols.join(", ")
         ),
-    ] {
+        TableKind::Timeseries => {
+            let series: Vec<&String> = pk_cols.iter().filter(|c| *c != "ts").collect();
+            if series.is_empty() {
+                return Err(format!("{db}.{table}: empty series key in listing"));
+            }
+            format!(
+                "CREATE TIMESERIES TABLE IF NOT EXISTS {db}.{table} (SERIES KEY ({}))",
+                series.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            )
+        }
+    };
+    for sql in [format!("CREATE DATABASE IF NOT EXISTS {db}"), create] {
         if let skaidb_proto::Response::Error(e) =
             crate::shared::execute_session_as(ctx, &role, &mut current_db, &sql, None)
         {

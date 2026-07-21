@@ -3400,6 +3400,7 @@ impl Database {
                     },
                     Value::Bool(def.witness),
                     Value::Bool(def.prev_placement.is_some()),
+                    Value::String("row".into()),
                 ]
             })
             .collect();
@@ -3412,6 +3413,13 @@ impl Database {
                     Value::Null,
                     Value::Bool(true),
                     Value::Bool(false),
+                    // The kind column routes consumers that must treat
+                    // time-series tables differently — a witness pulls rows
+                    // via ScanPage but samples via TsQuery, and telling the
+                    // two apart from name+pk alone is impossible.
+                    Value::String(
+                        if def.rollup_of.is_some() { "rollup" } else { "timeseries" }.into(),
+                    ),
                 ]);
             }
         }
@@ -3424,6 +3432,7 @@ impl Database {
                 "nodes".into(),
                 "witness".into(),
                 "transition".into(),
+                "kind".into(),
             ],
             rows,
         }
