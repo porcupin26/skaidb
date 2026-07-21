@@ -20,7 +20,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.134.1"
+version = "0.134.2"
 edition = "2021"
 license = "SSPL-1.0"
 repository = "https://github.com/porcupin26/skaidb"
