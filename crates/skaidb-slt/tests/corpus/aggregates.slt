@@ -1,0 +1,60 @@
+# Aggregation, GROUP BY, HAVING — including the alias-resolution semantics
+# fixed in v0.126.1 (aliases in ORDER BY/HAVING/GROUP BY used to read NULL
+# off the source docs and silently mis-order or empty the result).
+
+statement ok
+CREATE TABLE g (PRIMARY KEY (id))
+
+statement ok
+INSERT INTO g (id, dept, price) VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 5), (4, 'c', 40), (5, 'b', 7)
+
+query I
+SELECT count(*) FROM g
+----
+5
+
+query TI rowsort
+SELECT dept, count(*) FROM g GROUP BY dept
+----
+a 2
+b 2
+c 1
+
+query TI
+SELECT dept, sum(price) AS s FROM g GROUP BY dept ORDER BY s DESC
+----
+c 40
+a 30
+b 12
+
+# HAVING referencing an output alias (the v0.126.1 silent-empty bug).
+query TI rowsort
+SELECT dept, count(*) AS c FROM g GROUP BY dept HAVING c > 1
+----
+a 2
+b 2
+
+# ORDER BY an aliased expression on a plain select (silent-unordered bug).
+query II
+SELECT id, price * 2 AS p FROM g ORDER BY p DESC
+----
+4 80
+2 40
+1 20
+5 14
+3 10
+
+query R
+SELECT avg(price) FROM g WHERE dept = 'b'
+----
+6.000
+
+query II
+SELECT min(price), max(price) FROM g
+----
+5 40
+
+query I
+SELECT count(*) FROM g WHERE dept = 'nope'
+----
+0

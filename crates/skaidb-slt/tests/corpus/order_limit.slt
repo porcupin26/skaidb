@@ -1,0 +1,53 @@
+# ORDER BY direction and NULL placement, DISTINCT, LIMIT/OFFSET.
+
+statement ok
+CREATE TABLE o (PRIMARY KEY (id))
+
+statement ok
+INSERT INTO o (id, v, tag) VALUES (1, 30, 'x'), (2, 10, 'y'), (3, 20, 'x'), (5, 40, 'y')
+
+statement ok
+INSERT INTO o (id, tag) VALUES (4, 'x')
+
+query I
+SELECT id FROM o ORDER BY v
+----
+2
+3
+1
+5
+4
+
+query I
+SELECT id FROM o ORDER BY v DESC
+----
+4
+5
+1
+3
+2
+
+query I
+SELECT id FROM o ORDER BY v LIMIT 2
+----
+2
+3
+
+query I
+SELECT id FROM o ORDER BY v LIMIT 2 OFFSET 1
+----
+3
+1
+
+query T rowsort
+SELECT DISTINCT tag FROM o
+----
+x
+y
+
+query I rowsort
+SELECT id FROM o WHERE tag = 'x' ORDER BY id LIMIT 10
+----
+1
+3
+4

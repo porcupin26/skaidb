@@ -1,0 +1,85 @@
+# Predicate semantics: three-valued logic over schemaless rows (an absent
+# column reads as NULL), IN/BETWEEN/LIKE, and de-Morgan-ish shapes.
+
+statement ok
+CREATE TABLE f (PRIMARY KEY (id))
+
+# id=3 has no `a` at all; id=4 stores an explicit NULL — both must behave
+# as NULL in predicates.
+statement ok
+INSERT INTO f (id, a, c) VALUES (1, 5, 'apple'), (2, 15, 'banana')
+
+statement ok
+INSERT INTO f (id, c) VALUES (3, 'cherry')
+
+statement ok
+INSERT INTO f (id, a, c) VALUES (4, NULL, 'date')
+
+query I rowsort
+SELECT id FROM f WHERE a > 4
+----
+1
+2
+
+# NULL/absent never satisfies a comparison — and never satisfies its
+# negation either.
+query I rowsort
+SELECT id FROM f WHERE NOT (a > 4)
+----
+
+query I rowsort
+SELECT id FROM f WHERE a IS NULL
+----
+3
+4
+
+query I rowsort
+SELECT id FROM f WHERE a IS NOT NULL
+----
+1
+2
+
+query I rowsort
+SELECT id FROM f WHERE a IN (5, 15, 25)
+----
+1
+2
+
+query I rowsort
+SELECT id FROM f WHERE a NOT IN (5)
+----
+2
+
+query I rowsort
+SELECT id FROM f WHERE a BETWEEN 5 AND 15
+----
+1
+2
+
+query I rowsort
+SELECT id FROM f WHERE c LIKE 'ba%'
+----
+2
+
+query I rowsort
+SELECT id FROM f WHERE c LIKE '%e%'
+----
+1
+3
+4
+
+# LIKE is case-sensitive; ILIKE is the case-blind form.
+query I rowsort
+SELECT id FROM f WHERE c LIKE 'APPLE'
+----
+
+query I rowsort
+SELECT id FROM f WHERE c ILIKE 'APPLE'
+----
+1
+
+query I rowsort
+SELECT id FROM f WHERE a = 5 OR (c = 'cherry' AND a IS NULL)
+----
+1
+3

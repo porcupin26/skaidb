@@ -1,0 +1,59 @@
+# Time-series surface: create/insert/select, OOO drop reporting (v0.126.0),
+# label-DISTINCT from series metadata (v0.130.0), COUNT(*) via partials
+# (v0.131.0), ts_bucketed aggregation.
+
+statement ok
+CREATE TIMESERIES TABLE m (SERIES KEY (host), RETENTION 30d, OOO 2m)
+
+statement ok
+INSERT INTO m (host, ts, value) VALUES ('a', 60000, 1), ('a', 600000, 2), ('b', 60000, 5)
+
+# A point far outside the OOO window is dropped AND SAYS SO (affected 0).
+statement count 0
+INSERT INTO m (host, ts, value) VALUES ('a', 1, 9)
+
+query IR
+SELECT ts, value FROM m WHERE host = 'a' ORDER BY ts
+----
+60000 1.000
+600000 2.000
+
+query I
+SELECT count(*) FROM m
+----
+3
+
+query T rowsort
+SELECT DISTINCT host FROM m
+----
+a
+b
+
+query TI rowsort
+SELECT host, count(*) FROM m GROUP BY host
+----
+a 2
+b 1
+
+query R
+SELECT sum(value) FROM m WHERE host = 'a'
+----
+3.000
+
+statement error
+UPDATE m SET value = 0 WHERE host = 'a'
+
+statement error
+DELETE FROM m WHERE host = 'a'
+
+# Live-tunable OOO (v0.127.0): widen, and the same late point now lands.
+statement ok
+ALTER TABLE m SET (ooo = 10m)
+
+statement count 1
+INSERT INTO m (host, ts, value) VALUES ('a', 1, 9)
+
+query I
+SELECT count(*) FROM m
+----
+4

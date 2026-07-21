@@ -1,0 +1,45 @@
+# Core create/insert/select round-trips.
+
+statement ok
+CREATE TABLE t (PRIMARY KEY (id))
+
+statement ok
+INSERT INTO t (id, a, c) VALUES (1, 10, 'x'), (2, 20, 'y'), (3, 30, 'z')
+
+query IT rowsort
+SELECT id, c FROM t
+----
+1 x
+2 y
+3 z
+
+query II
+SELECT id, a + 5 FROM t WHERE id = 2
+----
+2 25
+
+query I
+SELECT a * 2 FROM t WHERE c = 'z'
+----
+60
+
+# Upsert: same pk replaces the row.
+statement ok
+INSERT INTO t (id, a, c) VALUES (2, 99, 'y2')
+
+query IT
+SELECT a, c FROM t WHERE id = 2
+----
+99 y2
+
+statement ok
+DELETE FROM t WHERE id = 1
+
+query I rowsort
+SELECT id FROM t
+----
+2
+3
+
+statement error
+SELECT id FROM no_such_table

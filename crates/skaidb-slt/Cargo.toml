@@ -1,0 +1,21 @@
+# SQL-correctness harness: a sqllogictest runner over the embedded engine
+# (native .slt corpus under tests/corpus/) plus a differential fuzzer that
+# cross-checks generated queries against SQLite and freezes divergences as
+# .slt repros. Dev tooling — never published, never shipped in packages.
+[package]
+name = "skaidb-slt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+skaidb-engine.workspace = true
+skaidb-types.workspace = true
+sqllogictest = "0.29"
+rusqlite = { version = "0.32", features = ["bundled"] }
+rand = "0.8"
+
+[[bin]]
+name = "slt-diff"
+path = "src/bin/slt_diff.rs"
