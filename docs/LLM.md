@@ -517,6 +517,11 @@ WHERE ts >= now() - 6h GROUP BY t;
 - **`ALTER TABLE <ts> SET (retention = 60d | ooo = 1h)`** — both
   live-tunable (retention applies at next flush, `0` clears it; ooo applies
   to subsequent inserts — widen it temporarily to backfill a live table).
+- **`SELECT DISTINCT <label cols>`** on a TS table serves from series
+  METADATA (label sets — no sample scan, immune to point count); a `ts`
+  constraint forces the sample path. remote_write: an incoming literal
+  `name` label renames to `exported_name` (collides with the metric-name
+  mapping otherwise).
 - **INSERT reports drops**: points outside the OOO window are discarded and
   `affected` counts only what landed (`0` = all dropped; per-field counts
   when a row has several numeric fields). Check `affected` in ingest code;

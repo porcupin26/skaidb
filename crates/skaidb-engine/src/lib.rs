@@ -1073,6 +1073,57 @@ mod tests {
         assert!(err.to_string().contains("TIMESERIES"), "{err}");
     }
 
+    /// `SELECT DISTINCT <label cols>` on a TS table answers from series
+    /// METADATA, not a sample gather: with a scan budget far below the
+    /// point count, label-DISTINCT succeeds while a raw sample dump
+    /// correctly still fails — the onet report (label-DISTINCT over a
+    /// growing metrics table died on the 250k budget while /api/v1/series
+    /// answered instantly).
+    #[test]
+    fn timeseries_label_distinct_serves_from_series_metadata() {
+        let opts = skaidb_storage::EngineOptions {
+            scan_row_budget: 20, // far below the 60 samples inserted
+            ..Default::default()
+        };
+        let mut db = Database::open_with_options(tempdir(), opts).unwrap();
+        db.execute("CREATE TIMESERIES TABLE m (SERIES KEY (src, kind))").unwrap();
+        for i in 0..20 {
+            let t = 1000 + i * 1000;
+            db.execute(&format!(
+                "INSERT INTO m (src, kind, ts, value) VALUES ('a', 'agent', {t}, 1), \
+                 ('b', 'agent', {t}, 2), ('c', 'probe', {t}, 3)"
+            ))
+            .unwrap();
+        }
+        // Label-DISTINCT: 3 series, well under the 20-row budget.
+        let rs = rows(
+            db.execute("SELECT DISTINCT src, kind FROM m ORDER BY src").unwrap(),
+        );
+        assert_eq!(
+            rs.rows,
+            vec![
+                vec![Value::String("a".into()), Value::String("agent".into())],
+                vec![Value::String("b".into()), Value::String("agent".into())],
+                vec![Value::String("c".into()), Value::String("probe".into())],
+            ]
+        );
+        // Label-filtered DISTINCT stays on the metadata path.
+        let rs = rows(
+            db.execute("SELECT DISTINCT src FROM m WHERE kind = 'agent' ORDER BY src")
+                .unwrap(),
+        );
+        assert_eq!(rs.rows.len(), 2);
+        // A raw sample dump still (correctly) charges the budget and fails.
+        let err = db.execute("SELECT ts, value FROM m").unwrap_err();
+        assert!(err.to_string().contains("scan budget"), "{err}");
+        // A ts-constrained DISTINCT cannot use all-time metadata: it takes
+        // the sample path and hits the budget — explicit, not silently
+        // wrong.
+        assert!(db
+            .execute("SELECT DISTINCT src FROM m WHERE ts >= 5000")
+            .is_err());
+    }
+
     #[test]
     fn timeseries_rejects_update_delete_and_bad_inserts() {
         let mut db = Database::open(tempdir()).unwrap();

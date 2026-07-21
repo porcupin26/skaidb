@@ -144,6 +144,55 @@ pub(crate) fn run_ts_select(
         extract_pushdown(filter, series_key, &mut t0, &mut t1, &mut matchers);
     }
 
+    // Label-DISTINCT metadata path: `SELECT DISTINCT <label cols> FROM ts`
+    // answers from series LABEL SETS — no sample materialization. A metrics
+    // table holds points in the millions but series in the hundreds; the
+    // sample gather died on the scan budget at 250k points (reported from
+    // onet: label-DISTINCT over a growing 12M-point table was impossible)
+    // while the series metadata answers instantly. Conditions: DISTINCT,
+    // every output a bare series-key column, no grouping/aggregates, no
+    // time constraint (label sets are all-time), and filter + ORDER BY
+    // touching only series-key columns (both re-apply over the label sets).
+    if sel.distinct
+        && sel.group_by.is_empty()
+        && sel.group_top.is_none()
+        && sel.having.is_none()
+        && t0 == i64::MIN
+        && t1 == i64::MAX
+        && !sel.items.is_empty()
+        && sel.items.iter().all(|item| matches!(
+            item,
+            SelectItem::Expr { expr: Expr::Column(c), .. } if series_key.contains(c)
+        ))
+        && sel
+            .filter
+            .as_ref()
+            .is_none_or(|f| columns_subset_of(f, series_key))
+        && sel
+            .order_by
+            .iter()
+            .all(|o| columns_subset_of(&o.expr, series_key))
+    {
+        let sets = cluster.ts_series_sets(&sel.from, &matchers)?;
+        crate::scan_meter::tick(sets.len())?;
+        let mut docs = Vec::with_capacity(sets.len());
+        for labels in sets {
+            let mut d = Document::new();
+            for (k, v) in labels {
+                if k != FIELD_LABEL {
+                    d.insert(k, Value::String(v));
+                }
+            }
+            // Residual semantics: the FULL filter re-applies (pushdown
+            // matchers re-check harmlessly; label-only residuals — regex
+            // has no matcher form here — apply exactly).
+            if eval_predicate(sel.filter.as_ref().unwrap_or(&Expr::Literal(Value::Bool(true))), &d)? {
+                docs.push(d);
+            }
+        }
+        return project(sel, docs, &HashSet::new(), true);
+    }
+
     // Partial-aggregate pushdown: an aggregation whose WHERE is entirely
     // served by the pushdown gathers per-series per-bucket partials from the
     // cluster (one replica's answer per series) instead of raw samples. Any
@@ -248,6 +297,20 @@ fn const_ms(e: &Expr) -> Option<i64> {
     }
     let v = eval(e, &Document::new()).ok()?;
     as_int_ms(&v)
+}
+
+/// Every column referenced by `e` is in `allowed` (label-only predicates
+/// for the series-metadata path).
+fn columns_subset_of(e: &Expr, allowed: &[String]) -> bool {
+    let mut ok = true;
+    walk(e, &mut |x| {
+        if let Expr::Column(c) = x {
+            if !allowed.contains(c) {
+                ok = false;
+            }
+        }
+    });
+    ok
 }
 
 fn expr_has_columns(e: &Expr) -> bool {

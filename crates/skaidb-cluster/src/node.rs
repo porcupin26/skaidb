@@ -5246,6 +5246,25 @@ impl Node {
                 }
                 None => Response::Err("busy: engine write-locked, retry".into()),
             },
+            Request::TsSeriesSets { table, matchers } => match self.local_read_bounded() {
+                Some(db) => {
+                    let matchers: Vec<skaidb_tsdb::Matcher> = matchers
+                        .into_iter()
+                        .map(|(negated, k, v)| {
+                            if negated {
+                                skaidb_tsdb::Matcher::Ne(k, v)
+                            } else {
+                                skaidb_tsdb::Matcher::Eq(k, v)
+                            }
+                        })
+                        .collect();
+                    match db.ts_series_sets(&table, &matchers) {
+                        Ok(series) => Response::TsLabelSets { series },
+                        Err(e) => Response::Err(e.to_string()),
+                    }
+                }
+                None => Response::Err("busy: engine write-locked, retry".into()),
+            },
             Request::TsMerge { table, rows } => match self.local_read_bounded() {
                 Some(db) => match db.ts_merge(&table, &rows) {
                     Ok(_) => Response::Ack,
@@ -7801,6 +7820,21 @@ fn shed_error() -> EngineError {
     EngineError::Cluster("memory pressure: node is shedding writes, retry".into())
 }
 
+/// The trait-default series-sets derivation (full TsQuery) — the exact
+/// fallback when the metadata verb can't serve (regex matchers, pre-verb
+/// peers, transport failures).
+fn fallback_series_sets(
+    c: &Coordinator,
+    table: &str,
+    matchers: &[skaidb_tsdb::Matcher],
+) -> EngineResult<Vec<skaidb_tsdb::Labels>> {
+    Ok(c.node
+        .ts_scatter(table, matchers, i64::MIN, i64::MAX, c.oc)?
+        .into_iter()
+        .map(|(labels, _)| labels)
+        .collect())
+}
+
 /// Serialize one on-disk hint record: `table`, `key`, op (`1`+value / `0`),
 /// then the 12-byte HLC. Length-prefixed so records can be streamed back.
 fn encode_hint_record(table: &str, key: &[u8], op: &WriteOp, hlc: Hlc) -> Vec<u8> {
@@ -8429,6 +8463,53 @@ impl Cluster for Coordinator {
         t1: i64,
     ) -> EngineResult<Vec<(skaidb_tsdb::Labels, Vec<skaidb_tsdb::Sample>)>> {
         self.node.ts_scatter(table, matchers, t0, t1, self.oc)
+    }
+
+    /// Series metadata scatter: union every member's label sets — series
+    /// placement shards them across members, and label sets are identical
+    /// on every replica of a series, so a plain union is exact. Only
+    /// equality matchers ship (the wire form); anything else falls back to
+    /// the trait default (full TsQuery), as does any member that predates
+    /// the verb (rolling upgrade).
+    fn ts_series_sets(
+        &self,
+        table: &str,
+        matchers: &[skaidb_tsdb::Matcher],
+    ) -> EngineResult<Vec<skaidb_tsdb::Labels>> {
+        let mut wire: Vec<(bool, String, String)> = Vec::with_capacity(matchers.len());
+        for m in matchers {
+            match m {
+                skaidb_tsdb::Matcher::Eq(k, v) => wire.push((false, k.clone(), v.clone())),
+                skaidb_tsdb::Matcher::Ne(k, v) => wire.push((true, k.clone(), v.clone())),
+                _ => {
+                    // Regex matchers have no wire form on this verb.
+                    return fallback_series_sets(self, table, matchers);
+                }
+            }
+        }
+        let mut set: std::collections::BTreeSet<skaidb_tsdb::Labels> = self
+            .node
+            .with_local_read(|db| db.ts_series_sets(table, matchers))
+            .unwrap_or_else(|| Ok(Vec::new()))
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let req = Request::TsSeriesSets {
+            table: table.to_string(),
+            matchers: wire,
+        };
+        for addr in self.node.peer_addrs() {
+            match self.node.pool.call(&addr, &req) {
+                Ok(Response::TsLabelSets { series }) => set.extend(series),
+                // Missing table on a peer that never saw a series of it is
+                // an empty contribution, not a failure.
+                Ok(Response::Err(e)) if e.contains("does not exist") => {}
+                // Pre-verb peer or transport failure: the union may be
+                // incomplete — fall back to the exact (heavy) path.
+                _ => return fallback_series_sets(self, table, matchers),
+            }
+        }
+        Ok(set.into_iter().collect())
     }
 
     fn ts_partials(

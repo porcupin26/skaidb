@@ -302,6 +302,16 @@ pub enum Request {
     /// (engine stats, no `df`, no per-table scan) used at (re)join to decide
     /// whether this node started far behind (a from-empty resync).
     DataBytes,
+    /// The peer's series LABEL SETS for a time-series table, matcher-
+    /// filtered (equality forms, like [`Request::TsQuery`]) — series
+    /// metadata only, no samples. Behind label-DISTINCT queries at metrics
+    /// scale. Answered with [`Response::TsLabelSets`]; a pre-verb peer
+    /// fails to decode and the coordinator falls back to a full
+    /// `TsQuery`.
+    TsSeriesSets {
+        table: String,
+        matchers: Vec<(bool, String, String)>,
+    },
 }
 
 /// A response from a peer member.
@@ -395,6 +405,11 @@ pub enum Response {
     TsPartials {
         series: TsPartialsData,
     },
+    /// Reply to [`Request::TsSeriesSets`]: this node's matching series
+    /// label sets (metadata only).
+    TsLabelSets {
+        series: Vec<Vec<(String, String)>>,
+    },
 }
 
 /// A versioned row on the wire: `(key, value, hlc, is_put)` — the shape shared
@@ -460,6 +475,7 @@ const REQ_TABLESEQ: u8 = 36;
 const REQ_SCANSINCE: u8 = 37;
 const REQ_REPAIRSEQ: u8 = 38;
 const REQ_DATABYTES: u8 = 39;
+const REQ_TSSERIESSETS: u8 = 40;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
@@ -483,6 +499,7 @@ const RES_TABLESEQ: u8 = 18;
 const RES_DELTAPAGE: u8 = 19;
 const RES_DATABYTES: u8 = 21;
 const RES_REPAIRSEQ: u8 = 20;
+const RES_TSLABELSETS: u8 = 22;
 
 impl Request {
     pub fn encode(&self) -> Vec<u8> {
@@ -571,6 +588,16 @@ impl Request {
                 }
                 o.extend_from_slice(&t0.to_le_bytes());
                 o.extend_from_slice(&t1.to_le_bytes());
+            }
+            Request::TsSeriesSets { table, matchers } => {
+                o.push(REQ_TSSERIESSETS);
+                put_str(o, table);
+                o.extend_from_slice(&(matchers.len() as u32).to_le_bytes());
+                for (negated, k, v) in matchers {
+                    o.push(u8::from(*negated));
+                    put_str(o, k);
+                    put_str(o, v);
+                }
             }
             Request::TsMerge { table, rows } => {
                 o.push(REQ_TSMERGE);
@@ -830,6 +857,18 @@ impl Request {
                     t0: c.u64()? as i64,
                     t1: c.u64()? as i64,
                 }
+            }
+            REQ_TSSERIESSETS => {
+                let table = c.string()?;
+                let n = c.u32()? as usize;
+                let mut matchers = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let negated = c.u8()? != 0;
+                    let k = c.string()?;
+                    let v = c.string()?;
+                    matchers.push((negated, k, v));
+                }
+                Request::TsSeriesSets { table, matchers }
             }
             REQ_TSMERGE => {
                 let table = c.string()?;
@@ -1168,6 +1207,13 @@ impl Response {
                     }
                 }
             }
+            Response::TsLabelSets { series } => {
+                o.push(RES_TSLABELSETS);
+                o.extend_from_slice(&(series.len() as u32).to_le_bytes());
+                for labels in series {
+                    put_labels(o, labels);
+                }
+            }
             Response::TsPartials { series } => {
                 o.push(RES_TSPARTIALS);
                 o.extend_from_slice(&(series.len() as u32).to_le_bytes());
@@ -1305,6 +1351,14 @@ impl Response {
                     series.push((labels, samples));
                 }
                 Response::TsSeries { series }
+            }
+            RES_TSLABELSETS => {
+                let n = c.u32()? as usize;
+                let mut series = Vec::with_capacity(n);
+                for _ in 0..n {
+                    series.push(c.labels()?);
+                }
+                Response::TsLabelSets { series }
             }
             RES_TSSUMMARIES => {
                 let n = c.u32()? as usize;
@@ -2176,6 +2230,14 @@ mod tests {
                 t0: i64::MIN,
                 t1: i64::MAX,
             },
+            Request::TsSeriesSets {
+                table: "cpu".into(),
+                matchers: vec![(false, "host".into(), "a".into()), (true, "core".into(), "0".into())],
+            },
+            Request::TsSeriesSets {
+                table: "cpu".into(),
+                matchers: vec![],
+            },
             Request::TsPartials {
                 table: "cpu".into(),
                 matchers: vec![(false, "__field__".into(), "value".into())],
@@ -2309,6 +2371,13 @@ mod tests {
                     (vec![], vec![]),
                 ],
             },
+            Response::TsLabelSets {
+                series: vec![
+                    vec![("host".into(), "a".into()), ("core".into(), "0".into())],
+                    vec![],
+                ],
+            },
+            Response::TsLabelSets { series: vec![] },
             Response::TsPartials {
                 series: vec![
                     (

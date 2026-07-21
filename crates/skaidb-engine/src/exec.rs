@@ -6683,6 +6683,23 @@ impl Database {
         Ok(res.appended)
     }
 
+    /// This node's series LABEL SETS for a time-series table, matcher-
+    /// filtered — labels only, no chunk decode, no sample materialization.
+    /// The series-metadata unit behind label-DISTINCT queries and the
+    /// `/api/v1/series` endpoint at scale.
+    pub fn ts_series_sets(
+        &self,
+        table: &str,
+        matchers: &[skaidb_tsdb::Matcher],
+    ) -> Result<Vec<skaidb_tsdb::Labels>> {
+        Ok(self
+            .ts_store(table)?
+            .series_labels()
+            .into_iter()
+            .filter(|labels| matchers.iter().all(|m| m.accepts(labels)))
+            .collect())
+    }
+
     /// Query samples from a time-series table (see [`Cluster::ts_query`]).
     pub fn ts_query(
         &self,
@@ -8622,6 +8639,23 @@ pub trait Cluster {
         Err(EngineError::Unsupported(
             "time-series tables are not available on this backend".into(),
         ))
+    }
+    /// Series LABEL SETS matching every matcher — series METADATA, no
+    /// sample materialization; the unit behind label-DISTINCT queries
+    /// (`SELECT DISTINCT <label cols> FROM <ts>` used to gather every
+    /// sample and die on the scan budget at metrics scale). The default
+    /// derives them from [`Cluster::ts_query`] (correct, heavy);
+    /// implementations override with the store's series listing.
+    fn ts_series_sets(
+        &self,
+        table: &str,
+        matchers: &[skaidb_tsdb::Matcher],
+    ) -> Result<Vec<skaidb_tsdb::Labels>> {
+        Ok(self
+            .ts_query(table, matchers, i64::MIN, i64::MAX)?
+            .into_iter()
+            .map(|(labels, _)| labels)
+            .collect())
     }
     /// Rollup routing metadata for a time-series table: the retention
     /// horizon (timestamp below which source blocks may already be dropped;
@@ -11328,6 +11362,14 @@ impl Cluster for LocalCluster<'_> {
         self.db.ts_query(table, matchers, t0, t1)
     }
 
+    fn ts_series_sets(
+        &self,
+        table: &str,
+        matchers: &[skaidb_tsdb::Matcher],
+    ) -> Result<Vec<skaidb_tsdb::Labels>> {
+        self.db.ts_series_sets(table, matchers)
+    }
+
     fn ts_rollup_info(&self, table: &str) -> Result<TsRollupInfo> {
         self.db.ts_rollup_info(table)
     }
@@ -11474,6 +11516,14 @@ impl Cluster for LocalRead<'_> {
         t1: i64,
     ) -> Result<Vec<(skaidb_tsdb::Labels, Vec<skaidb_tsdb::Sample>)>> {
         self.db.ts_query(table, matchers, t0, t1)
+    }
+
+    fn ts_series_sets(
+        &self,
+        table: &str,
+        matchers: &[skaidb_tsdb::Matcher],
+    ) -> Result<Vec<skaidb_tsdb::Labels>> {
+        self.db.ts_series_sets(table, matchers)
     }
 
     fn ts_rollup_info(&self, table: &str) -> Result<TsRollupInfo> {

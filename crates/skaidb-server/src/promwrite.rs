@@ -112,6 +112,10 @@ fn parse_prom_text(text: &str, ts: i64) -> Vec<(Labels, i64, f64)> {
                 let v = v.trim_matches('"').replace("\\\"", "\"").replace("\\\\", "\\");
                 let k = if let Some(stripped) = k.strip_prefix("__") {
                     format!("_{stripped}")
+                } else if k == "name" {
+                    // Collides with the metric-name label — same
+                    // `exported_name` rename as the remote_write decode.
+                    "exported_name".to_string()
                 } else {
                     k.to_string()
                 };
@@ -177,8 +181,16 @@ fn decode_timeseries(buf: &[u8], rows: &mut Vec<(Labels, i64, f64)>) -> Result<(
                 let (mut name, value) = decode_label(d.bytes()?)?;
                 // `__name__` → `name`; other double-underscore labels keep a
                 // single-underscore prefix (reserved namespace in skaidb).
+                // A series' OWN `name` label would collide with that mapping
+                // (the dedup below silently dropped one, corrupting series
+                // identity — prometheus_sd_* metrics carry `name="scrape"`
+                // and vanished from the mirror, caught by the validation
+                // soak's first compare): rename it `exported_name`, the
+                // convention Prometheus itself uses for label collisions.
                 if name == "__name__" {
                     name = "name".into();
+                } else if name == "name" {
+                    name = "exported_name".into();
                 } else if let Some(stripped) = name.strip_prefix("__") {
                     name = format!("_{stripped}");
                 }
@@ -379,5 +391,31 @@ pub(crate) mod tests {
         assert!(labels.windows(2).all(|w| w[0].0 <= w[1].0), "sorted");
         assert_eq!((*ts, *v), (1000, 5.0));
         assert_eq!(rows[2].1, 1000);
+    }
+
+    /// A series' OWN `name` label must not collide with the metric-name
+    /// mapping: it renames to `exported_name` (the Prometheus collision
+    /// convention). Before the fix the sort+dedup silently dropped one of
+    /// the two `name` entries — prometheus_sd_* series (they carry
+    /// `name="scrape"`) vanished from the mirror, caught by the TS
+    /// validation soak's first compare.
+    #[test]
+    fn own_name_label_renames_to_exported_name() {
+        let body = encode_write_request(&[(
+            &[("__name__", "prometheus_sd_updates_total"), ("name", "scrape")],
+            &[(1000, 4.0)],
+        )]);
+        let raw = snap::raw::Decoder::new().decompress_vec(&body).unwrap();
+        let rows = decode_write_request(&raw).unwrap();
+        let (labels, ..) = &rows[0];
+        assert!(
+            labels.contains(&("name".into(), "prometheus_sd_updates_total".into())),
+            "{labels:?}"
+        );
+        assert!(
+            labels.contains(&("exported_name".into(), "scrape".into())),
+            "{labels:?}"
+        );
+        assert_eq!(labels.iter().filter(|(k, _)| k == "name").count(), 1);
     }
 }

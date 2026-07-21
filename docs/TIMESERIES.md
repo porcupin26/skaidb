@@ -83,12 +83,19 @@ stored as its own compressed stream. Full grammar and semantics:
   the ordinary `COUNT/SUM/AVG/MIN/MAX`.
 - Storage pushdown of `AND`-combined `ts` ranges and label `=` / `!=`
   predicates; everything else applies afterward with full SQL semantics.
+- **Label-DISTINCT serves from series metadata**: `SELECT DISTINCT
+  <series-key columns> FROM <ts>` (optionally label-filtered/ordered)
+  answers from the store's series label sets — no sample materialization,
+  no scan-budget exposure, regardless of point count. A time (`ts`)
+  constraint forces the sample path (label sets are all-time).
 - **Prometheus `remote_write`** (v0.23.0): `POST /api/v1/write` on the REST
   listener (HTTP Basic auth like `/query`) accepts snappy-compressed
   protobuf WriteRequests from any Prometheus / Grafana Agent / OTel
   collector. Samples land in a `metrics` TS table (auto-created on first
   write, `SERIES KEY (name)`); `__name__` maps to the `name` label, other
-  labels pass through — and **any** label equality in SQL pushes down to the
+  labels pass through — a series' OWN `name` label renames to
+  `exported_name` (the Prometheus collision convention) so it cannot
+  clobber the metric name — and **any** label equality in SQL pushes down to the
   store, so `WHERE name = '...' AND instance = '...'` is efficient without
   declaring every label. In a cluster, ingested samples replicate through
   the same series-placement path as SQL INSERTs.
