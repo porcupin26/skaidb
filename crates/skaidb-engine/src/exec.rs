@@ -5246,6 +5246,12 @@ impl Database {
             .tables
             .get(table)
             .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+        // Key stats count PHYSICAL live keys; with a TTL, expired rows stay
+        // physically live until compaction, so the stats overcount. `None` =
+        // fall back to the streaming count, whose scan filters expiry.
+        if engine.has_ttl() {
+            return Ok(None);
+        }
         Ok(Some(engine.key_stats()?.live_keys))
     }
 
@@ -5265,6 +5271,12 @@ impl Database {
         }
         if !self.catalog.tables.contains_key(table) {
             return Err(EngineError::TableNotFound(table.to_string()));
+        }
+        // A covering-index count trusts entry liveness; with a TTL, entries
+        // of expired-but-unreclaimed rows still exist, so it overcounts —
+        // fall back to the streaming count (TTL-filtered scan).
+        if self.tables.get(table).is_some_and(|e| e.has_ttl()) {
+            return Ok(None);
         }
         let Some(expr) = filter else {
             return Ok(None);
@@ -10368,7 +10380,13 @@ fn run_simple_select(sel: &Select, cluster: &dyn Cluster) -> Result<ResultSet> {
             // when one exists — a `count_documents`-shaped query on a large
             // table must not gather the table.
             let counted = if sel.filter.is_none() {
-                cluster.count_rows(&sel.from)?
+                match cluster.count_rows(&sel.from)? {
+                    // Stats unavailable (open transaction, or a TTL table —
+                    // physical key stats overcount expired rows): stream a
+                    // counting scan rather than gathering the table.
+                    None => cluster.count_matching(&sel.from, &sel.filter)?,
+                    n => n,
+                }
             } else {
                 match cluster.count_filtered(&sel.from, &sel.filter)? {
                     // No covering index (e.g. a `!=` in the filter): stream a

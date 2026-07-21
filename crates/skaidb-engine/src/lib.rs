@@ -3147,9 +3147,15 @@ mod tests {
             vec![vec![Value::String("ephemeral".into())]]
         );
         std::thread::sleep(std::time::Duration::from_millis(80));
-        // Expired: gone from point read and scan.
+        // Expired: gone from point read, scan, AND count(*) — the unfiltered
+        // count served from physical key stats, which don't see expiry (they
+        // said 1 here); TTL tables now take the streaming count instead.
         assert!(rows(db.execute("SELECT v FROM s WHERE id = 1").unwrap()).rows.is_empty());
         assert!(rows(db.execute("SELECT v FROM s").unwrap()).rows.is_empty());
+        assert_eq!(
+            rows(db.execute("SELECT count(*) FROM s").unwrap()).rows,
+            vec![vec![Value::Int(0)]]
+        );
 
         // The TTL persists in the catalog and applies after a reopen.
         drop(db);
