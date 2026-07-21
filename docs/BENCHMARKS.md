@@ -44,6 +44,7 @@ idle non-participant containers). Run-to-run spread on this host is
 | FTS vs ES | 2026-07-16 | 0.92.1 | — | — | — | 8.14.3 |
 | Global-index A/B | 2026-07-16 | 0.92.1 | — | — | — | — |
 | Sharded scatter | 2026-07-16 | 0.92.1 | — | — | — | — |
+| Version-impact A/B | 2026-07-21 | 0.130.0 vs 0.134.1 | — | — | — | — |
 
 ¹ C0's skaidb column was measured with the exact code released as
 v0.94.x (both write-path fixes in), before the tag existed.
@@ -179,6 +180,60 @@ order-of-magnitude comparison, not a precise idle-state measurement:
 ¹ PostgreSQL's per-backend-process model makes single-process RSS
 misleading (shared_buffers is shared memory); not measured rather than
 publish a number known to understate it.
+
+## Version-impact A/B — v0.130.0 vs v0.134.1 (2026-07-21)
+
+Measures the July 21 change batch (read-cache byte-cap, standalone
+memory tier + shed gate, select-alias resolution, session-scoped
+transactions, TS `COUNT(*)`-via-partials and sliced LIMIT pagination)
+against the previously deployed v0.130.0. **Design: interleaved
+same-box A/B** (legs A,B,A,B back-to-back on bench node skaidb3 — 1
+vCPU / 512 MB, loopback client, fresh data dir per leg) so the steady
+background load now permanently present on this host (a production
+member plus soak containers) cancels out of the relative comparison;
+absolute numbers are NOT comparable to the C0 section's quiet-host
+round. Same in-tree `bench` client for both sides; values are the mean
+of two legs (leg-to-leg spread ±5%).
+
+**Core suite** (ops/s):
+
+| Workload | v0.130.0 | v0.134.1 | delta |
+|----------|--------:|--------:|------:|
+| write 1c | 1,460 | 1,466 | +0.4% |
+| write 16c | 4,489 | 4,519 | +0.7% |
+| read 16c (256 B rows, hot span) | 17,283 | 16,132 | −6.7% ¹ |
+| mixed 16c | 7,049 | 7,150 | +1.4% |
+| read 16c (**6 KB rows**, uniform) | 9,448 | 9,873 | **+4.5%** ² |
+
+`¹` legs overlap across versions (B's best 16,990 > A's worst 16,434);
+inside this host's noise band — treated as parity, worth re-checking on
+a quiet host if it ever matters.
+`²` consistent across legs (no overlap): the read-cache **byte-cap did
+not cost large-row reads — it helped**, by keeping the cache from
+churning itself with multi-KB entries.
+
+**Time-series paths** (250,000 points: 500 series × 500 samples,
+single value field; one REST query, wall time):
+
+| Query | v0.130.0 | v0.134.1 |
+|-------|--------:|--------:|
+| `SELECT count(*)` (unfiltered) | 1,003 ms (full sample gather — refuses entirely past the 250k scan budget) | **75 ms** (partials; size-independent) |
+| `SELECT DISTINCT <labels>` | 69 ms | 58 ms (both use the v0.130.0 series-metadata path) |
+| keyset page (label-filtered, LIMIT 100) | 57 ms | 56 ms |
+| grouped `avg` by label | 91 ms | 75 ms |
+
+The `count(*)` row is the headline: v0.130.0 sat exactly at the scan
+budget for this table size — one more point and it refuses outright,
+which is what production hit. v0.134.1 answers from per-bucket partial
+counts regardless of point count. Broad (label-unfiltered) LIMIT
+pagination gets the same class of win from time-sliced early stop
+(engine-tested: pages cost ~their own rows under a budget far below the
+table size); the label-filtered page shape above was already narrow on
+both versions.
+
+**Conclusion**: the July 21 batch is performance-neutral on the core
+write/read/mixed paths (all deltas inside noise), a consistent small win
+on large-row reads, and a category change for TS counts at scale.
 
 ## Global-index routed probe — phase-4 A/B (v0.92.1, 2026-07-16)
 
