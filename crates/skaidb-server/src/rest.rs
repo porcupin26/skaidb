@@ -950,6 +950,7 @@ fn handle_insert(ctx: &Shared, role: &str, body: &[u8]) -> (u16, Json) {
             Ok(stmt),
             consistency,
             "rest",
+            None,
         );
         match resp {
             Response::Mutation { .. } | Response::Ddl => inserted += n,

@@ -21,7 +21,7 @@ pub use error::EngineError;
 pub use exec::{
     doc_vector, filter_rows, filter_search_query, matches_filter, run, statement_is_read_only,
     vector_exact_distance, Cluster,
-    Database, DbStats, IndexScanRange, Inventory, InventoryIndex, InventorySearch,
+    Database, DbStats, IndexScanRange, SessionTxn, Inventory, InventoryIndex, InventorySearch,
     InventoryTable, InventoryTimeseries, InventoryVector, pk_point_key, pk_point_keys, TableStats,
     TsRollupInfo, QUANT_RESCORE_OVERSAMPLE,
     DecodedMaint, MaintTask,
@@ -1022,7 +1022,9 @@ mod tests {
                 vec![Value::Timestamp(600000), Value::Float(6.0)],
             ]
         );
-        // Per-store stats are visible.
+        // Per-store stats are visible — both under the legacy timeseries.*
+        // keys and in the table.* per-table breakdown (TS tables were
+        // invisible to clients walking table.*, reported from onet).
         let rs = rows(db.execute("SHOW STATUS").unwrap());
         assert!(rs.rows.iter().any(|r| r[0] == Value::String("timeseries.m.series".into())));
         assert!(rs
@@ -1030,6 +1032,17 @@ mod tests {
             .iter()
             .any(|r| r[0] == Value::String("timeseries.m.samples_rejected".into())
                 && r[1] == Value::Int(1)));
+        assert!(rs.rows.iter().any(
+            |r| r[0] == Value::String("table.default.m.kind".into())
+                && r[1] == Value::String("timeseries".into())
+        ));
+        assert!(rs
+            .rows
+            .iter()
+            .any(|r| r[0] == Value::String("table.default.m.disk_bytes".into())));
+        assert!(rs.rows.iter().any(
+            |r| r[0] == Value::String("table.default.m.series".into()) && r[1] == Value::Int(1)
+        ));
     }
 
     /// `ALTER TABLE <ts> SET (retention = ..., ooo = ...)` — retention and

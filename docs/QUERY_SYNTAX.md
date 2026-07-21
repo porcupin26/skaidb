@@ -315,7 +315,11 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
 - **`SHOW STATUS`** returns storage and runtime statistics for the current
   database as `(metric, value)` rows — table/index counts, on-disk and memtable
   bytes, SSTable count, WAL bytes/fsyncs, compactions, cache hit/miss/hit-rate,
-  and a per-table `table.<name>.{live_keys,tombstones,disk_bytes}` breakdown. It
+  and a per-table `table.<db>.<name>.*` breakdown: row tables report
+  `{live_keys,tombstones,disk_bytes}`, TIME-SERIES tables report
+  `{kind=timeseries,series,samples_appended,disk_bytes}` (there are no
+  tombstones and no cheap exact live-sample count; the legacy
+  `timeseries.<name>.*` keys remain). It
   is the same data the server publishes at `GET /metrics`, surfaced as SQL.
 - **`CREATE`/`DROP DATABASE`**, **`USE`**, and **`SHOW DATABASES`** manage
   databases — each is an isolated set of tables and indexes. A database is a
@@ -369,22 +373,20 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   share a column count (`UNION` removes duplicates, `UNION ALL` keeps them). A
   trailing `ORDER BY`/`LIMIT`/`OFFSET` after the last branch applies to the whole
   combined result and references the **output column** names.
-- **`BEGIN`/`COMMIT`/`ROLLBACK`** wrap several statements in a transaction with
-  read-your-writes: buffered writes are invisible until `COMMIT`, and
-  `ROLLBACK` discards them. **Embedded engine only, enforced**: every
-  server connection (standalone or cluster) refuses transaction control
-  and autocommits per statement — the engine's transaction buffer has no
-  session identity, so exposing it over connections let one connection's
-  uncommitted writes leak into another's reads (caught and closed by the
-  2026-07-21 ACID audit). DDL is not transactional.
+- **`BEGIN`/`COMMIT`/`ROLLBACK`** wrap several statements in a transaction
+  with read-your-writes: buffered writes are invisible to every OTHER
+  session until `COMMIT` (transaction state is per-connection), and
+  `ROLLBACK` discards them. Available on the embedded engine and over
+  **binary-driver connections to a standalone server**; stateless surfaces
+  (REST/ES/UI) autocommit, and cluster mode refuses (no distributed
+  transaction coordinator). Concurrent sessions' transactions coexist;
+  conflicting commits resolve last-writer-wins. DDL is not transactional.
   **Measured ACID contract** (`acid-crash` harness, kill -9 rounds):
-  every *acknowledged* statement or COMMIT survives a crash in full —
-  durability is fsync-on-ack and acked commits are all-or-nothing. A
-  commit the client never saw acknowledged may be **partially** applied
-  after a crash (commit applies row-by-row with no commit record):
-  treat an unacknowledged COMMIT as unknown-outcome and re-verify, as
-  with any database whose commit ack you did not receive.
-
+  every acknowledged statement survives a crash (durability is
+  fsync-on-ack), and a transaction commit is **all-or-nothing across
+  crashes** — COMMIT persists a redo journal before applying, and
+  recovery replays an interrupted commit to completion (a crash before
+  the journal is durable means the transaction cleanly never happened).
 - **Access control.** `<privilege>` is one of `SELECT`, `INSERT`, `UPDATE`,
   `DELETE`, `CREATE`, `DROP`, `GRANT`, `MONITOR`, `ADMIN` (`ADMIN` on `*` =
   superuser; `ADMIN` on a table implies every privilege on it). `MONITOR`

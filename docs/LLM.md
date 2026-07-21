@@ -329,13 +329,13 @@ DROP DATABASE [IF EXISTS] d
 USE d                                            -- session-state (binary protocol)
 SHOW DATABASES
 
--- Transactions — EMBEDDED ENGINE ONLY: every SERVER connection
--- (standalone or cluster) refuses these and autocommits per statement
--- (the txn buffer has no session identity; over connections it leaked
--- uncommitted writes into other sessions' reads — closed 2026-07-21).
--- ACID (measured, acid-crash harness): acked statements/commits survive
--- kill -9 in full (fsync-on-ack); an UNacked COMMIT may be partially
--- applied (no commit record) — treat as unknown-outcome and re-verify.
+-- Transactions — embedded engine + DRIVER connections to a STANDALONE
+-- server (per-connection state; stateless REST/ES/UI autocommit; cluster
+-- refuses — no distributed coordinator). Session-scoped: one session's
+-- uncommitted writes are invisible to others; concurrent txns coexist;
+-- commits resolve LWW. Crash-atomic COMMIT: a redo journal is durable
+-- before any row applies, and recovery replays interrupted commits to
+-- completion (acid-crash harness: 0 violations, partial txns impossible).
 BEGIN | COMMIT | ROLLBACK
 
 -- Users, roles, grants
@@ -368,7 +368,9 @@ DESCRIBE t FULL [SAMPLE n | EXACT]
                    -- SELECT; local shard on a cluster (complete when RF >=
                    -- members).
 SHOW STATUS        -- (metric, value): disk/memtable/wal/cache/compactions,
-                   -- per-table table.<db>.<table>.*, per-index search.<name>.*
+                   -- per-table table.<db>.<table>.* (row: live_keys/tombstones/
+                   -- disk_bytes; TS: kind/series/samples_appended/disk_bytes),
+                   -- per-index search.<name>.*
 SHOW DATABASES
 
 -- Admin statements (SQL spellings of the HTTP admin surface; reads need

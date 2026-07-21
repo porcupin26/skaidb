@@ -13,7 +13,7 @@ use skaidb_sql::ast::Statement;
 
 use crate::authn::AuthResult;
 use crate::metrics::Endpoint;
-use crate::shared::{execute_session_statement_via, execute_session_via, Shared};
+use crate::shared::{execute_session_statement_via, Shared};
 
 /// Cap on statements prepared per connection, so a misbehaving client can't
 /// grow the per-connection cache without bound. `Close` frees slots.
@@ -98,6 +98,10 @@ fn handle_connection(stream: TcpStream, ctx: Shared, acceptor: Option<&crate::tl
     // The current database is per-connection state: `USE` sets it for the life
     // of this connection; it starts at `default`.
     let mut current_db = skaidb_engine::DEFAULT_DATABASE.to_string();
+    // Per-connection transaction state: BEGIN/COMMIT/ROLLBACK (standalone
+    // backend only) buffer into THIS connection's slot — private to it by
+    // construction (the 2026-07-21 ACID audit's session-identity fix).
+    let mut session_txn = skaidb_engine::SessionTxn::default();
     // `SET CONSISTENCY` session override: when set, it wins over the
     // per-request wire value until changed (SQL-only clients get the
     // knob; drivers that pass consistency explicitly can keep doing so
@@ -130,13 +134,30 @@ fn handle_connection(stream: TcpStream, ctx: Shared, acceptor: Option<&crate::tl
                     resp
                 } else {
                     let c = session_consistency.unwrap_or(consistency);
-                    execute_session_via(&ctx, &role, &mut current_db, &sql, Some(c), "driver")
+                    execute_session_statement_via(
+                        &ctx,
+                        &role,
+                        &mut current_db,
+                        &sql,
+                        skaidb_sql::parse(&sql),
+                        Some(c),
+                        "driver",
+                        Some(&mut session_txn),
+                    )
                 }
             }
             Ok(ClientRequest::QueryStream { sql, consistency }) => {
                 let c = session_consistency.unwrap_or(consistency);
-                let response =
-                    execute_session_via(&ctx, &role, &mut current_db, &sql, Some(c), "driver");
+                let response = execute_session_statement_via(
+                    &ctx,
+                    &role,
+                    &mut current_db,
+                    &sql,
+                    skaidb_sql::parse(&sql),
+                    Some(c),
+                    "driver",
+                    Some(&mut session_txn),
+                );
                 if write_streamed(&mut conn, &mut outbuf, response, &ctx, tag).is_err() {
                     return;
                 }
@@ -157,6 +178,7 @@ fn handle_connection(stream: TcpStream, ctx: Shared, acceptor: Option<&crate::tl
                         Ok(bound),
                         Some(session_consistency.unwrap_or(consistency)),
                         "driver",
+                        Some(&mut session_txn),
                     ),
                     Err(e) => Response::Error(e.to_string()),
                 },
@@ -186,6 +208,7 @@ fn handle_connection(stream: TcpStream, ctx: Shared, acceptor: Option<&crate::tl
                                 Ok(bound),
                                 c,
                                 "driver",
+                                Some(&mut session_txn),
                             ),
                             Err(e) => Response::Error(e.to_string()),
                         };

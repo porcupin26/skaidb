@@ -619,12 +619,11 @@ derived state).
   admitted (above), but there's still no continuous gossip — a node that missed a
   membership broadcast while up needs it re-sent, and two *concurrent* topology
   changes aren't linearizable. Do one membership change at a time.
-- **Transactions are embedded-only.** `BEGIN/COMMIT/ROLLBACK` work against
-  the embedded engine; EVERY server connection (standalone or cluster)
-  refuses transaction control and autocommits per statement (enforced —
-  the shared transaction buffer has no session identity, so exposing it
-  over connections leaked uncommitted writes into other connections'
-  reads; closed by the 2026-07-21 ACID audit).
+- **Transactions are single-node.** `BEGIN/COMMIT/ROLLBACK` work on the
+  embedded engine and over driver connections to a STANDALONE server
+  (per-connection transaction state, crash-atomic commits via a redo
+  journal); the cluster coordinator autocommits per statement and refuses
+  transaction control — there is no distributed transaction coordinator.
 - **Joins gather to the coordinator.** A single-table `WHERE` is pushed to the
   shards, but a SQL `JOIN` pulls the tables to the coordinating node.
 - **Bulk-apply QoS.** Inbound bulk batch appliers (drain, rebalance, hint

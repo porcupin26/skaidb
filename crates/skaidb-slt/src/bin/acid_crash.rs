@@ -9,10 +9,10 @@
 //! - HARD violation — an ACKED write is missing after recovery
 //!   (durability), or an ACKED commit/statement is partially applied
 //!   (atomicity of acknowledged work).
-//! - SOFT observation — an UNacked multi-row statement or transaction is
-//!   partially visible after recovery. Not a broken promise (the client
-//!   never got an ack) but a documented-behavior fact: mid-crash partial
-//!   application is possible without a commit record.
+//! - SOFT observation — an UNacked multi-row STATEMENT is partially
+//!   visible after recovery (statements are not journaled). Transactions
+//!   are journaled: ANY partial transaction is a HARD violation, acked or
+//!   not — the commit journal makes them all-or-nothing across crashes.
 //!
 //! Exit is nonzero on hard violations. `--rounds N` (default 20),
 //! `--seed S`.
@@ -199,18 +199,34 @@ fn run_round(exe: &str, seed: u64) -> Outcome {
                     out.hard.push(format!("DURABILITY: acked single row {row} missing"));
                 }
             }
-            Op::Multi { rows } | Op::Txn { rows } => {
+            Op::Multi { rows } => {
                 let have = rows.iter().filter(|r| present.contains(r)).count();
-                let kind = if matches!(op, Op::Txn { .. }) { "txn" } else { "multi-row stmt" };
                 if was_acked && have != rows.len() {
                     out.hard.push(format!(
-                        "ATOMICITY: acked {kind} (op {id}) has {have}/{} rows",
+                        "ATOMICITY: acked multi-row stmt (op {id}) has {have}/{} rows",
                         rows.len()
                     ));
                 } else if !was_acked && have != 0 && have != rows.len() {
                     out.soft.push(format!(
-                        "partial unacked {kind} (op {id}): {have}/{} rows visible",
+                        "partial unacked multi-row stmt (op {id}): {have}/{} rows visible",
                         rows.len()
+                    ));
+                }
+            }
+            Op::Txn { rows } => {
+                // With the commit journal, a transaction is all-or-nothing
+                // REGARDLESS of whether its COMMIT was acknowledged: the
+                // journal is durable before any row applies, and recovery
+                // replays it to completion. Any partial is a violation.
+                let have = rows.iter().filter(|r| present.contains(r)).count();
+                if have != 0 && have != rows.len() {
+                    out.hard.push(format!(
+                        "ATOMICITY: txn (op {id}, acked={was_acked}) has {have}/{} rows",
+                        rows.len()
+                    ));
+                } else if was_acked && have == 0 {
+                    out.hard.push(format!(
+                        "DURABILITY: acked txn (op {id}) fully missing"
                     ));
                 }
             }

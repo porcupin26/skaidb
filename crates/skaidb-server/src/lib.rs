@@ -3346,41 +3346,83 @@ pub(crate) mod tests {
         assert_eq!(got[0][0], Value::Int(4));
     }
 
-    /// The transaction contract at the SERVER boundary, pinned by the ACID
-    /// audit (2026-07-21): transactions are EMBEDDED-ONLY. The engine's
-    /// single transaction buffer has no session identity, so a server
-    /// letting one connection BEGIN exposed its uncommitted overlay to
-    /// every other connection's reads — the audit's first run caught the
-    /// dirty read. Server sessions therefore refuse BEGIN/COMMIT/ROLLBACK
-    /// (cluster mode always did; standalone now matches) and autocommit
-    /// every statement.
+    /// The transaction contract at the SERVER boundary (ACID audit,
+    /// 2026-07-21, then the session-scoping + commit-journal rework):
+    /// stateless surfaces (no SessionTxn) refuse transaction control; a
+    /// driver connection owns a private SessionTxn — its uncommitted
+    /// overlay is invisible to every other session (the audit's dirty-read
+    /// finding, closed structurally), concurrent transactions coexist, and
+    /// ROLLBACK discards.
     #[test]
-    fn acid_server_sessions_refuse_transactions() {
-        use crate::shared::execute_session_via;
+    fn acid_session_scoped_transactions() {
+        use crate::shared::execute_session_statement_via;
+        use skaidb_engine::SessionTxn;
         let ctx = temp_ctx();
-        let mut db = skaidb_engine::DEFAULT_DATABASE.to_string();
-        let run = |ctx: &Shared, db: &mut String, sql: &str| {
-            execute_session_via(ctx, "superuser", db, sql, None, "driver")
+        let run = |ctx: &Shared, db: &mut String, sql: &str, txn: Option<&mut SessionTxn>| {
+            execute_session_statement_via(
+                ctx,
+                "superuser",
+                db,
+                sql,
+                skaidb_sql::parse(sql),
+                None,
+                "driver",
+                txn,
+            )
         };
+        let mut db_a = skaidb_engine::DEFAULT_DATABASE.to_string();
+        let mut db_b = skaidb_engine::DEFAULT_DATABASE.to_string();
+        let (mut txn_a, mut txn_b) = (SessionTxn::default(), SessionTxn::default());
         assert!(!matches!(
-            run(&ctx, &mut db, "CREATE TABLE t (PRIMARY KEY (id))"),
+            run(&ctx, &mut db_a, "CREATE TABLE t (PRIMARY KEY (id))", Some(&mut txn_a)),
             Response::Error(_)
         ));
-        for sql in ["BEGIN", "COMMIT", "ROLLBACK"] {
-            match run(&ctx, &mut db, sql) {
-                Response::Error(e) => {
-                    assert!(e.contains("embedded-only"), "{sql}: {e}")
-                }
-                other => panic!("{sql} must refuse over a connection: {other:?}"),
-            }
+        // Stateless surfaces still refuse.
+        match run(&ctx, &mut db_a, "BEGIN", None) {
+            Response::Error(e) => assert!(e.contains("driver connection"), "{e}"),
+            other => panic!("stateless BEGIN must refuse: {other:?}"),
         }
-        // Autocommit statements are unaffected.
+        // A's buffered write is invisible to B (the audit's dirty read).
+        assert!(!matches!(run(&ctx, &mut db_a, "BEGIN", Some(&mut txn_a)), Response::Error(_)));
         assert!(!matches!(
-            run(&ctx, &mut db, "INSERT INTO t (id, v) VALUES (1, 'x')"),
+            run(&ctx, &mut db_a, "INSERT INTO t (id, v) VALUES (1, 'a')", Some(&mut txn_a)),
             Response::Error(_)
         ));
-        match run(&ctx, &mut db, "SELECT v FROM t WHERE id = 1") {
-            Response::Rows { rows, .. } => assert_eq!(rows[0][0], Value::String("x".into())),
+        match run(&ctx, &mut db_b, "SELECT id FROM t", Some(&mut txn_b)) {
+            Response::Rows { rows, .. } => assert!(rows.is_empty(), "dirty read: {rows:?}"),
+            other => panic!("{other:?}"),
+        }
+        // Concurrent transactions coexist (each session has its own slot).
+        assert!(!matches!(run(&ctx, &mut db_b, "BEGIN", Some(&mut txn_b)), Response::Error(_)));
+        assert!(!matches!(
+            run(&ctx, &mut db_b, "INSERT INTO t (id, v) VALUES (2, 'b')", Some(&mut txn_b)),
+            Response::Error(_)
+        ));
+        // Each sees its own overlay, not the other's.
+        match run(&ctx, &mut db_a, "SELECT id FROM t", Some(&mut txn_a)) {
+            Response::Rows { rows, .. } => assert_eq!(rows.len(), 1, "{rows:?}"),
+            other => panic!("{other:?}"),
+        }
+        // Commit both; both rows land.
+        assert!(!matches!(run(&ctx, &mut db_a, "COMMIT", Some(&mut txn_a)), Response::Error(_)));
+        assert!(!matches!(run(&ctx, &mut db_b, "COMMIT", Some(&mut txn_b)), Response::Error(_)));
+        match run(&ctx, &mut db_a, "SELECT id FROM t", Some(&mut txn_a)) {
+            Response::Rows { rows, .. } => assert_eq!(rows.len(), 2),
+            other => panic!("{other:?}"),
+        }
+        // ROLLBACK discards; a second BEGIN in the SAME session refuses.
+        assert!(!matches!(run(&ctx, &mut db_a, "BEGIN", Some(&mut txn_a)), Response::Error(_)));
+        match run(&ctx, &mut db_a, "BEGIN", Some(&mut txn_a)) {
+            Response::Error(e) => assert!(e.contains("progress"), "{e}"),
+            other => panic!("nested BEGIN must refuse: {other:?}"),
+        }
+        assert!(!matches!(
+            run(&ctx, &mut db_a, "INSERT INTO t (id, v) VALUES (9, 'gone')", Some(&mut txn_a)),
+            Response::Error(_)
+        ));
+        assert!(!matches!(run(&ctx, &mut db_a, "ROLLBACK", Some(&mut txn_a)), Response::Error(_)));
+        match run(&ctx, &mut db_b, "SELECT id FROM t", Some(&mut txn_b)) {
+            Response::Rows { rows, .. } => assert_eq!(rows.len(), 2, "ROLLBACK must discard"),
             other => panic!("{other:?}"),
         }
     }

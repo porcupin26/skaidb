@@ -420,7 +420,26 @@ pub struct InventorySearch {
 /// `ROLLBACK` discards it. Embedded, single-connection only.
 #[derive(Debug, Default)]
 struct TxnBuffer {
-    writes: BTreeMap<(String, Vec<u8>), Option<Document>>,
+    writes: TxnWrites,
+}
+
+/// A transaction's buffered write set: `(table, key)` → put(doc) / delete.
+type TxnWrites = BTreeMap<(String, Vec<u8>), Option<Document>>;
+
+/// A caller-owned transaction slot — the session identity the ACID audit
+/// found missing (2026-07-21: the engine's single global buffer let one
+/// server connection's uncommitted writes leak into every other
+/// connection's reads). Each connection owns one and passes it to
+/// [`Database::execute_in_session`]; buffers are private to their owner by
+/// construction. `Default` = no open transaction.
+#[derive(Debug, Default)]
+pub struct SessionTxn(Option<TxnBuffer>);
+
+impl SessionTxn {
+    /// Whether this session has an open transaction.
+    pub fn open(&self) -> bool {
+        self.0.is_some()
+    }
 }
 
 impl Database {
@@ -687,6 +706,23 @@ impl Database {
             }
         }
         db.recover_deferred_maintenance()?;
+        // A durable-but-unretired transaction journal means a crash landed
+        // between COMMIT's journal fsync and the end of its apply: replay
+        // the write set to completion (idempotent — re-putting an applied
+        // row rewrites the same content) so the commit is all-or-nothing
+        // across crashes. A torn/invalid journal decodes to None: that
+        // commit never became durable and is (correctly) forgotten.
+        if let Some(writes) = read_txn_journal(&db.dir) {
+            let n = writes.len();
+            db.apply_txn_writes(writes)?;
+            let _ = std::fs::remove_file(txn_journal_path(&db.dir));
+            skaidb_types::slog!(
+                "skaidb: replayed an interrupted transaction commit ({n} writes) from txn.journal"
+            );
+        } else {
+            // Clean up a torn journal so it isn't re-parsed every open.
+            let _ = std::fs::remove_file(txn_journal_path(&db.dir));
+        }
         Ok(db)
     }
 
@@ -2678,6 +2714,25 @@ impl Database {
     /// Parse and execute a single SQL statement.
     pub fn execute(&mut self, sql: &str) -> Result<QueryOutput> {
         self.execute_statement(parse(sql)?)
+    }
+
+    /// Install a CALLER-OWNED transaction session for the statement about
+    /// to run (pair with [`Database::take_session_txn`] right after): every
+    /// internal path keeps its `self.txn` view while each connection's
+    /// transaction stays private to it — the session identity the ACID
+    /// audit found missing. The engine write lock serializes statements,
+    /// making the install race-free; the embedded slot must be idle (the
+    /// embedded `execute` API and server sessions never share a handle).
+    pub fn install_session_txn(&mut self, session: &mut SessionTxn) {
+        debug_assert!(self.txn.is_none(), "embedded txn slot busy under a server session");
+        self.txn = session.0.take();
+    }
+
+    /// Return the (possibly begun/committed/rolled-back) transaction state
+    /// to its owning session after a statement ran under
+    /// [`Database::install_session_txn`].
+    pub fn take_session_txn(&mut self, session: &mut SessionTxn) {
+        session.0 = self.txn.take();
     }
 
     /// Parse and execute a single **read-only** statement (`SELECT` / `SHOW …`)
@@ -5032,9 +5087,30 @@ impl Database {
         let Some(txn) = self.txn.take() else {
             return Err(EngineError::Constraint("no transaction in progress".into()));
         };
+        // Crash-atomic commit via a redo journal (the ACID audit showed a
+        // kill -9 mid-commit persisting a PREFIX of the transaction — the
+        // writes applied row-by-row with no commit record): persist the
+        // whole write set durably FIRST, then apply, then retire the
+        // journal. A crash before the journal is durable = the transaction
+        // never happened; a crash at any later point = `open()` replays
+        // the journal to completion (idempotent: re-putting an applied row
+        // rewrites the same content).
+        write_txn_journal(&self.dir, &txn.writes)?;
+        let applied = self.apply_txn_writes(txn.writes);
+        if applied.is_ok() {
+            let _ = std::fs::remove_file(txn_journal_path(&self.dir));
+        }
+        applied?;
+        Ok(QueryOutput::Ddl)
+    }
+
+    /// Apply a committed write set through the normal put/delete paths
+    /// (indexes maintained) and sync. Shared by COMMIT and the journal
+    /// replay in `open()`.
+    fn apply_txn_writes(&mut self, writes: TxnWrites) -> Result<()> {
         let mut local = LocalCluster::new(self);
         let apply = || -> Result<()> {
-            for ((table, key), op) in txn.writes {
+            for ((table, key), op) in writes {
                 match op {
                     Some(doc) => local.put(&table, &key, &doc)?,
                     None => {
@@ -5053,7 +5129,7 @@ impl Database {
         let synced = local.flush_pending();
         applied?;
         synced?;
-        Ok(QueryOutput::Ddl)
+        Ok(())
     }
 
     /// Roll back (discard) the open transaction.
@@ -7136,6 +7212,26 @@ impl Database {
                 row(&format!("table.{q}.live_keys"), Value::Int(t.live_keys as i64));
                 row(&format!("table.{q}.tombstones"), Value::Int(t.tombstones as i64));
                 row(&format!("table.{q}.disk_bytes"), Value::Int(t.disk_bytes as i64));
+            }
+            // TIME-SERIES tables join the per-table breakdown (they were
+            // invisible to any client walking `table.*` — reported from
+            // onet): same `table.<db>.<name>.` prefix, with the fields that
+            // are MEANINGFUL for a TS store (`series`, cumulative sample
+            // counters, `disk_bytes`) instead of pretending row-table
+            // semantics (there are no tombstones, and a cheap exact live
+            // count doesn't exist — the `timeseries.*` keys remain for
+            // existing consumers).
+            for (name, store) in &self.timeseries {
+                let ts = store.stats();
+                let (dbname, bare) = namespace::split(name);
+                let q = format!("{dbname}.{bare}");
+                row(&format!("table.{q}.kind"), Value::String("timeseries".into()));
+                row(&format!("table.{q}.series"), Value::Int(ts.series as i64));
+                row(
+                    &format!("table.{q}.samples_appended"),
+                    Value::Int(ts.samples_appended as i64),
+                );
+                row(&format!("table.{q}.disk_bytes"), Value::Int(ts.disk_bytes as i64));
             }
             // Per-search-index breakdown, in catalog (name) order.
             for name in self.catalog.search_indexes.keys() {
@@ -11529,6 +11625,95 @@ impl Cluster for LocalRead<'_> {
     fn ts_rollup_info(&self, table: &str) -> Result<TsRollupInfo> {
         self.db.ts_rollup_info(table)
     }
+}
+
+fn txn_journal_path(root: &Path) -> PathBuf {
+    root.join("txn.journal")
+}
+
+/// Persist a transaction's write set durably: tmp file + fsync + rename +
+/// dir fsync. Format: magic, entry count, then `(table, key, op, doc?)`
+/// records, a trailing FNV-1a checksum over everything before it. A torn
+/// or checksum-failing journal is treated as "never committed".
+fn write_txn_journal(root: &Path, writes: &TxnWrites) -> Result<()> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"SKTXJ1");
+    buf.extend_from_slice(&(writes.len() as u32).to_le_bytes());
+    for ((table, key), op) in writes {
+        buf.extend_from_slice(&(table.len() as u32).to_le_bytes());
+        buf.extend_from_slice(table.as_bytes());
+        buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        buf.extend_from_slice(key);
+        match op {
+            Some(doc) => {
+                buf.push(1);
+                let bytes = Value::encode_document(doc);
+                buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&bytes);
+            }
+            None => buf.push(0),
+        }
+    }
+    let sum = fnv1a(&buf);
+    buf.extend_from_slice(&sum.to_le_bytes());
+    let tmp = root.join("txn.journal.tmp");
+    std::fs::write(&tmp, &buf)?;
+    let f = std::fs::File::open(&tmp)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, txn_journal_path(root))?;
+    if let Ok(d) = std::fs::File::open(root) {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
+/// Decode a journal; `None` for missing/torn/checksum-failing files (the
+/// transaction was never durably committed).
+fn read_txn_journal(root: &Path) -> Option<TxnWrites> {
+    let buf = std::fs::read(txn_journal_path(root)).ok()?;
+    if buf.len() < 6 + 4 + 8 || &buf[..6] != b"SKTXJ1" {
+        return None;
+    }
+    let (body, sum_bytes) = buf.split_at(buf.len() - 8);
+    if fnv1a(body) != u64::from_le_bytes(sum_bytes.try_into().ok()?) {
+        return None;
+    }
+    let mut at = 6;
+    let take = |at: &mut usize, n: usize| -> Option<&[u8]> {
+        let s = body.get(*at..*at + n)?;
+        *at += n;
+        Some(s)
+    };
+    let count = u32::from_le_bytes(take(&mut at, 4)?.try_into().ok()?) as usize;
+    let mut writes = BTreeMap::new();
+    for _ in 0..count {
+        let tlen = u32::from_le_bytes(take(&mut at, 4)?.try_into().ok()?) as usize;
+        let table = String::from_utf8(take(&mut at, tlen)?.to_vec()).ok()?;
+        let klen = u32::from_le_bytes(take(&mut at, 4)?.try_into().ok()?) as usize;
+        let key = take(&mut at, klen)?.to_vec();
+        let op = match take(&mut at, 1)?[0] {
+            0 => None,
+            _ => {
+                let dlen = u32::from_le_bytes(take(&mut at, 4)?.try_into().ok()?) as usize;
+                let bytes = take(&mut at, dlen)?;
+                match Value::decode(bytes).ok()? {
+                    Value::Document(d) => Some(d),
+                    _ => return None,
+                }
+            }
+        };
+        writes.insert((table, key), op);
+    }
+    Some(writes)
+}
+
+fn fnv1a(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 fn table_dir(root: &Path, name: &str) -> PathBuf {

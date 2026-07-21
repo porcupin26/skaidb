@@ -103,6 +103,7 @@ fn run(ctx: &Shared, role: &str, stmt: Statement, audit: &str) -> Result<Respons
         Ok(stmt),
         None,
         "es",
+        None,
     ))
 }
 

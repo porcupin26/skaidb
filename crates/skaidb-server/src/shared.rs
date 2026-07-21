@@ -98,6 +98,7 @@ impl Backend {
         sql: &str,
         parsed: Result<Statement, ParseError>,
         consistency: Option<ClusterConsistency>,
+        txn: Option<&mut skaidb_engine::SessionTxn>,
     ) -> Result<SessionEffect, EngineError> {
         match self {
             // The embedded engine is single-node; consistency does not apply.
@@ -105,6 +106,33 @@ impl Backend {
                 // SQL that fails to parse errors here with the same
                 // `EngineError::Parse` the engine itself would have raised.
                 let stmt = parsed?;
+                // A driver connection with transaction state: transaction
+                // control, and EVERY statement while its transaction is
+                // open (reads must see the session's own overlay), runs
+                // under the exclusive lock with the session's buffer
+                // installed — private to this connection by construction.
+                if let Some(session) = txn {
+                    let control = matches!(
+                        stmt,
+                        Statement::Begin | Statement::Commit | Statement::Rollback
+                    );
+                    if control || session.open() {
+                        let mut guard = db
+                            .write()
+                            .map_err(|_| EngineError::Cluster("server lock poisoned".into()))?;
+                        guard.install_session_txn(session);
+                        let (res, pending) =
+                            guard.execute_session_statement_deferred(current_db, stmt);
+                        guard.take_session_txn(session);
+                        drop(guard);
+                        let synced = pending
+                            .into_iter()
+                            .try_for_each(|(sync, commit)| sync.sync_through(commit));
+                        let effect = res?;
+                        synced.map_err(EngineError::from)?;
+                        return Ok(effect);
+                    }
+                }
                 // Read-only statements (SELECT / SHOW …) execute under a shared
                 // lock so concurrent readers run in parallel instead of
                 // serializing; anything else takes the exclusive path.
@@ -783,7 +811,7 @@ pub fn execute_session_via(
     // choice, and (on the local backend) execution itself. SQL that fails to
     // parse skips the check — the backend then reports the parse error.
     let parsed = skaidb_sql::parse(sql);
-    execute_session_statement_via(ctx, role, current_db, sql, parsed, consistency, via)
+    execute_session_statement_via(ctx, role, current_db, sql, parsed, consistency, via, None)
 }
 
 /// [`execute_session_as`] for an already-parsed statement — the prepared
@@ -799,11 +827,12 @@ pub fn execute_session_statement_as(
     parsed: Result<Statement, ParseError>,
     consistency: Option<ProtoConsistency>,
 ) -> Response {
-    execute_session_statement_via(ctx, role, current_db, sql, parsed, consistency, "internal")
+    execute_session_statement_via(ctx, role, current_db, sql, parsed, consistency, "internal", None)
 }
 
 /// [`execute_session_statement_as`] with the access-surface tag (see
 /// [`execute_session_via`]).
+#[allow(clippy::too_many_arguments)] // the one instrumented choke point
 pub fn execute_session_statement_via(
     ctx: &Shared,
     role: &str,
@@ -812,6 +841,7 @@ pub fn execute_session_statement_via(
     parsed: Result<Statement, ParseError>,
     consistency: Option<ProtoConsistency>,
     via: &str,
+    txn: Option<&mut skaidb_engine::SessionTxn>,
 ) -> Response {
     // Standalone memory tier: under shed-level pressure, client mutations
     // are refused with the cluster tier's retryable error (drivers treat
@@ -819,21 +849,26 @@ pub fn execute_session_statement_via(
     if crate::memtier::would_shed(via, parsed.as_ref().ok(), crate::memtier::shedding()) {
         return Response::Error(crate::memtier::SHED_ERROR.into());
     }
-    // Transactions are EMBEDDED-ONLY (documented since they shipped); the
-    // engine's single transaction buffer has no session identity, so a
-    // server letting one connection BEGIN exposes its uncommitted overlay
-    // to every other connection's reads — a dirty read, caught by the ACID
-    // isolation audit (2026-07-21). Cluster mode always refused; the
-    // standalone server now matches. Server sessions autocommit.
+    // Transaction control needs a connection that OWNS transaction state
+    // (a binary-driver session, which passes its SessionTxn) on the
+    // standalone backend. Stateless surfaces (REST/ES/UI — no state
+    // outlives the request) and cluster mode (no distributed transaction
+    // coordinator) refuse. Session-scoped buffers are what closed the
+    // 2026-07-21 dirty-read finding: a session's uncommitted overlay is
+    // visible only to statements run with ITS buffer installed.
     if matches!(
         parsed.as_ref().ok(),
         Some(Statement::Begin | Statement::Commit | Statement::Rollback)
     ) {
-        return Response::Error(
-            "transactions are embedded-only: server sessions autocommit \
-             (BEGIN/COMMIT/ROLLBACK are not available over a connection)"
-                .into(),
-        );
+        let supported = txn.is_some() && matches!(ctx.backend, Backend::Local(_));
+        if !supported {
+            return Response::Error(
+                "transactions need a driver connection to a standalone server \
+                 (stateless surfaces autocommit; cluster mode has no distributed \
+                 transaction coordinator)"
+                    .into(),
+            );
+        }
     }
     // Authorization: check the role may perform the statement before
     // executing. `SHOW GRANTS FOR <own role>` is self-inspection and needs
@@ -921,7 +956,7 @@ pub fn execute_session_statement_via(
 
     let response = match ctx
         .backend
-        .execute_session(current_db, sql, parsed, consistency.map(map_consistency))
+        .execute_session(current_db, sql, parsed, consistency.map(map_consistency), txn)
     {
         Ok(SessionEffect::Output(QueryOutput::Rows(rs))) => Response::Rows {
             columns: rs.columns,
