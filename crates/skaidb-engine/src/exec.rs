@@ -6618,6 +6618,12 @@ impl Database {
         self.catalog.timeseries.get(table)
     }
 
+    /// The table's row TTL, if set (cluster coordinators filter merged
+    /// winners with it — the versioned wire paths are TTL-blind).
+    pub fn table_ttl_ms(&self, table: &str) -> Option<u64> {
+        self.catalog.tables.get(table)?.ttl_ms.map(|ms| ms as u64)
+    }
+
     /// Series-key columns when `table` is a time-series table.
     pub fn ts_series_key(&self, table: &str) -> Option<Vec<String>> {
         self.catalog

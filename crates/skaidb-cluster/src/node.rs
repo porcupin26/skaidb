@@ -6675,6 +6675,7 @@ impl Node {
         oc: Option<Consistency>,
     ) -> EngineResult<Vec<(Vec<u8>, Document)>> {
         self.counters.reads_total.fetch_add(1, Ordering::Relaxed);
+        let ttl = self.table_ttl_ms(table);
         let replicas = self.effective_replicas(table, key);
         let needed = oc
             .unwrap_or(self.cfg.read_consistency)
@@ -6791,7 +6792,12 @@ impl Node {
         }
 
         match best {
-            Some((_, Some(value))) => {
+            // TTL filter on the LWW WINNER: replicas answer versioned (so
+            // stamped data replicates and read-repair converges), and the
+            // coordinator applies the same expiry rule the local engine
+            // uses — without this, cluster point reads served rows the
+            // embedded read path had already expired.
+            Some((hlc, Some(value))) if !skaidb_storage::row_expired(ttl, hlc) => {
                 let doc = match Value::decode(&value)
                     .map_err(|e| EngineError::Cluster(format!("corrupt row: {e}")))?
                 {
@@ -6800,9 +6806,16 @@ impl Node {
                 };
                 Ok(vec![(key.to_vec(), doc)])
             }
-            // Absent everywhere, or newest version is a tombstone.
+            // Absent everywhere, newest version is a tombstone, or expired.
             _ => Ok(Vec::new()),
         }
+    }
+
+    /// The table's row TTL from the local catalog (`None` = no TTL or lock
+    /// unavailable — fail open: serving a not-yet-reclaimed row beats
+    /// erroring a read).
+    fn table_ttl_ms(&self, table: &str) -> Option<u64> {
+        self.local.read().ok().and_then(|db| db.table_ttl_ms(table))
     }
 
     /// Push the winning version (`hbest`, `valopt`) to every replica in `seen`
@@ -7075,6 +7088,9 @@ impl Node {
             _ => None,
         };
         self.counters.reads_total.fetch_add(1, Ordering::Relaxed);
+        // TTL applies to the merged LWW winner (see point_get) — pages
+        // arrive versioned and unfiltered so the merge itself stays exact.
+        let ttl = self.table_ttl_ms(table);
         // Source set + quorum divisor are per-table: a pinned table gathers
         // from its pins only — a non-pin coordinator routes to the pins
         // instead of scanning its own empty shard or scattering to every
@@ -7206,6 +7222,9 @@ impl Node {
                 merged_bytes = merged_bytes
                     .saturating_sub(k.len() + val.as_ref().map_or(0, Vec::len));
                 max_hlc = Some(max_hlc.map_or(hlc, |m| m.max(hlc)));
+                if skaidb_storage::row_expired(ttl, hlc) {
+                    continue; // TTL-expired winner: merged for LWW, not served
+                }
                 if keep.is_some_and(|set| !set.contains_key(&k)) {
                     continue; // not a candidate: merged for LWW, not returned
                 }

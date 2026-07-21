@@ -497,10 +497,7 @@ impl Engine {
 
     /// Whether a row stamped at `hlc` has outlived the table's TTL.
     fn is_expired(&self, hlc: Hlc) -> bool {
-        match self.ttl_ms {
-            Some(ttl) => now_wall_ms().saturating_sub(hlc.physical) > ttl,
-            None => false,
-        }
+        row_expired(self.ttl_ms, hlc)
     }
 
     /// Latest committed value for `key`, or `None` if absent, deleted, or
@@ -1652,6 +1649,14 @@ fn merge_write(
     SsTable::write_stream(path, entries, approx as usize, codec, enc)
 }
 
+/// The TTL expiry rule, shared with cluster coordinators (which merge
+/// VERSIONED replica copies — those paths must stay TTL-blind so stamped
+/// data replicates and converges, and filter the LWW winner with this
+/// exact predicate instead).
+pub fn row_expired(ttl_ms: Option<u64>, hlc: Hlc) -> bool {
+    ttl_ms.is_some_and(|ttl| now_wall_ms().saturating_sub(hlc.physical) > ttl)
+}
+
 /// Wall-clock milliseconds since the Unix epoch (TTL comparisons).
 fn now_wall_ms() -> u64 {
     std::time::SystemTime::now()
@@ -1800,6 +1805,19 @@ mod forensics {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// The shared TTL predicate — the engine's read paths AND the cluster
+    /// coordinator's LWW-winner filtering both use this exact rule, so a
+    /// row expires identically whether served locally or via quorum merge.
+    #[test]
+    fn row_expired_rule() {
+        let now = now_wall_ms();
+        assert!(!row_expired(None, Hlc::new(0, 0)), "no TTL: never expires");
+        assert!(row_expired(Some(1_000), Hlc::new(now - 5_000, 0)));
+        assert!(!row_expired(Some(1_000), Hlc::new(now, 0)));
+        // A stamp AHEAD of the wall clock (HLC ratchet) never underflows.
+        assert!(!row_expired(Some(1_000), Hlc::new(now + 60_000, 0)));
+    }
 
     fn tempdir() -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
