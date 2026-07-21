@@ -55,23 +55,56 @@ pub struct ReadCache {
 struct Inner {
     /// This shard's entry budget (the total capacity split across shards).
     capacity: usize,
+    /// This shard's byte budget (0 = none) — the entry cap alone is
+    /// byte-blind, and multi-KB rows pinned an order of magnitude more RAM
+    /// than the entry-derived budget assumed (the witness ramp incident).
+    byte_capacity: usize,
+    /// Live weight of `map` (keys + payloads + per-entry overhead).
+    bytes: usize,
     map: HashMap<Vec<u8>, CachedRead>,
     /// Insertion order, for FIFO eviction. May contain keys already removed by
     /// `invalidate`; those are skipped (they're no longer in `map`).
     fifo: VecDeque<Vec<u8>>,
 }
 
+/// Approximate resident weight of one entry: the key is held twice (map +
+/// fifo), plus the payload and fixed map/tuple overhead.
+fn weight(key: &[u8], value: &CachedRead) -> usize {
+    let payload = match value {
+        Some((_, VersionValue::Put(bytes))) => bytes.len(),
+        _ => 0,
+    };
+    key.len() * 2 + payload + 80
+}
+
 impl ReadCache {
-    /// Create a cache holding at most `capacity` entries (0 disables it).
-    pub fn new(capacity: usize) -> ReadCache {
-        let n_shards = capacity.min(MAX_SHARDS);
+    /// Create a cache holding at most `capacity` entries AND `byte_cap`
+    /// resident bytes (0 entries disables the cache; 0 bytes = no byte
+    /// ceiling).
+    pub fn new(capacity: usize, byte_cap: usize) -> ReadCache {
+        /// Floor on a shard's byte budget: the even split assumes keys
+        /// spread across shards, and a small byte cap sliced 64 ways
+        /// leaves shards too small to hold even one row. Fewer, bigger
+        /// shards keep small caches usable (production-sized caps still
+        /// get all 64).
+        const MIN_SHARD_BYTES: usize = 64 * 1024;
+        let mut n_shards = capacity.min(MAX_SHARDS);
+        if byte_cap > 0 {
+            n_shards = n_shards.min((byte_cap / MIN_SHARD_BYTES).max(1));
+        }
         let shards = (0..n_shards)
             .map(|i| {
-                // Split the budget evenly; the first shards absorb the remainder
-                // so per-shard capacities sum exactly to `capacity`.
+                // Split the budgets evenly; the first shards absorb the
+                // remainders so the totals sum exactly.
                 let cap = capacity / n_shards + usize::from(i < capacity % n_shards);
+                let bcap = if byte_cap == 0 {
+                    0
+                } else {
+                    (byte_cap / n_shards + usize::from(i < byte_cap % n_shards)).max(1)
+                };
                 Mutex::new(Inner {
                     capacity: cap,
+                    byte_capacity: bcap,
                     ..Inner::default()
                 })
             })
@@ -136,14 +169,23 @@ impl ReadCache {
         }
         let mut guard = self.shard(key).lock().expect("read cache");
         let inner = &mut *guard;
-        if inner.map.insert(key.to_vec(), value).is_none() {
-            inner.fifo.push_back(key.to_vec());
+        inner.bytes = inner.bytes.saturating_add(weight(key, &value));
+        match inner.map.insert(key.to_vec(), value) {
+            None => inner.fifo.push_back(key.to_vec()),
+            Some(old) => {
+                inner.bytes = inner.bytes.saturating_sub(weight(key, &old));
+            }
         }
-        // Evict oldest live entries until within capacity (skip stale fifo keys).
-        while inner.map.len() > inner.capacity {
+        // Evict oldest live entries until within BOTH caps (skip stale fifo
+        // keys). The byte cap makes eviction weight-aware: one multi-KB row
+        // displaces many small ones instead of hiding behind the entry count.
+        while inner.map.len() > inner.capacity
+            || (inner.byte_capacity > 0 && inner.bytes > inner.byte_capacity)
+        {
             match inner.fifo.pop_front() {
                 Some(old) => {
-                    if inner.map.remove(&old).is_some() {
+                    if let Some(v) = inner.map.remove(&old) {
+                        inner.bytes = inner.bytes.saturating_sub(weight(&old, &v));
                         self.evictions.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -166,7 +208,11 @@ impl ReadCache {
         if self.shards.is_empty() {
             return;
         }
-        self.shard(key).lock().expect("read cache").map.remove(key);
+        let mut guard = self.shard(key).lock().expect("read cache");
+        let inner = &mut *guard;
+        if let Some(v) = inner.map.remove(key) {
+            inner.bytes = inner.bytes.saturating_sub(weight(key, &v));
+        }
     }
 
     #[cfg(test)]
@@ -188,7 +234,7 @@ mod tests {
 
     #[test]
     fn hit_miss_and_invalidate() {
-        let c = ReadCache::new(8);
+        let c = ReadCache::new(8, 0);
         assert!(c.get(b"a").is_none()); // miss
         c.insert(b"a", put(1));
         assert_eq!(c.get(b"a"), Some(put(1))); // hit
@@ -198,14 +244,14 @@ mod tests {
 
     #[test]
     fn caches_negative_lookups() {
-        let c = ReadCache::new(8);
+        let c = ReadCache::new(8, 0);
         c.insert(b"missing", None);
         assert_eq!(c.get(b"missing"), Some(None)); // hit carrying "absent"
     }
 
     #[test]
     fn fifo_eviction_bounds_size() {
-        let c = ReadCache::new(4);
+        let c = ReadCache::new(4, 0);
         for i in 0..100u64 {
             c.insert(&i.to_le_bytes(), put(i));
         }
@@ -216,7 +262,7 @@ mod tests {
 
     #[test]
     fn invalidate_churn_keeps_fifo_bounded() {
-        let c = ReadCache::new(4);
+        let c = ReadCache::new(4, 0);
         for i in 0..1000u64 {
             c.insert(&i.to_le_bytes(), put(i));
             c.invalidate(&i.to_le_bytes()); // immediately invalidate
@@ -232,7 +278,7 @@ mod tests {
 
     #[test]
     fn capacity_zero_disables() {
-        let c = ReadCache::new(0);
+        let c = ReadCache::new(0, 0);
         c.insert(b"a", put(1));
         assert!(c.get(b"a").is_none());
     }
@@ -244,6 +290,37 @@ mod tests {
     /// normal `cargo test` runs stay fast; invoke explicitly:
     /// `cargo test --release -p skaidb-storage -- --ignored --nocapture
     /// read_cache_contention_probe`.
+    /// The byte cap evicts by WEIGHT: a few multi-KB payloads displace many
+    /// small entries, and one oversized payload cannot pin the cache past
+    /// its ceiling (the entry cap alone was byte-blind — the witness ramp).
+    #[test]
+    fn byte_cap_evicts_by_weight() {
+        let c = ReadCache::new(100, 4_096);
+        let big = vec![0u8; 1_500];
+        for i in 0u8..4 {
+            c.insert(&[i], Some((Hlc::new(1, 0), VersionValue::Put(big.clone()))));
+        }
+        let stats = c.stats();
+        assert!(stats.entries < 4, "byte cap must evict: {stats:?}");
+        assert!(stats.evictions > 0, "{stats:?}");
+        // Small entries still fit in numbers the entry budget allows.
+        let c = ReadCache::new(100, 64 * 1024);
+        for i in 0u8..50 {
+            c.insert(&[i], Some((Hlc::new(1, 0), VersionValue::Put(vec![7; 16]))));
+        }
+        assert_eq!(c.stats().entries, 50);
+        // Invalidation returns weight: churning one key must not leak
+        // accounted bytes into permanent eviction pressure.
+        let c = ReadCache::new(100, 8_192);
+        for _ in 0..100 {
+            c.insert(b"k", Some((Hlc::new(1, 0), VersionValue::Put(vec![0; 1_000]))));
+            c.invalidate(b"k");
+        }
+        c.insert(b"k2", Some((Hlc::new(1, 0), VersionValue::Put(vec![0; 100]))));
+        assert_eq!(c.stats().entries, 1);
+    }
+
+    /// See the module doc: run explicitly with `--ignored`.
     #[test]
     #[ignore]
     fn read_cache_contention_probe() {
@@ -251,7 +328,7 @@ mod tests {
         let threads: usize = std::env::var("THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(32);
         let ops: usize = std::env::var("OPS").ok().and_then(|s| s.parse().ok()).unwrap_or(2_000_000);
 
-        let cache = std::sync::Arc::new(ReadCache::new(16_384));
+        let cache = std::sync::Arc::new(ReadCache::new(16_384, 0));
         let keys: Vec<Vec<u8>> = (0..hot_keys).map(|i| format!("key{i:08}").into_bytes()).collect();
         for k in &keys {
             cache.insert(k, put(1));

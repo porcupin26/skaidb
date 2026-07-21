@@ -100,10 +100,17 @@ query catalog is pinned by the `grafana_promql_compatibility` test. Typical dash
 `histogram_quantile(0.9, sum by (le) (rate(req_bucket[5m])))` — work
 as-is.
 
+The per-sample math family (`abs`, `ceil`, `floor`, `round`,
+`clamp/clamp_min/clamp_max`, `sqrt`, `exp`, `ln`, `log2`, `log10`,
+`sgn`), the UTC calendar functions (`minute`, `hour`, `day_of_week`,
+`day_of_month`, `day_of_year`, `days_in_month`, `month`, `year` — the
+no-argument forms too), and `vector()`/`scalar()` are all supported;
+function names only bind when followed by `(`, so a metric that shares
+a name still selects.
+
 **Not supported (yet)**: subqueries, `on()/ignoring()` +
-`group_left`/`group_right` matching modifiers, the per-sample math
-family (`abs`, `ceil`, `clamp_*`, …), and the `@` modifier. Panels
-using those need the fallback below.
+`group_left`/`group_right` matching modifiers, and the `@` modifier.
+Panels using those need the fallback below.
 
 ### Monitoring skaidb itself
 

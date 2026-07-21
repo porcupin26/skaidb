@@ -200,12 +200,17 @@ pub fn run(
     // memory limit when set to "auto".
     let mut flush_threshold_bytes = (config.storage.memtable_size_mb.max(1) as usize) * 1024 * 1024;
     let mut read_cache_capacity = config.storage.read_cache_entries as usize;
+    // Byte ceiling scales with the configured entry count (4 KB/entry —
+    // generous for typical rows, a wall for multi-KB ones); a memory plan
+    // replaces it with the budget's actual read-cache byte share.
+    let mut read_cache_bytes = read_cache_capacity.saturating_mul(4096);
     let mut search_writer_heap_bytes = skaidb_engine::DEFAULT_SEARCH_WRITER_HEAP;
     let mut ts_head_max_bytes = 0u64; // unbounded without a budget
     match memory::resolve(&config.storage.memory_target) {
         Ok(Some(plan)) => {
             flush_threshold_bytes = plan.memtable_bytes as usize;
             read_cache_capacity = plan.read_cache_entries as usize;
+            read_cache_bytes = plan.read_cache_bytes as usize;
             search_writer_heap_bytes = plan.search_writer_bytes as usize;
             ts_head_max_bytes = plan.ts_head_bytes;
             skaidb_types::slog!(
@@ -232,6 +237,7 @@ pub fn run(
     let storage_opts = skaidb_engine::EngineOptions {
         flush_threshold_bytes,
         read_cache_capacity,
+        read_cache_bytes,
         search_writer_heap_bytes,
         ts_head_max_bytes,
         scan_row_budget: config.storage.scan_row_budget as usize,

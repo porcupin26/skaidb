@@ -47,6 +47,10 @@ pub struct MemoryPlan {
     pub budget: u64,
     pub memtable_bytes: u64,
     pub read_cache_entries: u64,
+    /// Byte ceiling for each engine's read cache — the byte share the entry
+    /// count was derived from, enforced directly so multi-KB rows can't pin
+    /// more than the budget assumed.
+    pub read_cache_bytes: u64,
     /// Tantivy writer heap per full-text search index (bytes).
     pub search_writer_bytes: u64,
     /// In-memory head cap per time-series table (bytes).
@@ -76,7 +80,8 @@ pub fn resolve(target: &str) -> Result<Option<MemoryPlan>, String> {
 /// Split a budget into concrete knobs.
 fn plan(budget: u64) -> MemoryPlan {
     let memtable_bytes = (budget / MEMTABLE_SHARE).clamp(MEMTABLE_MIN, MEMTABLE_MAX);
-    let read_cache_entries = (budget / READ_CACHE_SHARE) / ASSUMED_ENTRY_BYTES;
+    let read_cache_bytes = budget / READ_CACHE_SHARE;
+    let read_cache_entries = read_cache_bytes / ASSUMED_ENTRY_BYTES;
     let search_writer_bytes =
         (budget / SEARCH_WRITER_SHARE).clamp(SEARCH_WRITER_MIN, SEARCH_WRITER_MAX);
     let ts_head_bytes = (budget / TS_HEAD_SHARE).clamp(TS_HEAD_MIN, TS_HEAD_MAX);
@@ -84,6 +89,7 @@ fn plan(budget: u64) -> MemoryPlan {
         budget,
         memtable_bytes,
         read_cache_entries,
+        read_cache_bytes,
         search_writer_bytes,
         ts_head_bytes,
     }

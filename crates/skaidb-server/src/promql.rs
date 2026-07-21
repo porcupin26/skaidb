@@ -178,8 +178,143 @@ enum PExpr {
         without: Option<Vec<String>>,
         arg: Box<PExpr>,
     },
+    /// Tier-3 per-sample math / calendar function. `arg: None` is the
+    /// calendar functions' no-argument form (`hour()` ≡ `hour(vector(time()))`).
+    MathFn {
+        func: MathFn,
+        arg: Option<Box<PExpr>>,
+    },
+    /// `vector(s)` — a scalar as a single empty-labeled sample.
+    VectorOf { arg: Box<PExpr> },
+    /// `scalar(v)` — a one-series vector's value as a scalar (NaN otherwise).
+    ScalarOf { arg: Box<PExpr> },
     /// A bare number.
     Number(f64),
+}
+
+/// Per-sample functions: pure value math plus the UTC calendar family
+/// (whose input samples are unix-seconds timestamps, Prometheus-style).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MathFn {
+    Abs,
+    Ceil,
+    Floor,
+    Sqrt,
+    Exp,
+    Ln,
+    Log2,
+    Log10,
+    Sgn,
+    /// `round(v [, to_nearest])` — nearest multiple, default 1.
+    Round(f64),
+    /// `clamp(v, min, max)`; min > max yields NaN, like Prometheus.
+    Clamp(f64, f64),
+    ClampMin(f64),
+    ClampMax(f64),
+    Minute,
+    Hour,
+    DayOfWeek,
+    DayOfMonth,
+    DayOfYear,
+    DaysInMonth,
+    Month,
+    Year,
+}
+
+impl MathFn {
+    fn apply(self, v: f64) -> f64 {
+        // Calendar family: interpret the sample as unix SECONDS (UTC).
+        let civil = || civil_from_secs(v);
+        match self {
+            MathFn::Abs => v.abs(),
+            MathFn::Ceil => v.ceil(),
+            MathFn::Floor => v.floor(),
+            MathFn::Sqrt => v.sqrt(),
+            MathFn::Exp => v.exp(),
+            MathFn::Ln => v.ln(),
+            MathFn::Log2 => v.log2(),
+            MathFn::Log10 => v.log10(),
+            MathFn::Sgn => {
+                if v > 0.0 {
+                    1.0
+                } else if v < 0.0 {
+                    -1.0
+                } else {
+                    v // 0 and NaN pass through, Prometheus-style
+                }
+            }
+            MathFn::Round(nearest) => {
+                if nearest == 0.0 {
+                    f64::NAN
+                } else {
+                    (v / nearest).round() * nearest
+                }
+            }
+            MathFn::Clamp(min, max) => {
+                if min > max {
+                    f64::NAN
+                } else {
+                    v.min(max).max(min)
+                }
+            }
+            MathFn::ClampMin(min) => v.max(min),
+            MathFn::ClampMax(max) => v.min(max),
+            MathFn::Minute => ((v as i64).div_euclid(60).rem_euclid(60)) as f64,
+            MathFn::Hour => ((v as i64).div_euclid(3600).rem_euclid(24)) as f64,
+            MathFn::DayOfWeek => {
+                // Unix day 0 was a Thursday; Prometheus counts 0 = Sunday.
+                ((v as i64).div_euclid(86_400) + 4).rem_euclid(7) as f64
+            }
+            MathFn::DayOfMonth => civil().2 as f64,
+            MathFn::DayOfYear => {
+                let (y, m, d) = civil();
+                day_of_year(y, m, d) as f64
+            }
+            MathFn::DaysInMonth => {
+                let (y, m, _) = civil();
+                days_in_month(y, m) as f64
+            }
+            MathFn::Month => civil().1 as f64,
+            MathFn::Year => civil().0 as f64,
+        }
+    }
+}
+
+/// Civil (proleptic Gregorian, UTC) date from unix seconds — Howard
+/// Hinnant's `civil_from_days`. Returns `(year, month 1-12, day 1-31)`.
+fn civil_from_secs(secs: f64) -> (i64, u32, u32) {
+    let z = (secs as i64).div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+fn is_leap(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+fn days_in_month(y: i64, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            if is_leap(y) {
+                29
+            } else {
+                28
+            }
+        }
+    }
+}
+
+fn day_of_year(y: i64, m: u32, d: u32) -> u32 {
+    (1..m).map(|mm| days_in_month(y, mm)).sum::<u32>() + d
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -796,6 +931,101 @@ impl<'a> P<'a> {
                 arg: Box::new(arg),
             });
         }
+        // Tier-3 per-sample math / calendar / conversion functions — only
+        // when a '(' follows, so a METRIC named `year` or `abs` still
+        // parses as a selector.
+        if tier3_name(&name) && {
+            self.ws();
+            self.peek() == Some(b'(')
+        } {
+            self.expect(b'(')?;
+            return match name.as_str() {
+                "vector" => {
+                    let arg = self.expr()?;
+                    self.expect(b')')?;
+                    Ok(PExpr::VectorOf { arg: Box::new(arg) })
+                }
+                "scalar" => {
+                    let arg = self.expr()?;
+                    self.expect(b')')?;
+                    Ok(PExpr::ScalarOf { arg: Box::new(arg) })
+                }
+                "round" => {
+                    let arg = self.expr()?;
+                    let nearest = if self.eat(b',') {
+                        let PExpr::Number(n) = self.factor()? else {
+                            return Err("round's to_nearest must be a number".into());
+                        };
+                        n
+                    } else {
+                        1.0
+                    };
+                    self.expect(b')')?;
+                    Ok(PExpr::MathFn {
+                        func: MathFn::Round(nearest),
+                        arg: Some(Box::new(arg)),
+                    })
+                }
+                "clamp" | "clamp_min" | "clamp_max" => {
+                    let arg = self.expr()?;
+                    self.expect(b',')?;
+                    let PExpr::Number(a) = self.factor()? else {
+                        return Err(format!("{name} bounds must be numbers"));
+                    };
+                    let func = if name == "clamp" {
+                        self.expect(b',')?;
+                        let PExpr::Number(b) = self.factor()? else {
+                            return Err("clamp bounds must be numbers".into());
+                        };
+                        MathFn::Clamp(a, b)
+                    } else if name == "clamp_min" {
+                        MathFn::ClampMin(a)
+                    } else {
+                        MathFn::ClampMax(a)
+                    };
+                    self.expect(b')')?;
+                    Ok(PExpr::MathFn {
+                        func,
+                        arg: Some(Box::new(arg)),
+                    })
+                }
+                _ => {
+                    let func = match name.as_str() {
+                        "abs" => MathFn::Abs,
+                        "ceil" => MathFn::Ceil,
+                        "floor" => MathFn::Floor,
+                        "sqrt" => MathFn::Sqrt,
+                        "exp" => MathFn::Exp,
+                        "ln" => MathFn::Ln,
+                        "log2" => MathFn::Log2,
+                        "log10" => MathFn::Log10,
+                        "sgn" => MathFn::Sgn,
+                        "minute" => MathFn::Minute,
+                        "hour" => MathFn::Hour,
+                        "day_of_week" => MathFn::DayOfWeek,
+                        "day_of_month" => MathFn::DayOfMonth,
+                        "day_of_year" => MathFn::DayOfYear,
+                        "days_in_month" => MathFn::DaysInMonth,
+                        "month" => MathFn::Month,
+                        "year" => MathFn::Year,
+                        other => return Err(format!("unhandled function {other}")),
+                    };
+                    // Calendar functions allow the no-argument form
+                    // (`hour()` ≡ `hour(vector(time()))`).
+                    let arg = if self.eat(b')') {
+                        if !calendar_fn(func) {
+                            return Err(format!("{name} takes one argument"));
+                        }
+                        None
+                    } else {
+                        let a = self.expr()?;
+                        self.expect(b')')?;
+                        Some(Box::new(a))
+                    };
+                    Ok(PExpr::MathFn { func, arg })
+                }
+            };
+        }
         if name == "histogram_quantile" {
             self.expect(b'(')?;
             let PExpr::Number(phi) = self.factor()? else {
@@ -1027,7 +1257,14 @@ fn assign_slots(expr: &mut PExpr, specs: &mut Vec<(Vec<Matcher>, Option<i64>, i6
         | PExpr::Sort { arg, .. }
         | PExpr::Absent { arg, .. }
         | PExpr::AbsentOverTime { arg, .. }
-        | PExpr::CountValues { arg, .. } => assign_slots(arg, specs),
+        | PExpr::CountValues { arg, .. }
+        | PExpr::VectorOf { arg }
+        | PExpr::ScalarOf { arg } => assign_slots(arg, specs),
+        PExpr::MathFn { arg, .. } => {
+            if let Some(arg) = arg {
+                assign_slots(arg, specs);
+            }
+        }
         PExpr::Binary { lhs, rhs, .. } => {
             assign_slots(lhs, specs);
             assign_slots(rhs, specs);
@@ -1049,7 +1286,13 @@ fn selector_of(expr: &PExpr) -> Result<&Vec<Matcher>, String> {
         | PExpr::Sort { arg, .. }
         | PExpr::Absent { arg, .. }
         | PExpr::AbsentOverTime { arg, .. }
-        | PExpr::CountValues { arg, .. } => selector_of(arg),
+        | PExpr::CountValues { arg, .. }
+        | PExpr::VectorOf { arg }
+        | PExpr::ScalarOf { arg } => selector_of(arg),
+        PExpr::MathFn { arg: Some(arg), .. } => selector_of(arg),
+        PExpr::MathFn { arg: None, .. } => {
+            Err("number-only expressions are not supported".into())
+        }
         PExpr::Binary { lhs, .. } => selector_of(lhs),
         PExpr::Time | PExpr::Number(_) => {
             Err("number-only expressions are not supported".into())
@@ -1061,6 +1304,51 @@ fn selector_of(expr: &PExpr) -> Result<&Vec<Matcher>, String> {
 /// WHOLE source value.
 fn compile_anchored(pattern: &str) -> Result<regex::Regex, String> {
     regex::Regex::new(&format!("^(?:{pattern})$")).map_err(|e| format!("bad regex: {e}"))
+}
+
+/// The Tier-3 function names — routed to [`PExpr::MathFn`]/`VectorOf`/
+/// `ScalarOf` only when a '(' follows (a metric may share the name).
+fn tier3_name(name: &str) -> bool {
+    matches!(
+        name,
+        "abs" | "ceil"
+            | "floor"
+            | "round"
+            | "sqrt"
+            | "exp"
+            | "ln"
+            | "log2"
+            | "log10"
+            | "sgn"
+            | "clamp"
+            | "clamp_min"
+            | "clamp_max"
+            | "minute"
+            | "hour"
+            | "day_of_week"
+            | "day_of_month"
+            | "day_of_year"
+            | "days_in_month"
+            | "month"
+            | "year"
+            | "vector"
+            | "scalar"
+    )
+}
+
+/// Calendar functions accept the no-argument form.
+fn calendar_fn(f: MathFn) -> bool {
+    matches!(
+        f,
+        MathFn::Minute
+            | MathFn::Hour
+            | MathFn::DayOfWeek
+            | MathFn::DayOfMonth
+            | MathFn::DayOfYear
+            | MathFn::DaysInMonth
+            | MathFn::Month
+            | MathFn::Year
+    )
 }
 
 /// Labels Prometheus derives for an `absent`/`absent_over_time` sample:
@@ -1636,6 +1924,55 @@ fn eval_steps(expr: &PExpr, fetched: &[Fetched], steps: &[i64]) -> Result<Vec<St
                         Vec::new()
                     } else {
                         vec![(labels.clone(), 1.0)]
+                    })
+                })
+                .collect())
+        }
+        PExpr::MathFn { func, arg } => {
+            let inner = match arg {
+                Some(a) => eval_steps(a, fetched, steps)?,
+                // No-arg calendar form: `hour()` ≡ `hour(vector(time()))`.
+                None => steps
+                    .iter()
+                    .map(|&t| StepVal::Vector(vec![(Vec::new(), t as f64 / 1000.0)]))
+                    .collect(),
+            };
+            Ok(inner
+                .into_iter()
+                .map(|val| match val {
+                    StepVal::Scalar(v) => StepVal::Scalar(func.apply(v)),
+                    StepVal::Vector(v) => StepVal::Vector(
+                        v.into_iter()
+                            // Functions drop the metric name, PromQL-style.
+                            .map(|(labels, value)| (match_key(&labels), func.apply(value)))
+                            .collect(),
+                    ),
+                })
+                .collect())
+        }
+        PExpr::VectorOf { arg } => {
+            let inner = eval_steps(arg, fetched, steps)?;
+            inner
+                .into_iter()
+                .map(|val| match val {
+                    StepVal::Scalar(v) => Ok(StepVal::Vector(vec![(Vec::new(), v)])),
+                    StepVal::Vector(_) => {
+                        Err("vector() expects a scalar, e.g. vector(1)".to_string())
+                    }
+                })
+                .collect()
+        }
+        PExpr::ScalarOf { arg } => {
+            let inner = eval_steps(arg, fetched, steps)?;
+            Ok(inner
+                .into_iter()
+                .map(|val| {
+                    StepVal::Scalar(match val {
+                        // Exactly one series: its value; otherwise NaN,
+                        // Prometheus-style.
+                        StepVal::Vector(v) if v.len() == 1 => v[0].1,
+                        StepVal::Vector(_) => f64::NAN,
+                        StepVal::Scalar(v) => v,
                     })
                 })
                 .collect())
@@ -2450,6 +2787,43 @@ mod tests {
         let cv = eval(r#"count_values by (device_id) ("v", aqi)"#).unwrap();
         assert_eq!(cv.len(), 2);
         assert!(cv.iter().all(|(labels, n)| labels.len() == 2 && *n == 1.0), "{cv:?}");
+
+        // ---- Tier 3: per-sample math ----
+        assert_eq!(one(r#"abs(aqi{device_id="a"} - 15)"#), 3.0);
+        assert_eq!(one(r#"ceil(sqrt(aqi{device_id="a"}))"#), 4.0);
+        assert_eq!(one(r#"round(aqi{device_id="a"} / 5)"#), 2.0);
+        assert_eq!(one(r#"round(aqi{device_id="a"}, 5)"#), 10.0);
+        let clamped = eval("clamp(aqi, 15, 20)").unwrap();
+        let mut vals: Vec<f64> = clamped.iter().map(|(_, v)| *v).collect();
+        vals.sort_by(f64::total_cmp);
+        assert_eq!(vals, vec![15.0, 20.0]);
+        assert_eq!(one(r#"clamp_min(aqi{device_id="a"}, 15)"#), 15.0);
+        assert_eq!(one(r#"clamp_max(aqi{device_id="b"}, 15)"#), 15.0);
+        assert_eq!(one(r#"sgn(aqi{device_id="a"} - 15)"#), -1.0);
+        assert_eq!(one("log2(vector(8))"), 3.0);
+        assert_eq!(one("exp(vector(0))"), 1.0);
+        // vector()/scalar() conversions.
+        assert_eq!(one(r#"scalar(aqi{device_id="a"})"#), 12.0);
+        assert!(one("scalar(aqi)").is_nan(), "two series -> NaN");
+        assert!(eval("vector(aqi)").is_err(), "vector() wants a scalar");
+        // ---- Tier 3: calendar (UTC), eval time = 10s past the epoch ----
+        assert_eq!(one("hour()"), 0.0);
+        assert_eq!(one("minute()"), 0.0);
+        assert_eq!(one("day_of_week()"), 4.0, "1970-01-01 was a Thursday");
+        assert_eq!(one("day_of_month()"), 1.0);
+        assert_eq!(one("day_of_year()"), 1.0);
+        assert_eq!(one("days_in_month()"), 31.0);
+        assert_eq!(one("month()"), 1.0);
+        assert_eq!(one("year()"), 1970.0);
+        // With an explicit timestamp vector: 1784602171 = 2026-07-21 (Tue).
+        assert_eq!(one("year(vector(1784602171))"), 2026.0);
+        assert_eq!(one("month(vector(1784602171))"), 7.0);
+        assert_eq!(one("day_of_month(vector(1784602171))"), 21.0);
+        assert_eq!(one("day_of_week(vector(1784602171))"), 2.0, "a Tuesday");
+        assert_eq!(one("days_in_month(vector(1784602171))"), 31.0);
+        // A METRIC named like a function still parses as a selector when no
+        // parens follow.
+        assert_eq!(eval("year").unwrap().len(), 0, "bare name = selector");
     }
 
     /// Grafana's Metrics Drilldown emits `{__ignore_usage__="", }` — a

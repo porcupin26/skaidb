@@ -562,11 +562,14 @@ WHERE ts >= now() - 6h GROUP BY t;
   `sum/avg/min/max/count/stdvar/group [by|without]` + `count_values`,
   vector arithmetic `+ - * /`,
   `histogram_quantile`, `label_replace/label_join`, `sort/sort_desc`,
-  `absent(v)`, and the Tier-2 window analytics: `present/absent_over_time`,
+  `absent(v)`, the Tier-2 window analytics (`present/absent_over_time`,
   `changes/resets`, `deriv`/`predict_linear(m[w], t)`,
-  `stddev/stdvar/mad_over_time`, `quantile_over_time(φ, m[w])`.
-  Not supported: subqueries, `on/ignoring` + `group_left/right`,
-  per-sample math (`abs/ceil/clamp_*` …), `@`.
+  `stddev/stdvar/mad_over_time`, `quantile_over_time(φ, m[w])`), and the
+  Tier-3 per-sample family: `abs/ceil/floor/round(±to_nearest)/clamp*/
+  sqrt/exp/ln/log2/log10/sgn`, UTC calendar fns (`minute/hour/day_of_*/
+  days_in_month/month/year`, no-arg ok), `vector()/scalar()` (names bind
+  only with '(' — a metric named `year` stays a selector).
+  Not supported: subqueries, `on/ignoring` + `group_left/right`, `@`.
 - **Self-scrape**: `config set observability.self_scrape true` (live) makes
   the node ingest its own `/metrics` every
   `observability.self_scrape_interval_secs` — self-dashboarding without an

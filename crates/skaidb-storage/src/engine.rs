@@ -63,6 +63,12 @@ pub struct EngineOptions {
     /// `0` disables it. Recent data is already served from the memtable, so this
     /// only helps reads of keys that have been flushed to SSTables.
     pub read_cache_capacity: usize,
+    /// Byte ceiling for the read cache (keys + payloads + overhead), evicted
+    /// FIFO alongside the entry cap. The entry cap alone is byte-blind: a
+    /// workload of multi-KB rows (181k × ~6 KB vector rows, the witness
+    /// memory-ramp incident) pins an order of magnitude more RAM than any
+    /// entry-derived budget assumed. `0` = no byte ceiling (legacy).
+    pub read_cache_bytes: usize,
     /// Memory (ephemeral) engine: unlinked WAL with no fsync, never flushes
     /// to SSTables, empty on every open. For short-lived bounded data
     /// (stats, caches) where restart loss is fine — pair with a table TTL.
@@ -110,6 +116,9 @@ pub struct EngineOptions {
 /// Default read-cache size (entries). Modest so it can't dominate a small node's
 /// RAM; only populated by reads that fall through to SSTables.
 pub const DEFAULT_READ_CACHE_CAPACITY: usize = 16_384;
+/// Default read-cache byte ceiling: 4 KB/entry at the default capacity
+/// (64 MB) — generous for typical rows, a hard wall for multi-KB ones.
+pub const DEFAULT_READ_CACHE_BYTES: usize = DEFAULT_READ_CACHE_CAPACITY * 4096;
 
 /// Default full-text writer heap per index (peak RSS during a bulk build is
 /// ≈ 1.5× the heap — measured in the phase-0 spike).
@@ -143,6 +152,7 @@ impl Default for EngineOptions {
             // (per-block codec byte).
             bottom_compression: Codec::Lz4,
             read_cache_capacity: DEFAULT_READ_CACHE_CAPACITY,
+            read_cache_bytes: DEFAULT_READ_CACHE_BYTES,
             ephemeral: false,
             kek: None,
             at_rest_enabled: false,
@@ -357,7 +367,7 @@ impl Engine {
             clock.observe(max_hlc);
         }
 
-        let read_cache = ReadCache::new(opts.read_cache_capacity);
+        let read_cache = ReadCache::new(opts.read_cache_capacity, opts.read_cache_bytes);
 
         Ok(Engine {
             dir,
@@ -495,7 +505,7 @@ impl Engine {
     /// order of magnitude more RAM than the budget assumed — under pressure
     /// a cold cache beats an OOM kill; it refills from reads.
     pub fn clear_read_cache(&mut self) {
-        self.read_cache = ReadCache::new(self.opts.read_cache_capacity);
+        self.read_cache = ReadCache::new(self.opts.read_cache_capacity, self.opts.read_cache_bytes);
     }
 
     /// Set the deepest-level tombstone retention window (see the field).
@@ -1310,7 +1320,7 @@ impl Engine {
         self.frozen.clear();
         self.wal.truncate()?;
         let _ = self.wal.drop_segments_through(self.next_wal_seq);
-        self.read_cache = ReadCache::new(self.opts.read_cache_capacity);
+        self.read_cache = ReadCache::new(self.opts.read_cache_capacity, self.opts.read_cache_bytes);
         self.write_seq += 1; // data changed without an append — stamp it
         self.persist_manifest()?;
         remove_files(&old_paths);
