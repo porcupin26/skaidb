@@ -733,10 +733,17 @@ the table on open. Distributed: scatter, merge by distance.
 - **Memory pressure** (limits from cgroup/system RAM, non-reclaimable
   usage): above 75% a node actively releases (flushes memtables, commits
   search writers); above 85% it also sheds writes with a retryable
-  "memory pressure" error (clears at 70%). Shedding logs loudly (anon/file
-  + jemalloc allocated/resident/retained; a distress line every 60 s while
-  stuck). Anti-entropy passes log duration when they reconcile rows or run
-  ≥60 s. The systemd unit sets `MemoryHigh=85%` as a kernel-side backstop.
+  "memory pressure" error (clears at 70%) AND drops the point-read caches
+  (entry-capped, byte-blind — multi-KB rows can pin far more than the
+  budget assumed; a cold cache refills, an OOM kill does not). Shedding
+  logs loudly (anon/file + jemalloc allocated/resident/retained; a
+  distress line every 60 s while stuck). **STANDALONE nodes (witnesses,
+  single-node) run the same tier** — release/shed sampler on the local
+  backend, client mutations refused under shed while reads and internal
+  writers (witness bookkeeping) pass. Anti-entropy passes log duration
+  when they reconcile rows or run ≥60 s. The systemd unit sets
+  `MemoryHigh=85%` as a kernel-side backstop and jemalloc
+  background-purge decay (1 s) so RSS tracks the live set.
 
 ---
 

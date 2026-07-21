@@ -813,6 +813,21 @@ pub fn execute_session_statement_via(
     consistency: Option<ProtoConsistency>,
     via: &str,
 ) -> Response {
+    // Standalone memory tier: under shed-level pressure, client mutations
+    // are refused with the cluster tier's retryable error (drivers treat
+    // both identically). Reads pass through, and so do INTERNAL statements
+    // (`via == "internal"`: the witness pull's sync bookkeeping and other
+    // self-management — they self-pace and byte-flush, and blocking them
+    // would stall the very work that frees memory).
+    if via != "internal"
+        && crate::memtier::shedding()
+        && matches!(
+            parsed.as_ref().ok(),
+            Some(Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_))
+        )
+    {
+        return Response::Error(crate::memtier::SHED_ERROR.into());
+    }
     // Authorization: check the role may perform the statement before
     // executing. `SHOW GRANTS FOR <own role>` is self-inspection and needs
     // no privilege; a grant on the session's database covers its tables.

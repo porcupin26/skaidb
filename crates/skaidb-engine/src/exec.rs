@@ -7197,6 +7197,14 @@ impl Database {
             if bytes >= floor && engine.flush().is_ok() {
                 reclaimed += bytes;
             }
+            // Aggressive (shedding-level) pressure also drops the point-read
+            // caches: they are entry-capped and byte-blind, so bulk point
+            // reads of multi-KB rows can pin far more RAM than the budget
+            // assumed (the witness ramped to its ceiling this way with
+            // memtables flat). A cold cache refills; an OOM kill does not.
+            if aggressive {
+                engine.clear_read_cache();
+            }
         }
         for live in self.search_indexes.values_mut() {
             let _ = live.commit_if_dirty();

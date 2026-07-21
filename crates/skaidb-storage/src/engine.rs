@@ -490,6 +490,14 @@ impl Engine {
         self.ttl_ms = ttl_ms;
     }
 
+    /// Drop every point-read cache entry (memory-pressure reclaim). The
+    /// cache is entry-capped and byte-blind, so multi-KB rows can pin an
+    /// order of magnitude more RAM than the budget assumed — under pressure
+    /// a cold cache beats an OOM kill; it refills from reads.
+    pub fn clear_read_cache(&mut self) {
+        self.read_cache = ReadCache::new(self.opts.read_cache_capacity);
+    }
+
     /// Set the deepest-level tombstone retention window (see the field).
     pub fn set_tombstone_retention_ms(&mut self, ms: u64) {
         self.tombstone_retention_ms = ms;

@@ -15,6 +15,7 @@ mod es;
 pub mod binary;
 mod drivers;
 pub mod memory;
+mod memtier;
 mod naming;
 mod nodestats;
 mod promql;
@@ -556,6 +557,12 @@ pub fn run(
     // Witness mode: start the pull loop when [witness] is enabled (no-op,
     // with a logged refusal, otherwise — see witness_pull.rs).
     witness_pull::spawn_if_enabled(ctx.clone());
+
+    // Standalone memory-pressure tier: release at 75% of the detected
+    // limit, shed client writes at 85% (cluster members have their own
+    // Node-level tier; this is its missing standalone twin — see
+    // memtier.rs).
+    memtier::spawn_for_local(ctx.clone());
 
     // Witness-aware garbage collection: every minute, size the deepest-
     // level tombstone-retention window from the witness registry (how far
@@ -3331,6 +3338,52 @@ pub(crate) mod tests {
         // Re-pulls stay idempotent: total sample count is exact, no dupes.
         let got = rows_of(exec_w("SELECT count(*) FROM mirror.metrics"));
         assert_eq!(got[0][0], Value::Int(4));
+    }
+
+    /// The standalone memory tier's shed gate: client mutations bounce with
+    /// the cluster tier's retryable error, reads and INTERNAL statements
+    /// (witness bookkeeping) pass, and clearing the flag restores writes.
+    /// (The flag is forced — the sampler thread is not running in tests —
+    /// and cleared again promptly to keep the global out of other tests.)
+    #[test]
+    fn standalone_shed_gate_refuses_client_mutations_only() {
+        use crate::shared::{execute_session_statement_via, execute_session_via};
+        let ctx = temp_ctx();
+        match crate::shared::execute(&ctx, "CREATE TABLE t (PRIMARY KEY (id))") {
+            Response::Ddl => {}
+            other => panic!("setup: {other:?}"),
+        }
+        crate::memtier::force_shed_for_test(true);
+        let mut db = skaidb_engine::DEFAULT_DATABASE.to_string();
+        // A client-path (non-internal) INSERT is refused, retryably.
+        match execute_session_via(&ctx, "superuser", &mut db, "INSERT INTO t (id) VALUES (1)", None, "rest") {
+            Response::Error(e) => assert_eq!(e, crate::memtier::SHED_ERROR),
+            other => panic!("expected shed refusal, got {other:?}"),
+        }
+        // Reads still serve.
+        match execute_session_via(&ctx, "superuser", &mut db, "SELECT id FROM t", None, "rest") {
+            Response::Rows { .. } => {}
+            other => panic!("reads must pass under shed: {other:?}"),
+        }
+        // Internal writers (witness bookkeeping) are exempt.
+        match execute_session_via(&ctx, "superuser", &mut db, "INSERT INTO t (id) VALUES (2)", None, "internal") {
+            Response::Mutation { .. } => {}
+            other => panic!("internal writes must pass under shed: {other:?}"),
+        }
+        crate::memtier::force_shed_for_test(false);
+        // Cleared: client writes flow again.
+        match execute_session_statement_via(
+            &ctx,
+            "superuser",
+            &mut db,
+            "INSERT INTO t (id) VALUES (3)",
+            skaidb_sql::parse("INSERT INTO t (id) VALUES (3)"),
+            None,
+            "rest",
+        ) {
+            Response::Mutation { .. } => {}
+            other => panic!("writes must resume after recovery: {other:?}"),
+        }
     }
 
     /// The witness pulls over mutual TLS from a `cert`-mode primary: its pool

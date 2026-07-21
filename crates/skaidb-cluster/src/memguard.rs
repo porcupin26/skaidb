@@ -174,8 +174,9 @@ impl MemoryGuard {
         classify(used, limit, shedding)
     }
 
-    /// Force the shedding flag directly (tests only).
-    #[cfg(test)]
+    /// Force the shedding flag directly (tests only — including downstream
+    /// crates' tests, so no `cfg(test)`: that gate only applies when THIS
+    /// crate compiles in test mode, which a dependent's test build is not).
     pub fn force(&self, on: bool) {
         self.shedding.store(on, Ordering::Relaxed);
     }
