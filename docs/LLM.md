@@ -533,7 +533,10 @@ WHERE ts >= now() - 6h GROUP BY t;
   charges each gathered sample against the statement scan budget like any
   row gather — a huge unbounded range dump errors cleanly instead of
   materializing until OOM. Narrow the range or aggregate (per-bucket
-  partials are bounded and unaffected).
+  partials are bounded and unaffected). **Paging works at any size**:
+  `WHERE ts > <cursor> ORDER BY ts LIMIT n` walks time slices with early
+  stop (each page costs ~its own rows) — the export pattern. `COUNT(*)`
+  on single-field TS tables serves from partials (no sample gather).
 - **Rollups**: `CREATE ROLLUP r30m ON cpu BUCKET 30m RETENTION 90d` stores
   `f_count/f_sum/f_min/f_max/f_first/f_last` per bucket, auto-maintained on
   flush AND on repair backfill. Aggregate queries on the source
@@ -556,10 +559,14 @@ WHERE ts >= now() - 6h GROUP BY t;
   number-only exprs (`1+1` health check), comparisons `== != > < >= <=`
   (filter; 0/1 with `bool`), `and/or/unless` (drilldown emits
   `<e> and <e> > -Inf`), `Inf`/`NaN` literals,
-  `sum/avg/min/max/count [by|without]`, vector arithmetic `+ - * /`,
+  `sum/avg/min/max/count/stdvar/group [by|without]` + `count_values`,
+  vector arithmetic `+ - * /`,
   `histogram_quantile`, `label_replace/label_join`, `sort/sort_desc`,
-  `absent(v)`. Not supported: subqueries, `on/ignoring` + `group_left/right`,
-  per-sample math (`abs/ceil/clamp_*` …), `absent_over_time`, `@`.
+  `absent(v)`, and the Tier-2 window analytics: `present/absent_over_time`,
+  `changes/resets`, `deriv`/`predict_linear(m[w], t)`,
+  `stddev/stdvar/mad_over_time`, `quantile_over_time(φ, m[w])`.
+  Not supported: subqueries, `on/ignoring` + `group_left/right`,
+  per-sample math (`abs/ceil/clamp_*` …), `@`.
 - **Self-scrape**: `config set observability.self_scrape true` (live) makes
   the node ingest its own `/metrics` every
   `observability.self_scrape_interval_secs` — self-dashboarding without an

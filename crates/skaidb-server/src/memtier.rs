@@ -39,11 +39,26 @@ pub fn shedding() -> bool {
 /// drivers treat both identically.
 pub const SHED_ERROR: &str = "memory pressure: node is shedding writes, retry";
 
-/// Test hook: force (or clear) the shed flag without a sampler thread.
-#[cfg(test)]
-pub fn force_shed_for_test(on: bool) {
-    GUARD.get_or_init(MemoryGuard::new).force(on);
+/// The gate decision, factored pure so tests never have to touch the
+/// process-global flag (a forced global raced unrelated parallel tests'
+/// REST mutations on the first run): client-path mutations shed; reads
+/// and INTERNAL statements (witness bookkeeping and other
+/// self-management — they self-pace and byte-flush, and blocking them
+/// would stall the very work that frees memory) always pass.
+pub(crate) fn would_shed(
+    via: &str,
+    stmt: Option<&skaidb_sql::ast::Statement>,
+    shedding: bool,
+) -> bool {
+    use skaidb_sql::ast::Statement;
+    shedding
+        && via != "internal"
+        && matches!(
+            stmt,
+            Some(Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_))
+        )
 }
+
 
 /// Start the sampler when the backend is standalone. No-op (with no thread)
 /// for cluster backends and when no memory limit is detectable.
@@ -151,4 +166,31 @@ pub fn spawn_for_local(ctx: Shared) {
             std::thread::sleep(memguard::SAMPLE_INTERVAL);
         }
     });
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use skaidb_sql::parse;
+
+    #[test]
+    fn gate_sheds_client_mutations_only() {
+        let ins = parse("INSERT INTO t (id) VALUES (1)").unwrap();
+        let upd = parse("UPDATE t SET v = 1 WHERE id = 1").unwrap();
+        let del = parse("DELETE FROM t WHERE id = 1").unwrap();
+        let sel = parse("SELECT id FROM t").unwrap();
+        for stmt in [&ins, &upd, &del] {
+            assert!(would_shed("rest", Some(stmt), true));
+            assert!(would_shed("driver", Some(stmt), true));
+            // Internal writers are exempt even under pressure.
+            assert!(!would_shed("internal", Some(stmt), true));
+            // No pressure: everything flows.
+            assert!(!would_shed("rest", Some(stmt), false));
+        }
+        // Reads always pass.
+        assert!(!would_shed("rest", Some(&sel), true));
+        // Unparseable statements are not the gate's business.
+        assert!(!would_shed("rest", None, true));
+    }
 }

@@ -1124,6 +1124,101 @@ mod tests {
             .is_err());
     }
 
+    /// `COUNT(*)` on a single-field TS table routes through partials
+    /// (COUNT(*) ≡ COUNT(field) there, proven by series metadata) — with a
+    /// scan budget far below the point count it still answers exactly.
+    /// Multi-field tables keep the exact document-count fallback.
+    #[test]
+    fn timeseries_count_star_serves_from_partials() {
+        let opts = skaidb_storage::EngineOptions {
+            scan_row_budget: 10, // 40 samples inserted
+            ..Default::default()
+        };
+        let mut db = Database::open_with_options(tempdir(), opts).unwrap();
+        db.execute("CREATE TIMESERIES TABLE m (SERIES KEY (host))").unwrap();
+        for i in 0..20 {
+            let t = 1000 + i * 1000;
+            db.execute(&format!(
+                "INSERT INTO m (host, ts, value) VALUES ('a', {t}, 1), ('b', {t}, 2)"
+            ))
+            .unwrap();
+        }
+        let rs = rows(db.execute("SELECT count(*) FROM m").unwrap());
+        assert_eq!(rs.columns, vec!["count"], "rewrite must not rename the column");
+        assert_eq!(rs.rows, vec![vec![Value::Int(40)]]);
+        // Label-filtered and grouped shapes stay on the partials path too.
+        let rs = rows(db.execute("SELECT count(*) FROM m WHERE host = 'a'").unwrap());
+        assert_eq!(rs.rows, vec![vec![Value::Int(20)]]);
+        let rs = rows(
+            db.execute("SELECT host, count(*) AS c FROM m GROUP BY host ORDER BY host").unwrap(),
+        );
+        assert_eq!(rs.rows.len(), 2);
+        assert_eq!(rs.rows[0], vec![Value::String("a".into()), Value::Int(20)]);
+        // Two value fields: COUNT(*) counts merged (series, ts) docs — not
+        // derivable from per-field partials, so it falls back to the exact
+        // gather and (correctly) trips the tight budget.
+        db.execute("CREATE TIMESERIES TABLE m2 (SERIES KEY (host))").unwrap();
+        for i in 0..10 {
+            let t = 1000 + i * 1000;
+            db.execute(&format!(
+                "INSERT INTO m2 (host, ts, a, b) VALUES ('x', {t}, 1, 2)"
+            ))
+            .unwrap();
+        }
+        assert!(db.execute("SELECT count(*) FROM m2").is_err());
+    }
+
+    /// Keyset pagination over a raw TS read walks the range in time slices
+    /// with early stop: each page costs ~its own rows against the scan
+    /// budget instead of the whole remaining range, so paging a table far
+    /// larger than the budget works — while an unbounded dump still
+    /// (correctly) refuses.
+    #[test]
+    fn timeseries_limit_pages_within_scan_budget() {
+        let opts = skaidb_storage::EngineOptions {
+            scan_row_budget: 30, // 100 samples in the table
+            ..Default::default()
+        };
+        let mut db = Database::open_with_options(tempdir(), opts).unwrap();
+        db.execute("CREATE TIMESERIES TABLE m (SERIES KEY (host))").unwrap();
+        // One sample every 2h across ~8 days: data spans many 1h slices.
+        for i in 0..100i64 {
+            let t = i * 7_200_000;
+            db.execute(&format!("INSERT INTO m (host, ts, value) VALUES ('a', {t}, {i})"))
+                .unwrap();
+        }
+        // Unbounded dump: refused by the budget, as designed.
+        assert!(db.execute("SELECT ts, value FROM m").is_err());
+        // Bounded ascending page: answers within the budget.
+        let rs = rows(
+            db.execute("SELECT ts, value FROM m WHERE ts >= 0 ORDER BY ts LIMIT 10").unwrap(),
+        );
+        assert_eq!(rs.rows.len(), 10);
+        assert_eq!(rs.rows[0][1], Value::Float(0.0));
+        assert_eq!(rs.rows[9][1], Value::Float(9.0));
+        // Page 2 via the keyset cursor: exact continuation.
+        let rs = rows(
+            db.execute(&format!(
+                "SELECT ts, value FROM m WHERE ts > {} ORDER BY ts LIMIT 10",
+                9 * 7_200_000i64
+            ))
+            .unwrap(),
+        );
+        assert_eq!(rs.rows[0][1], Value::Float(10.0));
+        assert_eq!(rs.rows[9][1], Value::Float(19.0));
+        // Descending (newest-first) with a finite upper bound.
+        let rs = rows(
+            db.execute(&format!(
+                "SELECT ts, value FROM m WHERE ts <= {} ORDER BY ts DESC LIMIT 5",
+                99 * 7_200_000i64
+            ))
+            .unwrap(),
+        );
+        assert_eq!(rs.rows.len(), 5);
+        assert_eq!(rs.rows[0][1], Value::Float(99.0));
+        assert_eq!(rs.rows[4][1], Value::Float(95.0));
+    }
+
     #[test]
     fn timeseries_rejects_update_delete_and_bad_inserts() {
         let mut db = Database::open(tempdir()).unwrap();

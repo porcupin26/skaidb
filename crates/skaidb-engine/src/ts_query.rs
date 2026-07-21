@@ -193,6 +193,18 @@ pub(crate) fn run_ts_select(
         return project(sel, docs, &HashSet::new(), true);
     }
 
+    // `COUNT(*)` rewrite: partials carry per-FIELD counts, so COUNT(*)
+    // (which counts merged (series, ts) documents) is only derivable from
+    // them when the table has exactly ONE value field — then every document
+    // holds that field and COUNT(*) ≡ COUNT(field). That is every
+    // remote_write table and the dominant SQL-ingest shape; the field
+    // inventory comes from the series METADATA (cheap). Multi-field tables
+    // keep the exact document-count fallback (budget-bounded). Without
+    // this, an unfiltered COUNT(*) on a large metrics table gathered every
+    // sample and died on the scan budget (onet, 250k+ points).
+    let rewritten = count_star_rewrite(sel, cluster, &matchers)?;
+    let sel = rewritten.as_ref().unwrap_or(sel);
+
     // Partial-aggregate pushdown: an aggregation whose WHERE is entirely
     // served by the pushdown gathers per-series per-bucket partials from the
     // cluster (one replica's answer per series) instead of raw samples. Any
@@ -207,16 +219,90 @@ pub(crate) fn run_ts_select(
     // Which value fields does the query touch? `None` = all (wildcard, or
     // nothing referenced — e.g. `COUNT(*)`).
     let fields = referenced_fields(sel, series_key);
+    let mut hide = HashSet::new();
+    hide.insert(SERIES_FIELD.to_string());
+
+    // Sliced early-stop for LIMIT'd raw reads — the keyset-pagination shape
+    // (`WHERE ts > <last> ORDER BY ts LIMIT n`). The full-range gather
+    // scans everything from the bound to the end of data on EVERY page, so
+    // paging a big table was quadratic and pages beyond the scan budget
+    // refused. Walking the range in time slices and stopping once enough
+    // rows survive the filter makes a page cost ~its own rows. Sound
+    // because ts-slice order is result order: for ASC everything
+    // uncollected is later than everything collected (DESC mirrored), so
+    // the first `limit+offset` rows in order are already in hand; a bare
+    // LIMIT (no ORDER BY) accepts any rows. Requires a finite bound on the
+    // walking side; aggregations/DISTINCT need the whole range and keep
+    // the full gather (aggregations take partials above anyway).
+    if !is_grouped(sel) && !sel.distinct && sel.group_top.is_none() {
+        let ts_order = match sel.order_by.as_slice() {
+            [] => Some(false),
+            [o] if matches!(&o.expr, Expr::Column(c) if c == "ts") => Some(o.descending),
+            _ => None,
+        };
+        let target = sel
+            .limit
+            .map(|l| l as usize + sel.offset.unwrap_or(0) as usize);
+        if let (Some(desc), Some(target)) = (ts_order, target) {
+            let walkable = if desc { t1 != i64::MAX } else { t0 != i64::MIN };
+            if walkable && target > 0 {
+                let mut docs: Vec<Document> = Vec::new();
+                // 1h to start; empty slices widen 4× to skip sparse spans.
+                let mut width: i64 = 3_600_000;
+                let (mut lo, mut hi) = (t0, t1);
+                while docs.len() < target && lo <= hi {
+                    let (s0, s1) = if desc {
+                        (hi.saturating_sub(width - 1).max(lo), hi)
+                    } else {
+                        (lo, lo.saturating_add(width - 1).min(hi))
+                    };
+                    let mut slice = gather_docs(sel, cluster, &fields, &matchers, s0, s1)?;
+                    if slice.is_empty() {
+                        width = width.saturating_mul(4);
+                    }
+                    docs.append(&mut slice);
+                    if desc {
+                        if s0 == lo {
+                            break;
+                        }
+                        hi = s0 - 1;
+                    } else {
+                        if s1 == hi {
+                            break;
+                        }
+                        lo = s1 + 1;
+                    }
+                }
+                return project(sel, docs, &hide, true);
+            }
+        }
+    }
+
+    let docs = gather_docs(sel, cluster, &fields, &matchers, t0, t1)?;
+    project(sel, docs, &hide, true)
+}
+
+/// Gather `[t0, t1]` samples for the referenced fields, rebuild one
+/// document per `(series, ts)` (fields merged across streams), and apply
+/// the residual filter with full SQL semantics.
+fn gather_docs(
+    sel: &Select,
+    cluster: &dyn Cluster,
+    fields: &Option<Vec<String>>,
+    matchers: &[Matcher],
+    t0: i64,
+    t1: i64,
+) -> Result<Vec<Document>> {
     let mut gathered = Vec::new();
-    match &fields {
+    match fields {
         Some(names) => {
             for f in names {
-                let mut m = matchers.clone();
+                let mut m = matchers.to_vec();
                 m.push(Matcher::Eq(FIELD_LABEL.into(), f.clone()));
                 gathered.extend(cluster.ts_query(&sel.from, &m, t0, t1)?);
             }
         }
-        None => gathered = cluster.ts_query(&sel.from, &matchers, t0, t1)?,
+        None => gathered = cluster.ts_query(&sel.from, matchers, t0, t1)?,
     }
 
     // Rebuild documents: one per (series, ts), fields merged across streams,
@@ -271,10 +357,7 @@ pub(crate) fn run_ts_select(
             docs.push(doc);
         }
     }
-
-    let mut hide = HashSet::new();
-    hide.insert(SERIES_FIELD.to_string());
-    project(sel, docs, &hide, true)
+    Ok(docs)
 }
 
 /// Order-preserving series identity for grouping samples across field
@@ -297,6 +380,85 @@ fn const_ms(e: &Expr) -> Option<i64> {
     }
     let v = eval(e, &Document::new()).ok()?;
     as_int_ms(&v)
+}
+
+/// Rewrite `COUNT(*)` to `COUNT(<the field>)` when the (matcher-filtered)
+/// series metadata shows exactly one value field — the shape where the two
+/// are equivalent and the partials plan can serve the count without a
+/// sample gather. `None` = no rewrite applies (no COUNT(*), not grouped,
+/// or a multi-field table).
+fn count_star_rewrite(
+    sel: &Select,
+    cluster: &dyn Cluster,
+    matchers: &[Matcher],
+) -> Result<Option<Select>> {
+    fn has_count_star(e: &Expr) -> bool {
+        let mut found = false;
+        walk(e, &mut |x| {
+            if matches!(
+                x,
+                Expr::Aggregate { func: AggFunc::Count, arg: AggArg::Star }
+            ) {
+                found = true;
+            }
+        });
+        found
+    }
+    let wants = sel.items.iter().any(|i| matches!(i, SelectItem::Expr { expr, .. } if has_count_star(expr)))
+        || sel.having.as_ref().is_some_and(has_count_star)
+        || sel.order_by.iter().any(|o| has_count_star(&o.expr));
+    if !wants || !is_grouped(sel) {
+        return Ok(None);
+    }
+    let mut fields: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for labels in cluster.ts_series_sets(&sel.from, matchers)? {
+        if let Some((_, f)) = labels.iter().find(|(k, _)| k == FIELD_LABEL) {
+            fields.insert(f.clone());
+        }
+    }
+    let mut it = fields.into_iter();
+    let (Some(field), None) = (it.next(), it.next()) else {
+        return Ok(None); // empty or multi-field: keep the exact fallback
+    };
+    fn substitute(e: &mut Expr, field: &str) {
+        if let Expr::Aggregate { func: AggFunc::Count, arg } = e {
+            if matches!(arg, AggArg::Star) {
+                *arg = AggArg::Expr(Box::new(Expr::Column(field.to_string())));
+            }
+            return;
+        }
+        match e {
+            Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => substitute(expr, field),
+            Expr::Binary { left, right, .. } => {
+                substitute(left, field);
+                substitute(right, field);
+            }
+            Expr::Func { args, .. } => {
+                for a in args {
+                    substitute(a, field);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = sel.clone();
+    for item in &mut out.items {
+        if let SelectItem::Expr { expr, alias } = item {
+            if has_count_star(expr) && alias.is_none() {
+                // The rewrite must not rename the output column: the user
+                // asked for `count(*)`, not `count(<field>)`.
+                *alias = Some(expr_name(expr));
+            }
+            substitute(expr, &field);
+        }
+    }
+    if let Some(h) = &mut out.having {
+        substitute(h, &field);
+    }
+    for o in &mut out.order_by {
+        substitute(&mut o.expr, &field);
+    }
+    Ok(Some(out))
 }
 
 /// Every column referenced by `e` is in `allowed` (label-only predicates

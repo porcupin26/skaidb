@@ -76,7 +76,12 @@ Instant selectors with `=`/`!=`/`=~`/`!~` label matchers (regex forms
 anchored, Prometheus-style), `offset`, `rate` / `increase` / `delta` /
 `irate` / `idelta` and `avg/min/max/sum/count/last_over_time` over range
 selectors (`[5m]` — the `*_over_time` family is what Grafana's Metrics
-Drilldown tiles use), `sum/avg/min/max/count/stddev [by|without (...)]`,
+Drilldown tiles use), the window-analytics family
+(`present_over_time`, `absent_over_time`, `changes`, `resets`, `deriv`,
+`predict_linear(m[w], t)`, `stddev/stdvar/mad_over_time`,
+`quantile_over_time(φ, m[w])` — the alert-rule staples),
+`sum/avg/min/max/count/stddev/stdvar/group [by|without (...)]`,
+`count_values("label", v)`,
 `quantile(φ, v)` (the drilldown's "Standard deviation" / "Percentiles"
 previews) and `topk(k, v)` / `bottomk(k, v)`, vector arithmetic
 (`+ - * /`, one-to-one matching), comparison operators
@@ -97,8 +102,8 @@ as-is.
 
 **Not supported (yet)**: subqueries, `on()/ignoring()` +
 `group_left`/`group_right` matching modifiers, the per-sample math
-family (`abs`, `ceil`, `clamp_*`, …), `absent_over_time`, and the `@`
-modifier. Panels using those need the fallback below.
+family (`abs`, `ceil`, `clamp_*`, …), and the `@` modifier. Panels
+using those need the fallback below.
 
 ### Monitoring skaidb itself
 

@@ -121,6 +121,14 @@ stored as its own compressed stream. Full grammar and semantics:
   huge range fails with the budget error instead of materializing until
   the coordinator OOMs. Narrow the time range or aggregate (aggregations
   push down as bounded per-bucket partials and are unaffected).
+- **LIMIT'd raw reads page efficiently**: `WHERE ts > <cursor> ORDER BY
+  ts LIMIT n` (or `DESC` with an upper bound) walks the range in time
+  slices and stops as soon as `n` rows survive the filter — each page
+  costs ~its own rows, so exporting a table of any size is a linear
+  keyset-pagination loop instead of a quadratic re-scan (and pages never
+  trip the budget on their own). `COUNT(*)` on single-field tables (all
+  remote_write tables) serves from per-bucket partials the same way
+  aggregates do.
 - **Rollups / downsampling** (v0.27.0): `CREATE ROLLUP r30m ON cpu BUCKET
   30m RETENTION 90d` — per-bucket partials (`<field>_{count,sum,min,max,
   first,last}`) maintained automatically at window flush and queryable as a

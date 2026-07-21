@@ -166,6 +166,18 @@ enum PExpr {
     /// `absent(v)` — empty vector when v has samples; otherwise a single
     /// 1-valued sample carrying the labels derivable from v's `=` matchers.
     Absent { arg: Box<PExpr>, labels: Labels },
+    /// `absent_over_time(m[w])` — the window form of `absent`: 1 (with the
+    /// derived labels) when NO series has a sample in the window.
+    AbsentOverTime { arg: Box<PExpr>, labels: Labels },
+    /// `count_values("dst", v) [by|without (...)]` — one output series per
+    /// distinct sample value per group, the value carried in label `dst`,
+    /// the output value its count.
+    CountValues {
+        dst: String,
+        by: Option<Vec<String>>,
+        without: Option<Vec<String>>,
+        arg: Box<PExpr>,
+    },
     /// A bare number.
     Number(f64),
 }
@@ -245,6 +257,24 @@ enum RangeFn {
     /// in the window (irate is counter-reset-aware and per-second).
     IRate,
     IDelta,
+    /// Tier-2 window analytics (alerting/analytics parity).
+    /// `present_over_time` — 1 when the window has any sample.
+    PresentOverTime,
+    /// `changes` — value changes between consecutive samples.
+    Changes,
+    /// `resets` — counter decreases between consecutive samples.
+    Resets,
+    /// `deriv` — per-second least-squares slope over the window.
+    Deriv,
+    /// `predict_linear(m[w], t)` — regression value at eval time + t secs.
+    PredictLinear(f64),
+    /// Population stddev / variance over the window.
+    StddevOverTime,
+    StdvarOverTime,
+    /// Median absolute deviation over the window.
+    MadOverTime,
+    /// `quantile_over_time(φ, m[w])` — φ-quantile of the window's values.
+    QuantileOverTime(f64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -265,6 +295,10 @@ enum AggOp {
     /// folding aggregations above.
     TopK(f64),
     BottomK(f64),
+    /// Population variance (stddev²), Prometheus semantics.
+    Stdvar,
+    /// `group(v)` — 1 for every group (existence aggregation).
+    Group,
 }
 
 impl AggOp {
@@ -669,41 +703,97 @@ impl<'a> P<'a> {
                 arg: Box::new(arg),
             });
         }
-        if name == "absent" {
+        if name == "absent" || name == "absent_over_time" {
             self.expect(b'(')?;
             let arg = self.expr()?;
             self.expect(b')')?;
-            // Labels Prometheus derives for the "absent" sample: every
-            // unambiguous `=` matcher of a plain selector (name excluded).
-            let mut labels: Labels = Vec::new();
-            if let PExpr::Selector { matchers, .. } = &arg {
-                for m in matchers {
-                    if let Matcher::Eq(k, v) = m {
-                        if k != "name" && !v.is_empty() {
-                            labels.push((k.clone(), v.clone()));
+            let labels = match &arg {
+                PExpr::Selector { matchers, .. } => absent_labels(matchers),
+                _ => Vec::new(),
+            };
+            return Ok(if name == "absent" {
+                PExpr::Absent {
+                    arg: Box::new(arg),
+                    labels,
+                }
+            } else {
+                if !matches!(arg, PExpr::Selector { range_ms: Some(_), .. }) {
+                    return Err(
+                        "absent_over_time takes a range selector, e.g. absent_over_time(m[5m])"
+                            .into(),
+                    );
+                }
+                PExpr::AbsentOverTime {
+                    arg: Box::new(arg),
+                    labels,
+                }
+            });
+        }
+        if name == "quantile_over_time" {
+            self.expect(b'(')?;
+            let PExpr::Number(phi) = self.factor()? else {
+                return Err("quantile_over_time needs a number as its first argument".into());
+            };
+            self.expect(b',')?;
+            let arg = self.expr()?;
+            self.expect(b')')?;
+            return Ok(PExpr::RangeFn {
+                func: RangeFn::QuantileOverTime(phi),
+                arg: Box::new(arg),
+            });
+        }
+        if name == "predict_linear" {
+            self.expect(b'(')?;
+            let arg = self.expr()?;
+            self.expect(b',')?;
+            let PExpr::Number(t) = self.factor()? else {
+                return Err(
+                    "predict_linear needs a number of seconds as its second argument".into(),
+                );
+            };
+            self.expect(b')')?;
+            return Ok(PExpr::RangeFn {
+                func: RangeFn::PredictLinear(t),
+                arg: Box::new(arg),
+            });
+        }
+        if name == "count_values" {
+            // Optional by/without BEFORE the parens, like other aggs.
+            let (mut by, mut without) = (None, None);
+            self.ws();
+            if self.peek() != Some(b'(') {
+                let modifier = self.ident().ok_or("expected 'by', 'without' or '('")?;
+                self.expect(b'(')?;
+                let mut ls = Vec::new();
+                if !self.eat(b')') {
+                    loop {
+                        ls.push(self.ident().ok_or("expected label")?);
+                        if !self.eat(b',') {
+                            break;
                         }
                     }
+                    self.expect(b')')?;
                 }
-                labels.sort();
-                labels.dedup();
-                // A label `=`-matched against two different values is
-                // ambiguous — Prometheus omits it from the absent sample.
-                let mut i = 0;
-                while i < labels.len() {
-                    let dups = labels[i..]
-                        .iter()
-                        .take_while(|(k, _)| *k == labels[i].0)
-                        .count();
-                    if dups > 1 {
-                        labels.drain(i..i + dups);
-                    } else {
-                        i += 1;
-                    }
+                match modifier.as_str() {
+                    "by" => by = Some(ls),
+                    "without" => without = Some(ls),
+                    other => return Err(format!("unsupported modifier {other}")),
                 }
             }
-            return Ok(PExpr::Absent {
+            self.expect(b'(')?;
+            self.ws();
+            let dst = self.string()?;
+            if !valid_label_name(&dst) {
+                return Err(format!("count_values: invalid label name {dst:?}"));
+            }
+            self.expect(b',')?;
+            let arg = self.expr()?;
+            self.expect(b')')?;
+            return Ok(PExpr::CountValues {
+                dst,
+                by,
+                without,
                 arg: Box::new(arg),
-                labels,
             });
         }
         if name == "histogram_quantile" {
@@ -727,6 +817,8 @@ impl<'a> P<'a> {
             "max" => Some(AggOp::Max),
             "count" => Some(AggOp::Count),
             "stddev" => Some(AggOp::Stddev),
+            "stdvar" => Some(AggOp::Stdvar),
+            "group" => Some(AggOp::Group),
             // Scalar params parsed below, after the optional by/without.
             "quantile" => Some(AggOp::Quantile(f64::NAN)),
             "topk" => Some(AggOp::TopK(f64::NAN)),
@@ -792,6 +884,13 @@ impl<'a> P<'a> {
             "last_over_time" => Some(RangeFn::LastOverTime),
             "irate" => Some(RangeFn::IRate),
             "idelta" => Some(RangeFn::IDelta),
+            "present_over_time" => Some(RangeFn::PresentOverTime),
+            "changes" => Some(RangeFn::Changes),
+            "resets" => Some(RangeFn::Resets),
+            "deriv" => Some(RangeFn::Deriv),
+            "stddev_over_time" => Some(RangeFn::StddevOverTime),
+            "stdvar_over_time" => Some(RangeFn::StdvarOverTime),
+            "mad_over_time" => Some(RangeFn::MadOverTime),
             _ => None,
         };
         if let Some(func) = func {
@@ -926,7 +1025,9 @@ fn assign_slots(expr: &mut PExpr, specs: &mut Vec<(Vec<Matcher>, Option<i64>, i6
         | PExpr::LabelReplace { arg, .. }
         | PExpr::LabelJoin { arg, .. }
         | PExpr::Sort { arg, .. }
-        | PExpr::Absent { arg, .. } => assign_slots(arg, specs),
+        | PExpr::Absent { arg, .. }
+        | PExpr::AbsentOverTime { arg, .. }
+        | PExpr::CountValues { arg, .. } => assign_slots(arg, specs),
         PExpr::Binary { lhs, rhs, .. } => {
             assign_slots(lhs, specs);
             assign_slots(rhs, specs);
@@ -946,7 +1047,9 @@ fn selector_of(expr: &PExpr) -> Result<&Vec<Matcher>, String> {
         | PExpr::LabelReplace { arg, .. }
         | PExpr::LabelJoin { arg, .. }
         | PExpr::Sort { arg, .. }
-        | PExpr::Absent { arg, .. } => selector_of(arg),
+        | PExpr::Absent { arg, .. }
+        | PExpr::AbsentOverTime { arg, .. }
+        | PExpr::CountValues { arg, .. } => selector_of(arg),
         PExpr::Binary { lhs, .. } => selector_of(lhs),
         PExpr::Time | PExpr::Number(_) => {
             Err("number-only expressions are not supported".into())
@@ -958,6 +1061,35 @@ fn selector_of(expr: &PExpr) -> Result<&Vec<Matcher>, String> {
 /// WHOLE source value.
 fn compile_anchored(pattern: &str) -> Result<regex::Regex, String> {
     regex::Regex::new(&format!("^(?:{pattern})$")).map_err(|e| format!("bad regex: {e}"))
+}
+
+/// Labels Prometheus derives for an `absent`/`absent_over_time` sample:
+/// every unambiguous `=` matcher (name excluded; a label matched against
+/// two different values is ambiguous and omitted).
+fn absent_labels(matchers: &[Matcher]) -> Labels {
+    let mut labels: Labels = Vec::new();
+    for m in matchers {
+        if let Matcher::Eq(k, v) = m {
+            if k != "name" && !v.is_empty() {
+                labels.push((k.clone(), v.clone()));
+            }
+        }
+    }
+    labels.sort();
+    labels.dedup();
+    let mut i = 0;
+    while i < labels.len() {
+        let dups = labels[i..]
+            .iter()
+            .take_while(|(k, _)| *k == labels[i].0)
+            .count();
+        if dups > 1 {
+            labels.drain(i..i + dups);
+        } else {
+            i += 1;
+        }
+    }
+    labels
 }
 
 fn valid_label_name(s: &str) -> bool {
@@ -1246,6 +1378,38 @@ fn eval_steps(expr: &PExpr, fetched: &[Fetched], steps: &[i64]) -> Result<Vec<St
                                     change
                                 }
                             }
+                            // Regression family: least-squares over the
+                            // window, x = seconds relative to the eval time
+                            // (so the intercept IS the regressed value now).
+                            RangeFn::Deriv | RangeFn::PredictLinear(_) => {
+                                if win.len() < 2 {
+                                    continue;
+                                }
+                                let n = win.len() as f64;
+                                let (mut sx, mut sy) = (0.0f64, 0.0f64);
+                                for s in win {
+                                    sx += (s.ts - t) as f64 / 1000.0;
+                                    sy += s.value;
+                                }
+                                let (mx, my) = (sx / n, sy / n);
+                                let (mut cov, mut var) = (0.0f64, 0.0f64);
+                                for s in win {
+                                    let dx = (s.ts - t) as f64 / 1000.0 - mx;
+                                    cov += dx * (s.value - my);
+                                    var += dx * dx;
+                                }
+                                if var == 0.0 {
+                                    continue;
+                                }
+                                let slope = cov / var;
+                                match func {
+                                    RangeFn::Deriv => slope,
+                                    RangeFn::PredictLinear(secs) => {
+                                        (my - slope * mx) + slope * secs
+                                    }
+                                    _ => unreachable!(),
+                                }
+                            }
                             // Window aggregations: any sample counts.
                             _ => {
                                 if win.is_empty() {
@@ -1269,6 +1433,62 @@ fn eval_steps(expr: &PExpr, fetched: &[Fetched], steps: &[i64]) -> Result<Vec<St
                                     }
                                     RangeFn::CountOverTime => win.len() as f64,
                                     RangeFn::LastOverTime => win[win.len() - 1].value,
+                                    RangeFn::PresentOverTime => 1.0,
+                                    RangeFn::Changes => win
+                                        .windows(2)
+                                        .filter(|p| p[1].value != p[0].value)
+                                        .count()
+                                        as f64,
+                                    RangeFn::Resets => win
+                                        .windows(2)
+                                        .filter(|p| p[1].value < p[0].value)
+                                        .count()
+                                        as f64,
+                                    RangeFn::StddevOverTime | RangeFn::StdvarOverTime => {
+                                        let mean =
+                                            win.iter().map(|s| s.value).sum::<f64>()
+                                                / win.len() as f64;
+                                        let var = win
+                                            .iter()
+                                            .map(|s| (s.value - mean) * (s.value - mean))
+                                            .sum::<f64>()
+                                            / win.len() as f64;
+                                        if *func == RangeFn::StddevOverTime {
+                                            var.sqrt()
+                                        } else {
+                                            var
+                                        }
+                                    }
+                                    RangeFn::MadOverTime => {
+                                        let med = |mut v: Vec<f64>| -> f64 {
+                                            v.sort_by(f64::total_cmp);
+                                            let n = v.len();
+                                            if n % 2 == 1 {
+                                                v[n / 2]
+                                            } else {
+                                                (v[n / 2 - 1] + v[n / 2]) / 2.0
+                                            }
+                                        };
+                                        let m = med(win.iter().map(|s| s.value).collect());
+                                        med(win.iter().map(|s| (s.value - m).abs()).collect())
+                                    }
+                                    RangeFn::QuantileOverTime(phi) => {
+                                        if *phi < 0.0 {
+                                            f64::NEG_INFINITY
+                                        } else if *phi > 1.0 {
+                                            f64::INFINITY
+                                        } else {
+                                            let mut sorted: Vec<f64> =
+                                                win.iter().map(|s| s.value).collect();
+                                            sorted.sort_by(f64::total_cmp);
+                                            let rank = phi * (sorted.len() - 1) as f64;
+                                            let (lo, hi) =
+                                                (rank.floor() as usize, rank.ceil() as usize);
+                                            sorted[lo]
+                                                + (sorted[hi] - sorted[lo])
+                                                    * (rank - lo as f64)
+                                        }
+                                    }
                                     _ => unreachable!("change family handled above"),
                                 }
                             }
@@ -1391,6 +1611,73 @@ fn eval_steps(expr: &PExpr, fetched: &[Fetched], steps: &[i64]) -> Result<Vec<St
                     } else {
                         Vec::new()
                     })
+                })
+                .collect())
+        }
+        PExpr::AbsentOverTime { arg, labels } => {
+            let PExpr::Selector {
+                range_ms: Some(window),
+                slot,
+                ..
+            } = arg.as_ref()
+            else {
+                unreachable!("parser enforces a range selector");
+            };
+            let data = &fetched[*slot];
+            Ok(steps
+                .iter()
+                .map(|&t| {
+                    let any = data.series.iter().any(|(_, samples)| {
+                        let lo = samples.partition_point(|s| s.ts < t - *window);
+                        let hi = samples.partition_point(|s| s.ts <= t);
+                        hi > lo
+                    });
+                    StepVal::Vector(if any {
+                        Vec::new()
+                    } else {
+                        vec![(labels.clone(), 1.0)]
+                    })
+                })
+                .collect())
+        }
+        PExpr::CountValues {
+            dst,
+            by,
+            without,
+            arg,
+        } => {
+            let inner = eval_steps(arg, fetched, steps)?;
+            Ok(inner
+                .into_iter()
+                .map(|val| {
+                    let StepVal::Vector(vector) = val else {
+                        return StepVal::Vector(Vec::new());
+                    };
+                    // Group by (group key + the formatted value as `dst`),
+                    // count members. The value renders exactly like sample
+                    // output does, so `count_values("v", m)` labels align
+                    // with what clients see elsewhere.
+                    let mut groups: BTreeMap<Labels, f64> = BTreeMap::new();
+                    for (labels, value) in vector {
+                        let mut key: Labels = match (by, without) {
+                            (Some(by), _) => labels
+                                .iter()
+                                .filter(|(k, _)| by.contains(k))
+                                .cloned()
+                                .collect(),
+                            (None, Some(wo)) => labels
+                                .iter()
+                                .filter(|(k, _)| !wo.contains(k) && k != "__name__")
+                                .cloned()
+                                .collect(),
+                            (None, None) => Vec::new(),
+                        };
+                        key.retain(|(k, _)| k != dst);
+                        key.push((dst.clone(), format!("{value}")));
+                        key.sort();
+                        *groups.entry(key).or_insert(0.0) += 1.0;
+                    }
+                    StepVal::Vector(groups.into_iter().collect())
                 })
                 .collect())
         }
@@ -1531,13 +1818,18 @@ fn fold_agg(
                 AggOp::Min => values.iter().cloned().fold(f64::INFINITY, f64::min),
                 AggOp::Max => values.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
                 AggOp::Count => values.len() as f64,
-                AggOp::Stddev => {
-                    // Population stddev, Prometheus semantics.
+                AggOp::Stddev | AggOp::Stdvar => {
+                    // Population stddev/variance, Prometheus semantics.
                     let mean = values.iter().sum::<f64>() / values.len() as f64;
-                    (values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>()
-                        / values.len() as f64)
-                        .sqrt()
+                    let var = values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>()
+                        / values.len() as f64;
+                    if op == AggOp::Stddev {
+                        var.sqrt()
+                    } else {
+                        var
+                    }
                 }
+                AggOp::Group => 1.0,
                 AggOp::Quantile(phi) => {
                     // φ outside [0, 1] → ±Inf, like Prometheus.
                     if phi < 0.0 {
@@ -2125,6 +2417,39 @@ mod tests {
         // Ambiguous `=` constraints drop out of the derived labels.
         let ab = eval(r#"absent(nope{job="x", job="y", dc="ny"})"#).unwrap();
         assert_eq!(ab, vec![(vec![("dc".to_string(), "ny".to_string())], 1.0)]);
+
+        // ---- Tier 2: window analytics ----
+        // aqi device a in [0, 10s]: (1s, 10), (5s, 14), (9s, 12).
+        assert_eq!(eval("present_over_time(aqi[10s])").unwrap().len(), 2);
+        assert_eq!(eval("absent_over_time(aqi[10s])").unwrap().len(), 0);
+        assert_eq!(
+            eval(r#"absent_over_time(nope{job="x"}[10s])"#).unwrap(),
+            vec![(vec![("job".to_string(), "x".to_string())], 1.0)]
+        );
+        assert_eq!(one(r#"changes(aqi{device_id="a"}[10s])"#), 2.0);
+        assert_eq!(one(r#"resets(aqi{device_id="a"}[10s])"#), 1.0, "14 -> 12 dips once");
+        assert_eq!(one("resets(reqs_total[10s])"), 0.0, "monotone counter");
+        // Least squares over x = seconds before eval (-9, -5, -1),
+        // y = (10, 14, 12): slope 0.25; regressed value now = 13.25.
+        assert_eq!(one(r#"deriv(aqi{device_id="a"}[10s])"#), 0.25);
+        assert_eq!(one(r#"predict_linear(aqi{device_id="a"}[10s], 4)"#), 14.25);
+        let sv = one(r#"stdvar_over_time(aqi{device_id="a"}[10s])"#);
+        assert!((sv - 8.0 / 3.0).abs() < 1e-9, "{sv}");
+        let sd = one(r#"stddev_over_time(aqi{device_id="a"}[10s])"#);
+        assert!((sd - (8.0f64 / 3.0).sqrt()).abs() < 1e-9, "{sd}");
+        assert_eq!(one(r#"mad_over_time(aqi{device_id="a"}[10s])"#), 2.0);
+        assert_eq!(one(r#"quantile_over_time(0.5, aqi{device_id="a"}[10s])"#), 12.0);
+
+        // ---- Tier 2: aggregations ----
+        assert_eq!(one("stdvar(aqi)"), 25.0, "values 12 and 22");
+        assert_eq!(one("group(aqi)"), 1.0);
+        let cv = eval(r#"count_values("v", aqi)"#).unwrap();
+        assert_eq!(cv.len(), 2, "{cv:?}");
+        assert!(cv.contains(&(vec![("v".to_string(), "12".to_string())], 1.0)), "{cv:?}");
+        assert!(cv.contains(&(vec![("v".to_string(), "22".to_string())], 1.0)), "{cv:?}");
+        let cv = eval(r#"count_values by (device_id) ("v", aqi)"#).unwrap();
+        assert_eq!(cv.len(), 2);
+        assert!(cv.iter().all(|(labels, n)| labels.len() == 2 && *n == 1.0), "{cv:?}");
     }
 
     /// Grafana's Metrics Drilldown emits `{__ignore_usage__="", }` — a

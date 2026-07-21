@@ -815,17 +815,8 @@ pub fn execute_session_statement_via(
 ) -> Response {
     // Standalone memory tier: under shed-level pressure, client mutations
     // are refused with the cluster tier's retryable error (drivers treat
-    // both identically). Reads pass through, and so do INTERNAL statements
-    // (`via == "internal"`: the witness pull's sync bookkeeping and other
-    // self-management — they self-pace and byte-flush, and blocking them
-    // would stall the very work that frees memory).
-    if via != "internal"
-        && crate::memtier::shedding()
-        && matches!(
-            parsed.as_ref().ok(),
-            Some(Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_))
-        )
-    {
+    // both identically); see memtier::would_shed for the exemptions.
+    if crate::memtier::would_shed(via, parsed.as_ref().ok(), crate::memtier::shedding()) {
         return Response::Error(crate::memtier::SHED_ERROR.into());
     }
     // Authorization: check the role may perform the statement before

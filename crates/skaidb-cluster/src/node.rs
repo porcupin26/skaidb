@@ -11430,7 +11430,11 @@ mod tests {
         // (the keys c now owns migrated to it, and its index followed). The
         // new owner's search indexing commits on the NRT refresh tick, so
         // poll instead of asserting instantly — the bare assert flaked on a
-        // loaded CI runner.
+        // loaded CI runner, and the original 10s ceiling STILL flaked twice
+        // on 2026-07-21 (a loaded runner + a loaded workspace test run):
+        // migration + NRT commit can legitimately take longer under
+        // contention, so give it 60s — the pass exits early, only genuine
+        // hangs pay it.
         for coord in [&na, &nb, &nc] {
             for attempt in 0.. {
                 let rs = rows(
@@ -11442,7 +11446,7 @@ mod tests {
                     break;
                 }
                 assert!(
-                    attempt < 100,
+                    attempt < 600,
                     "incomplete result set after the join: {} of {n}",
                     rs.rows.len()
                 );
