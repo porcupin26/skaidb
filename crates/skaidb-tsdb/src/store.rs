@@ -339,6 +339,12 @@ impl Tsdb {
     }
 
     /// Force-flush everything currently in the head (shutdown, tests).
+    /// Approximate resident bytes of the in-memory head (the
+    /// memory-pressure release tier's reclaim unit).
+    pub fn head_bytes(&self) -> usize {
+        self.inner.lock().expect("tsdb lock").head.approx_bytes() as usize
+    }
+
     pub fn flush(&self) -> Result<()> {
         let mut inner = self.inner.lock().expect("tsdb lock");
         if inner.head.max_ts == i64::MIN {

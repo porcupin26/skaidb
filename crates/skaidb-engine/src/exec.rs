@@ -7337,6 +7337,21 @@ impl Database {
         for live in self.search_indexes.values_mut() {
             let _ = live.commit_if_dirty();
         }
+        // TIME-SERIES heads: up to 256 MB EACH (budget/8, clamped) and the
+        // release tier never touched them — under sustained TS ingest
+        // (onet's ~135 inserts/s across several per-org metrics tables)
+        // the heads were the ramp the flush-memtables release couldn't
+        // reclaim, and skai1 OOM-cycled through a full day (2026-07-21,
+        // 54 kernel kills). Flush them wholesale under pressure; the head
+        // repopulates from live ingest and the flushed blocks compact.
+        if aggressive {
+            for store in self.timeseries.values() {
+                let head = store.head_bytes();
+                if head >= floor && store.flush().is_ok() {
+                    reclaimed += head;
+                }
+            }
+        }
         reclaimed
     }
 
