@@ -19,3 +19,7 @@ rand = "0.8"
 [[bin]]
 name = "slt-diff"
 path = "src/bin/slt_diff.rs"
+
+[[bin]]
+name = "acid-crash"
+path = "src/bin/acid_crash.rs"

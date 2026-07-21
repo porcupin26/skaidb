@@ -3346,6 +3346,45 @@ pub(crate) mod tests {
         assert_eq!(got[0][0], Value::Int(4));
     }
 
+    /// The transaction contract at the SERVER boundary, pinned by the ACID
+    /// audit (2026-07-21): transactions are EMBEDDED-ONLY. The engine's
+    /// single transaction buffer has no session identity, so a server
+    /// letting one connection BEGIN exposed its uncommitted overlay to
+    /// every other connection's reads — the audit's first run caught the
+    /// dirty read. Server sessions therefore refuse BEGIN/COMMIT/ROLLBACK
+    /// (cluster mode always did; standalone now matches) and autocommit
+    /// every statement.
+    #[test]
+    fn acid_server_sessions_refuse_transactions() {
+        use crate::shared::execute_session_via;
+        let ctx = temp_ctx();
+        let mut db = skaidb_engine::DEFAULT_DATABASE.to_string();
+        let run = |ctx: &Shared, db: &mut String, sql: &str| {
+            execute_session_via(ctx, "superuser", db, sql, None, "driver")
+        };
+        assert!(!matches!(
+            run(&ctx, &mut db, "CREATE TABLE t (PRIMARY KEY (id))"),
+            Response::Error(_)
+        ));
+        for sql in ["BEGIN", "COMMIT", "ROLLBACK"] {
+            match run(&ctx, &mut db, sql) {
+                Response::Error(e) => {
+                    assert!(e.contains("embedded-only"), "{sql}: {e}")
+                }
+                other => panic!("{sql} must refuse over a connection: {other:?}"),
+            }
+        }
+        // Autocommit statements are unaffected.
+        assert!(!matches!(
+            run(&ctx, &mut db, "INSERT INTO t (id, v) VALUES (1, 'x')"),
+            Response::Error(_)
+        ));
+        match run(&ctx, &mut db, "SELECT v FROM t WHERE id = 1") {
+            Response::Rows { rows, .. } => assert_eq!(rows[0][0], Value::String("x".into())),
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// The witness pulls over mutual TLS from a `cert`-mode primary: its pool
     /// presents a CA-signed client cert and the primary accepts it. A witness
     /// whose pool uses a FOREIGN CA is rejected (mirrors nothing) — proving the

@@ -370,10 +370,20 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   trailing `ORDER BY`/`LIMIT`/`OFFSET` after the last branch applies to the whole
   combined result and references the **output column** names.
 - **`BEGIN`/`COMMIT`/`ROLLBACK`** wrap several statements in a transaction with
-  read-your-writes: buffered writes are invisible to other readers until
-  `COMMIT`, and `ROLLBACK` discards them. **Embedded engine only** — in cluster
-  mode each statement autocommits and transaction control returns an error
-  (there is no distributed transaction coordinator). DDL is not transactional.
+  read-your-writes: buffered writes are invisible until `COMMIT`, and
+  `ROLLBACK` discards them. **Embedded engine only, enforced**: every
+  server connection (standalone or cluster) refuses transaction control
+  and autocommits per statement — the engine's transaction buffer has no
+  session identity, so exposing it over connections let one connection's
+  uncommitted writes leak into another's reads (caught and closed by the
+  2026-07-21 ACID audit). DDL is not transactional.
+  **Measured ACID contract** (`acid-crash` harness, kill -9 rounds):
+  every *acknowledged* statement or COMMIT survives a crash in full —
+  durability is fsync-on-ack and acked commits are all-or-nothing. A
+  commit the client never saw acknowledged may be **partially** applied
+  after a crash (commit applies row-by-row with no commit record):
+  treat an unacknowledged COMMIT as unknown-outcome and re-verify, as
+  with any database whose commit ack you did not receive.
 
 - **Access control.** `<privilege>` is one of `SELECT`, `INSERT`, `UPDATE`,
   `DELETE`, `CREATE`, `DROP`, `GRANT`, `MONITOR`, `ADMIN` (`ADMIN` on `*` =

@@ -819,6 +819,22 @@ pub fn execute_session_statement_via(
     if crate::memtier::would_shed(via, parsed.as_ref().ok(), crate::memtier::shedding()) {
         return Response::Error(crate::memtier::SHED_ERROR.into());
     }
+    // Transactions are EMBEDDED-ONLY (documented since they shipped); the
+    // engine's single transaction buffer has no session identity, so a
+    // server letting one connection BEGIN exposes its uncommitted overlay
+    // to every other connection's reads — a dirty read, caught by the ACID
+    // isolation audit (2026-07-21). Cluster mode always refused; the
+    // standalone server now matches. Server sessions autocommit.
+    if matches!(
+        parsed.as_ref().ok(),
+        Some(Statement::Begin | Statement::Commit | Statement::Rollback)
+    ) {
+        return Response::Error(
+            "transactions are embedded-only: server sessions autocommit \
+             (BEGIN/COMMIT/ROLLBACK are not available over a connection)"
+                .into(),
+        );
+    }
     // Authorization: check the role may perform the statement before
     // executing. `SHOW GRANTS FOR <own role>` is self-inspection and needs
     // no privilege; a grant on the session's database covers its tables.
