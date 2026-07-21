@@ -125,7 +125,8 @@ ALTER CLUSTER ADD    NODE '<host:port>'
 ALTER CLUSTER REMOVE NODE '<id>'
 ALTER CLUSTER SET NAME '<name>'               -- rename the cluster (ADMIN)
 ALTER NODE '<alias|dotted|id>' SET NAME '<n>' -- rename a member/witness alias (ADMIN)
-ALTER TABLE <table> SET (witness = <bool>     -- toggle witness mirroring
+ALTER TABLE <table> SET (ttl = <dur>          -- live TTL change (0 clears)
+                       | witness = <bool>     -- toggle witness mirroring
                        | replication = <n>    -- online placement transition
                        | nodes = ['<ref>',..] -- online pin change
                        | placement_finalized = true)  -- operator escape hatch
@@ -152,6 +153,10 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   rule applied uniformly on every replica (the stamped data still
   replicates, so expiry converges regardless of which node serves the
   read). Useful for caches, sessions, and rolling event windows.
+  **TTL is live-tunable**: `ALTER TABLE t SET (ttl = 30d)` applies to
+  reads immediately — shortening it can expire existing rows at once, and
+  because expiry is lazy, widening or clearing it (`ttl = 0`) un-expires
+  rows compaction hasn't physically reclaimed yet.
 - `CREATE INDEX` with one path is a single-column index; with several it is a
   **composite** index (ordered left-to-right). See indexing notes below.
 - `WITH (global = true)` makes it a **global (value-sharded) index**: entries

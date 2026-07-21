@@ -3172,6 +3172,21 @@ mod tests {
         assert!(db
             .execute("CREATE TABLE bad (PRIMARY KEY (id)) WITH (nope = 1)")
             .is_err());
+
+        // TTL is LIVE-tunable: ALTER onto the no-TTL table expires its
+        // (already old) row immediately — rows expire by write stamp.
+        db.execute("ALTER TABLE keep SET (ttl = 50ms)").unwrap();
+        assert!(rows(db.execute("SELECT id FROM keep").unwrap()).rows.is_empty());
+        // Clearing it (0) survives reopen. Expiry is LAZY (filtered at
+        // read/compaction, not deleted on ALTER), so the not-yet-compacted
+        // row 1 resurfaces once the TTL is gone — widening/clearing a TTL
+        // un-expires rows compaction hasn't reclaimed yet.
+        db.execute("ALTER TABLE keep SET (ttl = 0)").unwrap();
+        db.execute("INSERT INTO keep (id) VALUES (2)").unwrap();
+        drop(db);
+        let mut db = Database::open(&dir).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert_eq!(rows(db.execute("SELECT id FROM keep").unwrap()).rows.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

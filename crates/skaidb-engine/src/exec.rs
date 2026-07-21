@@ -4695,6 +4695,30 @@ impl Database {
                         def.replication = Some(n);
                     }
                 }
+                // Live TTL change (mirrors the timeseries retention/ooo
+                // options): rows expire by their write stamp, so a new TTL
+                // applies to reads and compaction immediately — shortening
+                // it can expire existing rows at once; `0` clears it (keep
+                // forever).
+                "ttl" => {
+                    let ms: i64 = val.parse().map_err(|_| {
+                        EngineError::Constraint(format!(
+                            "ttl must be a duration like 30d (or integer ms), got '{val}'"
+                        ))
+                    })?;
+                    if ms < 0 {
+                        return Err(EngineError::Constraint("ttl must not be negative".into()));
+                    }
+                    let def = self
+                        .catalog
+                        .tables
+                        .get_mut(table)
+                        .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+                    def.ttl_ms = (ms > 0).then_some(ms);
+                    if let Some(engine) = self.tables.get_mut(table) {
+                        engine.set_ttl((ms > 0).then_some(ms as u64));
+                    }
+                }
                 // The transition's closing bracket — broadcast by the ALTER
                 // coordinator once repair has converged the new owners, or
                 // run by an operator after a manual REPAIR CLUSTER if the
@@ -4711,7 +4735,7 @@ impl Database {
                 other => {
                     return Err(EngineError::Unsupported(format!(
                         "unknown ALTER TABLE option '{other}' \
-                         (supported: witness, nodes, replication, placement_finalized; \
+                         (supported: ttl, witness, nodes, replication, placement_finalized; \
                          retention/ooo apply to TIMESERIES tables)"
                     )));
                 }

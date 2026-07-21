@@ -230,6 +230,9 @@ ALTER TABLE t SET (replication = n | nodes = ['ref', ...])
 --   System tables refuse the option. Default true.
 --   ttl: rows expire <dur> after their last write — immediately invisible to
 --   every read; space reclaimed lazily by compaction. Converges at any RF.
+--   Live-tunable: ALTER TABLE t SET (ttl = 30d); 0 clears. Shortening can
+--   expire existing rows at once; widening/clearing un-expires rows
+--   compaction hasn't reclaimed yet (expiry is lazy).
 DROP TABLE [IF EXISTS] t                    -- cascades to the table's
 --   secondary/search/vector indexes
 ALTER TABLE t RENAME TO t2
