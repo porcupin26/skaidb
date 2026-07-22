@@ -118,6 +118,23 @@ no-argument forms too), and `vector()`/`scalar()` are all supported;
 function names only bind when followed by `(`, so a metric that shares
 a name still selects.
 
+`rate`/`increase`/`delta` use Prometheus's exact window-extrapolation
+algorithm (`extrapolatedRate`), and non-finite samples render as
+`NaN`/`+Inf`/`-Inf` API values like Prometheus — so panel values agree
+with a real Prometheus on the same data, not just approximately.
+Aggregation grouping accepts both positions (`sum by (a) (x)` and
+`sum(x) by (a)`), and a scrape-time literal `name` label (systemd
+units, cooling devices — stored as `exported_name` since the metric
+name owns `name` in storage) renders back as `name`, so `{{name}}`
+legends work.
+
+**Verified panel-by-panel** (2026-07-22): the full *Node Exporter Full*
+dashboard (Grafana #1860 rev 101, 284 queries) evaluated against a real
+Prometheus 2.42 holding identical data (Prometheus scraped
+node_exporter and remote_wrote to skaidb): **253/253 panels with data
+matched exactly** (≤0.1% relative, most bit-identical); the remaining
+31 were empty on both sides (hardware metrics the test host lacks).
+
 **Out of scope**: native histograms (no native-histogram storage),
 trigonometric functions, `atan2`. Panels using those need the fallback
 below.

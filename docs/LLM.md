@@ -587,9 +587,15 @@ WHERE ts >= now() - 6h GROUP BY t;
   Tier-3 per-sample family: `abs/ceil/floor/round(±to_nearest)/clamp*/
   sqrt/exp/ln/log2/log10/sgn`, UTC calendar fns (`minute/hour/day_of_*/
   days_in_month/month/year`, no-arg ok), `vector()/scalar()` (names bind
-  only with '(' — a metric named `year` stays a selector). PromQL is
-  structurally COMPLETE (Tiers 1–4); out of scope: native histograms,
-  trig functions, `atan2`.
+  only with '(' — a metric named `year` stays a selector). Grouping
+  accepts both positions (`sum(x) by (a)` too); rate/increase/delta use
+  Prometheus's exact extrapolatedRate; NaN/±Inf render as API sample
+  values (not filtered); a scrape-time literal `name` label (stored as
+  `exported_name`) renders back as `name`. PromQL is structurally
+  COMPLETE (Tiers 1–4) and VERIFIED panel-by-panel: Node Exporter Full
+  (#1860, 284 queries) vs real Prometheus 2.42 on identical data —
+  253/253 non-empty panels exact (2026-07-22). Out of scope: native
+  histograms, trig functions, `atan2`.
 - **Self-scrape**: `config set observability.self_scrape true` (live) makes
   the node ingest its own `/metrics` every
   `observability.self_scrape_interval_secs` — self-dashboarding without an

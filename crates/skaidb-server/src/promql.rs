@@ -1191,6 +1191,14 @@ impl<'a> P<'a> {
             self.expect(b',')?;
             let arg = self.expr()?;
             self.expect(b')')?;
+            // Postfix by/without, like the other aggregations.
+            if by.is_none() && without.is_none() {
+                if self.keyword("by") {
+                    by = Some(self.label_list()?);
+                } else if self.keyword("without") {
+                    without = Some(self.label_list()?);
+                }
+            }
             return Ok(PExpr::CountValues {
                 dst,
                 by,
@@ -1361,6 +1369,16 @@ impl<'a> P<'a> {
             }
             let arg = self.expr()?;
             self.expect(b')')?;
+            // Postfix grouping is equally legal PromQL: `sum(x) by (a)` ≡
+            // `sum by (a) (x)` — the node-exporter dashboard's CPU-count
+            // idiom is `count(count(m) by (cpu))`.
+            if by.is_none() && without.is_none() {
+                if self.keyword("by") {
+                    by = Some(self.label_list()?);
+                } else if self.keyword("without") {
+                    without = Some(self.label_list()?);
+                }
+            }
             return Ok(PExpr::Agg {
                 op,
                 by,
@@ -2033,33 +2051,65 @@ fn window_value(func: RangeFn, win: &[Sample], t: i64, window: i64) -> Option<f6
                 inc / dt
             }
         }
-        // Change-over-window family: needs two samples.
+        // Change-over-window family: needs two samples. Uses Prometheus's
+        // exact extrapolation (promql/functions.go extrapolatedRate): the
+        // sampled change is extrapolated to the window boundaries when the
+        // first/last samples sit close to them (< 1.1× the average sample
+        // interval), by half an average interval otherwise — and a counter
+        // is never extrapolated below zero. This is what makes rate/
+        // increase/delta values agree with a real Prometheus on the same
+        // samples, not just approximate them (window/sampled-span skew is
+        // a systematic ~scrape_interval/window error otherwise).
         RangeFn::Rate | RangeFn::Increase | RangeFn::Delta => {
             if win.len() < 2 {
                 return None;
             }
-            let change = match func {
-                RangeFn::Delta => win[win.len() - 1].value - win[0].value,
-                _ => {
-                    // Counter-reset-aware increase.
-                    let mut inc = 0.0;
-                    let mut prev = win[0].value;
-                    for s in &win[1..] {
-                        inc += if s.value >= prev {
-                            s.value - prev
-                        } else {
-                            s.value
-                        };
-                        prev = s.value;
-                    }
-                    inc
-                }
-            };
-            if func == RangeFn::Rate {
-                change / (window as f64 / 1000.0)
-            } else {
-                change
+            let (first, last) = (&win[0], &win[win.len() - 1]);
+            let sampled_ms = (last.ts - first.ts) as f64;
+            if sampled_ms <= 0.0 {
+                return None;
             }
+            let is_counter = func != RangeFn::Delta;
+            let change = if is_counter {
+                // Counter-reset-aware increase.
+                let mut inc = 0.0;
+                let mut prev = first.value;
+                for s in &win[1..] {
+                    inc += if s.value >= prev { s.value - prev } else { s.value };
+                    prev = s.value;
+                }
+                inc
+            } else {
+                last.value - first.value
+            };
+            let avg_interval = sampled_ms / (win.len() - 1) as f64;
+            let threshold = avg_interval * 1.1;
+            let mut to_start = (first.ts - (t - window)) as f64;
+            let to_end = (t - last.ts) as f64;
+            if is_counter && change > 0.0 && first.value >= 0.0 {
+                // A counter cannot have been below zero: cap the start-side
+                // extrapolation where the counter would cross it.
+                let to_zero = sampled_ms * (first.value / change);
+                if to_zero < to_start {
+                    to_start = to_zero;
+                }
+            }
+            let mut extrapolate_to = sampled_ms;
+            extrapolate_to += if to_start < threshold {
+                to_start
+            } else {
+                avg_interval / 2.0
+            };
+            extrapolate_to += if to_end < threshold {
+                to_end
+            } else {
+                avg_interval / 2.0
+            };
+            let mut factor = extrapolate_to / sampled_ms;
+            if func == RangeFn::Rate {
+                factor /= window as f64 / 1000.0;
+            }
+            change * factor
         }
         // Regression family: least-squares over the window, x = seconds
         // relative to the eval time (so the intercept IS the regressed
@@ -2747,6 +2797,22 @@ fn fold_agg(
 }
 
 /// Pivot per-step values into the Prometheus `matrix` response.
+/// Sample-value rendering, Prometheus exposition strings: `NaN`, `+Inf`,
+/// `-Inf` — non-finite values are REAL samples in the Prometheus API
+/// (an idle disk's `0 * (0/0)` renders as NaN points, and Grafana shows
+/// them as gaps), so they must be emitted, not filtered.
+fn fmt_value(v: f64) -> String {
+    if v.is_nan() {
+        "NaN".into()
+    } else if v == f64::INFINITY {
+        "+Inf".into()
+    } else if v == f64::NEG_INFINITY {
+        "-Inf".into()
+    } else {
+        format!("{v}")
+    }
+}
+
 fn render_matrix(steps: &[i64], vals: Vec<StepVal>) -> (u16, Json) {
     let mut by_series: BTreeMap<Labels, Vec<(i64, f64)>> = BTreeMap::new();
     for (t, val) in steps.iter().zip(vals) {
@@ -2755,9 +2821,7 @@ fn render_matrix(steps: &[i64], vals: Vec<StepVal>) -> (u16, Json) {
             StepVal::Scalar(v) => vec![(Vec::new(), v)],
         };
         for (labels, value) in vector {
-            if value.is_finite() {
-                by_series.entry(labels).or_default().push((*t, value));
-            }
+            by_series.entry(labels).or_default().push((*t, value));
         }
     }
     let result: Vec<Json> = by_series
@@ -2765,7 +2829,7 @@ fn render_matrix(steps: &[i64], vals: Vec<StepVal>) -> (u16, Json) {
         .map(|(labels, points)| {
             let values: Vec<Json> = points
                 .into_iter()
-                .map(|(t, v)| json!([t as f64 / 1000.0, format!("{v}")]))
+                .map(|(t, v)| json!([t as f64 / 1000.0, fmt_value(v)]))
                 .collect();
             json!({"metric": labels_json(&labels), "values": values})
         })
@@ -2789,6 +2853,16 @@ fn clean_labels(labels: &Labels, keep_name: bool) -> Labels {
             if keep_name {
                 out.push(("__name__".to_string(), v.clone()));
             }
+            continue;
+        }
+        // Ingest renames an incoming literal `name` label to
+        // `exported_name` (the metric name owns `name` in storage);
+        // render it back as `name` so query output matches what the
+        // series looked like at the scrape (node_exporter's systemd /
+        // cooling-device / thermal series all carry one) — Grafana
+        // legends use `{{name}}`.
+        if k == "exported_name" {
+            out.push(("name".to_string(), v.clone()));
             continue;
         }
         out.push((k.clone(), v.clone()));
@@ -2896,11 +2970,10 @@ pub fn query(ctx: &Shared, scope: &Scope, params: &BTreeMap<String, String>) -> 
             };
             let result: Vec<Json> = vector
                 .into_iter()
-                .filter(|(_, v)| v.is_finite())
                 .map(|(labels, value)| {
                     json!({
                         "metric": labels_json(&labels),
-                        "value": [t as f64 / 1000.0, format!("{value}")],
+                        "value": [t as f64 / 1000.0, fmt_value(value)],
                     })
                 })
                 .collect();
@@ -2965,9 +3038,13 @@ pub fn labels(ctx: &Shared, scope: &Scope, value_of: Option<&str>) -> (u16, Json
     for (labels, _) in &series {
         for (k, v) in labels {
             // The scope's metric label surfaces as `__name__`; other internal
-            // (`__`-prefixed) labels stay hidden.
+            // (`__`-prefixed) labels stay hidden. A renamed scrape-time
+            // `name` label (stored as `exported_name`) surfaces as `name`,
+            // matching query rendering.
             let k = if k == metric {
                 "__name__"
+            } else if k == "exported_name" {
+                "name"
             } else if k.starts_with("__") {
                 continue;
             } else {
@@ -3229,8 +3306,11 @@ mod tests {
         // Histogram panels.
         let hq = one(r#"histogram_quantile(0.9, sum by (le) (rate(lat_bucket{}[10s])))"#);
         assert!(hq > 50.0 && hq <= 100.0, "{hq}");
-        // Classic dashboard staples (rate = increase / window: 100/10s → ×60).
-        assert_eq!(one(r#"sum by (job) (rate(reqs_total{job="api"}[10s])) * 60"#).round(), 600.0);
+        // Classic dashboard staples. Prometheus-exact extrapolatedRate:
+        // change 100 over the 8s sampled span, first/last samples within
+        // 1.1× the average interval of the window edges → extrapolate to
+        // the full 10s window: 100×(10/8)/10s = 12.5/s → ×60 = 750.
+        assert_eq!(one(r#"sum by (job) (rate(reqs_total{job="api"}[10s])) * 60"#).round(), 750.0);
         // "Last reading" stat panels: timestamp() surfaces the sample time
         // (unix seconds; the dashboard multiplies by 1000 for a Time field),
         // and time() - timestamp() is staleness.
