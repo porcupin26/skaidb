@@ -1,14 +1,17 @@
 # Global (value-sharded) secondary indexes — design
 
-Status: **phases 1+2+3 shipped, phase 4 partially done** (entry plumbing
-v0.89; routed read path + backfill v0.90; hardening v0.91; first A/B on
-the bench fleet 2026-07-16 — see BENCHMARKS.md "Global-index routed
-probe"). Phase-4 findings so far: **correctness exact** after two
-bench-caught backfill fixes (batched drives v0.91.1; retry-or-abort
-readiness v0.91.2), **latency parity at 2 members** (candidate resolve
-dominates; scatter is one extra RPC there). Remaining: the 3+ member
-run where the fan-out delta actually surfaces, then the prod-adoption
-call. Phase-3 notes:
+Status: **complete for the v1 scope — all four phases shipped and
+verified** (entry plumbing v0.89; routed read path + backfill v0.90;
+hardening v0.91; RF<members verify leg v0.92; phase-4 3-member A/B
+closed 2026-07-21 on v0.134.1 — see BENCHMARKS.md "Global-index routed
+probe"). Findings: **correctness exact** (2,000 probe pairs; the bench
+also caught the v0.91.1/.2 backfill fixes), routed probe wins reads
+**~16% median / ~12% p95** at 3 members vs the local-index scatter,
+writes pay **~20–27% batch latency** (the index entry drives to the
+value's replica set). **Adoption**: for genuinely sharded deployments
+(members > RF) with read-heavy selective-equality workloads; at
+RF = full a local index already answers without fan-out (no skai
+adoption). Phase-3 notes:
 
 - **Repair verify leg** (`gidx_repair`, part of every repair pass): paged
   two-direction verification of entries against rows — *heals missing
