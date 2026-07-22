@@ -216,6 +216,9 @@ const MERGE_COMPACT_BACKLOG: usize = 64;
 /// Budget for the `merge_samples`-triggered round (hint delivery latency
 /// rides on it).
 const MERGE_COMPACT_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+/// Sample cap per wide-block fold — the fold decodes every input sample
+/// into memory (2M samples ≈ 32 MB resident), so the cap bounds it.
+const WIDE_FOLD_MAX_SAMPLES: u64 = 2_000_000;
 
 /// One time-series store (one table's worth of series).
 #[derive(Debug)]
@@ -463,35 +466,94 @@ impl Tsdb {
     fn compact_locked(&self, inner: &mut Inner, budget: std::time::Duration) {
         let start = std::time::Instant::now();
         let blocks_dir = self.dir.join("blocks");
-        while let Some(mut group) = compact::plan(&inner.blocks, self.opts.block_span_ms) {
-            // A truncated group is a prefix of adjacent same-level blocks —
-            // still within the tier window, still mergeable.
-            group.truncate(MAX_MERGE_INPUTS);
-            if group.len() < 2 {
+        loop {
+            if let Some(mut group) = compact::plan(&inner.blocks, self.opts.block_span_ms) {
+                // A truncated group is a prefix of adjacent same-level
+                // blocks — still within the tier window, still mergeable.
+                group.truncate(MAX_MERGE_INPUTS);
+                if group.len() >= 2 {
+                    let seq = self.alloc_block_seq(inner);
+                    let inputs: Vec<&Block> = group.iter().map(|&i| &inner.blocks[i]).collect();
+                    let merged = match compact::merge(&blocks_dir, seq, &inputs) {
+                        Ok(dir) => dir,
+                        Err(_) => {
+                            inner.maintenance_errors += 1;
+                            break;
+                        }
+                    };
+                    let opened = match Block::open(&merged) {
+                        Ok(b) => b,
+                        Err(_) => {
+                            inner.maintenance_errors += 1;
+                            break;
+                        }
+                    };
+                    // Incremental list update: drop the inputs (descending
+                    // index order keeps earlier indices valid), add the
+                    // merged block.
+                    for &i in group.iter().rev() {
+                        inner.blocks.remove(i);
+                    }
+                    inner.blocks.push(opened);
+                    inner.blocks.sort_by_key(|b| (b.meta.min_ts, b.meta.seq));
+                    if start.elapsed() > budget {
+                        break;
+                    }
+                    continue;
+                }
+            }
+            // No normal group: fold WIDE level-0 blocks (span past the
+            // level-1 window — scattered-sample merge products that can
+            // never join a normal group) into span-aligned narrow blocks
+            // that rejoin normal tiering. Without this the drain stalls
+            // with thousands of unmergeable wide blocks (observed at
+            // 13.8k on skai3, 2026-07-22).
+            let Some(group) = compact::plan_wide(
+                &inner.blocks,
+                self.opts.block_span_ms,
+                MAX_MERGE_INPUTS,
+                WIDE_FOLD_MAX_SAMPLES,
+            ) else {
+                break;
+            };
+            let windows = {
+                let inputs: Vec<&Block> = group.iter().map(|&i| &inner.blocks[i]).collect();
+                match compact::wide_fold_collect(&inputs, self.opts.block_span_ms) {
+                    Ok(w) => w,
+                    Err(_) => {
+                        inner.maintenance_errors += 1;
+                        break;
+                    }
+                }
+            };
+            let mut written = Vec::with_capacity(windows.len());
+            let mut failed = false;
+            for (_, series) in windows {
+                let seq = self.alloc_block_seq(inner);
+                match write_block(&blocks_dir, seq, 0, series).and_then(|d| Block::open(&d)) {
+                    Ok(b) => written.push(b),
+                    Err(_) => {
+                        inner.maintenance_errors += 1;
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            if failed {
+                // Keep the inputs (nothing removed yet): the partial
+                // outputs hold duplicate data, which query-time dedupe and
+                // later folds absorb.
+                for b in written {
+                    inner.blocks.push(b);
+                }
+                inner.blocks.sort_by_key(|b| (b.meta.min_ts, b.meta.seq));
                 break;
             }
-            let seq = self.alloc_block_seq(inner);
-            let inputs: Vec<&Block> = group.iter().map(|&i| &inner.blocks[i]).collect();
-            let merged = match compact::merge(&blocks_dir, seq, &inputs) {
-                Ok(dir) => dir,
-                Err(_) => {
-                    inner.maintenance_errors += 1;
-                    break;
-                }
-            };
-            let opened = match Block::open(&merged) {
-                Ok(b) => b,
-                Err(_) => {
-                    inner.maintenance_errors += 1;
-                    break;
-                }
-            };
-            // Incremental list update: drop the inputs (descending index
-            // order keeps the earlier indices valid), add the merged block.
             for &i in group.iter().rev() {
-                inner.blocks.remove(i);
+                let old = inner.blocks.remove(i);
+                let _ = std::fs::remove_dir_all(&old.dir);
             }
-            inner.blocks.push(opened);
+            inner.blocks.extend(written);
             inner.blocks.sort_by_key(|b| (b.meta.min_ts, b.meta.seq));
             if start.elapsed() > budget {
                 break;
@@ -1041,6 +1103,44 @@ mod tests {
         let all = db.query(&[], 0, i64::MAX).unwrap();
         let n: usize = all.iter().map(|(_, s)| s.len()).sum();
         assert_eq!(n, 300);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Merging time-SCATTERED merge_samples ingest produces wide level-0
+    /// blocks (span past the level-1 tier window) that normal planning can
+    /// never group — the wide fold must split them into span-aligned
+    /// narrow blocks so the count converges instead of stalling (observed
+    /// stuck at 13.8k blocks on prod skai3, 2026-07-22).
+    #[test]
+    fn wide_blocks_fold_into_aligned_windows() {
+        let dir = temp_dir("wide");
+        let db = Tsdb::open(&dir, opts(10_000)).unwrap();
+        // Each call scatters samples across 40 windows — the backlog hook
+        // merges these into WIDE blocks as the count crosses the threshold.
+        for i in 0..200i64 {
+            let rows: Vec<_> = (0..3i64)
+                .map(|w| (labels("a"), (i * 3 + w) % 40 * 10_000 + i * 17 % 9_000, i as f64))
+                .collect();
+            db.merge_samples(&rows).unwrap();
+        }
+        let stats = db.stats();
+        assert!(
+            stats.blocks <= MERGE_COMPACT_BACKLOG + 1,
+            "wide blocks must fold, got {}",
+            stats.blocks
+        );
+        // Nothing lost in the folds: distinct (ts) count is preserved
+        // (values overwrite per ts by later-wins, so count distinct ts).
+        let all = db.query(&[], 0, i64::MAX).unwrap();
+        let mut ts: Vec<i64> = all.iter().flat_map(|(_, s)| s.iter().map(|x| x.ts)).collect();
+        ts.sort_unstable();
+        ts.dedup();
+        let mut expect: Vec<i64> = (0..200i64)
+            .flat_map(|i| (0..3i64).map(move |w| (i * 3 + w) % 40 * 10_000 + i * 17 % 9_000))
+            .collect();
+        expect.sort_unstable();
+        expect.dedup();
+        assert_eq!(ts, expect);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
