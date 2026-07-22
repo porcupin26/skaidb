@@ -679,6 +679,11 @@ pub fn collect_runtime_metrics(ctx: &Shared) {
                 &format!("skaidb_ts_table_samples_appended_total{{{labels}}}"),
                 t.samples_appended,
             );
+            m.set(&format!("skaidb_ts_table_blocks{{{labels}}}"), t.blocks);
+            m.set(
+                &format!("skaidb_ts_table_maintenance_errors_total{{{labels}}}"),
+                t.maintenance_errors,
+            );
             m.set(
                 &format!("skaidb_ts_table_samples_rejected_total{{{labels}}}"),
                 t.samples_rejected,

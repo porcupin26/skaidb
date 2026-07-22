@@ -342,6 +342,11 @@ pub struct TsTableStats {
     pub samples_appended: u64,
     pub samples_rejected: u64,
     pub disk_bytes: u64,
+    /// On-disk block count — the observable for compaction-backlog
+    /// drains (the 2026-07-22 390k-block incident's recovery metric).
+    pub blocks: u64,
+    /// Best-effort retention/compaction failures since open.
+    pub maintenance_errors: u64,
 }
 
 /// Per-table live-key / tombstone / size breakdown.
@@ -7261,6 +7266,10 @@ impl Database {
                     Value::Int(ts.samples_rejected as i64),
                 );
                 row(&format!("timeseries.{name}.disk_bytes"), Value::Int(ts.disk_bytes as i64));
+                row(
+                    &format!("timeseries.{name}.maintenance_errors"),
+                    Value::Int(ts.maintenance_errors as i64),
+                );
             }
         }
         ResultSet {
@@ -7406,6 +7415,8 @@ impl Database {
                     samples_appended: ts.samples_appended,
                     samples_rejected: ts.samples_rejected,
                     disk_bytes: ts.disk_bytes,
+                    blocks: ts.blocks as u64,
+                    maintenance_errors: ts.maintenance_errors,
                 });
             }
             agg

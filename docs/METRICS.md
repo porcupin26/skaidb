@@ -129,6 +129,8 @@ Enabled with `observability.per_table_metrics = true`. Each carries `db` and
 | `skaidb_ts_table_series` | gauge | `db`, `table` | Series count per time-series table. |
 | `skaidb_ts_table_samples_appended_total` | counter | `db`, `table` | Samples appended per time-series table. |
 | `skaidb_ts_table_samples_rejected_total` | counter | `db`, `table` | Samples rejected (OOO / series limit) per time-series table. |
+| `skaidb_ts_table_blocks` | gauge | `db`, `table` | On-disk block count per time-series table — watch it FALL during a compaction-backlog drain. |
+| `skaidb_ts_table_maintenance_errors_total` | counter | `db`, `table` | Best-effort retention/compaction failures (maintenance never fails an append). |
 
 ## Vector index
 
