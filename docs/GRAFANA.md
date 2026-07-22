@@ -70,10 +70,11 @@ and are queryable from SQL too:
 SELECT rate(value) FROM metrics WHERE name = 'http_requests_total' AND job = 'api';
 ```
 
-### Supported PromQL (v1 subset)
+### Supported PromQL
 
 Instant selectors with `=`/`!=`/`=~`/`!~` label matchers (regex forms
-anchored, Prometheus-style), `offset`, `rate` / `increase` / `delta` /
+anchored, Prometheus-style), `offset` and the `@` modifier (fixed unix
+time, `start()`, `end()`), `rate` / `increase` / `delta` /
 `irate` / `idelta` and `avg/min/max/sum/count/last_over_time` over range
 selectors (`[5m]` — the `*_over_time` family is what Grafana's Metrics
 Drilldown tiles use), the window-analytics family
@@ -84,10 +85,19 @@ Drilldown tiles use), the window-analytics family
 `count_values("label", v)`,
 `quantile(φ, v)` (the drilldown's "Standard deviation" / "Percentiles"
 previews) and `topk(k, v)` / `bottomk(k, v)`, vector arithmetic
-(`+ - * /`, one-to-one matching), comparison operators
+(`+ - * / % ^` with PromQL precedence — `^` right-associative and
+tightest, unary minus between `^` and `*` — one-to-one matching by
+default, `on(...)`/`ignoring(...)` to control the match key, and
+`group_left(...)`/`group_right(...)` for many-to-one joins like the
+classic `metric * on(instance) group_left(version) build_info`),
+comparison operators
 (`== != > < >= <=`, filtering by default, 0/1-valued with `bool`), the
-set operators `and` / `or` / `unless` (the drilldown's extreme-values
-filter emits `<expr> and <expr> > -Inf`), `Inf`/`NaN` literals,
+set operators `and` / `or` / `unless` (with `on`/`ignoring`; the
+drilldown's extreme-values
+filter emits `<expr> and <expr> > -Inf`), subqueries `[range:step]`
+feeding any range function (`max_over_time(rate(m[5m])[1h:1m])`; an
+omitted step defaults to 60s, inner steps epoch-aligned like
+Prometheus), `Inf`/`NaN` literals,
 number-only expressions (the `1+1` datasource health check),
 `histogram_quantile`, `label_replace` / `label_join`, `sort` /
 `sort_desc` (instant queries), `absent(v)` (labels derived from the
@@ -108,9 +118,9 @@ no-argument forms too), and `vector()`/`scalar()` are all supported;
 function names only bind when followed by `(`, so a metric that shares
 a name still selects.
 
-**Not supported (yet)**: subqueries, `on()/ignoring()` +
-`group_left`/`group_right` matching modifiers, and the `@` modifier.
-Panels using those need the fallback below.
+**Out of scope**: native histograms (no native-histogram storage),
+trigonometric functions, `atan2`. Panels using those need the fallback
+below.
 
 ### Monitoring skaidb itself
 

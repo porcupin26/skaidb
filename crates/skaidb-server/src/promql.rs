@@ -1,11 +1,15 @@
-//! PromQL subset + Prometheus HTTP query API (docs/TODO.md phase 7).
+//! PromQL + Prometheus HTTP query API (docs/TODO.md phase 7).
 //!
-//! Enough of PromQL for typical Grafana dashboards: instant selectors with
-//! label matchers, `rate`/`increase`/`delta` over range selectors, and
-//! `sum/avg/min/max/count [by|without (...)]` aggregation — evaluated over
-//! the `metrics` time-series table remote_write ingests into (the metric
-//! name is the `name` label). Not supported (v1): regex matchers, `offset`,
-//! subqueries, arithmetic between vectors, `histogram_quantile`.
+//! Structurally complete PromQL (Tiers 1–4): selectors with label/regex
+//! matchers, `offset` and `@`, range functions and the `*_over_time`
+//! family, aggregations with `by`/`without` (+ scalar-param forms),
+//! arithmetic/comparison/set operators with `bool`, `on`/`ignoring` and
+//! `group_left`/`group_right` vector matching, `%`/`^`/unary minus with
+//! PromQL precedence, subqueries `[range:step]`, `histogram_quantile`,
+//! and the per-sample math/calendar function set — evaluated over the
+//! `metrics` time-series table remote_write ingests into (the metric name
+//! is the `name` label). Out of scope: native histograms (no
+//! native-histogram storage), trigonometric functions, `atan2`.
 //!
 //! Responses follow the Prometheus HTTP API: timestamps in (float) seconds,
 //! sample values as strings, `resultType` of `vector` (instant) or `matrix`
@@ -103,17 +107,75 @@ fn normalize_series(series: &mut [(Labels, Vec<Sample>)], scope: &Scope) {
 /// Instant selectors look back this far for a series' latest sample.
 const LOOKBACK_MS: i64 = 5 * 60 * 1000;
 
+/// Subquery step when omitted (`m[1h:]`) — Prometheus uses its global
+/// evaluation interval here; this server's equivalent is the default
+/// query_range step (60s).
+const DEFAULT_SUBQUERY_STEP_MS: i64 = 60_000;
+
 // ---- expression AST ----
+
+/// The `@` modifier's anchor: a fixed unix time, or the query's own
+/// `start()`/`end()` (resolved to `Time` once the query window is known).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum At {
+    Time(i64),
+    Start,
+    End,
+}
+
+impl At {
+    /// The resolved anchor (only called after `resolve_at`).
+    fn ms(self) -> i64 {
+        match self {
+            At::Time(t) => t,
+            _ => unreachable!("resolve_at() runs before evaluation"),
+        }
+    }
+}
+
+/// Vector-matching modifiers on a binary operator:
+/// `on(...)`/`ignoring(...)` + optional `group_left/right(...)`.
+#[derive(Debug, Clone, PartialEq)]
+struct Matching {
+    /// `true` = `on(labels)` (match on exactly these), `false` =
+    /// `ignoring(labels)` (match on everything else sans `__name__`).
+    on: bool,
+    labels: Vec<String>,
+    group: MatchGroup,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum MatchGroup {
+    /// Strict one-to-one (also the no-modifier default).
+    One,
+    /// `group_left(extra)`: many-to-one, LEFT is the many side; `extra`
+    /// labels are copied from the one (right) side onto each result.
+    Left(Vec<String>),
+    /// `group_right(extra)`: mirror image (right is the many side).
+    Right(Vec<String>),
+}
 
 #[derive(Debug, Clone, PartialEq)]
 enum PExpr {
-    /// `metric{l="v", l2=~"a.*"} [range] [offset d]`. `slot` indexes the
-    /// pre-fetched data for this selector (assigned after parsing).
+    /// `metric{l="v", l2=~"a.*"} [range] [offset d] [@ t]`. `slot` indexes
+    /// the pre-fetched data for this selector (assigned after parsing).
     Selector {
         matchers: Vec<Matcher>,
         range_ms: Option<i64>,
         offset_ms: i64,
+        at: Option<At>,
         slot: usize,
+    },
+    /// `expr[range:step]` — a subquery: the inner expression evaluated at
+    /// epoch-aligned `step` intervals across `range`, consumable by any
+    /// range function (`max_over_time(rate(m[5m])[1h:1m])`). An omitted
+    /// step (`[1h:]`) defaults to 60s (this server's default query step).
+    Subquery {
+        arg: Box<PExpr>,
+        range_ms: i64,
+        step_ms: i64,
+        offset_ms: i64,
+        at: Option<At>,
     },
     /// `rate(sel[5m])` / `increase(...)` / `delta(...)`.
     RangeFn { func: RangeFn, arg: Box<PExpr> },
@@ -132,6 +194,9 @@ enum PExpr {
     Binary {
         op: BinOp,
         bool_mod: bool,
+        /// `on`/`ignoring` + `group_left/right` (None = the default
+        /// all-labels one-to-one match).
+        matching: Option<Matching>,
         lhs: Box<PExpr>,
         rhs: Box<PExpr>,
     },
@@ -323,6 +388,10 @@ enum BinOp {
     Sub,
     Mul,
     Div,
+    /// `%` — float modulo (sign of the dividend, like Prometheus/Go).
+    Mod,
+    /// `^` — exponentiation (binds tightest, right-associative).
+    Pow,
     /// Comparisons: filters without `bool` (keep the sample when true),
     /// 0/1-valued with it. Grafana's drilldown emits `<expr> > -Inf`
     /// (extreme-values filtering); alert rules live on `== 0` etc.
@@ -345,12 +414,21 @@ impl BinOp {
             BinOp::Sub => l - r,
             BinOp::Mul => l * r,
             BinOp::Div => l / r,
+            BinOp::Mod => l % r,
+            BinOp::Pow => l.powf(r),
             _ => unreachable!("comparison/set ops route through apply_binary"),
         }
     }
 
     fn is_arithmetic(self) -> bool {
-        matches!(self, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
+        matches!(
+            self,
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow
+        )
+    }
+
+    fn is_set(self) -> bool {
+        matches!(self, BinOp::And | BinOp::Or | BinOp::Unless)
     }
 
     fn is_comparison(self) -> bool {
@@ -589,15 +667,70 @@ impl<'a> P<'a> {
         }
     }
 
+    /// The optional `on(...)`/`ignoring(...)` + `group_left/right(...)`
+    /// vector-matching modifiers after a binary operator. Set operators
+    /// reject grouping (PromQL rule). `group_left (x)` attaches `(x)` as
+    /// the label list, greedily — same as Prometheus' grammar.
+    fn matching_mod(&mut self, op: BinOp) -> Result<Option<Matching>, String> {
+        let on = if self.keyword("on") {
+            true
+        } else if self.keyword("ignoring") {
+            false
+        } else {
+            return Ok(None);
+        };
+        let labels = self.label_list()?;
+        let group = if self.keyword("group_left") {
+            MatchGroup::Left(self.opt_label_list()?)
+        } else if self.keyword("group_right") {
+            MatchGroup::Right(self.opt_label_list()?)
+        } else {
+            MatchGroup::One
+        };
+        if op.is_set() && group != MatchGroup::One {
+            return Err("group_left/group_right are not allowed with and/or/unless".into());
+        }
+        Ok(Some(Matching { on, labels, group }))
+    }
+
+    /// A parenthesized label-name list: `(a, b)` (possibly empty `()`).
+    fn label_list(&mut self) -> Result<Vec<String>, String> {
+        self.expect(b'(')?;
+        let mut ls = Vec::new();
+        if !self.eat(b')') {
+            loop {
+                ls.push(self.ident().ok_or("expected label name")?);
+                if !self.eat(b',') {
+                    break;
+                }
+            }
+            self.expect(b')')?;
+        }
+        Ok(ls)
+    }
+
+    /// `group_left`/`group_right`'s label list is optional entirely.
+    fn opt_label_list(&mut self) -> Result<Vec<String>, String> {
+        if self.peek() == Some(b'(') {
+            self.label_list()
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
     /// PromQL precedence, loosest first: `or` → `and`/`unless` →
-    /// comparisons (`== != <= < >= >`, optional `bool`) → `+ -` → `* /`.
+    /// comparisons (`== != <= < >= >`, optional `bool`) → `+ -` →
+    /// `* / %` → unary `-`/`+` → `^` (right-assoc, tightest). Every
+    /// operator takes optional `on`/`ignoring` (+ grouping) modifiers.
     fn expr(&mut self) -> Result<PExpr, String> {
         let mut lhs = self.and_expr()?;
         while self.keyword("or") {
+            let matching = self.matching_mod(BinOp::Or)?;
             let rhs = self.and_expr()?;
             lhs = PExpr::Binary {
                 op: BinOp::Or,
                 bool_mod: false,
+                matching,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
             };
@@ -615,10 +748,12 @@ impl<'a> P<'a> {
             } else {
                 return Ok(lhs);
             };
+            let matching = self.matching_mod(op)?;
             let rhs = self.cmp_expr()?;
             lhs = PExpr::Binary {
                 op,
                 bool_mod: false,
+                matching,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
             };
@@ -656,10 +791,12 @@ impl<'a> P<'a> {
                 _ => return Ok(lhs),
             };
             let bool_mod = self.keyword("bool");
+            let matching = self.matching_mod(op)?;
             let rhs = self.add_expr()?;
             lhs = PExpr::Binary {
                 op,
                 bool_mod,
+                matching,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
             };
@@ -676,33 +813,163 @@ impl<'a> P<'a> {
                 _ => return Ok(lhs),
             };
             self.i += 1;
+            let matching = self.matching_mod(op)?;
             let rhs = self.term()?;
             lhs = PExpr::Binary {
                 op,
                 bool_mod: false,
+                matching,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
             };
         }
     }
 
-    /// `term := factor (('*'|'/') factor)*`
+    /// `term := unary (('*'|'/'|'%') unary)*`
     fn term(&mut self) -> Result<PExpr, String> {
-        let mut lhs = self.factor()?;
+        let mut lhs = self.unary()?;
         loop {
             let op = match self.peek() {
                 Some(b'*') => BinOp::Mul,
                 Some(b'/') => BinOp::Div,
+                Some(b'%') => BinOp::Mod,
                 _ => return Ok(lhs),
             };
             self.i += 1;
-            let rhs = self.factor()?;
+            let matching = self.matching_mod(op)?;
+            let rhs = self.unary()?;
             lhs = PExpr::Binary {
                 op,
                 bool_mod: false,
+                matching,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
             };
+        }
+    }
+
+    /// `unary := ('-'|'+') unary | power`. Binds looser than `^`
+    /// (`-2^2` = `-(2^2)` = -4, PromQL/math convention) and tighter than
+    /// `*`. Unary minus desugars to `0 - <operand>` (the scalar∘vector
+    /// rule — map values, drop `__name__` — is exactly unary-minus
+    /// semantics). `-Inf`/`-NaN` stay literals (handled in `factor`), as
+    /// do negative numbers in direct `factor()` argument positions
+    /// (`predict_linear(m[1h], -3600)`).
+    fn unary(&mut self) -> Result<PExpr, String> {
+        match self.peek() {
+            Some(b'+') => {
+                // Unary plus is a no-op (but `+` then a non-number must
+                // still parse the operand).
+                self.i += 1;
+                self.unary()
+            }
+            Some(b'-')
+                if !self.s.get(self.i + 1).is_some_and(|b| {
+                    b.eq_ignore_ascii_case(&b'i') || b.eq_ignore_ascii_case(&b'n')
+                }) =>
+            {
+                self.i += 1;
+                let arg = self.unary()?;
+                Ok(PExpr::Binary {
+                    op: BinOp::Sub,
+                    bool_mod: false,
+                    matching: None,
+                    lhs: Box::new(PExpr::Number(0.0)),
+                    rhs: Box::new(arg),
+                })
+            }
+            _ => self.power(),
+        }
+    }
+
+    /// `power := postfixed ('^' unary)?` — right-associative via the
+    /// recursion into `unary` (`a^b^c` = `a^(b^c)`, `2^-2` legal).
+    fn power(&mut self) -> Result<PExpr, String> {
+        let lhs = self.postfixed()?;
+        if self.peek() == Some(b'^') {
+            self.i += 1;
+            let matching = self.matching_mod(BinOp::Pow)?;
+            let rhs = self.unary()?;
+            return Ok(PExpr::Binary {
+                op: BinOp::Pow,
+                bool_mod: false,
+                matching,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            });
+        }
+        Ok(lhs)
+    }
+
+    /// A factor plus any postfix subquery `[range:step]` (with its own
+    /// `offset`/`@` tail). A selector consumes its own `[range]`/`[r:s]`
+    /// inside `factor`, so a '[' surviving to here after a RANGE selector
+    /// is the invalid `m[5m][1h:1m]` shape.
+    fn postfixed(&mut self) -> Result<PExpr, String> {
+        let mut e = self.factor()?;
+        while self.peek() == Some(b'[') {
+            if matches!(e, PExpr::Selector { range_ms: Some(_), .. }) {
+                return Err("a range selector cannot be subqueried directly".into());
+            }
+            self.i += 1;
+            let range_ms = self.duration()?;
+            self.expect(b':')?;
+            let step_ms = if self.peek() == Some(b']') {
+                DEFAULT_SUBQUERY_STEP_MS
+            } else {
+                self.duration()?
+            };
+            self.expect(b']')?;
+            let (offset_ms, at) = self.offset_at_tail()?;
+            e = PExpr::Subquery {
+                arg: Box::new(e),
+                range_ms,
+                step_ms: step_ms.max(1),
+                offset_ms,
+                at,
+            };
+        }
+        Ok(e)
+    }
+
+    /// The `offset <dur>` / `@ <t>` modifiers, either order, at most once
+    /// each. `@` takes unix seconds (float ok) or `start()`/`end()`.
+    fn offset_at_tail(&mut self) -> Result<(i64, Option<At>), String> {
+        let (mut offset_ms, mut at) = (None, None);
+        loop {
+            if offset_ms.is_none() && self.keyword("offset") {
+                offset_ms = Some(self.duration()?);
+                continue;
+            }
+            if at.is_none() && self.peek() == Some(b'@') {
+                self.i += 1;
+                self.ws();
+                at = Some(if self.keyword("start") {
+                    self.expect(b'(')?;
+                    self.expect(b')')?;
+                    At::Start
+                } else if self.keyword("end") {
+                    self.expect(b'(')?;
+                    self.expect(b')')?;
+                    At::End
+                } else {
+                    let start = self.i;
+                    while self
+                        .s
+                        .get(self.i)
+                        .is_some_and(|b| b.is_ascii_digit() || *b == b'.' || *b == b'-')
+                    {
+                        self.i += 1;
+                    }
+                    let text = std::str::from_utf8(&self.s[start..self.i]).unwrap_or("");
+                    let secs: f64 = text
+                        .parse()
+                        .map_err(|_| format!("@ needs a unix timestamp, got {text:?}"))?;
+                    At::Time((secs * 1000.0) as i64)
+                });
+                continue;
+            }
+            return Ok((offset_ms.unwrap_or(0), at));
         }
     }
 
@@ -1197,22 +1464,44 @@ impl<'a> P<'a> {
         }
     }
 
-    /// The optional `[range]` / `offset` tail after a selector's matchers.
+    /// The optional `[range]` / `[range:step]` / `offset` / `@` tail after
+    /// a selector's matchers. `[range:step]` is a SUBQUERY over the
+    /// instant selector (its own offset/@ apply to the subquery).
     fn selector_tail(&mut self, matchers: Vec<Matcher>) -> Result<PExpr, String> {
         let mut range_ms = None;
         if self.eat(b'[') {
-            range_ms = Some(self.duration()?);
+            let dur = self.duration()?;
+            if self.eat(b':') {
+                let step_ms = if self.peek() == Some(b']') {
+                    DEFAULT_SUBQUERY_STEP_MS
+                } else {
+                    self.duration()?
+                };
+                self.expect(b']')?;
+                let (offset_ms, at) = self.offset_at_tail()?;
+                return Ok(PExpr::Subquery {
+                    arg: Box::new(PExpr::Selector {
+                        matchers,
+                        range_ms: None,
+                        offset_ms: 0,
+                        at: None,
+                        slot: 0,
+                    }),
+                    range_ms: dur,
+                    step_ms: step_ms.max(1),
+                    offset_ms,
+                    at,
+                });
+            }
+            range_ms = Some(dur);
             self.expect(b']')?;
         }
-        let offset_ms = if self.keyword("offset") {
-            self.duration()?
-        } else {
-            0
-        };
+        let (offset_ms, at) = self.offset_at_tail()?;
         Ok(PExpr::Selector {
             matchers,
             range_ms,
             offset_ms,
+            at,
             slot: 0,
         })
     }
@@ -1235,18 +1524,37 @@ struct Fetched {
     series: Vec<(Labels, Vec<Sample>)>,
 }
 
-/// Assign each selector a fetch slot (pre-order) and return the fetch
-/// specs `(matchers, range, offset)` in slot order.
-fn assign_slots(expr: &mut PExpr, specs: &mut Vec<(Vec<Matcher>, Option<i64>, i64)>) {
+/// What `fetch_all` needs to pull one selector's data.
+struct FetchSpec {
+    matchers: Vec<Matcher>,
+    range_ms: Option<i64>,
+    offset_ms: i64,
+    /// A resolved `@` anchor (the selector's own, or inherited from an
+    /// enclosing subquery): fetch around this fixed time instead of the
+    /// query window.
+    at_ms: Option<i64>,
+    /// Extra history behind the window: the sum of enclosing subqueries'
+    /// ranges/offsets/steps (their inner steps reach this far back).
+    extra_back_ms: i64,
+}
+
+/// Resolve `@ start()` / `@ end()` against the query window (instant
+/// queries pass `start == end == t`).
+fn resolve_at(expr: &mut PExpr, start_ms: i64, end_ms: i64) {
+    let fix = |at: &mut Option<At>| {
+        if let Some(a) = at {
+            *a = match a {
+                At::Start => At::Time(start_ms),
+                At::End => At::Time(end_ms),
+                At::Time(t) => At::Time(*t),
+            };
+        }
+    };
     match expr {
-        PExpr::Selector {
-            matchers,
-            range_ms,
-            offset_ms,
-            slot,
-        } => {
-            *slot = specs.len();
-            specs.push((matchers.clone(), *range_ms, *offset_ms));
+        PExpr::Selector { at, .. } => fix(at),
+        PExpr::Subquery { arg, at, .. } => {
+            fix(at);
+            resolve_at(arg, start_ms, end_ms);
         }
         PExpr::RangeFn { arg, .. }
         | PExpr::Agg { arg, .. }
@@ -1259,15 +1567,78 @@ fn assign_slots(expr: &mut PExpr, specs: &mut Vec<(Vec<Matcher>, Option<i64>, i6
         | PExpr::AbsentOverTime { arg, .. }
         | PExpr::CountValues { arg, .. }
         | PExpr::VectorOf { arg }
-        | PExpr::ScalarOf { arg } => assign_slots(arg, specs),
+        | PExpr::ScalarOf { arg }
+        | PExpr::MathFn { arg: Some(arg), .. } => resolve_at(arg, start_ms, end_ms),
+        PExpr::Binary { lhs, rhs, .. } => {
+            resolve_at(lhs, start_ms, end_ms);
+            resolve_at(rhs, start_ms, end_ms);
+        }
+        PExpr::MathFn { arg: None, .. } | PExpr::Time | PExpr::Number(_) => {}
+    }
+}
+
+/// Assign each selector a fetch slot (pre-order) and return the fetch
+/// specs in slot order. `extra_back`/`at` carry enclosing-subquery
+/// context: inner selectors must be fetched across the whole subquery
+/// window, anchored at the subquery's `@` time when it has one. Run
+/// AFTER [`resolve_at`].
+fn assign_slots(
+    expr: &mut PExpr,
+    specs: &mut Vec<FetchSpec>,
+    extra_back: i64,
+    at: Option<i64>,
+) {
+    match expr {
+        PExpr::Selector {
+            matchers,
+            range_ms,
+            offset_ms,
+            at: sel_at,
+            slot,
+        } => {
+            *slot = specs.len();
+            specs.push(FetchSpec {
+                matchers: matchers.clone(),
+                range_ms: *range_ms,
+                offset_ms: *offset_ms,
+                at_ms: sel_at.map(At::ms).or(at),
+                extra_back_ms: extra_back,
+            });
+        }
+        PExpr::Subquery {
+            arg,
+            range_ms,
+            step_ms,
+            offset_ms,
+            at: sq_at,
+        } => {
+            // Inner steps reach back range (+ one step of alignment slack)
+            // + the subquery's own offset; a subquery @ re-anchors its
+            // whole inner window.
+            let child_extra = extra_back + *range_ms + *step_ms + *offset_ms;
+            let child_at = sq_at.map(At::ms).or(at);
+            assign_slots(arg, specs, child_extra, child_at);
+        }
+        PExpr::RangeFn { arg, .. }
+        | PExpr::Agg { arg, .. }
+        | PExpr::HistogramQuantile { arg, .. }
+        | PExpr::Timestamp { arg }
+        | PExpr::LabelReplace { arg, .. }
+        | PExpr::LabelJoin { arg, .. }
+        | PExpr::Sort { arg, .. }
+        | PExpr::Absent { arg, .. }
+        | PExpr::AbsentOverTime { arg, .. }
+        | PExpr::CountValues { arg, .. }
+        | PExpr::VectorOf { arg }
+        | PExpr::ScalarOf { arg } => assign_slots(arg, specs, extra_back, at),
         PExpr::MathFn { arg, .. } => {
             if let Some(arg) = arg {
-                assign_slots(arg, specs);
+                assign_slots(arg, specs, extra_back, at);
             }
         }
         PExpr::Binary { lhs, rhs, .. } => {
-            assign_slots(lhs, specs);
-            assign_slots(rhs, specs);
+            assign_slots(lhs, specs, extra_back, at);
+            assign_slots(rhs, specs, extra_back, at);
         }
         PExpr::Time | PExpr::Number(_) => {}
     }
@@ -1277,7 +1648,8 @@ fn assign_slots(expr: &mut PExpr, specs: &mut Vec<(Vec<Matcher>, Option<i64>, i6
 fn selector_of(expr: &PExpr) -> Result<&Vec<Matcher>, String> {
     match expr {
         PExpr::Selector { matchers, .. } => Ok(matchers),
-        PExpr::RangeFn { arg, .. }
+        PExpr::Subquery { arg, .. }
+        | PExpr::RangeFn { arg, .. }
         | PExpr::Agg { arg, .. }
         | PExpr::HistogramQuantile { arg, .. }
         | PExpr::Timestamp { arg }
@@ -1397,11 +1769,153 @@ fn match_key(labels: &Labels) -> Labels {
         .collect()
 }
 
+/// Match-key under `on`/`ignoring`: `on(ls)` keeps exactly the listed
+/// labels (absent = absent, which matches another series also lacking
+/// them — Prometheus treats absent and empty alike); `ignoring(ls)` is
+/// the default key minus the listed labels. `None` = the default
+/// (everything sans `__name__`).
+fn matching_key(labels: &Labels, m: Option<&Matching>) -> Labels {
+    match m {
+        None => match_key(labels),
+        Some(Matching { on: true, labels: ls, .. }) => labels
+            .iter()
+            .filter(|(k, _)| ls.iter().any(|l| l == k))
+            .cloned()
+            .collect(),
+        Some(Matching { on: false, labels: ls, .. }) => labels
+            .iter()
+            .filter(|(k, _)| k != "__name__" && !ls.iter().any(|l| l == k))
+            .cloned()
+            .collect(),
+    }
+}
+
+fn as01(b: bool) -> f64 {
+    if b {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+/// Vector∘vector arithmetic/comparison under a matching mode. One-to-one
+/// requires the match key unique on BOTH sides (Prometheus errors on
+/// many-to-many); `group_left`/`group_right` allow the many side to repeat
+/// a key, require the one side unique, and graft the requested extra
+/// labels from the one side onto each result.
+fn vector_binary(
+    op: BinOp,
+    bool_mod: bool,
+    matching: Option<&Matching>,
+    lv: Vector,
+    rv: Vector,
+) -> Result<Vector, String> {
+    let group = matching.map_or(&MatchGroup::One, |m| &m.group);
+    match group {
+        MatchGroup::One => {
+            let mut rhs_by: BTreeMap<Labels, f64> = BTreeMap::new();
+            for (labels, v) in &rv {
+                if rhs_by.insert(matching_key(labels, matching), *v).is_some() {
+                    return Err(
+                        "many-to-many matching not allowed: use group_left/group_right".into(),
+                    );
+                }
+            }
+            let mut seen: std::collections::BTreeSet<Labels> = std::collections::BTreeSet::new();
+            let mut out = Vec::new();
+            for (labels, a) in lv {
+                let key = matching_key(&labels, matching);
+                let Some(&b) = rhs_by.get(&key) else { continue };
+                if !seen.insert(key.clone()) {
+                    return Err(
+                        "many-to-many matching not allowed: use group_left/group_right".into(),
+                    );
+                }
+                if op.is_comparison() {
+                    if bool_mod {
+                        out.push((key, as01(op.cmp(a, b))));
+                    } else if op.cmp(a, b) {
+                        out.push((labels, a));
+                    }
+                } else {
+                    out.push((key, op.apply(a, b)));
+                }
+            }
+            Ok(out)
+        }
+        MatchGroup::Left(extra) | MatchGroup::Right(extra) => {
+            let left_is_many = matches!(group, MatchGroup::Left(_));
+            let (many, one) = if left_is_many { (lv, rv) } else { (rv, lv) };
+            let mut one_by: BTreeMap<Labels, (Labels, f64)> = BTreeMap::new();
+            for (labels, v) in one {
+                let key = matching_key(&labels, matching);
+                if one_by.insert(key, (labels, v)).is_some() {
+                    return Err(format!(
+                        "found duplicate series on the \"one\" side of group_{}",
+                        if left_is_many { "left" } else { "right" }
+                    ));
+                }
+            }
+            let mut out = Vec::new();
+            for (labels, mv) in many {
+                let key = matching_key(&labels, matching);
+                let Some((one_labels, ov)) = one_by.get(&key) else { continue };
+                // Operand order is lhs∘rhs regardless of which side is many.
+                let (a, b) = if left_is_many { (mv, *ov) } else { (*ov, mv) };
+                if op.is_comparison() && !bool_mod {
+                    // Filter semantics keep the many-side sample as-is.
+                    if op.cmp(a, b) {
+                        out.push((labels, mv));
+                    }
+                    continue;
+                }
+                // Result labels: the many side sans __name__, plus the
+                // requested extra labels copied from the one side (absent
+                // on the one side = removed from the result).
+                let mut rl: Labels = labels
+                    .iter()
+                    .filter(|(k, _)| k != "__name__")
+                    .cloned()
+                    .collect();
+                for name in extra {
+                    rl.retain(|(k, _)| k != name);
+                    if let Some((_, v)) = one_labels.iter().find(|(k, _)| k == name) {
+                        rl.push((name.clone(), v.clone()));
+                    }
+                }
+                rl.sort();
+                let val = if op.is_comparison() {
+                    as01(op.cmp(a, b))
+                } else {
+                    op.apply(a, b)
+                };
+                out.push((rl, val));
+            }
+            Ok(out)
+        }
+    }
+}
+
 /// One step of a binary operation. Arithmetic maps values (dropping
 /// `__name__`, PromQL-style); comparisons FILTER (keep the sample, labels
 /// intact, when true) unless `bool` makes them 0/1-valued (name dropped);
-/// `and`/`or`/`unless` are label-set operations over vectors.
-fn apply_binary(op: BinOp, bool_mod: bool, lv: StepVal, rv: StepVal) -> Result<StepVal, String> {
+/// `and`/`or`/`unless` are label-set operations over vectors. All of them
+/// honor `on`/`ignoring` (+ `group_left/right` for the value ops).
+fn apply_binary(
+    op: BinOp,
+    bool_mod: bool,
+    matching: Option<&Matching>,
+    lv: StepVal,
+    rv: StepVal,
+) -> Result<StepVal, String> {
+    if matching.is_some()
+        && !matches!(
+            (&lv, &rv),
+            (StepVal::Vector(_), StepVal::Vector(_))
+        )
+    {
+        return Err("on/ignoring require vector operands on both sides".into());
+    }
     if op.is_arithmetic() {
         return Ok(match (lv, rv) {
             (StepVal::Scalar(a), StepVal::Scalar(b)) => StepVal::Scalar(op.apply(a, b)),
@@ -1416,24 +1930,11 @@ fn apply_binary(op: BinOp, bool_mod: bool, lv: StepVal, rv: StepVal) -> Result<S
                     .collect(),
             ),
             (StepVal::Vector(lv), StepVal::Vector(rv)) => {
-                // One-to-one on identical label sets sans __name__.
-                let rhs_by: BTreeMap<Labels, f64> = rv
-                    .into_iter()
-                    .map(|(labels, v)| (match_key(&labels), v))
-                    .collect();
-                StepVal::Vector(
-                    lv.into_iter()
-                        .filter_map(|(labels, a)| {
-                            let key = match_key(&labels);
-                            rhs_by.get(&key).map(|b| (key, op.apply(a, *b)))
-                        })
-                        .collect(),
-                )
+                StepVal::Vector(vector_binary(op, bool_mod, matching, lv, rv)?)
             }
         });
     }
     if op.is_comparison() {
-        let as01 = |b: bool| if b { 1.0 } else { 0.0 };
         return Ok(match (lv, rv) {
             (StepVal::Scalar(a), StepVal::Scalar(b)) => {
                 if !bool_mod {
@@ -1466,22 +1967,7 @@ fn apply_binary(op: BinOp, bool_mod: bool, lv: StepVal, rv: StepVal) -> Result<S
                     .collect(),
             ),
             (StepVal::Vector(lv), StepVal::Vector(rv)) => {
-                let rhs_by: BTreeMap<Labels, f64> = rv
-                    .into_iter()
-                    .map(|(labels, v)| (match_key(&labels), v))
-                    .collect();
-                StepVal::Vector(
-                    lv.into_iter()
-                        .filter_map(|(labels, a)| {
-                            let b = *rhs_by.get(&match_key(&labels))?;
-                            if bool_mod {
-                                Some((match_key(&labels), as01(op.cmp(a, b))))
-                            } else {
-                                op.cmp(a, b).then_some((labels, a))
-                            }
-                        })
-                        .collect(),
-                )
+                StepVal::Vector(vector_binary(op, bool_mod, matching, lv, rv)?)
             }
         });
     }
@@ -1489,29 +1975,193 @@ fn apply_binary(op: BinOp, bool_mod: bool, lv: StepVal, rv: StepVal) -> Result<S
     let (StepVal::Vector(lv), StepVal::Vector(rv)) = (lv, rv) else {
         return Err("and/or/unless require vector operands on both sides".into());
     };
-    let rhs_keys: std::collections::BTreeSet<Labels> =
-        rv.iter().map(|(labels, _)| match_key(labels)).collect();
+    let rhs_keys: std::collections::BTreeSet<Labels> = rv
+        .iter()
+        .map(|(labels, _)| matching_key(labels, matching))
+        .collect();
     Ok(StepVal::Vector(match op {
         BinOp::And => lv
             .into_iter()
-            .filter(|(labels, _)| rhs_keys.contains(&match_key(labels)))
+            .filter(|(labels, _)| rhs_keys.contains(&matching_key(labels, matching)))
             .collect(),
         BinOp::Unless => lv
             .into_iter()
-            .filter(|(labels, _)| !rhs_keys.contains(&match_key(labels)))
+            .filter(|(labels, _)| !rhs_keys.contains(&matching_key(labels, matching)))
             .collect(),
         BinOp::Or => {
-            let lhs_keys: std::collections::BTreeSet<Labels> =
-                lv.iter().map(|(labels, _)| match_key(labels)).collect();
+            let lhs_keys: std::collections::BTreeSet<Labels> = lv
+                .iter()
+                .map(|(labels, _)| matching_key(labels, matching))
+                .collect();
             let mut out = lv;
             out.extend(
                 rv.into_iter()
-                    .filter(|(labels, _)| !lhs_keys.contains(&match_key(labels))),
+                    .filter(|(labels, _)| !lhs_keys.contains(&matching_key(labels, matching))),
             );
             out
         }
         _ => unreachable!("arithmetic/comparison handled above"),
     }))
+}
+
+/// One range-function value over a window of samples (`win` = samples in
+/// `[t - window, t]`, ascending). `None` = no output for this series at
+/// this step (empty/short window, zero time delta, degenerate regression).
+/// Shared by the raw-selector path and the subquery path, whose windows
+/// hold inner-evaluation results instead of raw samples.
+fn window_value(func: RangeFn, win: &[Sample], t: i64, window: i64) -> Option<f64> {
+    Some(match func {
+        // Instantaneous forms: the last two samples only.
+        RangeFn::IRate | RangeFn::IDelta => {
+            if win.len() < 2 {
+                return None;
+            }
+            let (a, b) = (&win[win.len() - 2], &win[win.len() - 1]);
+            if func == RangeFn::IDelta {
+                b.value - a.value
+            } else {
+                // Counter-reset-aware, per-second.
+                let inc = if b.value >= a.value {
+                    b.value - a.value
+                } else {
+                    b.value
+                };
+                let dt = (b.ts - a.ts) as f64 / 1000.0;
+                if dt <= 0.0 {
+                    return None;
+                }
+                inc / dt
+            }
+        }
+        // Change-over-window family: needs two samples.
+        RangeFn::Rate | RangeFn::Increase | RangeFn::Delta => {
+            if win.len() < 2 {
+                return None;
+            }
+            let change = match func {
+                RangeFn::Delta => win[win.len() - 1].value - win[0].value,
+                _ => {
+                    // Counter-reset-aware increase.
+                    let mut inc = 0.0;
+                    let mut prev = win[0].value;
+                    for s in &win[1..] {
+                        inc += if s.value >= prev {
+                            s.value - prev
+                        } else {
+                            s.value
+                        };
+                        prev = s.value;
+                    }
+                    inc
+                }
+            };
+            if func == RangeFn::Rate {
+                change / (window as f64 / 1000.0)
+            } else {
+                change
+            }
+        }
+        // Regression family: least-squares over the window, x = seconds
+        // relative to the eval time (so the intercept IS the regressed
+        // value now).
+        RangeFn::Deriv | RangeFn::PredictLinear(_) => {
+            if win.len() < 2 {
+                return None;
+            }
+            let n = win.len() as f64;
+            let (mut sx, mut sy) = (0.0f64, 0.0f64);
+            for s in win {
+                sx += (s.ts - t) as f64 / 1000.0;
+                sy += s.value;
+            }
+            let (mx, my) = (sx / n, sy / n);
+            let (mut cov, mut var) = (0.0f64, 0.0f64);
+            for s in win {
+                let dx = (s.ts - t) as f64 / 1000.0 - mx;
+                cov += dx * (s.value - my);
+                var += dx * dx;
+            }
+            if var == 0.0 {
+                return None;
+            }
+            let slope = cov / var;
+            match func {
+                RangeFn::Deriv => slope,
+                RangeFn::PredictLinear(secs) => (my - slope * mx) + slope * secs,
+                _ => unreachable!(),
+            }
+        }
+        // Window aggregations: any sample counts.
+        _ => {
+            if win.is_empty() {
+                return None;
+            }
+            match func {
+                RangeFn::AvgOverTime => {
+                    win.iter().map(|s| s.value).sum::<f64>() / win.len() as f64
+                }
+                RangeFn::MinOverTime => {
+                    win.iter().map(|s| s.value).fold(f64::INFINITY, f64::min)
+                }
+                RangeFn::MaxOverTime => win
+                    .iter()
+                    .map(|s| s.value)
+                    .fold(f64::NEG_INFINITY, f64::max),
+                RangeFn::SumOverTime => win.iter().map(|s| s.value).sum(),
+                RangeFn::CountOverTime => win.len() as f64,
+                RangeFn::LastOverTime => win[win.len() - 1].value,
+                RangeFn::PresentOverTime => 1.0,
+                RangeFn::Changes => win
+                    .windows(2)
+                    .filter(|p| p[1].value != p[0].value)
+                    .count() as f64,
+                RangeFn::Resets => win
+                    .windows(2)
+                    .filter(|p| p[1].value < p[0].value)
+                    .count() as f64,
+                RangeFn::StddevOverTime | RangeFn::StdvarOverTime => {
+                    let mean = win.iter().map(|s| s.value).sum::<f64>() / win.len() as f64;
+                    let var = win
+                        .iter()
+                        .map(|s| (s.value - mean) * (s.value - mean))
+                        .sum::<f64>()
+                        / win.len() as f64;
+                    if func == RangeFn::StddevOverTime {
+                        var.sqrt()
+                    } else {
+                        var
+                    }
+                }
+                RangeFn::MadOverTime => {
+                    let med = |mut v: Vec<f64>| -> f64 {
+                        v.sort_by(f64::total_cmp);
+                        let n = v.len();
+                        if n % 2 == 1 {
+                            v[n / 2]
+                        } else {
+                            (v[n / 2 - 1] + v[n / 2]) / 2.0
+                        }
+                    };
+                    let m = med(win.iter().map(|s| s.value).collect());
+                    med(win.iter().map(|s| (s.value - m).abs()).collect())
+                }
+                RangeFn::QuantileOverTime(phi) => {
+                    if phi < 0.0 {
+                        f64::NEG_INFINITY
+                    } else if phi > 1.0 {
+                        f64::INFINITY
+                    } else {
+                        let mut sorted: Vec<f64> = win.iter().map(|s| s.value).collect();
+                        sorted.sort_by(f64::total_cmp);
+                        let rank = phi * (sorted.len() - 1) as f64;
+                        let (lo, hi) = (rank.floor() as usize, rank.ceil() as usize);
+                        sorted[lo] + (sorted[hi] - sorted[lo]) * (rank - lo as f64)
+                    }
+                }
+                _ => unreachable!("change family handled above"),
+            }
+        }
+    })
 }
 
 /// Evaluate `expr` at each step in `steps` (ms). Returns per-step values.
@@ -1547,12 +2197,12 @@ fn eval_steps(expr: &PExpr, fetched: &[Fetched], steps: &[i64]) -> Result<Vec<St
                 })
                 .collect())
         }
-        PExpr::Binary { op, bool_mod, lhs, rhs } => {
+        PExpr::Binary { op, bool_mod, matching, lhs, rhs } => {
             let l = eval_steps(lhs, fetched, steps)?;
             let r = eval_steps(rhs, fetched, steps)?;
             l.into_iter()
                 .zip(r)
-                .map(|(lv, rv)| apply_binary(*op, *bool_mod, lv, rv))
+                .map(|(lv, rv)| apply_binary(*op, *bool_mod, matching.as_ref(), lv, rv))
                 .collect()
         }
         PExpr::HistogramQuantile { phi, arg } => {
@@ -1567,17 +2217,16 @@ fn eval_steps(expr: &PExpr, fetched: &[Fetched], steps: &[i64]) -> Result<Vec<St
                 })
                 .collect())
         }
-        PExpr::Selector { range_ms, .. } => {
+        PExpr::Selector { range_ms, slot, at, .. } => {
             if range_ms.is_some() {
                 return Err("range selectors need rate()/increase()/delta()".into());
             }
-            let PExpr::Selector { slot, .. } = expr else {
-                unreachable!()
-            };
             let data = &fetched[*slot];
             Ok(steps
                 .iter()
                 .map(|&t| {
+                    // `@` pins the evaluation time for every step.
+                    let t = at.map(At::ms).unwrap_or(t);
                     let mut v = Vec::new();
                     for (labels, samples) in &data.series {
                         // Latest sample at or before t, within the lookback.
@@ -1593,10 +2242,84 @@ fn eval_steps(expr: &PExpr, fetched: &[Fetched], steps: &[i64]) -> Result<Vec<St
                 })
                 .collect())
         }
+        PExpr::Subquery { .. } => Err(
+            "a subquery must feed a range function, e.g. max_over_time(rate(m[5m])[1h:1m])"
+                .into(),
+        ),
         PExpr::RangeFn { func, arg } => {
+            // Range functions drop the metric name, PromQL-style —
+            // except last_over_time, which returns a raw sample.
+            let keep_name = *func == RangeFn::LastOverTime;
+            // Subquery argument: evaluate the inner expression once over
+            // the union of epoch-aligned inner steps, then window that
+            // synthetic series-set exactly like raw samples.
+            if let PExpr::Subquery {
+                arg: inner,
+                range_ms,
+                step_ms,
+                offset_ms,
+                at,
+            } = arg.as_ref()
+            {
+                // Per outer step t, the window anchor (@-pinned when set).
+                let anchor = |t: i64| at.map(At::ms).unwrap_or(t) - offset_ms;
+                let (amin, amax) = match (steps.first(), steps.last()) {
+                    (Some(&a), Some(&b)) => (anchor(a), anchor(b)),
+                    _ => return Ok(Vec::new()),
+                };
+                // Epoch-aligned inner steps covering every window.
+                let mut inner_steps = Vec::new();
+                let mut s = {
+                    let lo = amin - range_ms;
+                    lo - lo.rem_euclid(*step_ms)
+                        + if lo.rem_euclid(*step_ms) != 0 { *step_ms } else { 0 }
+                };
+                while s <= amax {
+                    inner_steps.push(s);
+                    s += step_ms;
+                }
+                let vals = eval_steps(inner, fetched, &inner_steps)?;
+                let mut by_series: BTreeMap<Labels, Vec<Sample>> = BTreeMap::new();
+                for (&ts, val) in inner_steps.iter().zip(&vals) {
+                    let StepVal::Vector(v) = val else {
+                        return Err("a subquery needs a vector expression inside".into());
+                    };
+                    for (labels, value) in v {
+                        by_series
+                            .entry(labels.clone())
+                            .or_default()
+                            .push(Sample { ts, value: *value });
+                    }
+                }
+                return Ok(steps
+                    .iter()
+                    .map(|&t| {
+                        let a = anchor(t);
+                        let mut v = Vec::new();
+                        for (labels, samples) in &by_series {
+                            let lo = samples.partition_point(|s| s.ts < a - range_ms);
+                            let hi = samples.partition_point(|s| s.ts <= a);
+                            if let Some(value) =
+                                window_value(*func, &samples[lo..hi], a, *range_ms)
+                            {
+                                // Inner labels are already eval-space
+                                // (`__name__`), not storage-space.
+                                let labels = labels
+                                    .iter()
+                                    .filter(|(k, _)| keep_name || k != "__name__")
+                                    .cloned()
+                                    .collect();
+                                v.push((labels, value));
+                            }
+                        }
+                        StepVal::Vector(v)
+                    })
+                    .collect());
+            }
             let PExpr::Selector {
                 range_ms: Some(window),
                 slot,
+                at,
                 ..
             } = arg.as_ref()
             else {
@@ -1610,181 +2333,14 @@ fn eval_steps(expr: &PExpr, fetched: &[Fetched], steps: &[i64]) -> Result<Vec<St
             Ok(steps
                 .iter()
                 .map(|&t| {
+                    let t = at.map(At::ms).unwrap_or(t);
                     let mut v = Vec::new();
                     for (labels, samples) in &data.series {
                         let lo = samples.partition_point(|s| s.ts < t - window);
                         let hi = samples.partition_point(|s| s.ts <= t);
-                        let win = &samples[lo..hi];
-                        let value = match func {
-                            // Instantaneous forms: the last two samples only.
-                            RangeFn::IRate | RangeFn::IDelta => {
-                                if win.len() < 2 {
-                                    continue;
-                                }
-                                let (a, b) = (&win[win.len() - 2], &win[win.len() - 1]);
-                                if *func == RangeFn::IDelta {
-                                    b.value - a.value
-                                } else {
-                                    // Counter-reset-aware, per-second.
-                                    let inc = if b.value >= a.value {
-                                        b.value - a.value
-                                    } else {
-                                        b.value
-                                    };
-                                    let dt = (b.ts - a.ts) as f64 / 1000.0;
-                                    if dt <= 0.0 {
-                                        continue;
-                                    }
-                                    inc / dt
-                                }
-                            }
-                            // Change-over-window family: needs two samples.
-                            RangeFn::Rate | RangeFn::Increase | RangeFn::Delta => {
-                                if win.len() < 2 {
-                                    continue;
-                                }
-                                let change = match func {
-                                    RangeFn::Delta => win[win.len() - 1].value - win[0].value,
-                                    _ => {
-                                        // Counter-reset-aware increase.
-                                        let mut inc = 0.0;
-                                        let mut prev = win[0].value;
-                                        for s in &win[1..] {
-                                            inc += if s.value >= prev {
-                                                s.value - prev
-                                            } else {
-                                                s.value
-                                            };
-                                            prev = s.value;
-                                        }
-                                        inc
-                                    }
-                                };
-                                if *func == RangeFn::Rate {
-                                    change / (window as f64 / 1000.0)
-                                } else {
-                                    change
-                                }
-                            }
-                            // Regression family: least-squares over the
-                            // window, x = seconds relative to the eval time
-                            // (so the intercept IS the regressed value now).
-                            RangeFn::Deriv | RangeFn::PredictLinear(_) => {
-                                if win.len() < 2 {
-                                    continue;
-                                }
-                                let n = win.len() as f64;
-                                let (mut sx, mut sy) = (0.0f64, 0.0f64);
-                                for s in win {
-                                    sx += (s.ts - t) as f64 / 1000.0;
-                                    sy += s.value;
-                                }
-                                let (mx, my) = (sx / n, sy / n);
-                                let (mut cov, mut var) = (0.0f64, 0.0f64);
-                                for s in win {
-                                    let dx = (s.ts - t) as f64 / 1000.0 - mx;
-                                    cov += dx * (s.value - my);
-                                    var += dx * dx;
-                                }
-                                if var == 0.0 {
-                                    continue;
-                                }
-                                let slope = cov / var;
-                                match func {
-                                    RangeFn::Deriv => slope,
-                                    RangeFn::PredictLinear(secs) => {
-                                        (my - slope * mx) + slope * secs
-                                    }
-                                    _ => unreachable!(),
-                                }
-                            }
-                            // Window aggregations: any sample counts.
-                            _ => {
-                                if win.is_empty() {
-                                    continue;
-                                }
-                                match func {
-                                    RangeFn::AvgOverTime => {
-                                        win.iter().map(|s| s.value).sum::<f64>()
-                                            / win.len() as f64
-                                    }
-                                    RangeFn::MinOverTime => win
-                                        .iter()
-                                        .map(|s| s.value)
-                                        .fold(f64::INFINITY, f64::min),
-                                    RangeFn::MaxOverTime => win
-                                        .iter()
-                                        .map(|s| s.value)
-                                        .fold(f64::NEG_INFINITY, f64::max),
-                                    RangeFn::SumOverTime => {
-                                        win.iter().map(|s| s.value).sum()
-                                    }
-                                    RangeFn::CountOverTime => win.len() as f64,
-                                    RangeFn::LastOverTime => win[win.len() - 1].value,
-                                    RangeFn::PresentOverTime => 1.0,
-                                    RangeFn::Changes => win
-                                        .windows(2)
-                                        .filter(|p| p[1].value != p[0].value)
-                                        .count()
-                                        as f64,
-                                    RangeFn::Resets => win
-                                        .windows(2)
-                                        .filter(|p| p[1].value < p[0].value)
-                                        .count()
-                                        as f64,
-                                    RangeFn::StddevOverTime | RangeFn::StdvarOverTime => {
-                                        let mean =
-                                            win.iter().map(|s| s.value).sum::<f64>()
-                                                / win.len() as f64;
-                                        let var = win
-                                            .iter()
-                                            .map(|s| (s.value - mean) * (s.value - mean))
-                                            .sum::<f64>()
-                                            / win.len() as f64;
-                                        if *func == RangeFn::StddevOverTime {
-                                            var.sqrt()
-                                        } else {
-                                            var
-                                        }
-                                    }
-                                    RangeFn::MadOverTime => {
-                                        let med = |mut v: Vec<f64>| -> f64 {
-                                            v.sort_by(f64::total_cmp);
-                                            let n = v.len();
-                                            if n % 2 == 1 {
-                                                v[n / 2]
-                                            } else {
-                                                (v[n / 2 - 1] + v[n / 2]) / 2.0
-                                            }
-                                        };
-                                        let m = med(win.iter().map(|s| s.value).collect());
-                                        med(win.iter().map(|s| (s.value - m).abs()).collect())
-                                    }
-                                    RangeFn::QuantileOverTime(phi) => {
-                                        if *phi < 0.0 {
-                                            f64::NEG_INFINITY
-                                        } else if *phi > 1.0 {
-                                            f64::INFINITY
-                                        } else {
-                                            let mut sorted: Vec<f64> =
-                                                win.iter().map(|s| s.value).collect();
-                                            sorted.sort_by(f64::total_cmp);
-                                            let rank = phi * (sorted.len() - 1) as f64;
-                                            let (lo, hi) =
-                                                (rank.floor() as usize, rank.ceil() as usize);
-                                            sorted[lo]
-                                                + (sorted[hi] - sorted[lo])
-                                                    * (rank - lo as f64)
-                                        }
-                                    }
-                                    _ => unreachable!("change family handled above"),
-                                }
-                            }
-                        };
-                        // Range functions drop the metric name, PromQL-style —
-                        // except last_over_time, which returns a raw sample.
-                        let keep_name = *func == RangeFn::LastOverTime;
-                        v.push((clean_labels(labels, keep_name), value));
+                        if let Some(value) = window_value(*func, &samples[lo..hi], t, window) {
+                            v.push((clean_labels(labels, keep_name), value));
+                        }
                     }
                     StepVal::Vector(v)
                 })
@@ -2255,25 +2811,32 @@ fn labels_json(labels: &Labels) -> Json {
 /// Fetch every selector's data. `offset` shifts the fetched window into
 /// the past and then shifts the sample timestamps forward by the same
 /// amount, so the evaluator's step arithmetic needs no offset awareness.
+/// A resolved `@` anchors the window at its fixed time instead of the
+/// query range, and `extra_back_ms` widens it for enclosing subqueries.
 fn fetch_all(
     ctx: &Shared,
     scope: &Scope,
-    specs: &[(Vec<Matcher>, Option<i64>, i64)],
+    specs: &[FetchSpec],
     t0: i64,
     t1: i64,
 ) -> Result<Vec<Fetched>, String> {
     let mut out = Vec::with_capacity(specs.len());
-    for (matchers, range, offset) in specs {
-        let mut matchers = matchers.clone();
+    for spec in specs {
+        let mut matchers = spec.matchers.clone();
         scope_matchers(&mut matchers, scope);
+        let (t0, t1) = match spec.at_ms {
+            Some(a) => (a, a),
+            None => (t0, t1),
+        };
         // The evaluator needs history behind the first step: the range
-        // window (or instant lookback), whichever the selector uses.
-        let back = range.unwrap_or(LOOKBACK_MS) + offset;
+        // window (or instant lookback), whichever the selector uses,
+        // plus any enclosing subquery's reach.
+        let back = spec.range_ms.unwrap_or(LOOKBACK_MS) + spec.offset_ms + spec.extra_back_ms;
         let mut series = match ctx.backend.ts_query(
             &scope.table,
             &matchers,
             t0.saturating_sub(back),
-            t1.saturating_sub(*offset),
+            t1.saturating_sub(spec.offset_ms),
         ) {
             Ok(series) => series,
             // No ingest yet: an empty result, not an error — a fresh
@@ -2282,10 +2845,10 @@ fn fetch_all(
             Err(e) if e.to_string().contains("does not exist") => Vec::new(),
             Err(e) => return Err(e.to_string()),
         };
-        if *offset != 0 {
+        if spec.offset_ms != 0 {
             for (_, samples) in &mut series {
                 for sample in samples {
-                    sample.ts += offset;
+                    sample.ts += spec.offset_ms;
                 }
             }
         }
@@ -2310,8 +2873,9 @@ pub fn query(ctx: &Shared, scope: &Scope, params: &BTreeMap<String, String>) -> 
     };
     // Number-only expressions (Grafana's datasource health check probes
     // `1+1`) fetch nothing and evaluate to a scalar.
+    resolve_at(&mut expr, t, t);
     let mut specs = Vec::new();
-    assign_slots(&mut expr, &mut specs);
+    assign_slots(&mut expr, &mut specs, 0, None);
     let fetched = match fetch_all(ctx, scope, &specs, t, t) {
         Ok(f) => f,
         Err(e) => return err_json(&e),
@@ -2375,8 +2939,9 @@ pub fn query_range(ctx: &Shared, scope: &Scope, params: &BTreeMap<String, String
     };
     // Number-only expressions fetch nothing; `render_matrix` turns the
     // per-step scalars into one `{}`-labeled series, matching Prometheus.
+    resolve_at(&mut expr, start, end);
     let mut specs = Vec::new();
-    assign_slots(&mut expr, &mut specs);
+    assign_slots(&mut expr, &mut specs, 0, None);
     let steps: Vec<i64> = (0..).map(|i| start + i * step_ms).take_while(|t| *t <= end).collect();
     let fetched = match fetch_all(ctx, scope, &specs, start, end) {
         Ok(f) => f,
@@ -2543,7 +3108,7 @@ mod tests {
         let run = |q: &str, fetched: &Fetched| -> Vec<(Labels, f64)> {
             let mut e = P::new(q).parse().unwrap();
             let mut specs = Vec::new();
-            assign_slots(&mut e, &mut specs);
+            assign_slots(&mut e, &mut specs, 0, None);
             let f = vec![Fetched { series: fetched.series.clone() }];
             let vals = eval_steps(&e, &f, &[10_000]).unwrap();
             let StepVal::Vector(v) = &vals[0] else { panic!("expected vector") };
@@ -2609,13 +3174,13 @@ mod tests {
         let eval = |q: &str| -> Result<Vec<(Labels, f64)>, String> {
             let mut e = P::new(q).parse()?;
             let mut specs = Vec::new();
-            assign_slots(&mut e, &mut specs);
+            assign_slots(&mut e, &mut specs, 0, None);
             let fetched: Vec<Fetched> = specs
                 .iter()
-                .map(|(ms, _, _)| Fetched {
+                .map(|spec| Fetched {
                     series: universe
                         .iter()
-                        .filter(|(labels, _)| matches(ms, labels))
+                        .filter(|(labels, _)| matches(&spec.matchers, labels))
                         .cloned()
                         .collect(),
                 })
@@ -2830,6 +3395,151 @@ mod tests {
     /// no-op empty-value matcher AND a trailing comma (its filters variable
     /// interpolated empty). Both must parse; the empty-value Eq matches
     /// series lacking the label.
+    /// Tier 4 structural features: `%`/`^`/unary minus with PromQL
+    /// precedence, `on`/`ignoring` + `group_left`/`group_right` vector
+    /// matching, the `@` modifier (fixed time and `start()`/`end()`),
+    /// and subqueries `[range:step]` feeding range functions.
+    #[test]
+    fn tier4_structural() {
+        let mk = |pairs: &[(&str, &str)], samples: &[(i64, f64)]| {
+            let mut labels: Labels =
+                pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            labels.sort();
+            let samples: Vec<Sample> =
+                samples.iter().map(|&(ts, value)| Sample { ts, value }).collect();
+            (labels, samples)
+        };
+        let universe: Vec<(Labels, Vec<Sample>)> = vec![
+            mk(&[("name", "m"), ("dc", "a"), ("instance", "i1")], &[(1_000, 5.0), (9_000, 10.0)]),
+            mk(&[("name", "m"), ("dc", "a"), ("instance", "i2")], &[(1_000, 15.0), (9_000, 20.0)]),
+            mk(&[("name", "n"), ("dc", "a")], &[(9_000, 100.0)]),
+            mk(&[("name", "info"), ("instance", "i1"), ("version", "v1")], &[(9_000, 1.0)]),
+            mk(&[("name", "info"), ("instance", "i2"), ("version", "v2")], &[(9_000, 1.0)]),
+        ];
+        let matches = |ms: &[Matcher], labels: &Labels| {
+            let get = |k: &str| {
+                labels.iter().find(|(lk, _)| lk == k).map_or("", |(_, v)| v.as_str())
+            };
+            ms.iter().all(|m| match m {
+                Matcher::Eq(k, v) => get(k) == v,
+                Matcher::Ne(k, v) => get(k) != v,
+                Matcher::Re(k, r) => r.is_match(get(k)),
+                Matcher::NotRe(k, r) => !r.is_match(get(k)),
+            })
+        };
+        let eval = |q: &str| -> Result<Vec<(Labels, f64)>, String> {
+            let mut e = P::new(q).parse()?;
+            resolve_at(&mut e, 10_000, 10_000);
+            let mut specs = Vec::new();
+            assign_slots(&mut e, &mut specs, 0, None);
+            let fetched: Vec<Fetched> = specs
+                .iter()
+                .map(|spec| Fetched {
+                    series: universe
+                        .iter()
+                        .filter(|(labels, _)| matches(&spec.matchers, labels))
+                        .cloned()
+                        .collect(),
+                })
+                .collect();
+            match eval_steps(&e, &fetched, &[10_000])?.pop() {
+                Some(StepVal::Vector(v)) => Ok(v),
+                Some(StepVal::Scalar(v)) => Ok(vec![(Vec::new(), v)]),
+                None => Ok(Vec::new()),
+            }
+        };
+        let one = |q: &str| -> f64 {
+            let v = eval(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+            assert_eq!(v.len(), 1, "{q}: expected one value, got {v:?}");
+            v[0].1
+        };
+        let err = |q: &str| eval(q).unwrap_err();
+
+        // ---- % / ^ / unary minus, with precedence ----
+        assert_eq!(one("10 % 3"), 1.0);
+        assert_eq!(one("2 ^ 3 ^ 2"), 512.0, "^ is right-associative");
+        assert_eq!(one("-2 ^ 2"), -4.0, "unary minus binds looser than ^");
+        assert_eq!(one("2 ^ -1"), 0.5);
+        assert_eq!(one("4 - -2"), 6.0);
+        assert_eq!(one("2 + 3 % 2"), 3.0, "% at */ precedence");
+        {
+            let mut v = eval("m % 3").unwrap();
+            v.sort_by(|a, b| a.1.total_cmp(&b.1));
+            assert_eq!((v.len(), v[0].1, v[1].1), (2, 1.0, 2.0));
+            let mut v = eval("-m").unwrap();
+            v.sort_by(|a, b| a.1.total_cmp(&b.1));
+            assert_eq!((v[0].1, v[1].1), (-20.0, -10.0));
+        }
+
+        // ---- on/ignoring one-to-one ----
+        // m carries {dc, instance}; info carries {instance, version}: only
+        // an explicit on(instance) matches them.
+        assert_eq!(eval("m * info").unwrap().len(), 0);
+        {
+            let mut v = eval("m * on(instance) info").unwrap();
+            v.sort_by(|a, b| a.1.total_cmp(&b.1));
+            assert_eq!((v.len(), v[0].1, v[1].1), (2, 10.0, 20.0));
+            // One-to-one with on(): result labels are the on() labels only.
+            assert_eq!(v[0].0, vec![("instance".to_string(), "i1".to_string())]);
+            let w = eval("m * ignoring(dc) info").unwrap();
+            assert_eq!(w.len(), 0, "ignoring(dc) still leaves version unmatched");
+            let w = eval("m * ignoring(dc, version) info").unwrap();
+            assert_eq!(w.len(), 2);
+        }
+        // Duplicate keys on a side require grouping.
+        assert!(err("m + on(dc) n").contains("group_left"));
+
+        // ---- group_left / group_right ----
+        {
+            let mut v = eval("m + on(dc) group_left n").unwrap();
+            v.sort_by(|a, b| a.1.total_cmp(&b.1));
+            assert_eq!((v.len(), v[0].1, v[1].1), (2, 110.0, 120.0));
+            let mut v = eval("m * on(instance) group_left(version) info").unwrap();
+            v.sort_by(|a, b| a.1.total_cmp(&b.1));
+            assert_eq!((v.len(), v[0].1, v[1].1), (2, 10.0, 20.0));
+            // Many-side labels kept (sans name), `version` grafted from one side.
+            let find = |ls: &Labels, k: &str| {
+                ls.iter().find(|(lk, _)| lk == k).map(|(_, v)| v.clone())
+            };
+            assert_eq!(find(&v[0].0, "version").as_deref(), Some("v1"));
+            assert_eq!(find(&v[0].0, "dc").as_deref(), Some("a"));
+            // group_right mirrors: the many side is on the right.
+            let mut w = eval("info * on(instance) group_right(version) m").unwrap();
+            w.sort_by(|a, b| a.1.total_cmp(&b.1));
+            assert_eq!((w.len(), w[0].1, w[1].1), (2, 10.0, 20.0));
+            assert_eq!(find(&w[1].0, "version").as_deref(), Some("v2"));
+        }
+
+        // ---- set ops with on() ----
+        assert_eq!(eval("m and on(instance) info").unwrap().len(), 2);
+        assert_eq!(eval("m unless on(instance) info").unwrap().len(), 0);
+        assert!(err("m and on(instance) group_left info").contains("not allowed"));
+        assert!(err("1 + on(x) m").contains("vector operands"));
+
+        // ---- @ modifier ----
+        assert_eq!(one("sum(m @ 2)"), 20.0, "@ pins evaluation at t=2s");
+        assert_eq!(one("sum(m @ end())"), 30.0);
+        assert_eq!(one("sum(m @ start())"), 30.0, "instant query: start == end");
+        assert_eq!(one("sum(max_over_time(m[8s] @ 2))"), 20.0);
+
+        // ---- subqueries ----
+        // Inner steps: epoch-aligned multiples of 2s in [t-6s, t].
+        assert_eq!(one("sum_over_time(vector(1)[6s:2s])"), 4.0);
+        // Default step (60s): two aligned steps land inside a 120s window.
+        assert_eq!(one("sum_over_time(vector(1)[120s:])"), 2.0);
+        assert_eq!(one("max_over_time(m{instance=\"i1\"}[8s:2s])"), 10.0);
+        assert_eq!(one("min_over_time(m{instance=\"i1\"}[8s:2s])"), 5.0);
+        // offset / @ anchor the whole subquery window.
+        assert_eq!(one("max_over_time(m{instance=\"i1\"}[4s:2s] offset 4s)"), 5.0);
+        assert_eq!(one("max_over_time(m{instance=\"i1\"}[4s:2s] @ 4)"), 5.0);
+        // Subqueries over computed expressions (the headline shape).
+        assert_eq!(one("max_over_time(sum(m)[8s:2s])"), 30.0);
+        assert_eq!(one("count_over_time((m{instance=\"i1\"} > 3)[8s:2s])"), 5.0);
+        // Errors: a bare subquery, and a subqueried range selector.
+        assert!(err("sum(m[10s:2s])").contains("range function"));
+        assert!(err("m[5s][10s:2s]").contains("cannot be subqueried"));
+    }
+
     #[test]
     fn matcher_block_accepts_drilldown_shapes() {
         // The exact tile expression that failed with "expected label name".
@@ -2837,9 +3547,9 @@ mod tests {
             .parse()
             .unwrap();
         let mut specs = Vec::new();
-        assign_slots(&mut e, &mut specs);
+        assign_slots(&mut e, &mut specs, 0, None);
         assert_eq!(specs.len(), 1);
-        assert!(specs[0].0.iter().any(
+        assert!(specs[0].matchers.iter().any(
             |m| matches!(m, Matcher::Eq(k, v) if k == "__ignore_usage__" && v.is_empty())
         ));
         let fetched = vec![Fetched {
@@ -2870,7 +3580,7 @@ mod tests {
     fn number_only_expressions_evaluate() {
         let mut e = P::new("1+1").parse().unwrap();
         let mut specs = Vec::new();
-        assign_slots(&mut e, &mut specs);
+        assign_slots(&mut e, &mut specs, 0, None);
         assert!(specs.is_empty());
         let vals = eval_steps(&e, &[], &[1000, 2000]).unwrap();
         assert_eq!(vals.len(), 2);
@@ -2935,7 +3645,7 @@ mod tests {
         };
         let mut a = P::new("a / b").parse().unwrap();
         let mut specs = Vec::new();
-        assign_slots(&mut a, &mut specs);
+        assign_slots(&mut a, &mut specs, 0, None);
         assert_eq!(specs.len(), 2);
         let fetched = vec![
             Fetched { series: vec![series("a", &[("job", "x")], 10.0)] },
@@ -2950,7 +3660,7 @@ mod tests {
         // scalar * vector.
         let mut e = P::new("2 * a").parse().unwrap();
         let mut specs = Vec::new();
-        assign_slots(&mut e, &mut specs);
+        assign_slots(&mut e, &mut specs, 0, None);
         let fetched = vec![Fetched { series: vec![series("a", &[], 21.0)] }];
         let vals = eval_steps(&e, &fetched, &[1000]).unwrap();
         let StepVal::Vector(v) = &vals[0] else { panic!() };

@@ -574,7 +574,12 @@ WHERE ts >= now() - 6h GROUP BY t;
   (filter; 0/1 with `bool`), `and/or/unless` (drilldown emits
   `<e> and <e> > -Inf`), `Inf`/`NaN` literals,
   `sum/avg/min/max/count/stdvar/group [by|without]` + `count_values`,
-  vector arithmetic `+ - * /`,
+  vector arithmetic `+ - * / % ^` (PromQL precedence: `^` right-assoc
+  tightest, unary minus between `^` and `*`; `on/ignoring` matching +
+  `group_left/right(extra)` many-to-one joins, set ops take `on/ignoring`
+  too), the `@` modifier (unix time, `start()`, `end()`), subqueries
+  `[range:step]` into any range function (omitted step = 60s, inner
+  steps epoch-aligned),
   `histogram_quantile`, `label_replace/label_join`, `sort/sort_desc`,
   `absent(v)`, the Tier-2 window analytics (`present/absent_over_time`,
   `changes/resets`, `deriv`/`predict_linear(m[w], t)`,
@@ -582,8 +587,9 @@ WHERE ts >= now() - 6h GROUP BY t;
   Tier-3 per-sample family: `abs/ceil/floor/round(±to_nearest)/clamp*/
   sqrt/exp/ln/log2/log10/sgn`, UTC calendar fns (`minute/hour/day_of_*/
   days_in_month/month/year`, no-arg ok), `vector()/scalar()` (names bind
-  only with '(' — a metric named `year` stays a selector).
-  Not supported: subqueries, `on/ignoring` + `group_left/right`, `@`.
+  only with '(' — a metric named `year` stays a selector). PromQL is
+  structurally COMPLETE (Tiers 1–4); out of scope: native histograms,
+  trig functions, `atan2`.
 - **Self-scrape**: `config set observability.self_scrape true` (live) makes
   the node ingest its own `/metrics` every
   `observability.self_scrape_interval_secs` — self-dashboarding without an
