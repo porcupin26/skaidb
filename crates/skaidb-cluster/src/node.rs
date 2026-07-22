@@ -7129,14 +7129,46 @@ impl Node {
         };
         let needed = oc.unwrap_or(self.cfg.read_consistency).required(divisor);
 
+        // PK-prefix narrowing (agencik E-8): when the filter equality-pins a
+        // leftmost run of PK columns, every source — the local shard walk and
+        // each peer's scan cursor — is narrowed to that key range instead of
+        // walking its whole shard. Purely cursor-level: the bare prefix bytes
+        // are a strict byte-prefix of (hence strictly less than) every real
+        // row key in the range, so seeding the exclusive `after` cursors with
+        // `start` skips nothing; pages are clamped at the exclusive `end`.
+        // No wire change — peers already resume from an arbitrary cursor.
+        // The bounds are a superset of the matches (`matches_filter` re-checks
+        // below) and LWW-exact: every version of an in-range key lives at
+        // that key on every replica, so narrowing all sources identically
+        // merges the same versions a full walk would.
+        let pk_range = self
+            .table_primary_key(table)
+            .and_then(|pk| skaidb_engine::pk_prefix_scan_range(&pk, filter));
+
         // Per-source paging state. Index 0 is the local shard (inactive when
         // this node is not a replica of a pinned table — it must neither
         // contribute rows nor count as a responder); the rest track `addrs`.
         // `done` = this source has delivered its whole shard; `ok` = it
         // has never errored (only `ok` sources count toward the read quorum).
-        let mut local_cursor: Option<Vec<u8>> = None;
+        let start_cursor = pk_range.as_ref().map(|(start, _)| start.clone());
+        let range_end = pk_range.and_then(|(_, end)| end);
+        // Truncate a page at the exclusive range end; `true` = bound reached,
+        // the source is done (pages arrive in key order).
+        let clamp = |rows: &mut Vec<BatchRow>| -> bool {
+            let Some(end) = range_end.as_ref() else {
+                return false;
+            };
+            match rows.iter().position(|(k, ..)| k >= end) {
+                Some(pos) => {
+                    rows.truncate(pos);
+                    true
+                }
+                None => false,
+            }
+        };
+        let mut local_cursor: Option<Vec<u8>> = start_cursor.clone();
         let mut local_done = !local_active;
-        let mut peer_cursor: Vec<Option<Vec<u8>>> = vec![None; addrs.len()];
+        let mut peer_cursor: Vec<Option<Vec<u8>>> = vec![start_cursor; addrs.len()];
         let mut peer_done: Vec<bool> = vec![false; addrs.len()];
         let mut peer_ok: Vec<bool> = vec![true; addrs.len()];
 
@@ -7152,38 +7184,54 @@ impl Node {
 
         loop {
             // 1. Pull the next page from every still-active source and merge it.
+            // Row-budget accounting (agencik E-7): the meter ticks once per
+            // DISTINCT key entering `merged`, not once per delivered row — at
+            // RF=3 every replica delivers its own copy of every key, and
+            // per-source counting made a full-replica gather cost RF× the
+            // table against `scan_row_budget` (183k rows examined "over
+            // 250k"). Per-copy work is still bounded: delivered bytes are
+            // paced by the page sizes, resident bytes by `check_resident`,
+            // and each distinct key still costs one tick.
             if !local_done {
-                let rows = self
+                let mut rows = self
                     .local
                     .read()
                     .map_err(|_| EngineError::Cluster("local lock poisoned".into()))?
                     .local_scan_versioned_page(table, local_cursor.as_deref(), LOCAL_SCAN_BATCH_ROWS)?;
                 local_done = rows.len() < LOCAL_SCAN_BATCH_ROWS;
+                if clamp(&mut rows) {
+                    local_done = true;
+                }
                 if let Some((k, ..)) = rows.last() {
                     local_cursor = Some(k.clone());
                 }
-                skaidb_engine::scan_meter::tick(rows.len())?;
+                let mut new_keys = 0;
                 for (key, value, hlc, is_put) in rows {
                     let value = is_put.then_some(value);
                     let value = match (project, value) {
                         (Some(wanted), Some(bytes)) => Some(prune_row_bytes(&bytes, wanted)?),
                         (_, v) => v,
                     };
-                    merged_bytes =
-                        merged_bytes.saturating_add_signed(merge_row(&mut merged, key, value, hlc));
+                    let (delta, is_new) = merge_row(&mut merged, key, value, hlc);
+                    new_keys += usize::from(is_new);
+                    merged_bytes = merged_bytes.saturating_add_signed(delta);
                 }
+                skaidb_engine::scan_meter::tick(new_keys)?;
             }
             for (i, addr) in addrs.iter().enumerate() {
                 if peer_done[i] || !peer_ok[i] {
                     continue;
                 }
                 match self.scan_peer_page(addr, table, peer_cursor[i].as_deref()) {
-                    Some((rows, exhausted)) => {
+                    Some((mut rows, exhausted)) => {
                         peer_done[i] = exhausted;
+                        if clamp(&mut rows) {
+                            peer_done[i] = true;
+                        }
                         if let Some((k, ..)) = rows.last() {
                             peer_cursor[i] = Some(k.clone());
                         }
-                        skaidb_engine::scan_meter::tick(rows.len())?;
+                        let mut new_keys = 0;
                         for (key, value, hlc, is_put) in rows {
                             let value = is_put.then_some(value);
                             let value = match (project, value) {
@@ -7192,9 +7240,11 @@ impl Node {
                                 }
                                 (_, v) => v,
                             };
-                            merged_bytes = merged_bytes
-                                .saturating_add_signed(merge_row(&mut merged, key, value, hlc));
+                            let (delta, is_new) = merge_row(&mut merged, key, value, hlc);
+                            new_keys += usize::from(is_new);
+                            merged_bytes = merged_bytes.saturating_add_signed(delta);
                         }
+                        skaidb_engine::scan_meter::tick(new_keys)?;
                     }
                     // Peer failed mid-scan: stop reading it and drop it from the
                     // responder count (its rows still reach us via other replicas).
@@ -7775,32 +7825,34 @@ fn prune_row_bytes(bytes: &[u8], wanted: &HashSet<String>) -> EngineResult<Vec<u
 }
 
 /// Merge one versioned row into the gather buffer under last-writer-wins,
-/// returning the change in RESIDENT bytes (key + value) the buffer now holds —
-/// positive on a fresh key or a larger LWW replacement, negative when a
-/// replacement shrinks the value, zero when the incoming version loses. The
-/// caller sums these to bound the in-flight buffer (see
-/// `scan_meter::check_resident`).
+/// returning `(byte_delta, is_new_key)`. `byte_delta` is the change in
+/// RESIDENT bytes (key + value) the buffer now holds — positive on a fresh
+/// key or a larger LWW replacement, negative when a replacement shrinks the
+/// value, zero when the incoming version loses; the caller sums these to
+/// bound the in-flight buffer (see `scan_meter::check_resident`).
+/// `is_new_key` is true only when the key was not yet buffered — the gather
+/// ticks `scan_row_budget` once per distinct key, not once per replica copy.
 fn merge_row(
     merged: &mut BTreeMap<Vec<u8>, (Hlc, Option<Vec<u8>>)>,
     key: Vec<u8>,
     value: Option<Vec<u8>>,
     hlc: Hlc,
-) -> isize {
+) -> (isize, bool) {
     let new_len = value.as_ref().map_or(0, Vec::len);
     match merged.entry(key) {
         std::collections::btree_map::Entry::Occupied(mut e) => {
             if hlc > e.get().0 {
                 let old_len = e.get().1.as_ref().map_or(0, Vec::len);
                 *e.get_mut() = (hlc, value);
-                new_len as isize - old_len as isize
+                (new_len as isize - old_len as isize, false)
             } else {
-                0
+                (0, false)
             }
         }
         std::collections::btree_map::Entry::Vacant(e) => {
             let delta = e.key().len() + new_len;
             e.insert((hlc, value));
-            delta as isize
+            (delta as isize, true)
         }
     }
 }
@@ -13386,34 +13438,45 @@ mod tests {
     /// bound itself: a fresh key adds key+value bytes, a newer (LWW-winning)
     /// version adjusts by the value-size difference, and a losing version adds
     /// nothing. Correct accounting here is what keeps `merged_bytes` tracking
-    /// the buffer's true size so `check_resident` fires before an OOM.
+    /// the buffer's true size so `check_resident` fires before an OOM. The
+    /// second return (`is_new_key`) must be true exactly once per distinct
+    /// key — it drives `scan_row_budget` accounting, which counts each key
+    /// once no matter how many replicas deliver a copy (agencik E-7).
     #[test]
     fn merge_row_reports_resident_byte_delta() {
         let mut m: BTreeMap<Vec<u8>, (Hlc, Option<Vec<u8>>)> = BTreeMap::new();
         let mut bytes: usize = 0;
 
-        // Fresh key "k1" (2 bytes) + 4-byte value = +6.
-        bytes = bytes.saturating_add_signed(merge_row(
+        // Fresh key "k1" (2 bytes) + 4-byte value = +6, and it is NEW.
+        let (delta, is_new) = merge_row(
             &mut m, b"k1".to_vec(), Some(b"aaaa".to_vec()), Hlc::new(10, 0),
-        ));
+        );
+        assert!(is_new);
+        bytes = bytes.saturating_add_signed(delta);
         assert_eq!(bytes, 6);
 
-        // Older version loses: no change.
-        bytes = bytes.saturating_add_signed(merge_row(
+        // Older version loses: no change, not new.
+        let (delta, is_new) = merge_row(
             &mut m, b"k1".to_vec(), Some(b"zzzzzzzz".to_vec()), Hlc::new(5, 0),
-        ));
+        );
+        assert!(!is_new);
+        bytes = bytes.saturating_add_signed(delta);
         assert_eq!(bytes, 6);
 
-        // Newer version replaces 4-byte value with 8-byte value: +4.
-        bytes = bytes.saturating_add_signed(merge_row(
+        // Newer version replaces 4-byte value with 8-byte value: +4, not new.
+        let (delta, is_new) = merge_row(
             &mut m, b"k1".to_vec(), Some(b"bbbbbbbb".to_vec()), Hlc::new(20, 0),
-        ));
+        );
+        assert!(!is_new);
+        bytes = bytes.saturating_add_signed(delta);
         assert_eq!(bytes, 10);
 
         // Newer tombstone (None value) shrinks by the 8-byte value: -8.
-        bytes = bytes.saturating_add_signed(merge_row(
+        let (delta, is_new) = merge_row(
             &mut m, b"k1".to_vec(), None, Hlc::new(30, 0),
-        ));
+        );
+        assert!(!is_new);
+        bytes = bytes.saturating_add_signed(delta);
         assert_eq!(bytes, 2); // just the key remains resident
 
         // Removing the finalized entry returns the buffer to empty, matching
@@ -13421,6 +13484,113 @@ mod tests {
         let (_, val) = m.remove(b"k1".as_slice()).unwrap();
         bytes = bytes.saturating_sub(b"k1".len() + val.as_ref().map_or(0, Vec::len));
         assert_eq!(bytes, 0);
+    }
+
+    /// PK-prefix narrowing on the CLUSTERED gather (agencik E-8): a filter
+    /// that equality-pins the leftmost PK column must narrow every source's
+    /// scan to that key slice — proven by a row budget big enough for one
+    /// channel's slice but far too small for the whole table. Also covers
+    /// the trailing-range form (`channel = ? AND ts >= ? AND ts < ?`), and
+    /// that the un-narrowed full walk still trips the budget (the guard is
+    /// armed on this path, not bypassed).
+    #[test]
+    fn clustered_gather_narrows_to_pk_prefix_range() {
+        let (a, b) = (free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b)];
+        // Coordinator budget: 100. One channel = 40 rows, and the filtered
+        // path examines each candidate twice on the coordinator (narrowed
+        // filter walk + quorum re-read) = 80 ticks; the un-narrowed local
+        // walk alone is 120 and must trip. The whole table = 120 rows.
+        let opts = skaidb_storage::EngineOptions {
+            scan_row_budget: 100,
+            ..Default::default()
+        };
+        let na = Node::new(
+            Database::open_with_options(temp_dir("pkr-a"), opts).unwrap(),
+            cfg_auth("a", &a, &members, 2, Authenticator::None),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("pkr-b")).unwrap(),
+            cfg_auth("b", &b, &members, 2, Authenticator::None),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        na.execute("CREATE TABLE msgs (PRIMARY KEY (channel, ts))").unwrap();
+        for ch in ["a", "b", "c"] {
+            for ts in 0..40 {
+                na.execute(&format!(
+                    "INSERT INTO msgs (channel, ts, v) VALUES ('{ch}', {ts}, 'm-{ch}-{ts}')"
+                ))
+                .unwrap();
+            }
+        }
+
+        // Equality-pinned prefix: one channel's slice, under budget.
+        let rs = rows(na.execute("SELECT v FROM msgs WHERE channel = 'b'").unwrap());
+        assert_eq!(rs.rows.len(), 40);
+
+        // Prefix + trailing range on the next PK column.
+        let rs = rows(
+            na.execute("SELECT ts FROM msgs WHERE channel = 'b' AND ts >= 10 AND ts < 20")
+                .unwrap(),
+        );
+        assert_eq!(rs.rows.len(), 10);
+        let mut ts: Vec<i64> = rs
+            .rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Int(n) => *n,
+                other => panic!("expected int ts, got {other:?}"),
+            })
+            .collect();
+        ts.sort_unstable();
+        assert_eq!(ts, (10..20).collect::<Vec<i64>>());
+
+        // The original E-8 repro shape: a QUORUM COUNT(*) over a PK-prefix
+        // filter (streams through `cluster_scan_collect_counted`, narrowed).
+        let rs = rows(
+            na.execute("SELECT COUNT(*) FROM msgs WHERE channel = 'b'").unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Int(40)]]);
+
+        // No narrowing possible: the full 120-row walk must trip the budget.
+        let err = na.execute("SELECT v FROM msgs").unwrap_err();
+        assert!(
+            err.to_string().contains("scan budget exceeded"),
+            "expected scan-budget error, got: {err}"
+        );
+    }
+
+    /// Row-budget accounting on the clustered gather counts DISTINCT keys,
+    /// not per-replica copies (agencik E-7): at RF=2 every key arrives from
+    /// both sources, and a budget of exactly the table's row count must
+    /// still admit a full gather. Under the old per-source accounting this
+    /// gather ticked 2× the table and errored.
+    #[test]
+    fn clustered_gather_budget_counts_distinct_keys_not_replica_copies() {
+        let (a, b) = (free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b)];
+        let opts = skaidb_storage::EngineOptions {
+            scan_row_budget: 120,
+            ..Default::default()
+        };
+        let na = Node::new(
+            Database::open_with_options(temp_dir("dk-a"), opts).unwrap(),
+            cfg_auth("a", &a, &members, 2, Authenticator::None),
+        );
+        let nb = Node::new(
+            Database::open(temp_dir("dk-b")).unwrap(),
+            cfg_auth("b", &b, &members, 2, Authenticator::None),
+        );
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        na.execute("CREATE TABLE t (PRIMARY KEY (id))").unwrap();
+        for id in 0..120 {
+            na.execute(&format!("INSERT INTO t (id, v) VALUES ({id}, 'v{id}')"))
+                .unwrap();
+        }
+        let rs = rows(na.execute("SELECT id FROM t").unwrap());
+        assert_eq!(rs.rows.len(), 120);
     }
 
     /// The resident check trips once a caller-tracked live size exceeds the

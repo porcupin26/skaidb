@@ -2290,6 +2290,13 @@ impl Database {
                                 namespace::split(&idx).1
                             ),
                         );
+                    } else if pk_prefix_scan_range(&pk, &sel.filter).is_some() {
+                        push(
+                            "access",
+                            "primary-key prefix range (leftmost PK column(s) \
+                             equality-pinned; every shard scans only that key slice)"
+                                .into(),
+                        );
                     } else {
                         push("access", "full table scan (streaming k-way merge)".into());
                     }
@@ -5254,7 +5261,18 @@ impl Database {
             .get(table)
             .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
         let mut n = 0usize;
-        for item in engine.scan_iter() {
+        // PK-prefix narrowing (agencik E-8): an equality-pinned leftmost PK
+        // run bounds the count to that key slice — `scan_range_iter` streams
+        // live, TTL-filtered rows exactly like the full `scan_iter` walk.
+        let range = self
+            .table_def(table)
+            .ok()
+            .and_then(|def| pk_prefix_scan_range(&def.primary_key, filter));
+        let iter: Box<dyn Iterator<Item = _>> = match &range {
+            Some((start, end)) => Box::new(engine.scan_range_iter(Some(start), end.as_deref())),
+            None => Box::new(engine.scan_iter()),
+        };
+        for item in iter {
             crate::scan_meter::tick(1)?;
             let (_key, bytes) = item?;
             if let Ok(Value::Document(doc)) = Value::decode(&bytes) {
@@ -5571,44 +5589,13 @@ impl Database {
         // claimed only when no explicit ORDER BY was requested.
         {
             let pk = self.table_def(table)?.primary_key.clone();
-            let constraints = column_constraints(filter);
-            let get =
-                |col: &str| constraints.iter().find(|(c, _)| c == col).map(|(_, c)| c);
-            let mut prefix: Vec<Value> = Vec::new();
-            while prefix.len() < pk.len() {
-                match get(&pk[prefix.len()]).and_then(|c| c.eq.clone()) {
-                    Some(v) => prefix.push(v),
-                    None => break,
-                }
-            }
-            // Full-PK equality is the point-read fast path above; a partial
-            // prefix (or a prefix plus trailing range) is ours.
-            if !prefix.is_empty() && prefix.len() < pk.len() {
-                let trailing = get(&pk[prefix.len()])
-                    .filter(|c| c.eq.is_none() && (c.lo.is_some() || c.hi.is_some()));
-                let (start, end) = match trailing {
-                    Some(c) => {
-                        let start = match &c.lo {
-                            Some(v) => Some(index_prefix_n(&push(&prefix, v))),
-                            None => Some(index_prefix_n(&prefix)),
-                        };
-                        let end = match &c.hi {
-                            Some(v) => index_upper_bound_n(&push(&prefix, v)),
-                            None => index_upper_bound_n(&prefix),
-                        };
-                        (start, end)
-                    }
-                    None => (
-                        Some(index_prefix_n(&prefix)),
-                        index_upper_bound_n(&prefix),
-                    ),
-                };
+            if let Some((start, end)) = pk_prefix_scan_range(&pk, filter) {
                 let engine = self
                     .tables
                     .get(table)
                     .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
                 let mut out = Vec::new();
-                for (key, bytes) in engine.scan_range(start.as_deref(), end.as_deref())? {
+                for (key, bytes) in engine.scan_range(Some(&start), end.as_deref())? {
                     crate::scan_meter::tick(1)?;
                     if let Ok(doc) = Self::decode_row(&bytes, project) {
                         if matches_filter(filter, &doc)? {
@@ -7993,6 +7980,33 @@ impl Database {
             .get(table)
             .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
         let mut out = Vec::new();
+        // PK-prefix narrowing (agencik E-8): when the filter equality-pins a
+        // leftmost run of PK columns, walk only that key slice of this shard
+        // instead of the whole table — this runs on EVERY member (the
+        // coordinator's local leg and each peer's `FilteredScan` handler
+        // both land here), so the clustered `WHERE channel = ?` shape stops
+        // costing a full shard scan per member. Streaming, like the full
+        // walk below. Tombstones need no separate handling: `scan_range_iter`
+        // yields live puts only, and a key whose latest version is a
+        // tombstone was never a candidate.
+        if let Some((start, end)) = self
+            .table_def(table)
+            .ok()
+            .and_then(|def| pk_prefix_scan_range(&def.primary_key, filter))
+        {
+            for item in engine.scan_range_iter(Some(&start), end.as_deref()) {
+                crate::scan_meter::tick(1)?;
+                let (key, bytes) = item?;
+                if let Value::Document(doc) = Value::decode(&bytes)
+                    .map_err(|e| EngineError::Constraint(format!("corrupt row: {e}")))?
+                {
+                    if matches_filter(filter, &doc)? {
+                        out.push(key);
+                    }
+                }
+            }
+            return Ok(out);
+        }
         // Stream one row at a time: the materializing scan built a whole-table
         // Vec (~1.8 GB on the largest production table) per filtered RPC and
         // OOM'd 4 GB nodes when several stacked (2026-07-13).
@@ -12401,6 +12415,52 @@ fn geo_entry_key(doc: &Document, path: &str, row_key: &[u8]) -> Option<Vec<u8>> 
 /// The shared byte prefix of every index entry whose leading values are
 /// `values` (the encoding of the array `[values..]` without its trailing array
 /// terminator). Also the inclusive lower bound for a scan starting there.
+/// Primary-key prefix range for `filter` over a table with PK columns `pk`:
+/// a leftmost run of PK columns pinned by equality (plus one optional
+/// trailing range on the next PK column) bounds the scan to `[start, end)`
+/// of the table's own key space — the table IS the primary index, ordered by
+/// its encoded key. `WHERE channel = ?` on PK `(channel, ts)` reads one
+/// channel's slice instead of the whole table. `None` when the filter pins
+/// no leftmost PK column, and for full-PK equality (that is the point-read
+/// fast path). Bounds are a *superset* of the matches (see
+/// [`column_constraints`]) — callers re-check the filter on every row.
+/// `end = None` means unbounded above. Used by the local gather
+/// ([`Database::gather_rows_planned`]) and the clustered gather
+/// (`cluster_scan_collect`), which narrows every source — its own shard
+/// walk and each peer's scan cursor — to the same range.
+pub fn pk_prefix_scan_range(
+    pk: &[String],
+    filter: &Option<Expr>,
+) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+    let constraints = column_constraints(filter);
+    let get = |col: &str| constraints.iter().find(|(c, _)| c == col).map(|(_, c)| c);
+    let mut prefix: Vec<Value> = Vec::new();
+    while prefix.len() < pk.len() {
+        match get(&pk[prefix.len()]).and_then(|c| c.eq.clone()) {
+            Some(v) => prefix.push(v),
+            None => break,
+        }
+    }
+    if prefix.is_empty() || prefix.len() >= pk.len() {
+        return None;
+    }
+    let trailing = get(&pk[prefix.len()])
+        .filter(|c| c.eq.is_none() && (c.lo.is_some() || c.hi.is_some()));
+    Some(match trailing {
+        Some(c) => (
+            match &c.lo {
+                Some(v) => index_prefix_n(&push(&prefix, v)),
+                None => index_prefix_n(&prefix),
+            },
+            match &c.hi {
+                Some(v) => index_upper_bound_n(&push(&prefix, v)),
+                None => index_upper_bound_n(&prefix),
+            },
+        ),
+        None => (index_prefix_n(&prefix), index_upper_bound_n(&prefix)),
+    })
+}
+
 fn index_prefix_n(values: &[Value]) -> Vec<u8> {
     let mut key = Value::Array(values.to_vec()).encode_key();
     key.pop(); // drop the array-terminator byte

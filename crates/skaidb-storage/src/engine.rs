@@ -812,6 +812,11 @@ impl Engine {
         }
         KWayMerge::new(sources)
             .filter_map(|item| match item {
+                // TTL: an expired row is physically live until compaction but
+                // must not be served — same filter as `scan_iter`/`get` (a
+                // pinned-PK-prefix gather reads row bytes straight from this
+                // range, with no point-read re-check to catch expiry).
+                Ok((_, hlc, VersionValue::Put(_))) if self.is_expired(hlc) => None,
                 Ok((k, _, VersionValue::Put(bytes))) => Some(Ok((k, bytes))),
                 Ok((_, _, VersionValue::Delete)) => None,
                 Err(e) => Some(Err(e)),
@@ -858,6 +863,8 @@ impl Engine {
             ));
         }
         KWayMerge::new(sources).filter_map(|item| match item {
+            // TTL: same expiry filter as `scan_range` — see the note there.
+            Ok((_, hlc, VersionValue::Put(_))) if self.is_expired(hlc) => None,
             Ok((k, _, VersionValue::Put(bytes))) => Some(Ok((k, bytes))),
             Ok((_, _, VersionValue::Delete)) => None,
             Err(e) => Some(Err(e)),
@@ -1854,6 +1861,33 @@ mod tests {
             level1_capacity: 8,
             ..Default::default()
         }
+    }
+
+    /// TTL applies to RANGE scans, not only point reads and full walks: an
+    /// expired row is physically live until compaction, and `scan_range` /
+    /// `scan_range_iter` used to serve it — the pinned-PK-prefix gather
+    /// reads row bytes straight from these ranges with no point-read
+    /// re-check, so a TTL table with a composite PK leaked expired rows to
+    /// `WHERE <pk-prefix> = ?` queries.
+    #[test]
+    fn range_scans_filter_ttl_expired_rows() {
+        let dir = tempdir();
+        let mut e = Engine::open_with_options(&dir, small_opts()).unwrap();
+        e.set_ttl(Some(60_000)); // 1 min
+        let now = now_wall_ms();
+        e.put_with_hlc(b"k-fresh", b"live".to_vec(), Hlc::new(now, 0)).unwrap();
+        e.put_with_hlc(b"k-stale", b"dead".to_vec(), Hlc::new(now - 120_000, 0)).unwrap();
+
+        let rows = e.scan_range(None, None).unwrap();
+        assert_eq!(rows.len(), 1, "scan_range must filter the expired row");
+        assert_eq!(rows[0].0, b"k-fresh");
+
+        let rows: Vec<_> = e
+            .scan_range_iter(None, None)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows.len(), 1, "scan_range_iter must filter the expired row");
+        assert_eq!(rows[0].0, b"k-fresh");
     }
 
     /// End-to-end at-rest: an encrypted engine flushes + compacts encrypted

@@ -135,7 +135,10 @@ Key facts an agent must know:
   point read — even for an absent key (no full-table scan). A leftmost
   equality *prefix* (plus one trailing range on the next PK column) scans
   only that key slice — `WHERE channel = ?` reads one channel, `AND ts >= ?`
-  narrows it. No secondary index needed for shapes the primary key orders:
+  narrows it. This holds on CLUSTERED reads too (SELECT and COUNT at any
+  consistency): the coordinator and every member narrow their shard walks
+  to the pinned slice, instead of each full-scanning its shard to push the
+  filter down. EXPLAIN reports it as `primary-key prefix range`. No secondary index needed for shapes the primary key orders:
   `ORDER BY <leftmost pk column> LIMIT k` (optionally with a pk range —
   keyset pagination: `WHERE id > ? ORDER BY id LIMIT ?`) walks the table
   in key order with early stop, at ONE and QUORUM (k ≤ 1000) alike, with
@@ -160,7 +163,10 @@ Key facts an agent must know:
   rows (default 250k; 0 disables), materialize at most `storage.scan_byte_budget`
   bytes into a result set (default 256 MB; 0 disables), and run at most
   `storage.statement_timeout_secs` (default 120s; 0 disables) — past any of them
-  it errors with `resource limit: ...`. `LIMIT` bounds output, not scan work: a
+  it errors with `resource limit: ...`. On a clustered gather the row budget
+  counts each DISTINCT row key once, however many replicas deliver a copy —
+  an RF=3 full-copy gather of a 183k-row table costs 183k, not 3×183k.
+  `LIMIT` bounds output, not scan work: a
   filter matching nothing under `ORDER BY .. LIMIT` walks the whole range. The
   row budget bounds work; the byte budget bounds MEMORY — a scan of many
   multi-KB rows can stay under 250k rows yet gather gigabytes on the
