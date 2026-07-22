@@ -4756,6 +4756,12 @@ impl Node {
         }
         // Time-series hints replay via TsMerge, which accepts samples of any
         // age (the receiver may have moved past them while it was down).
+        // COALESCED per table: every TsMerge call cuts a level-0 block on
+        // the receiver, so per-batch delivery turned a hint backlog into a
+        // block directory per hinted WRITE (the 2026-07-22 390k-block
+        // incident). One merged request per table per drain pass instead,
+        // chunked so a deep backlog doesn't build an unbounded RPC.
+        const TS_MERGE_CHUNK_SAMPLES: usize = 50_000;
         let ts_pending: Vec<(NodeId, Vec<TsHint>)> = {
             let mut hints = self.ts_hints.lock().expect("ts hints lock");
             hints.drain().collect()
@@ -4764,17 +4770,24 @@ impl Node {
             let Some(addr) = self.peer_addr(&replica) else {
                 continue;
             };
-            let mut remaining = Vec::new();
+            let mut by_table: BTreeMap<String, Vec<(skaidb_tsdb::Labels, i64, f64)>> =
+                BTreeMap::new();
             for (table, rows) in batches {
-                match self.pool.call(
-                    &addr,
-                    &Request::TsMerge {
-                        table: table.clone(),
-                        rows: rows.clone(),
-                    },
-                ) {
-                    Ok(Response::Ack) => delivered += rows.len(),
-                    _ => remaining.push((table, rows)),
+                by_table.entry(table).or_default().extend(rows);
+            }
+            let mut remaining = Vec::new();
+            for (table, rows) in by_table {
+                for chunk in rows.chunks(TS_MERGE_CHUNK_SAMPLES) {
+                    match self.pool.call(
+                        &addr,
+                        &Request::TsMerge {
+                            table: table.clone(),
+                            rows: chunk.to_vec(),
+                        },
+                    ) {
+                        Ok(Response::Ack) => delivered += chunk.len(),
+                        _ => remaining.push((table.clone(), chunk.to_vec())),
+                    }
                 }
             }
             if !remaining.is_empty() {

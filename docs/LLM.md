@@ -540,6 +540,14 @@ WHERE ts >= now() - 6h GROUP BY t;
   `affected` counts only what landed (`0` = all dropped; per-field counts
   when a row has several numeric fields). Check `affected` in ingest code;
   `timeseries.<t>.samples_rejected` in SHOW STATUS is the cumulative view.
+- **TS maintenance is best-effort and self-bounding**: retention/compaction
+  failures never fail the append that triggered them (they count into the
+  store's `maintenance_errors` stat and retry next flush); repair/hint
+  merge ingest folds its own block backlog inline (bounded rounds), and
+  hinted TS writes coalesce per table per drain pass — a hint storm can't
+  grow the block-directory count without bound, and leftover directories
+  from an interrupted block write can't wedge later flushes (ENOTEMPTY
+  incident class, fixed 2026-07-22).
 - `rate/increase/delta` are counter-reset-aware, computed per series then
   summed across the group (PromQL `sum(rate(...))` semantics); `first/last`
   take the earliest/latest value.

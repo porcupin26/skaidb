@@ -61,7 +61,14 @@ pub fn plan(blocks: &[Block], block_span: i64) -> Option<Vec<usize>> {
 /// Merge the given blocks into one at `level + 1`, writing the new block
 /// under `blocks_dir` with `seq`, then deleting the inputs. Chunks for the
 /// same series concatenate in time order (block windows are disjoint).
-pub fn merge(blocks_dir: &Path, seq: u64, inputs: &[&Block]) -> Result<()> {
+/// Returns the new block's directory so the caller can update its block
+/// list incrementally — re-listing the whole blocks directory per merge is
+/// O(blocks) and was what kept a 390k-block backlog from ever draining
+/// (2026-07-22 incident). Input-directory removal is best-effort: a
+/// leftover input holds duplicate data that query-time dedupe and the next
+/// compaction pass fold away, while an ERROR here used to abort the flush
+/// with the store's in-memory state out of sync with disk.
+pub fn merge(blocks_dir: &Path, seq: u64, inputs: &[&Block]) -> Result<std::path::PathBuf> {
     let level = inputs.iter().map(|b| b.meta.level).max().unwrap_or(0) + 1;
     // Inputs are time-ordered, so appending per series preserves chunk order.
     let mut merged: Vec<(Labels, Vec<SealedChunk>)> = Vec::new();
@@ -103,26 +110,28 @@ pub fn merge(blocks_dir: &Path, seq: u64, inputs: &[&Block]) -> Result<()> {
             *chunks = crate::head::rechunk(&samples, i64::MAX)?;
         }
     }
-    write_block(blocks_dir, seq, level, merged)?;
+    let new_dir = write_block(blocks_dir, seq, level, merged)?;
     for block in inputs {
-        fs::remove_dir_all(&block.dir)?;
+        let _ = fs::remove_dir_all(&block.dir);
     }
-    Ok(())
+    Ok(new_dir)
 }
 
 /// Delete blocks whose entire window is older than `cutoff_ts`. Returns how
-/// many were dropped.
-pub fn drop_expired(blocks: &mut Vec<Block>, cutoff_ts: i64) -> Result<usize> {
+/// many were dropped. Removal is best-effort per block: a directory that
+/// fails to delete stays in the list and is retried on the next pass —
+/// erroring out used to LOSE the drained-but-unremoved blocks from the
+/// in-memory list while their directories stayed on disk.
+pub fn drop_expired(blocks: &mut Vec<Block>, cutoff_ts: i64) -> usize {
     let mut dropped = 0;
     let mut kept = Vec::with_capacity(blocks.len());
     for block in blocks.drain(..) {
-        if block.meta.max_ts < cutoff_ts {
-            fs::remove_dir_all(&block.dir)?;
+        if block.meta.max_ts < cutoff_ts && fs::remove_dir_all(&block.dir).is_ok() {
             dropped += 1;
         } else {
             kept.push(block);
         }
     }
     *blocks = kept;
-    Ok(dropped)
+    dropped
 }

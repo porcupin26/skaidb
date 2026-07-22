@@ -181,6 +181,9 @@ pub struct TsdbStats {
     pub samples_appended: u64,
     pub samples_rejected: u64,
     pub disk_bytes: u64,
+    /// Best-effort retention/compaction failures since open (maintenance
+    /// never fails an append; this is where its errors surface).
+    pub maintenance_errors: u64,
 }
 
 #[derive(Debug)]
@@ -194,7 +197,25 @@ struct Inner {
     flushed_through: i64,
     samples_appended: u64,
     samples_rejected: u64,
+    /// Best-effort maintenance (retention / compaction) failures since
+    /// open — surfaced in stats; maintenance never fails an append.
+    maintenance_errors: u64,
 }
+
+/// Max input blocks folded per compaction round — bounds one round's I/O
+/// and the size of the readdir-free incremental list splice.
+const MAX_MERGE_INPUTS: usize = 256;
+/// Wall-clock budget for the compaction that rides a flush (holds the
+/// store lock; appends queue behind it).
+const FLUSH_COMPACT_BUDGET: std::time::Duration = std::time::Duration::from_millis(2000);
+/// `merge_samples` triggers a compaction round once the store holds more
+/// than this many blocks — repair/hint ingest cuts a block per call, so
+/// without this hook a hint storm grows the block count without bound
+/// (nothing else compacts until the next head flush).
+const MERGE_COMPACT_BACKLOG: usize = 64;
+/// Budget for the `merge_samples`-triggered round (hint delivery latency
+/// rides on it).
+const MERGE_COMPACT_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// One time-series store (one table's worth of series).
 #[derive(Debug)]
@@ -258,8 +279,29 @@ impl Tsdb {
                 flushed_through,
                 samples_appended: 0,
                 samples_rejected: 0,
+                maintenance_errors: 0,
             }),
         })
+    }
+
+    /// Claim the next block sequence number, skipping any sequence whose
+    /// `b-` directory already exists on disk. A failed `write_block` used
+    /// to leave `next_block_seq` un-advanced while its output directory
+    /// could exist — the next flush then renamed onto the existing
+    /// non-empty directory and every TS write failed with ENOTEMPTY
+    /// ("Directory not empty", 2026-07-22 prod incident) until a restart
+    /// re-derived the counter. Claiming BEFORE the write (and skipping
+    /// occupied sequences) makes a collision impossible to repeat: the
+    /// worst a failed write leaves behind is a `tmp-` directory, which
+    /// `open_all` sweeps.
+    fn alloc_block_seq(&self, inner: &mut Inner) -> u64 {
+        let blocks_dir = self.dir.join("blocks");
+        let mut seq = inner.next_block_seq;
+        while blocks_dir.join(format!("b-{seq:08}")).exists() {
+            seq += 1;
+        }
+        inner.next_block_seq = seq + 1;
+        seq
     }
 
     /// Append a batch of samples: one WAL record + one fsync for the whole
@@ -362,9 +404,8 @@ impl Tsdb {
     ) -> Result<FlushedSeries> {
         let flushed = inner.head.take_before(boundary, self.opts.block_span_ms)?;
         if !flushed.is_empty() {
-            let seq = inner.next_block_seq;
+            let seq = self.alloc_block_seq(inner);
             let dir = write_block(&self.dir.join("blocks"), seq, 0, flushed.clone())?;
-            inner.next_block_seq += 1;
             inner.blocks.push(Block::open(&dir)?);
             inner
                 .blocks
@@ -399,19 +440,63 @@ impl Tsdb {
         inner.wal.sync()?;
         inner.wal.truncate_before(keep)?;
 
-        // Retention + compaction ride the flush cadence.
+        // Retention + compaction ride the flush cadence — BEST-EFFORT: a
+        // maintenance failure must not fail the client write that
+        // triggered this flush (the samples above are already durable in
+        // blocks + WAL). Failures count into stats and retry next flush.
         if let Some(retention) = self.opts.retention_ms {
             let cutoff = inner.head.max_ts.saturating_sub(retention);
-            compact::drop_expired(&mut inner.blocks, cutoff)?;
+            compact::drop_expired(&mut inner.blocks, cutoff);
         }
-        while let Some(group) = compact::plan(&inner.blocks, self.opts.block_span_ms) {
-            let inputs: Vec<&Block> = group.iter().map(|&i| &inner.blocks[i]).collect();
-            let seq = inner.next_block_seq;
-            compact::merge(&self.dir.join("blocks"), seq, &inputs)?;
-            inner.next_block_seq += 1;
-            inner.blocks = Block::open_all(&self.dir.join("blocks"))?;
-        }
+        self.compact_locked(inner, FLUSH_COMPACT_BUDGET);
         Ok(flushed)
+    }
+
+    /// Run bounded compaction rounds under the (already-held) store lock:
+    /// capped merge-group size, incremental block-list updates, and a
+    /// wall-clock budget so a large backlog drains progressively across
+    /// calls instead of holding the lock (and every append behind it)
+    /// hostage. The unbounded predecessor re-listed the whole blocks
+    /// directory per merge round — O(blocks) each — which meant a 390k
+    /// single-sample-block backlog (hint-replay storms, 2026-07-22
+    /// incident) could never drain and stalled writes trying.
+    fn compact_locked(&self, inner: &mut Inner, budget: std::time::Duration) {
+        let start = std::time::Instant::now();
+        let blocks_dir = self.dir.join("blocks");
+        while let Some(mut group) = compact::plan(&inner.blocks, self.opts.block_span_ms) {
+            // A truncated group is a prefix of adjacent same-level blocks —
+            // still within the tier window, still mergeable.
+            group.truncate(MAX_MERGE_INPUTS);
+            if group.len() < 2 {
+                break;
+            }
+            let seq = self.alloc_block_seq(inner);
+            let inputs: Vec<&Block> = group.iter().map(|&i| &inner.blocks[i]).collect();
+            let merged = match compact::merge(&blocks_dir, seq, &inputs) {
+                Ok(dir) => dir,
+                Err(_) => {
+                    inner.maintenance_errors += 1;
+                    break;
+                }
+            };
+            let opened = match Block::open(&merged) {
+                Ok(b) => b,
+                Err(_) => {
+                    inner.maintenance_errors += 1;
+                    break;
+                }
+            };
+            // Incremental list update: drop the inputs (descending index
+            // order keeps the earlier indices valid), add the merged block.
+            for &i in group.iter().rev() {
+                inner.blocks.remove(i);
+            }
+            inner.blocks.push(opened);
+            inner.blocks.sort_by_key(|b| (b.meta.min_ts, b.meta.seq));
+            if start.elapsed() > budget {
+                break;
+            }
+        }
     }
 
     /// All samples in `[t0, t1]` for series matching every matcher, grouped
@@ -504,11 +589,17 @@ impl Tsdb {
             series.push((labels, chunks));
         }
         let mut inner = self.inner.lock().expect("tsdb lock");
-        let seq = inner.next_block_seq;
+        let seq = self.alloc_block_seq(&mut inner);
         let dir = write_block(&self.dir.join("blocks"), seq, 0, series)?;
-        inner.next_block_seq += 1;
         inner.blocks.push(Block::open(&dir)?);
         inner.blocks.sort_by_key(|b| (b.meta.min_ts, b.meta.seq));
+        // Repair/hint ingest cuts a block per call; fold the backlog as it
+        // forms — a hint storm used to grow the block count without bound
+        // (390k single-sample block dirs, 2026-07-22 incident) because
+        // only head flushes compacted.
+        if inner.blocks.len() > MERGE_COMPACT_BACKLOG {
+            self.compact_locked(&mut inner, MERGE_COMPACT_BUDGET);
+        }
         Ok(n)
     }
 
@@ -557,6 +648,7 @@ impl Tsdb {
             samples_appended: inner.samples_appended,
             samples_rejected: inner.samples_rejected,
             disk_bytes,
+            maintenance_errors: inner.maintenance_errors,
         }
     }
 
@@ -617,8 +709,7 @@ impl Tsdb {
         }
         for (old_dir, kept) in pending {
             if !kept.is_empty() {
-                let seq = inner.next_block_seq;
-                inner.next_block_seq += 1;
+                let seq = self.alloc_block_seq(&mut inner);
                 let dir = write_block(&blocks_dir, seq, 0, kept)?;
                 rebuilt.push(Block::open(&dir)?);
             }
@@ -900,6 +991,56 @@ mod tests {
         assert_eq!(res.appended, 1);
         assert_eq!(res.rejected_out_of_order, 1);
         assert_eq!(res.rejected_series_limit, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A leftover block directory on a sequence the counter would hand out
+    /// (the residue of a failed/crashed block write) must not wedge the
+    /// store: `alloc_block_seq` skips occupied sequences instead of
+    /// renaming onto the existing non-empty directory. The unfixed path
+    /// failed EVERY subsequent flush/merge with ENOTEMPTY ("Directory not
+    /// empty (os error 39)", 2026-07-22 prod incident) until a restart.
+    #[test]
+    fn block_seq_collision_skips_orphan_dir() {
+        let dir = temp_dir("orph");
+        let db = Tsdb::open(&dir, opts(10_000)).unwrap();
+        db.merge_samples(&[(labels("a"), 1_000, 1.0)]).unwrap();
+        // Plant a non-empty orphan directory at the NEXT sequence.
+        let orphan = dir.join("blocks").join("b-00000003");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join("junk"), b"x").unwrap();
+        // Both merge-path and flush-path block writes must route around it.
+        db.merge_samples(&[(labels("a"), 2_000, 2.0)]).unwrap();
+        db.append_batch(&[(labels("a"), 25_000, 3.0)]).unwrap(); // crosses window → flush
+        let all = db.query(&[], 0, i64::MAX).unwrap();
+        let n: usize = all.iter().map(|(_, s)| s.len()).sum();
+        assert_eq!(n, 3, "all samples served despite the orphan");
+        assert!(orphan.join("junk").exists(), "orphan left untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Repair/hint ingest (`merge_samples`) cuts a block per call; the
+    /// backlog hook must fold them so the block count stays bounded — a
+    /// hint storm used to accumulate one directory per hinted write
+    /// (389,940 single-sample dirs on prod, 2026-07-22) with nothing
+    /// compacting until the next head flush.
+    #[test]
+    fn merge_samples_backlog_stays_bounded() {
+        let dir = temp_dir("mrgb");
+        let db = Tsdb::open(&dir, opts(10_000)).unwrap();
+        for i in 0..300i64 {
+            db.merge_samples(&[(labels("a"), i * 100, i as f64)]).unwrap();
+        }
+        let stats = db.stats();
+        assert!(
+            stats.blocks <= MERGE_COMPACT_BACKLOG + 1,
+            "block backlog must stay bounded, got {}",
+            stats.blocks
+        );
+        // Every sample survives the folding.
+        let all = db.query(&[], 0, i64::MAX).unwrap();
+        let n: usize = all.iter().map(|(_, s)| s.len()).sum();
+        assert_eq!(n, 300);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

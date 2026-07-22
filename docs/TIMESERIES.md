@@ -174,7 +174,17 @@ stored as its own compressed stream. Full grammar and semantics:
   divergent series via a merge path that accepts samples of any age (fills
   mid-series gaps a normal append would reject). Duplicate chunks the merge
   creates fold away at the next compaction. A long-down replica now
-  converges durably, not just at read time.
+  converges durably, not just at read time. Merge ingest folds its own
+  backlog: each merge call cuts a level-0 block, and once a store holds
+  more than a small backlog of blocks a bounded compaction round runs
+  inline (capped group size, wall-clock budget), so hint-replay storms
+  can't grow the block count without bound. Hinted TS writes coalesce
+  per table into one merge per drain pass. Retention/compaction are
+  best-effort maintenance: a maintenance failure surfaces in stats
+  (`maintenance_errors`) and retries next flush — it never fails the
+  client append that triggered it. Block sequence numbers skip any
+  directory already on disk, so residue from an interrupted block write
+  can't wedge later flushes.
 - **Cluster distribution**: TS DDL broadcasts like other DDL; a series (its
   labels) is the placement unit on the ring, replicated to RF nodes — all of
   a series' field streams co-locate. Appends group per replica set (one
