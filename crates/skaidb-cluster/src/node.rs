@@ -7541,6 +7541,7 @@ impl Node {
         query: &[f32],
         k: usize,
         filter: &Option<Expr>,
+        oc: Option<Consistency>,
     ) -> EngineResult<Vec<(Vec<u8>, Document, f32)>> {
         let (table, rescore) = {
             let db = self
@@ -7612,7 +7613,8 @@ impl Node {
         ranked.sort_by(|a, b| a.1.total_cmp(&b.1));
         let mut out = Vec::new();
         for (key, dist) in ranked {
-            let rows = filter_rows(filter, self.point_get(table.as_str(), &key, None)?)?;
+            // Same consistency-honoring re-read as `search` (see there).
+            let rows = filter_rows(filter, self.point_get(table.as_str(), &key, oc)?)?;
             if let Some((_, doc)) = rows.into_iter().next() {
                 out.push((key, doc, dist));
                 if out.len() >= want {
@@ -7654,6 +7656,7 @@ impl Node {
         k: Option<usize>,
         filter: &Option<Expr>,
         highlights: &[HlReq],
+        oc: Option<Consistency>,
     ) -> EngineResult<Vec<(Vec<u8>, Document, f32)>> {
         // Over-fetch per shard so the merge (and any filtering) still yields k.
         let fetch = k.map(|k| {
@@ -7730,7 +7733,11 @@ impl Node {
             // hit the scan budget instead of tying the coordinator up for
             // the whole statement timeout (2026-07-15 incident).
             skaidb_engine::scan_meter::tick(1)?;
-            let rows = filter_rows(filter, self.point_get(table, &key, None)?)?;
+            // The caller's read consistency governs the hit re-read: at
+            // `SET CONSISTENCY ONE` a degraded replica set (node down at
+            // RF=2) still serves from the surviving replica instead of
+            // failing the whole search on the default-quorum re-read.
+            let rows = filter_rows(filter, self.point_get(table, &key, oc)?)?;
             if let Some((_, mut doc)) = rows.into_iter().next() {
                 for (col, h) in &highlighters {
                     let snippet = h.snippet_doc(&doc, col);
@@ -8614,7 +8621,7 @@ impl Cluster for Coordinator {
             })?;
         // Distributed ANN: scatter to every node's local HNSW, merge by
         // distance, re-read survivors at the read quorum.
-        self.node.vector_search(&index, query, k, filter)
+        self.node.vector_search(&index, query, k, filter, self.oc)
     }
 
     fn embed_query(&self, table: &str, path: &str, text: &str) -> EngineResult<Vec<f32>> {
@@ -8649,7 +8656,7 @@ impl Cluster for Coordinator {
         // Multi-node: scatter to every member's local shard and merge
         // (per-shard BM25, re-read at read consistency).
         if self.node.member_count() > 1 {
-            return self.node.search(table, query, k, filter, highlights);
+            return self.node.search(table, query, k, filter, highlights, self.oc);
         }
         // Sole member: every row is local. Serve under the write lock so
         // pending index writes commit first (read-your-writes).
@@ -10247,7 +10254,7 @@ mod tests {
 
         // Distributed kNN coordinated by a different node: scatter to all
         // members' local HNSW, merge, re-read at quorum.
-        assert_eq!(ids(nb.vector_search("docs_emb", &[1.0, 0.0, 0.0], 2, &None).unwrap()), vec![1, 4]);
+        assert_eq!(ids(nb.vector_search("docs_emb", &[1.0, 0.0, 0.0], 2, &None, None).unwrap()), vec![1, 4]);
 
         // Filtered distributed kNN: WHERE cat = 'a' excludes id 4.
         let filter = Some(Expr::Binary {
@@ -10256,7 +10263,7 @@ mod tests {
             right: Box::new(Expr::Literal(Value::String("a".into()))),
         });
         assert_eq!(
-            ids(nc.vector_search("docs_emb", &[1.0, 0.0, 0.0], 2, &filter).unwrap()),
+            ids(nc.vector_search("docs_emb", &[1.0, 0.0, 0.0], 2, &filter, None).unwrap()),
             vec![1, 3]
         );
 
@@ -10851,6 +10858,64 @@ mod tests {
             );
             assert_eq!(rs.rows[0][0], Value::Int(1), "id1 nearest from every coord");
         }
+    }
+
+    /// A degraded replica set must not fail a search served at ONE: the
+    /// hit re-read honors the caller's read consistency. It used to
+    /// hardcode `None` (the cluster default — QUORUM), so at RF=2 with a
+    /// member down EVERY search failed "read quorum not met: 1/2" even
+    /// when the session asked for ONE — found live by the 2026-07-22 FTS
+    /// cluster kill/rejoin re-run (280k-doc corpus, bench fleet).
+    #[test]
+    fn search_hit_reread_honors_caller_consistency() {
+        let (a, b, c) = (free_addr(), free_addr(), free_addr());
+        let members = vec![member("a", &a), member("b", &b), member("c", &c)];
+        // RF=2, default read QUORUM (both replicas), writes at ONE so
+        // ingest survives the dead member.
+        let mk = |id: &str, addr: &str| NodeConfig {
+            id: NodeId::new(id),
+            internode_addr: addr.to_string(),
+            members: members.clone(),
+            replication_factor: 2,
+            vnodes_per_node: 64,
+            read_consistency: Consistency::Quorum,
+            write_consistency: Consistency::One,
+            auth: Arc::new(Authenticator::None),
+            auto_join: false,
+            anti_entropy_interval_secs: 0,
+        };
+        let na = Node::new(Database::open(temp_dir("dsc-a")).unwrap(), mk("a", &a));
+        let nb = Node::new(Database::open(temp_dir("dsc-b")).unwrap(), mk("b", &b));
+        // Member "c" is configured but never serves: a down replica.
+        na.serve_internode().unwrap();
+        nb.serve_internode().unwrap();
+        na.execute("CREATE TABLE arts (PRIMARY KEY (id))").unwrap();
+        na.execute("CREATE SEARCH INDEX arts_fts ON arts (body)").unwrap();
+        for i in 0..40 {
+            na.execute(&format!(
+                "INSERT INTO arts (id, body) VALUES ({i}, 'shared needle {i}')"
+            ))
+            .unwrap();
+        }
+        let query = skaidb_fts::SearchQuery::Match {
+            field: Some("body".into()),
+            text: "needle".into(),
+        };
+        // At the QUORUM default, some hit's replica set includes the dead
+        // member and the re-read fails.
+        let err = na
+            .search("arts", &query, Some(10), &None, &[], None)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("read quorum not met"),
+            "expected quorum failure, got: {err}"
+        );
+        // The same search at the caller's ONE serves from the surviving
+        // replicas, complete.
+        let hits = na
+            .search("arts", &query, Some(10), &None, &[], Some(Consistency::One))
+            .unwrap();
+        assert_eq!(hits.len(), 10);
     }
 
     /// Hybrid retrieval (`RANK BY RRF`) works cluster-wide: both legs scatter

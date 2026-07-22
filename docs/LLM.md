@@ -765,7 +765,10 @@ the table on open. Distributed: scatter, merge by distance.
   scatters) falls back to an exact row gather.
 - **Transactions do not work on clusters** (each statement autocommits).
 - Every acked write is durable (WAL) and searchable cluster-wide within the
-  refresh interval.
+  refresh interval. Search/vector hit re-reads honor the session's
+  `SET CONSISTENCY`: at RF=2 with a member down, QUORUM reads refuse
+  (1/2 replicas) but `SET CONSISTENCY ONE` serves complete results from
+  the surviving replicas (verified live, 280k-doc kill/rejoin leg).
 - **Graceful shutdown**: SIGTERM flushes memtables + commits search
   writers (fast restart, no index rebuild). **Full-copy counts**: at
   RF >= members, unfiltered `COUNT(*)` answers from local key stats (no

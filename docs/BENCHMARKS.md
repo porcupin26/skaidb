@@ -41,7 +41,7 @@ idle non-participant containers). Run-to-run spread on this host is
 |---|---|---|---|---|---|---|
 | C1–C4 | 2026-07-17 | 0.94.3 | 17.10 | 7.0.37 / 8.0.26 | 11.4 | — |
 | C0 | 2026-07-16 | 0.94.x-dev¹ | 15.18 | 7.0.34 / — | 11.4 | 8.14.3 |
-| FTS vs ES | 2026-07-16 | 0.92.1 | — | — | — | 8.14.3 |
+| FTS vs ES | 2026-07-22 | 0.137.0 | — | — | — | 8.19.18 |
 | Global-index A/B | 2026-07-21 | 0.134.1 | — | — | — | — |
 | Sharded scatter | 2026-07-16 | 0.92.1 | — | — | — | — |
 | Version-impact A/B | 2026-07-21 | 0.130.0 vs 0.134.1 | — | — | — | — |
@@ -298,40 +298,62 @@ log documents (text `msg`, keyword `level`, long `bytes`).
 Kill/rejoin and live-reshard resilience demos were not re-run this
 round — re-run them before citing resilience claims from this document.
 
-## Full-text search vs Elasticsearch (v0.92.1, 2026-07-16)
+## Full-text search vs Elasticsearch (v0.137.0, 2026-07-22)
 
 skaidb `SEARCH INDEX` vs Elasticsearch, single node each, both on
-dedicated **2 vCPU / 2 GB** LXCs, driven from a third VLAN-local client.
-**100,000-document synthetic corpus** (short prose, deterministic
-generation, `id`/`title`/`body`) — not the original 280,595-doc Simple
-English Wikipedia corpus (regenerating it is a known follow-up). Both
-engines: `standard` analyzer, 1 s refresh, per-batch durability (skaidb:
-WAL fsync per statement; ES: translog fsync per bulk), 1 GB ES heap /
-matching skaidb memtable budget.
+dedicated **2 vCPU / 2 GB** LXCs, driven from a VLAN-local client. The
+**original 280,595-document Simple English Wikipedia corpus** (real
+prose; lead sections of ns-0 articles) and the original 400-query set —
+the full-scale re-verification the 2026-07-16 synthetic round deferred.
+Both engines: `standard` analyzer, 1 s refresh, per-batch durability,
+1 GB ES heap / matching skaidb memory target. Two full passes each,
+alternated order; ranges below span the two passes.
 
-|                       | skaidb 0.92.1 | Elasticsearch 8.14.3 |
-|-----------------------|--------------:|----------------------:|
-| ingest (docs/s)       |     **7,952** |                  4,733 |
-| term p50 / p95 (ms)   |    **1.3 / 1.7** |            14.2 / 19.9 |
-| AND p50 / p95 (ms)    |    **4.1 / 6.3** |            26.6 / 53.6 |
-| OR p50 / p95 (ms)     |    **4.4 / 5.2** |            29.3 / 32.5 |
-| phrase p50 / p95 (ms) |         26.2 / 26.8 |        **27.1 / 37.9** |
-| NRT visibility (ms)   |         **43** |                    684 |
-| process RSS (post-ingest) | **~291 MB** |               ~1,412 MB |
+|                       | skaidb 0.137.0 | Elasticsearch 8.19.18 |
+|-----------------------|---------------:|----------------------:|
+| ingest (docs/s)       | **10,267–10,535** |          4,896–6,578 |
+| term p50 / p95 (ms)   |  **0.6–1.1 / 0.8–3.4** |  6.9–8.5 / 13.5–16.4 |
+| AND p50 / p95 (ms)    |  **0.6 / 0.7–1.4** |       5.2–7.2 / 8.5–10.5 |
+| OR p50 / p95 (ms)     |  **0.7–0.8 / 1.1–1.2** |   5.4–7.2 / 8.3–11.4 |
+| phrase p50 / p95 (ms) |  **0.7–1.5 / 6.9–7.0** |  5.0–5.4 / 13.2–19.7 |
+| NRT visibility (ms)   |      394–535 |             **73–331** |
+| process RSS (post-ingest) | **~727 MB** |             ~1,570 MB |
 
-skaidb leads ingest (1.7×) and every query class except phrase, where the
-two are within noise — a synthetic-corpus artifact (heavy phrase
-repetition stresses phrase adjacency for both engines).
+skaidb leads ingest ~1.8× and every query class by ~5–10× at this
+corpus; NRT is refresh-cycle-bound on both (1 s refresh — the spread is
+where in the cycle the probe lands, not engine speed). Hit counts per
+class were identical across engines on every run (1000/845/1000/495).
 
-**Result-set parity** (top-10 id-set overlap): term 94.7% / and 99.0% /
-or 97.0% / phrase 86.0% strict; **94.2% overall strict, 99.6%
-tie-tolerant** (@10-in-15) — in line with the original natural-prose
-corpus round (98.5%/99.8%); the synthetic corpus stresses BM25
-tie-breaking harder.
+**Result-set parity** (top-10 id-set overlap): term 99.7% / and 99.7% /
+or 100.0% / phrase 99.6% strict — **99.8% overall strict, 100.0%
+tie-tolerant** (@10-in-15). On real prose the two engines agree
+essentially exactly; the 2026-07-16 synthetic corpus's 94.2% strict was
+BM25 tie-break stress, as suspected.
 
-The original round's 3-node cluster leg (ingest + scatter latency +
-kill/rejoin) was not re-verified — re-run before citing cluster-scale FTS
-claims.
+### Cluster leg — 3-node RF=2, kill / degraded serve / wipe-rejoin (v0.137.0, 2026-07-22)
+
+Same corpus into a 3-member RF=2 cluster of **512 MB** LXCs
+(64 MB memtables, `memory_target = 384MB`), client on a fourth box.
+
+- **Clustered ingest** (QUORUM writes, replication ×2): 2,872 docs/s.
+- **Scatter MATCH latency**: p50 16–26 ms per class on the fresh index;
+  a warm pass after convergence ran p50 2.1–2.6 ms. Hit counts exactly
+  matched the single-node ground truth on every pass.
+- **Kill a member**: at RF=2 the QUORUM default correctly refuses reads
+  (1/2 replicas); `SET CONSISTENCY ONE` serves **complete, exact**
+  results from the surviving replicas (hits identical, p50 ~2 ms).
+  This leg found a real bug: the search/vector hit re-read ignored the
+  session consistency (hardcoded the cluster default), so degraded-mode
+  reads failed even at ONE — fixed (`search_hit_reread_honors_caller_
+  consistency` pins it) and verified live on the degraded cluster.
+- **Wipe + rejoin**: the killed member restarted with an empty data dir
+  resynced rows AND rebuilt its search-index shard live (~2 min for its
+  share of 280k docs) while the cluster kept serving; the post-rejoin
+  full query pass at QUORUM was exact.
+- Note: unfiltered `COUNT(*)` on a 280k-row table at RF<members streams
+  through the scan budget (250k default) and errors — the documented
+  behavior; raise `storage.scan_row_budget` or count via a covering
+  filter.
 
 ## Encryption overhead A/B (2026-07-18)
 
