@@ -8596,6 +8596,15 @@ impl Cluster for Coordinator {
             .ts_partials_scatter(table, matchers, t0, t1, bucket_ms, self.oc)
     }
 
+    fn ts_local_range(&self, table: &str) -> EngineResult<Option<(i64, i64)>> {
+        // Local view: exact on full-copy tables (prod's RF = members); at
+        // RF < members the walk's edge gathers cover cross-shard skew.
+        Ok(self
+            .node
+            .local_read_bounded()
+            .and_then(|db| db.ts_local_range(table)))
+    }
+
     fn ts_rollup_info(&self, table: &str) -> EngineResult<skaidb_engine::TsRollupInfo> {
         // Rollup registrations replicate with the schema, and the local data
         // frontier is a sound horizon: it can only lag the cluster's, which

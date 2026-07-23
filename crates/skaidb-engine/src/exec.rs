@@ -6801,6 +6801,13 @@ impl Database {
     /// below which source blocks may already be dropped (`max_ts -
     /// retention`; `None` without a `RETENTION` or on an empty store) — and
     /// the table's rollups as `(name, bucket_ms)`.
+    /// The table's local data range `(oldest, newest)` across head and
+    /// blocks (`None` = empty / not a TS table) — see
+    /// [`Cluster::ts_local_range`].
+    pub fn ts_local_range(&self, table: &str) -> Option<(i64, i64)> {
+        self.timeseries.get(table)?.ts_range()
+    }
+
     pub fn ts_rollup_info(&self, table: &str) -> Result<TsRollupInfo> {
         let def = self
             .catalog
@@ -8823,6 +8830,16 @@ pub trait Cluster {
             .map(|(labels, _)| labels)
             .collect())
     }
+    /// The table's LOCAL data range `(oldest, newest)`, `None` when
+    /// unknown/empty. Anchors unbounded LIMIT slice walks at the actual
+    /// data frontier instead of the wall clock (a dormant table's data is
+    /// otherwise only reachable via a widened slice that swallows it
+    /// whole). Local is exact at RF = members (full copies, e.g. prod);
+    /// at RF < members the pre-walk edge gathers cover cross-shard skew.
+    fn ts_local_range(&self, _table: &str) -> Result<Option<(i64, i64)>> {
+        Ok(None)
+    }
+
     /// Rollup routing metadata for a time-series table: the retention
     /// horizon (timestamp below which source blocks may already be dropped;
     /// `None` = source is complete) and the table's rollups as
@@ -11536,6 +11553,10 @@ impl Cluster for LocalCluster<'_> {
         self.db.ts_series_sets(table, matchers)
     }
 
+    fn ts_local_range(&self, table: &str) -> Result<Option<(i64, i64)>> {
+        Ok(self.db.ts_local_range(table))
+    }
+
     fn ts_rollup_info(&self, table: &str) -> Result<TsRollupInfo> {
         self.db.ts_rollup_info(table)
     }
@@ -11690,6 +11711,10 @@ impl Cluster for LocalRead<'_> {
         matchers: &[skaidb_tsdb::Matcher],
     ) -> Result<Vec<skaidb_tsdb::Labels>> {
         self.db.ts_series_sets(table, matchers)
+    }
+
+    fn ts_local_range(&self, table: &str) -> Result<Option<(i64, i64)>> {
+        Ok(self.db.ts_local_range(table))
     }
 
     fn ts_rollup_info(&self, table: &str) -> Result<TsRollupInfo> {

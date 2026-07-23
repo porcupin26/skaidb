@@ -782,6 +782,21 @@ impl Tsdb {
         Ok(found.len())
     }
 
+    /// The store's full data range `(oldest, newest)` across head and
+    /// blocks, `None` when empty — the anchor for unbounded LIMIT walks
+    /// (a walk anchored at the wall clock reaches a dormant table's data
+    /// only via slices wide enough to swallow it whole).
+    pub fn ts_range(&self) -> Option<(i64, i64)> {
+        let inner = self.inner.lock().expect("tsdb lock");
+        let bmin = inner.blocks.iter().map(|b| b.meta.min_ts).min();
+        let bmax = inner.blocks.iter().map(|b| b.meta.max_ts).max();
+        let hmin = inner.head.min_ts();
+        let hmax = (inner.head.max_ts != i64::MIN).then_some(inner.head.max_ts);
+        let min = [bmin, hmin].into_iter().flatten().min()?;
+        let max = [bmax, hmax].into_iter().flatten().max()?;
+        Some((min, max))
+    }
+
     /// The newest timestamp anywhere in the store (head **and** blocks —
     /// merged blocks can outrun the head), `i64::MIN` when empty.
     pub fn max_ts_all(&self) -> i64 {

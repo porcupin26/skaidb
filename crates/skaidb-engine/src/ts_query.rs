@@ -260,25 +260,37 @@ pub(crate) fn run_ts_select(
             // `LIMIT n`) used to require an explicit bound and fell back
             // to the full-range gather — `SELECT * FROM <big ts> LIMIT 1`
             // died on the scan budget having examined the whole table.
-            // Anchor AT the wall clock, not past it: any pad puts an
-            // empty gap between the anchor and live data, and the 4×
-            // widening then reaches the data with a slice wide enough to
-            // swallow the whole table (budget error again). Samples
-            // stamped ahead of the clock are caught by the pre-walk
-            // gather over `(anchor, MAX]` instead.
+            // Anchor an unbounded walk at the table's LOCAL DATA FRONTIER
+            // (falling back to the wall clock): anchoring at "now" reaches
+            // a DORMANT table's data only via a widened slice that
+            // swallows the whole table — the onet UI report's second act
+            // (2026-07-23: `LIMIT 1` on a table whose ingest ended 25
+            // days earlier examined 250k samples). The local frontier is
+            // exact on full-copy tables; cross-shard skew and samples
+            // landing past the anchor are covered by the edge gather.
+            let range = cluster.ts_local_range(&sel.from)?;
             let mut hi = t1;
-            let mut anchored = false;
+            let mut lo = t0;
+            let mut desc_anchored = false;
+            let mut asc_anchored = false;
             if desc && hi == i64::MAX {
-                hi = wall_ms();
-                anchored = true;
+                hi = range.map(|(_, max)| max).unwrap_or_else(wall_ms);
+                desc_anchored = true;
             }
-            let walkable = if desc { hi != i64::MAX } else { t0 != i64::MIN };
+            if !desc && lo == i64::MIN {
+                if let Some((min, _)) = range {
+                    lo = min;
+                    asc_anchored = true;
+                }
+            }
+            let walkable = if desc { hi != i64::MAX } else { lo != i64::MIN };
             if walkable && target > 0 {
                 let mut docs: Vec<Document> = Vec::new();
-                if anchored {
-                    // Future-stamped stragglers beyond the anchor come
-                    // FIRST in DESC order; the region is normally empty
-                    // and the gather over it near-free.
+                if desc_anchored {
+                    // Samples beyond the anchor (concurrent appends,
+                    // cross-shard skew, future-stamped writers) come FIRST
+                    // in DESC order; the region is normally empty and the
+                    // gather near-free.
                     docs = gather_docs(
                         sel,
                         cluster,
@@ -287,12 +299,22 @@ pub(crate) fn run_ts_select(
                         hi.saturating_add(1),
                         i64::MAX,
                     )?;
+                } else if asc_anchored {
+                    // Mirror image: cross-shard samples older than the
+                    // local minimum come first in ASC order.
+                    docs = gather_docs(
+                        sel,
+                        cluster,
+                        &fields,
+                        &matchers,
+                        i64::MIN,
+                        lo.saturating_sub(1),
+                    )?;
                 }
                 // 1 min to start — narrow enough that dense (per-second)
                 // data doesn't overshoot a small LIMIT; empty slices widen
                 // 4× to cross sparse spans in O(log gap) near-free gathers.
                 let mut width: i64 = 60_000;
-                let mut lo = t0;
                 while docs.len() < target && lo <= hi {
                     let (s0, s1) = if desc {
                         (hi.saturating_sub(width - 1).max(lo), hi)

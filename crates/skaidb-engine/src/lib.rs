@@ -1267,6 +1267,45 @@ mod tests {
         assert_eq!(rs.rows.len(), 5);
         assert_eq!(rs.rows[0][1], Value::Float(99.0), "newest first");
         assert_eq!(rs.rows[4][1], Value::Float(95.0));
+        // "Oldest n": ASC with no lower bound (anchors at the data start).
+        let rs = rows(db.execute("SELECT ts, value FROM m ORDER BY ts LIMIT 5").unwrap());
+        assert_eq!(rs.rows.len(), 5);
+        assert_eq!(rs.rows[0][1], Value::Float(0.0), "oldest first");
+    }
+
+    /// A DORMANT table (ingest stopped long ago) anchors unbounded LIMIT
+    /// walks at its DATA frontier, not the wall clock — a now-anchored
+    /// walk reached the data only via a widened slice that swallowed the
+    /// whole table (onet prod, 2026-07-23: `LIMIT 1` on a table idle for
+    /// 25 days examined 250k samples and died on the scan budget).
+    #[test]
+    fn timeseries_dormant_table_limit_anchors_at_frontier() {
+        let opts = skaidb_storage::EngineOptions {
+            scan_row_budget: 30, // 100 samples in the table
+            ..Default::default()
+        };
+        let mut db = Database::open_with_options(tempdir(), opts).unwrap();
+        db.execute("CREATE TIMESERIES TABLE m (SERIES KEY (host))").unwrap();
+        // Data ended ~25 days ago; one sample per minute before that.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let end = now - 25 * 86_400_000;
+        for i in 0..100i64 {
+            let t = end - (99 - i) * 60_000;
+            db.execute(&format!("INSERT INTO m (host, ts, value) VALUES ('a', {t}, {i})"))
+                .unwrap();
+        }
+        let rs = rows(db.execute("SELECT ts, value FROM m LIMIT 1").unwrap());
+        assert_eq!(rs.rows.len(), 1);
+        let rs = rows(
+            db.execute("SELECT ts, value FROM m ORDER BY ts DESC LIMIT 5").unwrap(),
+        );
+        assert_eq!(rs.rows.len(), 5);
+        assert_eq!(rs.rows[0][1], Value::Float(99.0), "newest first");
+        let rs = rows(db.execute("SELECT ts, value FROM m ORDER BY ts LIMIT 5").unwrap());
+        assert_eq!(rs.rows[0][1], Value::Float(0.0), "oldest first");
     }
 
     /// TS tables appear in the per-table stats breakdown (they were

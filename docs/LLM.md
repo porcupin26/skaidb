@@ -558,11 +558,10 @@ WHERE ts >= now() - 6h GROUP BY t;
   partials are bounded and unaffected). **Paging works at any size**:
   `WHERE ts > <cursor> ORDER BY ts LIMIT n` walks time slices with early
   stop (each page costs ~its own rows) — the export pattern. Bare
-  `LIMIT n` and unbounded `ORDER BY ts DESC LIMIT n` ("latest n")
-  self-anchor the walk at the wall clock, so they work on live tables
-  without an explicit time bound (a table whose data ended long ago may
-  still need one — the walk widens toward it and the final slice can
-  exceed the budget). `COUNT(*)`
+  `LIMIT n` and unbounded `ORDER BY ts [DESC] LIMIT n` ("latest/oldest
+  n") self-anchor the walk at the table's DATA FRONTIER (local
+  min/max across head+blocks; wall-clock fallback), so they work
+  without an explicit time bound on live AND dormant tables alike. `COUNT(*)`
   on single-field TS tables serves from partials (no sample gather).
 - **Rollups**: `CREATE ROLLUP r30m ON cpu BUCKET 30m RETENTION 90d` stores
   `f_count/f_sum/f_min/f_max/f_first/f_last` per bucket, auto-maintained on
