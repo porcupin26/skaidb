@@ -1233,6 +1233,42 @@ mod tests {
         assert_eq!(rs.rows[4][1], Value::Float(95.0));
     }
 
+    /// Bare `LIMIT n` and unbounded `ORDER BY ts DESC LIMIT n` ("latest
+    /// n") self-anchor the slice walk at the wall clock — they used to
+    /// require an explicit time bound and fell back to the full-range
+    /// gather, so `SELECT * FROM <big ts table> LIMIT 1` died on the scan
+    /// budget having examined every sample (onet UI report, 2026-07-22).
+    #[test]
+    fn timeseries_bare_limit_anchors_at_now() {
+        let opts = skaidb_storage::EngineOptions {
+            scan_row_budget: 30, // 100 samples in the table
+            ..Default::default()
+        };
+        let mut db = Database::open_with_options(tempdir(), opts).unwrap();
+        db.execute("CREATE TIMESERIES TABLE m (SERIES KEY (host))").unwrap();
+        // Live table: one sample per minute for the last 100 minutes,
+        // appended oldest-first (in-order, like real ingest).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        for i in 0..100i64 {
+            let t = now - (99 - i) * 60_000;
+            db.execute(&format!("INSERT INTO m (host, ts, value) VALUES ('a', {t}, {i})"))
+                .unwrap();
+        }
+        // The incident shape: bare LIMIT, no filter, no ORDER BY.
+        let rs = rows(db.execute("SELECT ts, value FROM m LIMIT 1").unwrap());
+        assert_eq!(rs.rows.len(), 1);
+        // "Latest n": DESC with no upper bound.
+        let rs = rows(
+            db.execute("SELECT ts, value FROM m ORDER BY ts DESC LIMIT 5").unwrap(),
+        );
+        assert_eq!(rs.rows.len(), 5);
+        assert_eq!(rs.rows[0][1], Value::Float(99.0), "newest first");
+        assert_eq!(rs.rows[4][1], Value::Float(95.0));
+    }
+
     /// TS tables appear in the per-table stats breakdown (they were
     /// invisible to /metrics per-table gauges and SHOW STATUS table.* —
     /// reported from onet).

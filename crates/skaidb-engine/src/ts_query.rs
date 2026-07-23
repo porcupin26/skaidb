@@ -20,6 +20,14 @@ use crate::eval::{as_int_ms, eval, eval_predicate};
 use crate::exec::{expr_name, is_grouped, project, Cluster};
 use crate::result::{QueryOutput, ResultSet};
 
+/// Wall-clock milliseconds since the Unix epoch (walk anchoring).
+fn wall_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// The reserved label carrying a sample's field name.
 const FIELD_LABEL: &str = "__field__";
 /// The hidden per-row field identifying a sample's series (used by
@@ -235,8 +243,10 @@ pub(crate) fn run_ts_select(
     // walking side; aggregations/DISTINCT need the whole range and keep
     // the full gather (aggregations take partials above anyway).
     if !is_grouped(sel) && !sel.distinct && sel.group_top.is_none() {
+        // Bare LIMIT (no ORDER BY) accepts ANY rows — walk DESC so the
+        // wall-clock anchor below applies (data lives at or below "now").
         let ts_order = match sel.order_by.as_slice() {
-            [] => Some(false),
+            [] => Some(true),
             [o] if matches!(&o.expr, Expr::Column(c) if c == "ts") => Some(o.descending),
             _ => None,
         };
@@ -244,12 +254,45 @@ pub(crate) fn run_ts_select(
             .limit
             .map(|l| l as usize + sel.offset.unwrap_or(0) as usize);
         if let (Some(desc), Some(target)) = (ts_order, target) {
-            let walkable = if desc { t1 != i64::MAX } else { t0 != i64::MIN };
+            // A DESC walk with no upper bound anchors at the wall clock
+            // (plus slack for clock-skewed/future-stamped writers): the
+            // "latest n" shape (`ORDER BY ts DESC LIMIT n`, and bare
+            // `LIMIT n`) used to require an explicit bound and fell back
+            // to the full-range gather — `SELECT * FROM <big ts> LIMIT 1`
+            // died on the scan budget having examined the whole table.
+            // Anchor AT the wall clock, not past it: any pad puts an
+            // empty gap between the anchor and live data, and the 4×
+            // widening then reaches the data with a slice wide enough to
+            // swallow the whole table (budget error again). Samples
+            // stamped ahead of the clock are caught by the pre-walk
+            // gather over `(anchor, MAX]` instead.
+            let mut hi = t1;
+            let mut anchored = false;
+            if desc && hi == i64::MAX {
+                hi = wall_ms();
+                anchored = true;
+            }
+            let walkable = if desc { hi != i64::MAX } else { t0 != i64::MIN };
             if walkable && target > 0 {
                 let mut docs: Vec<Document> = Vec::new();
-                // 1h to start; empty slices widen 4× to skip sparse spans.
-                let mut width: i64 = 3_600_000;
-                let (mut lo, mut hi) = (t0, t1);
+                if anchored {
+                    // Future-stamped stragglers beyond the anchor come
+                    // FIRST in DESC order; the region is normally empty
+                    // and the gather over it near-free.
+                    docs = gather_docs(
+                        sel,
+                        cluster,
+                        &fields,
+                        &matchers,
+                        hi.saturating_add(1),
+                        i64::MAX,
+                    )?;
+                }
+                // 1 min to start — narrow enough that dense (per-second)
+                // data doesn't overshoot a small LIMIT; empty slices widen
+                // 4× to cross sparse spans in O(log gap) near-free gathers.
+                let mut width: i64 = 60_000;
+                let mut lo = t0;
                 while docs.len() < target && lo <= hi {
                     let (s0, s1) = if desc {
                         (hi.saturating_sub(width - 1).max(lo), hi)
@@ -259,6 +302,11 @@ pub(crate) fn run_ts_select(
                     let mut slice = gather_docs(sel, cluster, &fields, &matchers, s0, s1)?;
                     if slice.is_empty() {
                         width = width.saturating_mul(4);
+                    } else {
+                        // Back to narrow slices once data appears — a
+                        // widened slice entering a dense region would
+                        // otherwise gather far past the target.
+                        width = 60_000;
                     }
                     docs.append(&mut slice);
                     if desc {
