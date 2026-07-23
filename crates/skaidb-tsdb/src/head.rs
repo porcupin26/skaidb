@@ -156,11 +156,19 @@ impl Head {
     ) -> Result<()> {
         let entry = self.entry_mut(id)?;
         if ts <= entry.last_ts {
-            if ooo_window > 0
+            let in_window = ooo_window > 0
                 && ts > entry.last_ts.saturating_sub(ooo_window)
-                && ts < entry.last_ts
-                && entry.ooo.len() < OOO_MAX_PER_SERIES
-            {
+                && ts < entry.last_ts;
+            if in_window {
+                // A full buffer is NOT a window violation: the store
+                // flushes (draining every buffer) and retries — rejecting
+                // here made the configured window look like zero once a
+                // backfill outpaced the flush cadence (onet report,
+                // 2026-07-23: sustained 26h-behind ingest worked only
+                // while memory pressure happened to flush constantly).
+                if entry.ooo.len() >= OOO_MAX_PER_SERIES {
+                    return Err(TsdbError::OooBufferFull);
+                }
                 // Sorted insert; an equal timestamp overwrites (last wins).
                 match entry.ooo.binary_search_by_key(&ts, |s| s.ts) {
                     Ok(i) => entry.ooo[i].value = value,

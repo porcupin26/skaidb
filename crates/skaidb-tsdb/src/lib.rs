@@ -36,6 +36,11 @@ pub enum TsdbError {
     Corrupt(String),
     #[error("out-of-order sample: ts {ts} <= last {last} for series")]
     OutOfOrder { ts: i64, last: i64 },
+    /// The sample is INSIDE the OOO window but the series' out-of-order
+    /// buffer is full — the store flushes to drain it and retries; this
+    /// never reaches callers of `append_batch`.
+    #[error("out-of-order buffer full (internal; drained by flush)")]
+    OooBufferFull,
     #[error("series limit reached ({0}); raise max_series or reduce label cardinality")]
     SeriesLimit(usize),
     #[error("invalid argument: {0}")]

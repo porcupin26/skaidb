@@ -347,6 +347,41 @@ impl Tsdb {
                     result.appended += 1;
                 }
                 Err(TsdbError::OutOfOrder { .. }) => result.rejected_out_of_order += 1,
+                // In-window sample, full OOO buffer: flush the head (which
+                // merges every buffered OOO sample into blocks) and retry
+                // once — a sustained backfill costs one flush per 512
+                // buffered samples per series instead of silently
+                // rejecting everything until the next boundary flush. The
+                // flush can evict fully-drained series entries, so the id
+                // is re-resolved for the retry.
+                Err(TsdbError::OooBufferFull) => {
+                    let boundary = inner.head.max_ts + 1;
+                    self.flush_before(&mut inner, boundary)?;
+                    let (id, created) =
+                        inner.head.get_or_create(labels, self.opts.max_series)?;
+                    if created {
+                        new_series.push(Record::Series {
+                            id,
+                            labels: labels.clone(),
+                        });
+                    }
+                    match inner.head.append(
+                        id,
+                        *ts,
+                        *value,
+                        self.opts.block_span_ms,
+                        self.opts.ooo_window_ms,
+                    ) {
+                        Ok(()) => {
+                            accepted.push((id, *ts, *value));
+                            result.appended += 1;
+                        }
+                        Err(TsdbError::OutOfOrder { .. }) | Err(TsdbError::OooBufferFull) => {
+                            result.rejected_out_of_order += 1;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -1156,6 +1191,42 @@ mod tests {
         expect.sort_unstable();
         expect.dedup();
         assert_eq!(ts, expect);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sustained backfill inside the OOO window must not be rejected
+    /// once the 512-sample per-series OOO buffer fills: the store flushes
+    /// to drain the buffer and retries. Rejecting made the configured
+    /// window look like ZERO whenever a backfill outpaced the flush
+    /// cadence (onet report, 2026-07-23 — 26h-behind ingest only worked
+    /// while memory pressure happened to flush constantly).
+    #[test]
+    fn ooo_backfill_beyond_buffer_cap_is_accepted() {
+        let dir = temp_dir("ooofill");
+        let db = Tsdb::open(
+            &dir,
+            TsdbOptions {
+                block_span_ms: 10_000,
+                ooo_window_ms: 100 * 86_400_000, // 100d window
+                sync_on_append: false,
+                ..TsdbOptions::default()
+            },
+        )
+        .unwrap();
+        let head_ts = 90 * 86_400_000i64;
+        db.append_batch(&[(labels("a"), head_ts, 0.0)]).unwrap();
+        // 1,500 in-window backfill samples (3× the 512 buffer cap),
+        // oldest-first, all behind the series head.
+        let rows: Vec<_> = (0..1_500i64)
+            .map(|i| (labels("a"), i * 60_000, i as f64))
+            .collect();
+        let res = db.append_batch(&rows).unwrap();
+        assert_eq!(res.appended, 1_500, "rejected {}", res.rejected_out_of_order);
+        assert_eq!(res.rejected_out_of_order, 0);
+        // Everything queryable exactly once.
+        let all = db.query(&[], 0, i64::MAX).unwrap();
+        let n: usize = all.iter().map(|(_, s)| s.len()).sum();
+        assert_eq!(n, 1_501);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

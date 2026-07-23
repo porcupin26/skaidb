@@ -540,6 +540,12 @@ WHERE ts >= now() - 6h GROUP BY t;
   `affected` counts only what landed (`0` = all dropped; per-field counts
   when a row has several numeric fields). Check `affected` in ingest code;
   `timeseries.<t>.samples_rejected` in SHOW STATUS is the cumulative view.
+- **OOO ingest is buffer-drained, not buffer-capped**: behind-head
+  samples inside the OOO window buffer per series (512); a FULL buffer
+  triggers a head flush (draining every buffer) and a retry instead of
+  rejecting — a sustained backfill costs ~1 flush per 512 samples per
+  series and is never refused while in-window (it used to bounce once
+  the buffer filled, making the configured window look like zero).
 - **TS maintenance is best-effort and self-bounding**: retention/compaction
   failures never fail the append that triggered them (they count into the
   store's `maintenance_errors` stat and retry next flush); repair/hint
