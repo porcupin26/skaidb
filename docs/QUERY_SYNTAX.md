@@ -525,7 +525,8 @@ RESTORE FROM '<path>'     -- embedded / single node only; old data kept aside
   `geo_distance` comparisons, and constant, so the geo index still prunes:
   `WHERE geo_distance(loc, 40.7, -74.0) <= distance('5km')`),
   `now()` (the query's start time, as a timestamp —
-  one instant per statement), `time_bucket(<step>, <ts>)` (floors `<ts>`
+  one instant per statement), `coalesce(<a>, <b>, ...)` (the first
+  non-NULL argument, NULL if all are), `time_bucket(<step>, <ts>)` (floors `<ts>`
   to a `<step>`-wide bucket: `time_bucket(5m, ts)`), and
   `to_timestamp(<value>)` — coerce to a timestamp: numeric epoch-ms passes
   through and an ISO-8601 string is parsed (`YYYY-MM-DD`,

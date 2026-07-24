@@ -109,6 +109,18 @@ fn eval_func(name: &str, args: &[Expr], row: &Document) -> Result<Value> {
         "now" => Ok(Value::Timestamp(
             crate::exec::now_ms(),
         )),
+        // First non-NULL argument (SQL COALESCE). Also used internally by
+        // the TS partials rewrite: COUNT folds to SUM(partial counts), and
+        // SUM over zero rows is NULL where COUNT must be 0.
+        "coalesce" => {
+            for a in args {
+                let v = eval(a, row)?;
+                if !v.is_null() {
+                    return Ok(v);
+                }
+            }
+            Ok(Value::Null)
+        }
         // Coerce a value into a timestamp: numeric epoch-ms passes through,
         // and an ISO-8601 string is parsed. The escape hatch for data whose
         // timestamps landed as strings (e.g. a Mongo migration): the typed
