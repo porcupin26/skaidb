@@ -1849,14 +1849,18 @@ fn vector_binary(
                         "many-to-many matching not allowed: use group_left/group_right".into(),
                     );
                 }
+                // Every vector∘vector op drops the metric name, even when
+                // `on(__name__)` kept it in the match key. A filter
+                // comparison keeps the full LHS label set (sans name); the
+                // value/bool forms take the match key (sans name).
                 if op.is_comparison() {
                     if bool_mod {
-                        out.push((key, as01(op.cmp(a, b))));
+                        out.push((match_key(&key), as01(op.cmp(a, b))));
                     } else if op.cmp(a, b) {
-                        out.push((labels, a));
+                        out.push((match_key(&labels), a));
                     }
                 } else {
-                    out.push((key, op.apply(a, b)));
+                    out.push((match_key(&key), op.apply(a, b)));
                 }
             }
             Ok(out)
@@ -1880,16 +1884,10 @@ fn vector_binary(
                 let Some((one_labels, ov)) = one_by.get(&key) else { continue };
                 // Operand order is lhs∘rhs regardless of which side is many.
                 let (a, b) = if left_is_many { (mv, *ov) } else { (*ov, mv) };
-                if op.is_comparison() && !bool_mod {
-                    // Filter semantics keep the many-side sample as-is.
-                    if op.cmp(a, b) {
-                        out.push((labels, mv));
-                    }
-                    continue;
-                }
                 // Result labels: the many side sans __name__, plus the
                 // requested extra labels copied from the one side (absent
-                // on the one side = removed from the result).
+                // on the one side = removed from the result). This applies
+                // to filter comparisons too — group_left(x) still grafts x.
                 let mut rl: Labels = labels
                     .iter()
                     .filter(|(k, _)| k != "__name__")
@@ -1902,6 +1900,14 @@ fn vector_binary(
                     }
                 }
                 rl.sort();
+                if op.is_comparison() && !bool_mod {
+                    // Filter semantics keep the many-side value where the
+                    // comparison holds (name dropped, extras grafted above).
+                    if op.cmp(a, b) {
+                        out.push((rl, mv));
+                    }
+                    continue;
+                }
                 let val = if op.is_comparison() {
                     as01(op.cmp(a, b))
                 } else {
@@ -2659,41 +2665,60 @@ fn histogram_quantile(phi: f64, vector: Vector) -> Vector {
         let Ok(le) = le.trim_start_matches('+').parse::<f64>() else {
             continue;
         };
-        let base: Labels = labels.iter().filter(|(k, _)| k != "le").cloned().collect();
+        // Output labels drop `le` AND the metric name — Prometheus's
+        // histogram_quantile never carries `__name__` even when fed a bare
+        // selector (rate() usually strips it upstream, which masked this).
+        let base: Labels = labels
+            .iter()
+            .filter(|(k, _)| k != "le" && k != "__name__")
+            .cloned()
+            .collect();
         groups.entry(base).or_default().push((le, value));
     }
     let mut out = Vec::new();
     for (labels, mut buckets) in groups {
         buckets.sort_by(|a, b| a.0.total_cmp(&b.0));
-        if buckets.len() < 2 || buckets.last().map(|(le, _)| *le) != Some(f64::INFINITY) {
-            continue;
-        }
-        // Monotone counts (merged/raced buckets can dip).
-        let mut max_so_far = 0.0f64;
-        for (_, c) in &mut buckets {
-            max_so_far = max_so_far.max(*c);
-            *c = max_so_far;
-        }
-        let total = buckets.last().expect("len checked").1;
-        if total.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
-            continue; // empty histogram (or NaN counts)
-        }
-        let value = if phi < 0.0 {
+        // Prometheus order: the φ bounds are checked BEFORE the histogram's
+        // validity, and every degenerate case yields a SAMPLE (±Inf / NaN),
+        // never a dropped series — an idle series whose bucket rates sum to
+        // zero still emits NaN at that step (matching a real Prometheus,
+        // which is what the compliance suite compares against).
+        let value = if phi.is_nan() {
+            f64::NAN
+        } else if phi < 0.0 {
             f64::NEG_INFINITY
         } else if phi > 1.0 {
             f64::INFINITY
+        } else if buckets.len() < 2
+            || buckets.last().map(|(le, _)| *le) != Some(f64::INFINITY)
+        {
+            // Not a usable histogram: <2 buckets, or a highest bound that
+            // isn't +Inf.
+            f64::NAN
         } else {
-            let rank = phi * total;
-            let idx = buckets.partition_point(|(_, c)| *c < rank).min(buckets.len() - 1);
-            let (end, count) = buckets[idx];
-            if end.is_infinite() {
-                buckets[idx - 1].0
+            // Monotone counts (merged/raced buckets can dip).
+            let mut max_so_far = 0.0f64;
+            for (_, c) in &mut buckets {
+                max_so_far = max_so_far.max(*c);
+                *c = max_so_far;
+            }
+            let total = buckets.last().expect("len checked").1;
+            if total.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+                // Zero observations (or NaN counts) → NaN.
+                f64::NAN
             } else {
-                let (start, count_start) = if idx == 0 { (0.0, 0.0) } else { buckets[idx - 1] };
-                if count <= count_start {
-                    end
+                let rank = phi * total;
+                let idx = buckets.partition_point(|(_, c)| *c < rank).min(buckets.len() - 1);
+                let (end, count) = buckets[idx];
+                if end.is_infinite() {
+                    buckets[idx - 1].0
                 } else {
-                    start + (end - start) * (rank - count_start) / (count - count_start)
+                    let (start, count_start) = if idx == 0 { (0.0, 0.0) } else { buckets[idx - 1] };
+                    if count <= count_start {
+                        end
+                    } else {
+                        start + (end - start) * (rank - count_start) / (count - count_start)
+                    }
                 }
             }
         };
@@ -2716,9 +2741,12 @@ fn fold_agg(
                 .filter(|(k, _)| by.contains(k))
                 .cloned()
                 .collect(),
+            // `without` drops the listed labels AND always the metric
+            // name — aggregation output never carries `__name__` (matches
+            // count_values below and Prometheus).
             (None, Some(wo)) => labels
                 .iter()
-                .filter(|(k, _)| !wo.contains(k))
+                .filter(|(k, _)| !wo.contains(k) && k != "__name__")
                 .cloned()
                 .collect(),
             (None, None) => Vec::new(),
@@ -3207,6 +3235,115 @@ mod tests {
         assert_eq!(run("avg_over_time(m[10s])", &one)[0].1, 7.0);
         // The drilldown's exact tile shape parses and evaluates.
         assert_eq!(run("avg(avg_over_time(m[10s]))", &one)[0].1, 7.0);
+    }
+
+    /// Regression: `without(...)` aggregations and EVERY vector∘vector
+    /// binary operator must drop the metric name (`__name__`), like
+    /// Prometheus. The 2026-07-23 promql-compliance run scored 89.6%, and
+    /// ~35 of the 47 value-diffs were this single bug — values identical,
+    /// only a lingering `__name__` differed (`by(...)` already dropped it,
+    /// which is why only `without` and binops leaked it).
+    #[test]
+    fn without_and_binops_drop_metric_name() {
+        let s = |name: &str, ty: &str, job: &str, v: f64| {
+            let mut labels: Labels = vec![
+                ("name".to_string(), name.to_string()),
+                ("type".to_string(), ty.to_string()),
+                ("job".to_string(), job.to_string()),
+            ];
+            labels.sort();
+            (labels, vec![Sample { ts: 9_000, value: v }])
+        };
+        let universe = vec![s("mem", "free", "demo", 3.0), s("mem", "used", "demo", 5.0)];
+        let eval = |q: &str| -> Vec<(Labels, f64)> {
+            let mut e = P::new(q).parse().unwrap_or_else(|err| panic!("{q}: {err}"));
+            let mut specs = Vec::new();
+            assign_slots(&mut e, &mut specs, 0, None);
+            // Every selector sees the same universe (binops fetch twice).
+            let fetched: Vec<Fetched> =
+                specs.iter().map(|_| Fetched { series: universe.clone() }).collect();
+            let StepVal::Vector(v) =
+                eval_steps(&e, &fetched, &[10_000]).unwrap_or_else(|err| panic!("{q}: {err}")).pop().unwrap()
+            else {
+                panic!("{q}: expected vector")
+            };
+            v
+        };
+        let has_name = |v: &[(Labels, f64)]| {
+            v.iter().any(|(l, _)| l.iter().any(|(k, _)| k == "__name__"))
+        };
+
+        // `without()` keeps other labels but never the name.
+        let wo = eval("sum without() (mem)");
+        assert_eq!(wo.len(), 2, "{wo:?}");
+        assert!(!has_name(&wo), "sum without() kept __name__: {wo:?}");
+        // `without(type, job)` collapses to one label-less, name-less series.
+        let wot = eval("sum without(type, job) (mem)");
+        assert_eq!(wot.len(), 1);
+        assert!(wot[0].0.is_empty(), "expected empty labels, got {:?}", wot[0].0);
+        assert_eq!(wot[0].1, 8.0);
+
+        // Arithmetic, filter comparison, and on(__name__) all drop the name.
+        for q in ["mem + mem", "mem == mem", "mem / on(__name__, type) mem"] {
+            let v = eval(q);
+            assert!(!v.is_empty(), "{q}: empty result");
+            assert!(!has_name(&v), "{q} kept __name__: {v:?}");
+        }
+        // Name-drop didn't corrupt matching: values still line up per type.
+        let sum = eval("mem + mem");
+        assert!(
+            sum.iter().any(|(_, v)| *v == 6.0) && sum.iter().any(|(_, v)| *v == 10.0),
+            "{sum:?}"
+        );
+
+        // group_left still grafts the requested label (and drops the name).
+        let gl = eval("sum by(type) (mem) == on(type) group_left(job) mem");
+        assert_eq!(gl.len(), 2, "{gl:?}");
+        assert!(!has_name(&gl), "group_left result kept __name__: {gl:?}");
+        assert!(
+            gl.iter().all(|(l, _)| l.iter().any(|(k, v)| k == "job" && v == "demo")),
+            "group_left(job) failed to graft job: {gl:?}"
+        );
+    }
+
+    /// Regression: `histogram_quantile` must emit a SAMPLE for every group,
+    /// not drop degenerate ones — an idle series (bucket rates summing to
+    /// zero) yields NaN, and the φ bounds (`-Inf`/`+Inf`) are checked before
+    /// histogram validity, exactly like Prometheus. The 2026-07-23
+    /// compliance run's remaining `histogram_quantile` diffs were all this:
+    /// Prometheus emitted `NaN @ t` (or ±Inf) where skaidb left a gap.
+    #[test]
+    fn histogram_quantile_degenerate_emits_samples() {
+        let mk = |le: &str, v: f64| {
+            let mut labels: Labels =
+                vec![("name".to_string(), "h".to_string()), ("le".to_string(), le.to_string())];
+            labels.sort();
+            (labels, vec![Sample { ts: 9_000, value: v }])
+        };
+        let run = |q: &str, series: Vec<(Labels, Vec<Sample>)>| -> Vec<(Labels, f64)> {
+            let mut e = P::new(q).parse().unwrap();
+            let mut specs = Vec::new();
+            assign_slots(&mut e, &mut specs, 0, None);
+            let f = vec![Fetched { series }];
+            let StepVal::Vector(v) = eval_steps(&e, &f, &[10_000]).unwrap().pop().unwrap() else {
+                panic!("{q}: expected vector")
+            };
+            v
+        };
+        // Valid histogram: le=1 count 1, le=+Inf count 2 → median interpolates.
+        let valid = vec![mk("1", 1.0), mk("+Inf", 2.0)];
+        let m = run("histogram_quantile(0.5, h)", valid.clone());
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].1, 1.0, "{:?}", m[0]);
+        // Empty histogram (all-zero counts): a NaN SAMPLE, not a dropped series.
+        let empty = vec![mk("1", 0.0), mk("+Inf", 0.0)];
+        let e0 = run("histogram_quantile(0.5, h)", empty.clone());
+        assert_eq!(e0.len(), 1, "empty histogram must still emit a sample");
+        assert!(e0[0].1.is_nan(), "empty histogram must be NaN, got {}", e0[0].1);
+        // φ bounds are checked before validity: ±Inf even for an empty histogram.
+        assert_eq!(run("histogram_quantile(-0.5, h)", empty.clone())[0].1, f64::NEG_INFINITY);
+        assert_eq!(run("histogram_quantile(1.5, h)", empty)[0].1, f64::INFINITY);
+        assert_eq!(run("histogram_quantile(1.5, h)", valid)[0].1, f64::INFINITY);
     }
 
     /// Grafana / Metrics Drilldown compatibility: the catalog of PromQL
