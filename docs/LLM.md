@@ -707,9 +707,20 @@ WHERE ts >= now() - 6h GROUP BY t;
   drains its own memtables by bytes applied, not page count.
   TIME-SERIES tables mirror too (routed by SHOW TABLES' `kind` column):
   samples pull via time-windowed TsQuery scattered over every member,
-  unioned + deduped into one any-aged merge; recreated locally as plain
+  unioned + deduped into any-aged merges; recreated locally as plain
   TIMESERIES tables (source series key, NO retention — the backup keeps
   what the primary ages out; rollups mirror as plain TS tables).
+  TS pulls are PAGED (v0.139.1): the range walks in adaptive time slices
+  (~50k samples/page target, slice sized from what members return,
+  exponential zoom over empty full-sweep prefixes), each page unioned,
+  merged, and its watermark saved before the next — a multi-day or
+  from-empty catch-up of a multi-million-sample table moves in bounded
+  responses (the old one-shot `TsQuery [t0, MAX]` produced responses big
+  enough that primaries aborted the connection mid-send — the 2026-07-24
+  onetw finding) and a crash resumes at the last landed window.
+  Ops note for Docker witnesses: run with `--ulimit nofile=65536` —
+  TS block handles hold an FD each, and the Docker default 1024 broke
+  every onetw cycle for three days (EMFILE) before diagnosis.
   The single-row
   `witness_gc_config` table holds `grace_period_secs` (default 7 days) —
   cluster-consistent because it is a table row, settable with a plain

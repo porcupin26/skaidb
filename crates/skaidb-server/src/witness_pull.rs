@@ -67,6 +67,97 @@ const PULL_PAGE_PAUSE_FLOOR: std::time::Duration = std::time::Duration::from_mil
 /// absorbs modest HLC skew between primary members.
 const DELTA_MARGIN_MS: u64 = 60_000;
 
+/// Soft per-page sample target for the TIME-SLICED TS pull. A witness
+/// catching up a large delta used to issue ONE `TsQuery [t0, MAX]` per
+/// member — onetw's ~3-day catch-up of an 11.9M-sample table produced a
+/// response every primary aborted mid-send (and would have had to sit
+/// fully resident in a 320 MB container). The walk below slices the range
+/// into windows sized so no single response should much exceed this.
+const TS_PAGE_TARGET: usize = 50_000;
+/// First window width; adapted per page from what the members return.
+const TS_SLICE_INIT_MS: i64 = 15 * 60_000;
+/// Adaptive bounds for windows that produced data. EMPTY windows always
+/// grow the slice ×8 uncapped — an empty span of ANY size (the decades
+/// before a full sweep's first sample, or a mid-range ingest pause) is
+/// crossed in logarithmically many probes instead of thousands of capped
+/// pages. The first window after a long gap can therefore arrive with a
+/// huge slice and return one oversized response; the clamp below then
+/// snaps the next window back into range — one bounded overshoot per gap
+/// crossing, vs. the old one-shot pull's guaranteed whole-range response.
+const TS_SLICE_MIN_MS: i64 = 10_000;
+const TS_SLICE_MAX_MS: i64 = 24 * 3_600_000;
+/// Runaway backstop: a cycle that somehow needs more pages than this
+/// fails (and retries next cycle) instead of looping forever.
+const TS_MAX_PAGES_PER_CYCLE: usize = 10_000;
+
+/// The adaptive time-window walk driving a paged TS pull. Pure state
+/// machine (no I/O) so the sizing/advance logic is unit-testable: `window`
+/// yields the next `[t0, t1]` to fetch (t1 = `i64::MAX` on the final page,
+/// catching future-stamped samples exactly like the old one-shot pull),
+/// `advance` moves past the fetched window and resizes the slice from the
+/// largest per-member sample count the window returned.
+struct TsWalk {
+    cursor: i64,
+    slice: i64,
+    frontier: i64,
+    done: bool,
+}
+
+impl TsWalk {
+    fn new(start: i64, frontier: i64) -> TsWalk {
+        TsWalk {
+            cursor: start,
+            slice: TS_SLICE_INIT_MS,
+            frontier,
+            done: false,
+        }
+    }
+
+    /// The next window to fetch, or `None` when the walk is complete.
+    /// The final window (whose end would pass the frontier) extends to
+    /// `i64::MAX`.
+    fn window(&self) -> Option<(i64, i64)> {
+        if self.done {
+            return None;
+        }
+        let end = self.cursor.saturating_add(self.slice);
+        if end > self.frontier {
+            Some((self.cursor, i64::MAX))
+        } else {
+            Some((self.cursor, end - 1))
+        }
+    }
+
+    /// Advance past the window just fetched. `max_member_samples` is the
+    /// largest sample count any single member returned for it.
+    fn advance(&mut self, max_member_samples: usize) {
+        let end = self.cursor.saturating_add(self.slice);
+        if end > self.frontier {
+            self.done = true;
+            return;
+        }
+        self.cursor = end;
+        if max_member_samples == 0 {
+            // Empty window: zoom exponentially, uncapped — cross any gap
+            // (or the pre-data epoch of a full sweep) in O(log) probes.
+            self.slice = self.slice.saturating_mul(8);
+            return;
+        }
+        // Data window: adapt, clamped into the bounded range (this also
+        // snaps a gap-crossing zoomed slice straight back to TS_SLICE_MAX).
+        let adapted = if max_member_samples > 2 * TS_PAGE_TARGET {
+            self.slice / 4
+        } else if max_member_samples > TS_PAGE_TARGET {
+            self.slice / 2
+        } else if max_member_samples < TS_PAGE_TARGET / 8 {
+            self.slice.saturating_mul(2)
+        } else {
+            self.slice
+        };
+        self.slice = adapted.clamp(TS_SLICE_MIN_MS, TS_SLICE_MAX_MS);
+    }
+}
+
 /// Local (witness-side) persistent per-table sync state: which primary
 /// member's `write_seq` we last saw (comparable only against that member),
 /// the HLC-physical watermark deltas resume from, and the last FULL sweep
@@ -559,98 +650,159 @@ fn sync_ts_table(
     let Backend::Local(local) = &ctx.backend else {
         return Err("witness pull requires a standalone backend".into());
     };
-    let mut union: std::collections::BTreeMap<(Vec<(String, String)>, i64), f64> =
-        std::collections::BTreeMap::new();
-    let mut pulled = 0usize;
-    // Deferred per-member watermark saves: only recorded once the merge
-    // below lands, else a crash between "state saved" and "data applied"
-    // would skip these samples until the full-sweep backstop.
-    let mut saves: Vec<(String, String, u64, u64)> = Vec::new();
-    let mut reachable = 0usize;
-    let mut last_err = String::new();
-    for addr in &cfg.primary_internode_addrs {
-        let state_key = format!("{qualified}|{addr}");
-        let state = load_sync_state(ctx, &state_key);
-        let backstop_due = now.saturating_sub(state.last_full_ms)
-            >= cfg.full_sweep_interval_secs.saturating_mul(1000);
-        let full = state.watermark_ms == 0 || backstop_due;
-        let t0 = if full {
-            0
-        } else {
-            state.watermark_ms.saturating_sub(DELTA_MARGIN_MS) as i64
-        };
-        let query_started = std::time::Instant::now();
-        let series = match pool.call(
-            addr,
-            &Request::TsQuery {
-                table: qualified.to_string(),
-                matchers: Vec::new(),
+    // Per-member pull state for this cycle.
+    struct Member {
+        addr: String,
+        state_key: String,
+        t0: i64,
+        watermark: u64,
+        full: bool,
+        last_full_ms: u64,
+        failed: bool,
+    }
+    let mut members: Vec<Member> = cfg
+        .primary_internode_addrs
+        .iter()
+        .map(|addr| {
+            let state_key = format!("{qualified}|{addr}");
+            let state = load_sync_state(ctx, &state_key);
+            let backstop_due = now.saturating_sub(state.last_full_ms)
+                >= cfg.full_sweep_interval_secs.saturating_mul(1000);
+            let full = state.watermark_ms == 0 || backstop_due;
+            let t0 = if full {
+                0
+            } else {
+                state.watermark_ms.saturating_sub(DELTA_MARGIN_MS) as i64
+            };
+            Member {
+                addr: addr.clone(),
+                state_key,
                 t0,
-                t1: i64::MAX,
-            },
-        ) {
-            Ok(Response::TsSeries { series }) => series,
-            Ok(Response::Err(e)) => {
-                skaidb_types::slog!(
-                    "witness: {qualified} (timeseries) @{addr} unavailable this cycle: {e}"
-                );
-                last_err = e;
-                continue;
+                watermark: state.watermark_ms,
+                full,
+                last_full_ms: state.last_full_ms,
+                failed: false,
             }
-            Ok(other) => {
-                last_err = format!("unexpected {other:?}");
-                skaidb_types::slog!("witness: {qualified} (timeseries) @{addr}: {last_err}");
-                continue;
-            }
-            Err(e) => {
-                skaidb_types::slog!(
-                    "witness: {qualified} (timeseries) @{addr} unavailable this cycle: {e}"
-                );
-                last_err = e.to_string();
-                continue;
-            }
-        };
-        reachable += 1;
-        let mut max_ts: u64 = state.watermark_ms;
-        for (labels, samples) in series {
-            for (ts, value) in samples {
-                if ts > 0 {
-                    max_ts = max_ts.max(ts as u64);
-                }
-                pulled += 1;
-                union.insert((labels.clone(), ts), value);
-            }
+        })
+        .collect();
+    let start = members.iter().map(|m| m.t0).min().unwrap_or(0);
+    let mut walk = TsWalk::new(start, now as i64);
+    let mut pulled = 0usize;
+    let mut applied = 0usize;
+    let mut pages = 0usize;
+    let mut last_err = String::new();
+    while let Some((t0, t1)) = walk.window() {
+        pages += 1;
+        if pages > TS_MAX_PAGES_PER_CYCLE {
+            return Err(format!("ts pull did not converge in {TS_MAX_PAGES_PER_CYCLE} pages"));
         }
-        saves.push((
-            state_key,
-            addr.clone(),
-            max_ts,
-            if full { now } else { state.last_full_ms },
-        ));
-        // Duty pacing, same rule as the row pull: rest in proportion to
-        // the time this member just spent serving us.
-        let pct = f64::from(cfg.duty_pct.clamp(1, 90));
-        let rest = query_started.elapsed().mul_f64((100.0 - pct) / pct);
-        std::thread::sleep(rest.max(PULL_PAGE_PAUSE_FLOOR));
+        let mut union: std::collections::BTreeMap<(Vec<(String, String)>, i64), f64> =
+            std::collections::BTreeMap::new();
+        let mut page_max = 0usize; // largest single-member sample count
+        let mut answered: Vec<usize> = Vec::new();
+        for (i, m) in members.iter_mut().enumerate() {
+            if m.failed || (t1 != i64::MAX && m.t0 > t1) {
+                continue; // window entirely behind this member's watermark
+            }
+            let query_started = std::time::Instant::now();
+            let series = match pool.call(
+                &m.addr,
+                &Request::TsQuery {
+                    table: qualified.to_string(),
+                    matchers: Vec::new(),
+                    t0,
+                    t1,
+                },
+            ) {
+                Ok(Response::TsSeries { series }) => series,
+                Ok(Response::Err(e)) => {
+                    skaidb_types::slog!(
+                        "witness: {qualified} (timeseries) @{} unavailable this cycle: {e}",
+                        m.addr
+                    );
+                    last_err = e;
+                    m.failed = true;
+                    continue;
+                }
+                Ok(other) => {
+                    last_err = format!("unexpected {other:?}");
+                    skaidb_types::slog!(
+                        "witness: {qualified} (timeseries) @{}: {last_err}",
+                        m.addr
+                    );
+                    m.failed = true;
+                    continue;
+                }
+                Err(e) => {
+                    skaidb_types::slog!(
+                        "witness: {qualified} (timeseries) @{} unavailable this cycle: {e}",
+                        m.addr
+                    );
+                    last_err = e.to_string();
+                    m.failed = true;
+                    continue;
+                }
+            };
+            let mut member_samples = 0usize;
+            for (labels, samples) in series {
+                for (ts, value) in samples {
+                    if ts > 0 {
+                        m.watermark = m.watermark.max(ts as u64);
+                    }
+                    member_samples += 1;
+                    union.insert((labels.clone(), ts), value);
+                }
+            }
+            pulled += member_samples;
+            page_max = page_max.max(member_samples);
+            answered.push(i);
+            // Duty pacing, same rule as the row pull: rest in proportion
+            // to the time this member just spent serving us.
+            let pct = f64::from(cfg.duty_pct.clamp(1, 90));
+            let rest = query_started.elapsed().mul_f64((100.0 - pct) / pct);
+            std::thread::sleep(rest.max(PULL_PAGE_PAUSE_FLOOR));
+        }
+        if answered.is_empty() && members.iter().all(|m| m.failed) {
+            // Progress through prior pages is already saved; the next
+            // cycle resumes from the advanced watermarks.
+            return Err(format!("no source reachable: {last_err}"));
+        }
+        // Land THIS page, then advance the answering members' watermarks —
+        // a crash mid-walk resumes at the last landed window instead of
+        // re-pulling (or worse, skipping) the whole range. Samples merge
+        // idempotently, so the DELTA_MARGIN overlap and re-pulls are safe.
+        if !union.is_empty() {
+            let rows: Vec<_> = union
+                .into_iter()
+                .map(|((labels, ts), value)| (labels, ts, value))
+                .collect();
+            let db = local
+                .read()
+                .map_err(|_| "witness local lock poisoned".to_string())?;
+            applied += db
+                .ts_merge(qualified, &rows)
+                .map_err(|e| format!("ts merge {qualified}: {e}"))?;
+        }
+        // Watermarks track DATA time (max sample ts seen), never wall-clock
+        // coverage — a table whose samples lag the wall clock (backfills,
+        // epoch-stamped test data) must keep its delta anchor at the data,
+        // or the next cycle's `watermark - margin` starts above samples
+        // that haven't arrived yet. Saving per landed page makes a
+        // mid-walk crash resume from the last data seen; empty-window
+        // progress is deliberately not persisted (re-crossing a gap costs
+        // O(log) zoom pages).
+        for &i in &answered {
+            let m = &mut members[i];
+            save_sync_state(ctx, &m.state_key, &m.addr, 0, m.watermark, m.last_full_ms)?;
+        }
+        walk.advance(page_max);
     }
-    if reachable == 0 {
-        return Err(format!("no source reachable: {last_err}"));
-    }
-    let applied = if union.is_empty() {
-        0
-    } else {
-        let rows: Vec<_> = union
-            .into_iter()
-            .map(|((labels, ts), value)| (labels, ts, value))
-            .collect();
-        let db = local
-            .read()
-            .map_err(|_| "witness local lock poisoned".to_string())?;
-        db.ts_merge(qualified, &rows)
-            .map_err(|e| format!("ts merge {qualified}: {e}"))?
-    };
-    for (state_key, addr, max_ts, last_full) in saves {
-        save_sync_state(ctx, &state_key, &addr, 0, max_ts, last_full)?;
+    // A full sweep only counts as complete for members that answered every
+    // window they were asked — stamp their backstop clock.
+    for m in &members {
+        if m.full && !m.failed {
+            save_sync_state(ctx, &m.state_key, &m.addr, 0, m.watermark, now)?;
+        }
     }
     Ok((pulled, applied))
 }
@@ -1054,4 +1206,71 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The paged TS walk: covers [start, frontier] in bounded windows with
+    /// a final `i64::MAX` window, zooms exponentially over an empty
+    /// full-sweep prefix, shrinks under dense pages, and never exceeds the
+    /// page cap for a realistic span. Regression for the 2026-07-24 onetw
+    /// finding: a multi-day catch-up must not ride one unbounded TsQuery.
+    #[test]
+    fn ts_walk_pages_cover_range_and_adapt() {
+        // Delta-style walk: 2h behind, quiet table -> few pages, last is MAX.
+        let now = 1_784_000_000_000i64;
+        let mut w = TsWalk::new(now - 2 * 3_600_000, now);
+        let mut windows = Vec::new();
+        while let Some((t0, t1)) = w.window() {
+            windows.push((t0, t1));
+            w.advance(100); // sparse data
+            assert!(windows.len() < 100, "quiet 2h delta must not page-storm");
+        }
+        assert_eq!(windows.last().unwrap().1, i64::MAX, "final window catches future stamps");
+        // Contiguous coverage, no gaps.
+        for pair in windows.windows(2) {
+            assert_eq!(pair[0].1 + 1, pair[1].0, "gap between windows: {pair:?}");
+        }
+        assert_eq!(windows[0].0, now - 2 * 3_600_000);
+
+        // Full sweep from 0: the empty epoch prefix must zoom, not crawl.
+        let mut w = TsWalk::new(0, now);
+        let mut pages = 0;
+        while let Some((_, t1)) = w.window() {
+            pages += 1;
+            // Empty until the last ~2 days of the span, then dense.
+            let dense = t1 == i64::MAX || t1 > now - 2 * 86_400_000;
+            w.advance(if dense { 3 * TS_PAGE_TARGET } else { 0 });
+            assert!(pages < 200, "full sweep from epoch 0 page-stormed");
+        }
+        assert!(pages < 100, "expected a few dozen pages, got {pages}");
+
+        // Data at EPOCH-SMALL timestamps followed by a ~55-year empty span
+        // (the witness_pull_mirrors_timeseries_tables shape): the walk must
+        // re-zoom after data ends, not crawl the gap at the capped slice.
+        let mut w = TsWalk::new(0, now);
+        let mut pages = 0;
+        while let Some((t0, t1)) = w.window() {
+            pages += 1;
+            let has_data = t0 <= 3_000 && t1 >= 1_000; // samples at ts 1000..3000
+            w.advance(if has_data { 3 } else { 0 });
+            assert!(pages < 60, "epoch-data walk page-stormed (gap not re-zoomed)");
+        }
+
+        // Dense pages shrink the slice toward the floor; sparse re-grow it.
+        let mut w = TsWalk::new(0, now);
+        let before = w.slice;
+        w.advance(3 * TS_PAGE_TARGET);
+        assert!(w.slice < before, "dense page must shrink the slice");
+        let shrunk = w.slice;
+        w.advance(1); // nearly-empty page (data seen already)
+        assert!(w.slice > shrunk, "sparse page must re-grow the slice");
+        // Floor holds under repeated dense pages.
+        for _ in 0..50 {
+            w.advance(10 * TS_PAGE_TARGET);
+        }
+        assert!(w.slice >= TS_SLICE_MIN_MS);
+    }
 }
