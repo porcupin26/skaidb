@@ -1,4 +1,5 @@
 # Private / local-only files — never commit
+claude.start
 .priv/
 
 # LLM / agent artifacts — never commit
