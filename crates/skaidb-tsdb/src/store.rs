@@ -604,6 +604,23 @@ impl Tsdb {
         t0: i64,
         t1: i64,
     ) -> Result<Vec<(Labels, Vec<Sample>)>> {
+        self.query_with(matchers, t0, t1, &mut |_| Ok(()))
+    }
+
+    /// [`Tsdb::query`] with a caller-supplied charge hook, called with each
+    /// sample-batch size AS IT IS COLLECTED (per series fragment, before the
+    /// result accumulates). Lets a resource-metered caller abort the walk
+    /// the moment its budget is exhausted instead of after the whole result
+    /// has materialized — an unbounded gather over a multi-million-sample
+    /// selection otherwise sits fully resident before the caller's meter
+    /// ever sees a count. The hook's error aborts and propagates verbatim.
+    pub fn query_with(
+        &self,
+        matchers: &[Matcher],
+        t0: i64,
+        t1: i64,
+        charge: &mut dyn FnMut(usize) -> std::result::Result<(), TsdbError>,
+    ) -> Result<Vec<(Labels, Vec<Sample>)>> {
         let inner = self.inner.lock().expect("tsdb lock");
         let mut merged: BTreeMap<Labels, Vec<Sample>> = BTreeMap::new();
         // Blocks are time-ordered and per-series ranges are disjoint, so
@@ -612,6 +629,7 @@ impl Tsdb {
         // back to the full walk when none can restrict).
         for block in &inner.blocks {
             for (labels, samples) in block.query_matchers(matchers, t0, t1)? {
+                charge(samples.len())?;
                 merged.entry(labels).or_default().extend(samples);
             }
         }
@@ -639,6 +657,7 @@ impl Tsdb {
         for (id, labels) in head_hits {
             let samples = inner.head.samples(id, t0, t1)?;
             if !samples.is_empty() {
+                charge(samples.len())?;
                 merged.entry(labels).or_default().extend(samples);
             }
         }

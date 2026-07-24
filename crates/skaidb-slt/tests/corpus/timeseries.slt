@@ -97,3 +97,18 @@ SELECT ts, value FROM m2 ORDER BY ts DESC LIMIT 2
 ----
 100000000 999.000
 600000 599.000
+
+# --- COUNT over an empty selection is 0, not NULL (2026-07-24): the
+# partials plan folds COUNT to SUM(per-bucket counts), and SQL SUM over
+# zero rows is NULL — caught live on onet (an empty time window returned
+# NULL where every SQL COUNT must return 0).
+
+query I
+SELECT count(*) FROM m WHERE host = 'a' AND ts >= 999999999999
+----
+0
+
+query I
+SELECT count(*) FROM m WHERE host = 'no-such-host'
+----
+0

@@ -377,14 +377,15 @@ fn gather_docs(
 
     // Rebuild documents: one per (series, ts), fields merged across streams,
     // ordered series-then-time so `rate()` sees per-series runs in order.
-    // Every sample charges the statement's scan budget — the raw gather
-    // materializes at the coordinator (like any row gather), and an
-    // unbounded `SELECT * FROM <ts>` over a large range must fail with the
-    // budget error, not grow until the OOM killer arrives. Aggregations
-    // took the bounded partials path above and never get here.
+    // The scan budget was already charged at the SOURCE — inside the local
+    // store walk (`Database::ts_query`) and per peer shard as scatter
+    // responses arrive — so an over-budget gather aborts before the result
+    // materializes at the coordinator, not after (an unbounded
+    // `SELECT * FROM <ts>` over a multi-million-sample selection used to sit
+    // fully resident before the meter fired). No tick here: it would
+    // double-charge every gathered sample.
     let mut merged: BTreeMap<(Vec<u8>, i64), Document> = BTreeMap::new();
     for (labels, samples) in gathered {
-        crate::scan_meter::tick(samples.len())?;
         let field = labels
             .iter()
             .find(|(k, _)| k == FIELD_LABEL)
@@ -1257,7 +1258,12 @@ fn rewrite_aggs(e: &mut Expr) {
                 arg: AggArg::Expr(Box::new(Expr::Column(format!("{prefix}{f}")))),
             };
             *e = match func {
-                AggFunc::Count => agg(AggFunc::Sum, "__pcnt_"),
+                // SUM over zero rows is NULL; COUNT over zero rows must be
+                // 0 — wrap the partial-count fold accordingly.
+                AggFunc::Count => Expr::Func {
+                    name: "coalesce".into(),
+                    args: vec![agg(AggFunc::Sum, "__pcnt_"), Expr::Literal(Value::Int(0))],
+                },
                 AggFunc::Sum => agg(AggFunc::Sum, "__psum_"),
                 // avg = Σsum / Σcount (all field values are non-null floats,
                 // so the raw path's denominator is exactly Σcount).

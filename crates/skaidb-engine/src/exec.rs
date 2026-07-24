@@ -6784,6 +6784,14 @@ impl Database {
     }
 
     /// Query samples from a time-series table (see [`Cluster::ts_query`]).
+    ///
+    /// Charges every returned sample against the statement's scan meter at
+    /// the SOURCE — so a statement dies as soon as its budget is exhausted,
+    /// before the coordinator/gather layers accumulate the whole result
+    /// (metering after the full gather let a multi-million-sample source
+    /// materialize ~100 MB before the budget fired — the 2026-07-24 onet
+    /// diagnosis). Meter-less callers (repair, witness pulls, PromQL,
+    /// remote peers serving TsQuery) tick into an unarmed meter: a no-op.
     pub fn ts_query(
         &self,
         table: &str,
@@ -6791,9 +6799,23 @@ impl Database {
         t0: i64,
         t1: i64,
     ) -> Result<Vec<(skaidb_tsdb::Labels, Vec<skaidb_tsdb::Sample>)>> {
-        self.ts_store(table)?
-            .query(matchers, t0, t1)
-            .map_err(|e| EngineError::Timeseries(e.to_string()))
+        // The charge hook runs inside the store walk; a budget error aborts
+        // it via TsdbError::Aborted and is surfaced from `meter_err` so the
+        // caller sees the original EngineError (not a stringified wrapper).
+        let mut meter_err: Option<EngineError> = None;
+        let result = self.ts_store(table)?.query_with(matchers, t0, t1, &mut |n| {
+            crate::scan_meter::tick(n).map_err(|e| {
+                let msg = e.to_string();
+                meter_err = Some(e);
+                skaidb_tsdb::TsdbError::Aborted(msg)
+            })
+        });
+        match result {
+            Ok(series) => Ok(series),
+            Err(e) => Err(meter_err
+                .take()
+                .unwrap_or_else(|| EngineError::Timeseries(e.to_string()))),
+        }
     }
 
     /// Rollup routing metadata for a time-series table (see
@@ -6859,10 +6881,16 @@ impl Database {
         t1: i64,
         bucket_ms: i64,
     ) -> Result<Vec<(skaidb_tsdb::Labels, Vec<crate::ts_query::TsPartial>)>> {
-        Ok(crate::ts_query::ts_partialize(
-            self.ts_query(table, matchers, t0, t1)?,
-            bucket_ms,
-        ))
+        // Deliberately NOT `self.ts_query` (which charges the scan meter at
+        // the source): partial aggregation is the documented budget-exempt
+        // path — its output is bounded per bucket, and metering the raw walk
+        // underneath would make every aggregate fail on exactly the tables
+        // the partials plan exists to serve.
+        let raw = self
+            .ts_store(table)?
+            .query(matchers, t0, t1)
+            .map_err(|e| EngineError::Timeseries(e.to_string()))?;
+        Ok(crate::ts_query::ts_partialize(raw, bucket_ms))
     }
 
     /// `SHOW TABLES`: the catalog's tables and their primary keys, in name
@@ -11545,6 +11573,19 @@ impl Cluster for LocalCluster<'_> {
         self.db.ts_query(table, matchers, t0, t1)
     }
 
+    // NOT the trait default (which derives from the scan-metered
+    // `ts_query`): partial aggregation is the budget-exempt path.
+    fn ts_partials(
+        &self,
+        table: &str,
+        matchers: &[skaidb_tsdb::Matcher],
+        t0: i64,
+        t1: i64,
+        bucket_ms: i64,
+    ) -> Result<Vec<(skaidb_tsdb::Labels, Vec<crate::ts_query::TsPartial>)>> {
+        self.db.ts_partials(table, matchers, t0, t1, bucket_ms)
+    }
+
     fn ts_series_sets(
         &self,
         table: &str,
@@ -11703,6 +11744,19 @@ impl Cluster for LocalRead<'_> {
         t1: i64,
     ) -> Result<Vec<(skaidb_tsdb::Labels, Vec<skaidb_tsdb::Sample>)>> {
         self.db.ts_query(table, matchers, t0, t1)
+    }
+
+    // NOT the trait default (which derives from the scan-metered
+    // `ts_query`): partial aggregation is the budget-exempt path.
+    fn ts_partials(
+        &self,
+        table: &str,
+        matchers: &[skaidb_tsdb::Matcher],
+        t0: i64,
+        t1: i64,
+        bucket_ms: i64,
+    ) -> Result<Vec<(skaidb_tsdb::Labels, Vec<crate::ts_query::TsPartial>)>> {
+        self.db.ts_partials(table, matchers, t0, t1, bucket_ms)
     }
 
     fn ts_series_sets(

@@ -557,11 +557,19 @@ WHERE ts >= now() - 6h GROUP BY t;
 - `rate/increase/delta` are counter-reset-aware, computed per series then
   summed across the group (PromQL `sum(rate(...))` semantics); `first/last`
   take the earliest/latest value.
-- **Raw dumps are scan-metered** (v0.91): a raw `SELECT` (no aggregation)
-  charges each gathered sample against the statement scan budget like any
-  row gather — a huge unbounded range dump errors cleanly instead of
-  materializing until OOM. Narrow the range or aggregate (per-bucket
-  partials are bounded and unaffected). **Paging works at any size**:
+- **Raw dumps are scan-metered** (v0.91; at the SOURCE since v0.139): a raw
+  `SELECT` (no aggregation) charges each gathered sample against the
+  statement scan budget like any row gather — a huge unbounded range dump
+  errors cleanly instead of materializing until OOM. The charge lands
+  inside the store walk (and per peer response on a cluster), so the
+  abort happens before the result accumulates at the coordinator.
+  Narrow the range or aggregate (per-bucket partials are bounded, exempt,
+  and unaffected). `COUNT(*)` over an empty selection returns 0, not NULL
+  (v0.139; the partials COUNT→SUM fold coalesces). Gotcha worth knowing:
+  `ts` is epoch MILLISECONDS — a bound sent in epoch seconds reads as
+  ~1970 and unbounds the walk (symptom: a narrow-window query dies on the
+  scan budget having examined a whole series' history).
+  **Paging works at any size**:
   `WHERE ts > <cursor> ORDER BY ts LIMIT n` walks time slices with early
   stop (each page costs ~its own rows) — the export pattern. Bare
   `LIMIT n` and unbounded `ORDER BY ts [DESC] LIMIT n` ("latest/oldest
@@ -609,11 +617,26 @@ WHERE ts >= now() - 6h GROUP BY t;
   accepts both positions (`sum(x) by (a)` too); rate/increase/delta use
   Prometheus's exact extrapolatedRate; NaN/±Inf render as API sample
   values (not filtered); a scrape-time literal `name` label (stored as
-  `exported_name`) renders back as `name`. PromQL is structurally
-  COMPLETE (Tiers 1–4) and VERIFIED panel-by-panel: Node Exporter Full
-  (#1860, 284 queries) vs real Prometheus 2.42 on identical data —
-  253/253 non-empty panels exact (2026-07-22). Out of scope: native
-  histograms, trig functions, `atan2`.
+  `exported_name`) renders back as `name`. Label-set semantics match
+  Prometheus exactly (v0.139): `without(...)` aggregations and EVERY
+  vector∘vector binary operator drop `__name__` (including filter
+  comparisons and `on(__name__, ...)` keys), group_left/right filter
+  comparisons graft the requested extra labels, and
+  `histogram_quantile` drops `__name__` even from bare-selector input
+  and emits a SAMPLE for every group — φ bounds checked before
+  histogram validity (φ<0 → -Inf, φ>1 → +Inf, invalid/empty histogram
+  → NaN) instead of dropping the series. PromQL is structurally
+  COMPLETE (Tiers 1–4) and VERIFIED two ways: panel-by-panel — Node
+  Exporter Full (#1860, 284 queries) vs real Prometheus 2.42 on
+  identical data, 253/253 non-empty panels exact (2026-07-22) — and via
+  the official prometheus/compliance promql-compliance-tester vs
+  Prometheus 2.53 on identical remote_written data: **526/538 (97.8%)**,
+  identical single-node and 3-node RF=3 (2026-07-24). The remaining
+  ledger is small and known: scientific/hex number literals, negative
+  `offset`, `timestamp(<expr>)` beyond a bare selector,
+  `{__name__=~".*"}` acceptance, `clamp(min>max)` → NaN vs empty,
+  staleness markers. Out of scope: native histograms, trig functions,
+  `atan2`.
 - **Self-scrape**: `config set observability.self_scrape true` (live) makes
   the node ingest its own `/metrics` every
   `observability.self_scrape_interval_secs` — self-dashboarding without an

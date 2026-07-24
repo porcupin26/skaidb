@@ -115,12 +115,23 @@ stored as its own compressed stream. Full grammar and semantics:
   applied by the coordinator (peers answer the equality-matched
   superset). A fresh datasource with no ingest sees empty
   results, not errors. Datasource setup recipes: [GRAFANA.md](GRAFANA.md).
-- **Raw dumps are scan-metered** (v0.91): a raw `SELECT` over a
-  time-series table charges each gathered sample against the statement's
-  scan budget, exactly like row-table gathers — an unbounded dump over a
-  huge range fails with the budget error instead of materializing until
-  the coordinator OOMs. Narrow the time range or aggregate (aggregations
-  push down as bounded per-bucket partials and are unaffected).
+- **Raw dumps are scan-metered** (v0.91; metered at the source since
+  v0.139): a raw `SELECT` over a time-series table charges each gathered
+  sample against the statement's scan budget, exactly like row-table
+  gathers — an unbounded dump over a huge range fails with the budget
+  error instead of materializing until the coordinator OOMs. The charge
+  now lands *inside* the store walk (and per peer response on a
+  cluster), so an over-budget gather aborts as it reads instead of after
+  the whole result sits resident at the coordinator. Narrow the time
+  range or aggregate (aggregations push down as bounded per-bucket
+  partials and are unaffected). Note `ts` bounds are epoch
+  **milliseconds** — a bound accidentally supplied in epoch *seconds*
+  reads as ~1970, unbounding the walk (the classic symptom: a
+  narrow-window query dying on the scan budget).
+- **`COUNT(*)` over an empty selection returns 0** (v0.139): the
+  partials plan folds COUNT into a SUM of per-bucket counts, and SQL SUM
+  over zero rows is NULL — the fold now coalesces to 0, so an empty time
+  window or non-matching filter counts as 0 like every SQL COUNT.
 - **LIMIT'd raw reads page efficiently**: `WHERE ts > <cursor> ORDER BY
   ts LIMIT n` (or `DESC` with an upper bound) walks the range in time
   slices and stops as soon as `n` rows survive the filter — each page

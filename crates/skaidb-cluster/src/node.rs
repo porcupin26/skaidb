@@ -2675,6 +2675,11 @@ impl Node {
                 if !post_matchers.iter().all(|m| m.accepts(&labels)) {
                     continue; // peers only saw the equality forms
                 }
+                // Remote samples reach the coordinator unmetered (the peer's
+                // handler has no armed meter); charge them here, per series,
+                // before they accumulate — mirrors the local leg's charge
+                // inside the store walk.
+                skaidb_engine::scan_meter::tick(samples.len())?;
                 let entry = merged.entry(labels).or_default();
                 for (ts, value) in samples {
                     entry.insert(ts, value);

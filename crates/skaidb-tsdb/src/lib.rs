@@ -45,6 +45,11 @@ pub enum TsdbError {
     SeriesLimit(usize),
     #[error("invalid argument: {0}")]
     Invalid(String),
+    /// A `query_with` charge hook aborted the walk (e.g. a caller's scan
+    /// budget ran out). Callers that pass a hook should surface their own
+    /// error instead of this one; the payload is a best-effort message.
+    #[error("{0}")]
+    Aborted(String),
 }
 
 pub type Result<T> = std::result::Result<T, TsdbError>;
