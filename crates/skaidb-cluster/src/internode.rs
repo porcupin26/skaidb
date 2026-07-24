@@ -94,6 +94,22 @@ pub enum Request {
         t0: i64,
         t1: i64,
     },
+    /// Like [`Request::TsQuery`], but the peer bounds the response at
+    /// `max_samples` by serving a shorter time window it chooses (server-
+    /// side boundary search) — the TS twin of `ScanPage`. Answered with
+    /// [`Response::TsSeriesPage`], whose `resume_t0` says where to
+    /// continue (`None` = the requested range is complete). An unbounded
+    /// `TsQuery` of a multi-million-sample range produced responses that
+    /// blew the 64 MB frame server-side or the puller's RAM client-side
+    /// (the 2026-07-24 onetw witness incident); only the SERVER knows how
+    /// many samples a window holds, so the cap must live here.
+    TsQueryPaged {
+        table: String,
+        matchers: Vec<(bool, String, String)>,
+        t0: i64,
+        t1: i64,
+        max_samples: u32,
+    },
     /// Repair-path merge: apply samples of any age to the peer's local
     /// store (fills mid-series gaps that `TsAppend` would reject).
     TsMerge {
@@ -396,6 +412,13 @@ pub enum Response {
     TsSeries {
         series: TsSeriesData,
     },
+    /// Reply to [`Request::TsQueryPaged`]: samples for the served window
+    /// (all of `[t0, resume_t0-1]`), plus where to resume. `None` = the
+    /// requested range is complete.
+    TsSeriesPage {
+        series: TsSeriesData,
+        resume_t0: Option<i64>,
+    },
     /// Reply to [`Request::TsSummary`]: `(labels, deduped count, checksum)`.
     TsSummaries {
         series: Vec<TsSummaryRow>,
@@ -476,6 +499,7 @@ const REQ_SCANSINCE: u8 = 37;
 const REQ_REPAIRSEQ: u8 = 38;
 const REQ_DATABYTES: u8 = 39;
 const REQ_TSSERIESSETS: u8 = 40;
+const REQ_TSQUERYPAGED: u8 = 41;
 
 const RES_ACK: u8 = 0;
 const RES_SCAN: u8 = 1;
@@ -500,6 +524,7 @@ const RES_DELTAPAGE: u8 = 19;
 const RES_DATABYTES: u8 = 21;
 const RES_REPAIRSEQ: u8 = 20;
 const RES_TSLABELSETS: u8 = 22;
+const RES_TSSERIESPAGE: u8 = 23;
 
 impl Request {
     pub fn encode(&self) -> Vec<u8> {
@@ -588,6 +613,25 @@ impl Request {
                 }
                 o.extend_from_slice(&t0.to_le_bytes());
                 o.extend_from_slice(&t1.to_le_bytes());
+            }
+            Request::TsQueryPaged {
+                table,
+                matchers,
+                t0,
+                t1,
+                max_samples,
+            } => {
+                o.push(REQ_TSQUERYPAGED);
+                put_str(o, table);
+                o.extend_from_slice(&(matchers.len() as u32).to_le_bytes());
+                for (negated, k, v) in matchers {
+                    o.push(u8::from(*negated));
+                    put_str(o, k);
+                    put_str(o, v);
+                }
+                o.extend_from_slice(&t0.to_le_bytes());
+                o.extend_from_slice(&t1.to_le_bytes());
+                o.extend_from_slice(&max_samples.to_le_bytes());
             }
             Request::TsSeriesSets { table, matchers } => {
                 o.push(REQ_TSSERIESSETS);
@@ -869,6 +913,24 @@ impl Request {
                     matchers.push((negated, k, v));
                 }
                 Request::TsSeriesSets { table, matchers }
+            }
+            REQ_TSQUERYPAGED => {
+                let table = c.string()?;
+                let n = c.u32()? as usize;
+                let mut matchers = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let negated = c.u8()? != 0;
+                    let k = c.string()?;
+                    let v = c.string()?;
+                    matchers.push((negated, k, v));
+                }
+                Request::TsQueryPaged {
+                    table,
+                    matchers,
+                    t0: c.u64()? as i64,
+                    t1: c.u64()? as i64,
+                    max_samples: c.u32()?,
+                }
             }
             REQ_TSMERGE => {
                 let table = c.string()?;
@@ -1207,6 +1269,20 @@ impl Response {
                     }
                 }
             }
+            Response::TsSeriesPage { series, resume_t0 } => {
+                o.push(RES_TSSERIESPAGE);
+                o.push(u8::from(resume_t0.is_some()));
+                o.extend_from_slice(&resume_t0.unwrap_or(0).to_le_bytes());
+                o.extend_from_slice(&(series.len() as u32).to_le_bytes());
+                for (labels, samples) in series {
+                    put_labels(o, labels);
+                    o.extend_from_slice(&(samples.len() as u32).to_le_bytes());
+                    for (ts, value) in samples {
+                        o.extend_from_slice(&ts.to_le_bytes());
+                        o.extend_from_slice(&value.to_bits().to_le_bytes());
+                    }
+                }
+            }
             Response::TsLabelSets { series } => {
                 o.push(RES_TSLABELSETS);
                 o.extend_from_slice(&(series.len() as u32).to_le_bytes());
@@ -1351,6 +1427,26 @@ impl Response {
                     series.push((labels, samples));
                 }
                 Response::TsSeries { series }
+            }
+            RES_TSSERIESPAGE => {
+                let has_resume = c.u8()? != 0;
+                let resume = c.u64()? as i64;
+                let n = c.u32()? as usize;
+                let mut series = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let labels = c.labels()?;
+                    let m = c.u32()? as usize;
+                    let mut samples = Vec::with_capacity(m);
+                    for _ in 0..m {
+                        let ts = c.u64()? as i64;
+                        samples.push((ts, f64::from_bits(c.u64()?)));
+                    }
+                    series.push((labels, samples));
+                }
+                Response::TsSeriesPage {
+                    series,
+                    resume_t0: has_resume.then_some(resume),
+                }
             }
             RES_TSLABELSETS => {
                 let n = c.u32()? as usize;

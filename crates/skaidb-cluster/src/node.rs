@@ -5264,6 +5264,91 @@ impl Node {
                 }
                 None => Response::Err("busy: engine write-locked, retry".into()),
             },
+            Request::TsQueryPaged {
+                table,
+                matchers,
+                t0,
+                t1,
+                max_samples,
+            } => match self.local_read_bounded() {
+                Some(db) => {
+                    let matchers: Vec<skaidb_tsdb::Matcher> = matchers
+                        .into_iter()
+                        .map(|(negated, k, v)| {
+                            if negated {
+                                skaidb_tsdb::Matcher::Ne(k, v)
+                            } else {
+                                skaidb_tsdb::Matcher::Eq(k, v)
+                            }
+                        })
+                        .collect();
+                    // Server-side boundary search: probe successively
+                    // shorter windows until one fits the cap. Every probe's
+                    // work is bounded (the capped walk aborts at cap+1), so
+                    // serving a multi-million-sample range costs O(log)
+                    // bounded probes instead of one unbounded response.
+                    let cap = (max_samples as usize).max(1);
+                    let mut w_end = t1;
+                    loop {
+                        match db.ts_query_capped(&table, &matchers, t0, w_end, cap) {
+                            Ok((series, true)) => {
+                                break Response::TsSeriesPage {
+                                    series: series
+                                        .into_iter()
+                                        .map(|(labels, samples)| {
+                                            (
+                                                labels,
+                                                samples
+                                                    .into_iter()
+                                                    .map(|s| (s.ts, s.value))
+                                                    .collect(),
+                                            )
+                                        })
+                                        .collect(),
+                                    resume_t0: (w_end < t1)
+                                        .then(|| w_end.saturating_add(1)),
+                                };
+                            }
+                            Ok((_, false)) => {
+                                if w_end <= t0 {
+                                    // A single instant alone exceeds the cap
+                                    // (a pathological same-timestamp burst):
+                                    // serve it whole — bounded by that one
+                                    // instant — rather than loop forever.
+                                    match db.ts_query_capped(
+                                        &table, &matchers, t0, t0, usize::MAX,
+                                    ) {
+                                        Ok((series, _)) => {
+                                            break Response::TsSeriesPage {
+                                                series: series
+                                                    .into_iter()
+                                                    .map(|(labels, samples)| {
+                                                        (
+                                                            labels,
+                                                            samples
+                                                                .into_iter()
+                                                                .map(|s| (s.ts, s.value))
+                                                                .collect(),
+                                                        )
+                                                    })
+                                                    .collect(),
+                                                resume_t0: (t0 < t1)
+                                                    .then(|| t0.saturating_add(1)),
+                                            };
+                                        }
+                                        Err(e) => break Response::Err(e.to_string()),
+                                    }
+                                }
+                                // Shrink toward t0 (span/8 per probe).
+                                let span = w_end.saturating_sub(t0);
+                                w_end = t0.saturating_add(span / 8);
+                            }
+                            Err(e) => break Response::Err(e.to_string()),
+                        }
+                    }
+                }
+                None => Response::Err("busy: engine write-locked, retry".into()),
+            },
             Request::TsSeriesSets { table, matchers } => match self.local_read_bounded() {
                 Some(db) => {
                     let matchers: Vec<skaidb_tsdb::Matcher> = matchers

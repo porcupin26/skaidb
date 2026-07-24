@@ -710,14 +710,17 @@ WHERE ts >= now() - 6h GROUP BY t;
   unioned + deduped into any-aged merges; recreated locally as plain
   TIMESERIES tables (source series key, NO retention — the backup keeps
   what the primary ages out; rollups mirror as plain TS tables).
-  TS pulls are PAGED (v0.139.1): the range walks in adaptive time slices
-  (~50k samples/page target, slice sized from what members return,
-  exponential zoom over empty full-sweep prefixes), each page unioned,
-  merged, and its watermark saved before the next — a multi-day or
-  from-empty catch-up of a multi-million-sample table moves in bounded
-  responses (the old one-shot `TsQuery [t0, MAX]` produced responses big
-  enough that primaries aborted the connection mid-send — the 2026-07-24
-  onetw finding) and a crash resumes at the last landed window.
+  TS pulls are PAGED SERVER-SIDE (v0.139.2, `TsQueryPaged` internode
+  verb — the TS twin of ScanPage): each member serves a window it bounds
+  itself at ~50k samples (server-side boundary search over a capped
+  store walk; only the server knows how many samples a window holds —
+  client-guessed windows either blew the 64 MB internode frame
+  server-side or OOM'd the 320 MB witness on a frame-fitting-but-huge
+  response, the 2026-07-24 onetw findings), pages are trimmed to the
+  members' common window, unioned, merged, and watermarks saved per
+  landed page (crash-resumable; watermarks keep DATA-time semantics).
+  Mixed-version fallback: primaries without the verb get one legacy
+  client-side adaptive-window walk per cycle.
   Ops note for Docker witnesses: run with `--ulimit nofile=65536` —
   TS block handles hold an FD each, and the Docker default 1024 broke
   every onetw cycle for three days (EMFILE) before diagnosis.

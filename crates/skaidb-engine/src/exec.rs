@@ -6818,6 +6818,38 @@ impl Database {
         }
     }
 
+    /// [`Database::ts_query`] bounded at `cap` samples: `(series, true)`
+    /// when the whole range fit, `(empty, false)` the moment the walk
+    /// exceeds the cap — the building block for serving `TsQueryPaged`
+    /// (the peer probes successively shorter windows until one fits, so no
+    /// response can materialize unbounded on either end). Deliberately NOT
+    /// scan-metered: this serves internode witness pulls, whose work is
+    /// bounded by the cap itself, not by a client statement's budget.
+    #[allow(clippy::type_complexity)]
+    pub fn ts_query_capped(
+        &self,
+        table: &str,
+        matchers: &[skaidb_tsdb::Matcher],
+        t0: i64,
+        t1: i64,
+        cap: usize,
+    ) -> Result<(Vec<(skaidb_tsdb::Labels, Vec<skaidb_tsdb::Sample>)>, bool)> {
+        let mut seen = 0usize;
+        let result = self.ts_store(table)?.query_with(matchers, t0, t1, &mut |n| {
+            seen = seen.saturating_add(n);
+            if seen > cap {
+                Err(skaidb_tsdb::TsdbError::Aborted("over cap".into()))
+            } else {
+                Ok(())
+            }
+        });
+        match result {
+            Ok(series) => Ok((series, true)),
+            Err(skaidb_tsdb::TsdbError::Aborted(_)) => Ok((Vec::new(), false)),
+            Err(e) => Err(EngineError::Timeseries(e.to_string())),
+        }
+    }
+
     /// Rollup routing metadata for a time-series table (see
     /// [`Cluster::ts_rollup_info`]): the retention horizon — the timestamp
     /// below which source blocks may already be dropped (`max_ts -
